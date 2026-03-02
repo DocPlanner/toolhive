@@ -946,20 +946,28 @@ func (v *TokenValidator) validateClaims(claims jwt.MapClaims) error {
 	// Validate the audience if provided
 	if v.audience != "" {
 		audiences, err := claims.GetAudience()
-		if err != nil {
-			return ErrInvalidAudience
-		}
-
-		found := false
-		for _, aud := range audiences {
-			if aud == v.audience {
-				found = true
-				break
+		// Some providers (e.g., Cognito access tokens) may omit `aud` and
+		// expose `client_id` instead. If `aud` is missing, accept the token
+		// when configured client_id matches token client_id.
+		if err != nil || len(audiences) == 0 {
+			if v.clientID == "" {
+				return ErrInvalidAudience
 			}
-		}
-
-		if !found {
-			return ErrInvalidAudience
+			clientID, ok := claims["client_id"].(string)
+			if !ok || strings.TrimSpace(clientID) != strings.TrimSpace(v.clientID) {
+				return ErrInvalidAudience
+			}
+		} else {
+			found := false
+			for _, aud := range audiences {
+				if aud == v.audience {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return ErrInvalidAudience
+			}
 		}
 	}
 
