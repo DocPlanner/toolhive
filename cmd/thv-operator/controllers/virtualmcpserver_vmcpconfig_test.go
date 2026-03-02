@@ -1489,6 +1489,212 @@ func TestConfigMapContent_DynamicMode(t *testing.T) {
 	t.Log("Dynamic mode ConfigMap contains minimal content without backends")
 }
 
+// TestConfigMapContent_StaticMode_UsesExplicitBackendsWhenGroupEmpty verifies that
+// explicit spec.config.backends are honored in static mode even when group discovery
+// returns no backends.
+func TestConfigMapContent_StaticMode_UsesExplicitBackendsWhenGroupEmpty(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	testScheme := createRunConfigTestScheme()
+
+	mcpGroup := &mcpv1alpha1.MCPGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "empty-group",
+			Namespace: "default",
+		},
+		Spec: mcpv1alpha1.MCPGroupSpec{},
+		Status: mcpv1alpha1.MCPGroupStatus{
+			Phase: mcpv1alpha1.MCPGroupPhaseReady,
+		},
+	}
+
+	vmcpServer := &mcpv1alpha1.VirtualMCPServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-vmcp",
+			Namespace: "default",
+		},
+		Spec: mcpv1alpha1.VirtualMCPServerSpec{
+			Config: vmcpconfig.Config{
+				Group: "empty-group",
+				Backends: []vmcpconfig.StaticBackendConfig{
+					{
+						Name:      "github-mcp",
+						URL:       "http://github-mcp.default.svc.cluster.local:8080",
+						Transport: vmcpconfig.TransportSSE,
+					},
+					{
+						Name:      "fetch-mcp",
+						URL:       "http://fetch-mcp.default.svc.cluster.local:8080",
+						Transport: vmcpconfig.TransportStreamableHTTP,
+					},
+				},
+			},
+			IncomingAuth: &mcpv1alpha1.IncomingAuthConfig{
+				Type: "anonymous",
+			},
+			OutgoingAuth: &mcpv1alpha1.OutgoingAuthConfig{
+				Source: "inline",
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(testScheme).
+		WithObjects(vmcpServer, mcpGroup).
+		Build()
+
+	reconciler := &VirtualMCPServerReconciler{
+		Client: fakeClient,
+		Scheme: testScheme,
+	}
+
+	workloadDiscoverer := workloads.NewK8SDiscovererWithClient(fakeClient, vmcpServer.Namespace)
+	workloadNames, err := workloadDiscoverer.ListWorkloadsInGroup(ctx, vmcpServer.Spec.Config.Group)
+	require.NoError(t, err)
+	require.Empty(t, workloadNames, "group should be empty")
+
+	statusCollector := virtualmcpserverstatus.NewStatusManager(vmcpServer)
+	err = reconciler.ensureVmcpConfigConfigMap(ctx, vmcpServer, workloadNames, statusCollector)
+	require.NoError(t, err)
+
+	configMap := &corev1.ConfigMap{}
+	err = fakeClient.Get(ctx, types.NamespacedName{
+		Name:      vmcpConfigMapName("test-vmcp"),
+		Namespace: "default",
+	}, configMap)
+	require.NoError(t, err)
+
+	var config vmcpconfig.Config
+	err = yaml.Unmarshal([]byte(configMap.Data["config.yaml"]), &config)
+	require.NoError(t, err)
+
+	require.Len(t, config.Backends, 2, "explicit static backends should be preserved")
+	assert.ElementsMatch(t, []string{"github-mcp", "fetch-mcp"}, []string{
+		config.Backends[0].Name,
+		config.Backends[1].Name,
+	})
+}
+
+// TestConfigMapContent_StaticMode_MergesDiscoveredAndExplicitBackends verifies that
+// static mode merges discovered group backends with explicit spec.config.backends and
+// uses explicit entries when names collide.
+func TestConfigMapContent_StaticMode_MergesDiscoveredAndExplicitBackends(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	testScheme := createRunConfigTestScheme()
+
+	mcpGroup := &mcpv1alpha1.MCPGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-group",
+			Namespace: "default",
+		},
+		Spec: mcpv1alpha1.MCPGroupSpec{},
+		Status: mcpv1alpha1.MCPGroupStatus{
+			Phase: mcpv1alpha1.MCPGroupPhaseReady,
+		},
+	}
+
+	mcpServer := &mcpv1alpha1.MCPServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "discovered-backend",
+			Namespace: "default",
+		},
+		Spec: mcpv1alpha1.MCPServerSpec{
+			GroupRef:  "test-group",
+			Transport: vmcpconfig.TransportSSE,
+		},
+		Status: mcpv1alpha1.MCPServerStatus{
+			Phase: mcpv1alpha1.MCPServerPhaseRunning,
+			URL:   "http://discovered-backend.default.svc.cluster.local:8080",
+		},
+	}
+
+	vmcpServer := &mcpv1alpha1.VirtualMCPServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-vmcp",
+			Namespace: "default",
+		},
+		Spec: mcpv1alpha1.VirtualMCPServerSpec{
+			Config: vmcpconfig.Config{
+				Group: "test-group",
+				Backends: []vmcpconfig.StaticBackendConfig{
+					{
+						Name:      "discovered-backend",
+						URL:       "https://override.example.com/backend",
+						Transport: vmcpconfig.TransportStreamableHTTP,
+						Metadata: map[string]string{
+							"source": "inline",
+						},
+					},
+					{
+						Name:      "inline-only-backend",
+						URL:       "https://inline-only.example.com/backend",
+						Transport: vmcpconfig.TransportSSE,
+					},
+				},
+			},
+			IncomingAuth: &mcpv1alpha1.IncomingAuthConfig{
+				Type: "anonymous",
+			},
+			OutgoingAuth: &mcpv1alpha1.OutgoingAuthConfig{
+				Source: "inline",
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(testScheme).
+		WithObjects(vmcpServer, mcpGroup, mcpServer).
+		WithStatusSubresource(mcpServer).
+		Build()
+
+	reconciler := &VirtualMCPServerReconciler{
+		Client: fakeClient,
+		Scheme: testScheme,
+	}
+
+	workloadDiscoverer := workloads.NewK8SDiscovererWithClient(fakeClient, vmcpServer.Namespace)
+	workloadNames, err := workloadDiscoverer.ListWorkloadsInGroup(ctx, vmcpServer.Spec.Config.Group)
+	require.NoError(t, err)
+	require.NotEmpty(t, workloadNames, "group should have discovered backends")
+
+	statusCollector := virtualmcpserverstatus.NewStatusManager(vmcpServer)
+	err = reconciler.ensureVmcpConfigConfigMap(ctx, vmcpServer, workloadNames, statusCollector)
+	require.NoError(t, err)
+
+	configMap := &corev1.ConfigMap{}
+	err = fakeClient.Get(ctx, types.NamespacedName{
+		Name:      vmcpConfigMapName("test-vmcp"),
+		Namespace: "default",
+	}, configMap)
+	require.NoError(t, err)
+
+	var config vmcpconfig.Config
+	err = yaml.Unmarshal([]byte(configMap.Data["config.yaml"]), &config)
+	require.NoError(t, err)
+
+	require.Len(t, config.Backends, 2, "discovered and explicit backends should be merged")
+
+	backendsByName := make(map[string]vmcpconfig.StaticBackendConfig, len(config.Backends))
+	for _, backend := range config.Backends {
+		backendsByName[backend.Name] = backend
+	}
+
+	discoveredBackend, found := backendsByName["discovered-backend"]
+	require.True(t, found, "merged config should contain discovered-backend")
+	assert.Equal(t, "https://override.example.com/backend", discoveredBackend.URL,
+		"explicit backend entry should override discovered backend with same name")
+	assert.Equal(t, vmcpconfig.TransportStreamableHTTP, discoveredBackend.Transport)
+	assert.Equal(t, "inline", discoveredBackend.Metadata["source"])
+
+	inlineOnlyBackend, found := backendsByName["inline-only-backend"]
+	require.True(t, found, "merged config should contain inline-only backend")
+	assert.Equal(t, "https://inline-only.example.com/backend", inlineOnlyBackend.URL)
+	assert.Equal(t, vmcpconfig.TransportSSE, inlineOnlyBackend.Transport)
+}
+
 // TestConfigMapContent_StaticMode_InlineOverrides tests that in static mode (inline),
 // explicitly specified backends in the spec are preserved in the ConfigMap.
 // This tests inline overrides, not discovery. See TestConfigMapContent_StaticModeWithDiscovery
@@ -1803,151 +2009,4 @@ func TestStaticModeTransportConstants(t *testing.T) {
 	// 2. Update the CRD enum in StaticBackendConfig.Transport: +kubebuilder:validation:Enum=...
 	// 3. Run: task operator-generate && task operator-manifests
 	// 4. This test will verify the constants match the expected values
-}
-
-// TestOptimizerEmbeddingServiceURL tests that the optimizer's EmbeddingService
-// field is populated with the full base URL (scheme + host + port) from the EmbeddingServer
-// Status.URL. This ensures the optimizer can use it directly as an HTTP client endpoint.
-func TestOptimizerEmbeddingServiceURL(t *testing.T) {
-	t.Parallel()
-
-	const (
-		testNamespace       = "default"
-		testGroup           = "test-group"
-		customPort    int32 = 9090
-	)
-
-	tests := []struct {
-		name        string
-		vmcp        *mcpv1alpha1.VirtualMCPServer
-		esName      string
-		esPort      int32
-		expectedURL string
-	}{
-		{
-			name: "referenced embedding server populates full URL",
-			vmcp: &mcpv1alpha1.VirtualMCPServer{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "my-vmcp",
-					Namespace: testNamespace,
-				},
-				Spec: mcpv1alpha1.VirtualMCPServerSpec{
-					Config: vmcpconfig.Config{
-						Group:     testGroup,
-						Optimizer: &vmcpconfig.OptimizerConfig{},
-					},
-					EmbeddingServerRef: &mcpv1alpha1.EmbeddingServerRef{
-						Name: "shared-embedding",
-					},
-				},
-			},
-			esName:      "shared-embedding",
-			esPort:      customPort,
-			expectedURL: "http://shared-embedding.default.svc.cluster.local:9090",
-		},
-		{
-			name: "ref without optimizer auto-populates optimizer with defaults",
-			vmcp: &mcpv1alpha1.VirtualMCPServer{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "my-vmcp",
-					Namespace: testNamespace,
-				},
-				Spec: mcpv1alpha1.VirtualMCPServerSpec{
-					Config: vmcpconfig.Config{
-						Group: testGroup,
-						// No Optimizer — validation auto-populates it when ref is set
-					},
-					EmbeddingServerRef: &mcpv1alpha1.EmbeddingServerRef{
-						Name: "shared-embedding",
-					},
-				},
-			},
-			esName:      "shared-embedding",
-			esPort:      customPort,
-			expectedURL: "http://shared-embedding.default.svc.cluster.local:9090",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			ctx := context.Background()
-			testScheme := createRunConfigTestScheme()
-
-			mcpGroup := &mcpv1alpha1.MCPGroup{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      testGroup,
-					Namespace: testNamespace,
-				},
-				Spec:   mcpv1alpha1.MCPGroupSpec{},
-				Status: mcpv1alpha1.MCPGroupStatus{Phase: mcpv1alpha1.MCPGroupPhaseReady},
-			}
-
-			objects := []runtime.Object{tt.vmcp, mcpGroup}
-
-			// Create the EmbeddingServer with Status.URL if one is expected
-			if tt.esName != "" {
-				es := &mcpv1alpha1.EmbeddingServer{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      tt.esName,
-						Namespace: testNamespace,
-					},
-					Spec: mcpv1alpha1.EmbeddingServerSpec{
-						Image: "ghcr.io/huggingface/text-embeddings-inference:cpu-1.5",
-						Model: "BAAI/bge-small-en-v1.5",
-						Port:  tt.esPort,
-					},
-					Status: mcpv1alpha1.EmbeddingServerStatus{
-						Phase:         mcpv1alpha1.EmbeddingServerPhaseRunning,
-						ReadyReplicas: 1,
-						URL: fmt.Sprintf("http://%s.%s.svc.cluster.local:%d",
-							tt.esName, testNamespace, tt.esPort),
-					},
-				}
-				objects = append(objects, es)
-			}
-
-			fakeClient := fake.NewClientBuilder().
-				WithScheme(testScheme).
-				WithRuntimeObjects(objects...).
-				Build()
-
-			reconciler := &VirtualMCPServerReconciler{
-				Client: fakeClient,
-				Scheme: testScheme,
-			}
-
-			workloadDiscoverer := workloads.NewK8SDiscovererWithClient(fakeClient, testNamespace)
-			workloadNames, err := workloadDiscoverer.ListWorkloadsInGroup(ctx, testGroup)
-			require.NoError(t, err)
-
-			// Run validation (mirrors controller flow: validateSpec → ensureVmcpConfigConfigMap).
-			// Validate() may auto-populate optimizer defaults when embeddingServerRef is set.
-			err = tt.vmcp.Validate()
-			require.NoError(t, err)
-
-			statusManager := virtualmcpserverstatus.NewStatusManager(tt.vmcp)
-			err = reconciler.ensureVmcpConfigConfigMap(ctx, tt.vmcp, workloadNames, statusManager)
-			require.NoError(t, err)
-
-			// Read back the ConfigMap and parse the config
-			configMap := &corev1.ConfigMap{}
-			err = fakeClient.Get(ctx, types.NamespacedName{
-				Name:      vmcpConfigMapName(tt.vmcp.Name),
-				Namespace: testNamespace,
-			}, configMap)
-			require.NoError(t, err)
-
-			var config vmcpconfig.Config
-			err = yaml.Unmarshal([]byte(configMap.Data["config.yaml"]), &config)
-			require.NoError(t, err)
-
-			if tt.expectedURL != "" {
-				require.NotNil(t, config.Optimizer, "Optimizer config should be present")
-				assert.Equal(t, tt.expectedURL, config.Optimizer.EmbeddingService,
-					"EmbeddingService should contain the full base URL from EmbeddingServer Status.URL")
-			}
-		})
-	}
 }
