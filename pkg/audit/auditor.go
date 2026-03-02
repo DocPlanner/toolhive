@@ -370,7 +370,7 @@ func (*Auditor) getClientIP(r *http.Request) string {
 
 // extractSubjectsFromIdentity extracts subject information from an Identity.
 // This helper ensures consistent fallback order and validation across all auditors.
-// Fallback order for user: Name → PreferredUsername → Email
+// Fallback order for user: Name → PreferredUsername → Username → Email
 func extractSubjectsFromIdentity(identity *auth.Identity) map[string]string {
 	subjects := make(map[string]string)
 
@@ -379,11 +379,14 @@ func extractSubjectsFromIdentity(identity *auth.Identity) map[string]string {
 		subjects[SubjectKeyUserID] = identity.Subject
 	}
 
-	// Extract user name with fallback order: Name → PreferredUsername → Email
+	// Extract user name with fallback order:
+	// Name → PreferredUsername → Username → Email
 	if identity.Name != "" {
 		subjects[SubjectKeyUser] = identity.Name
 	} else if preferredUsername, ok := identity.Claims["preferred_username"].(string); ok && preferredUsername != "" {
 		subjects[SubjectKeyUser] = preferredUsername
+	} else if username, ok := identity.Claims["username"].(string); ok && username != "" {
+		subjects[SubjectKeyUser] = username
 	} else if identity.Email != "" {
 		subjects[SubjectKeyUser] = identity.Email
 	}
