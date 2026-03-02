@@ -146,6 +146,7 @@ func TestVirtualMCPServerValidateGroupRef(t *testing.T) {
 	}
 
 	for _, tt := range tests {
+		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -400,7 +401,7 @@ func TestVirtualMCPServerEnsureRBACResources_Idempotency(t *testing.T) {
 	}
 
 	// Call ensureRBACResources multiple times
-	for i := range 3 {
+	for i := 0; i < 3; i++ {
 		err := r.ensureRBACResources(context.Background(), vmcp)
 		require.NoError(t, err, "iteration %d should succeed", i)
 	}
@@ -1060,6 +1061,7 @@ func TestVirtualMCPServerUpdateStatus(t *testing.T) {
 	}
 
 	for _, tt := range tests {
+		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -1302,7 +1304,7 @@ func TestVirtualMCPServerAuthConfiguredCondition(t *testing.T) {
 			}
 
 			statusManager := virtualmcpserverstatus.NewStatusManager(tt.vmcp)
-			_, err := r.ensureAllResources(context.Background(), tt.vmcp, statusManager)
+			err := r.ensureAllResources(context.Background(), tt.vmcp, statusManager)
 
 			if tt.expectError {
 				assert.Error(t, err)
@@ -1596,7 +1598,7 @@ func TestVirtualMCPServerEnsureAllResources_Errors(t *testing.T) {
 
 			collector := virtualmcpserverstatus.NewStatusManager(vmcp)
 
-			_, err := reconciler.ensureAllResources(context.Background(), vmcp, collector)
+			err := reconciler.ensureAllResources(context.Background(), vmcp, collector)
 
 			if tt.expectError {
 				assert.Error(t, err)
@@ -2967,183 +2969,4 @@ func TestVirtualMCPServerEnsureService_NoUpdateNeeded(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.Equal(t, ctrl.Result{}, result)
-}
-
-// TestVirtualMCPServerValidateEmbeddingServerRef tests the EmbeddingServerRef validation.
-// validateEmbeddingServerRef only validates existence, not readiness — readiness is
-// checked by isEmbeddingServerReady.
-func TestVirtualMCPServerValidateEmbeddingServerRef(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name            string
-		vmcp            *mcpv1alpha1.VirtualMCPServer
-		embeddingServer *mcpv1alpha1.EmbeddingServer
-		expectError     bool
-		expectedPhase   mcpv1alpha1.VirtualMCPServerPhase
-		expectedReason  string
-	}{
-		{
-			name: "no ref configured (skip validation)",
-			vmcp: &mcpv1alpha1.VirtualMCPServer{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      testVmcpName,
-					Namespace: "default",
-				},
-				Spec: mcpv1alpha1.VirtualMCPServerSpec{
-					Config: vmcpconfig.Config{Group: testGroupName},
-				},
-			},
-			expectError: false,
-		},
-		{
-			name: "referenced EmbeddingServer exists and is running",
-			vmcp: &mcpv1alpha1.VirtualMCPServer{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      testVmcpName,
-					Namespace: "default",
-				},
-				Spec: mcpv1alpha1.VirtualMCPServerSpec{
-					Config: vmcpconfig.Config{Group: testGroupName},
-					EmbeddingServerRef: &mcpv1alpha1.EmbeddingServerRef{
-						Name: "shared-embedding",
-					},
-				},
-			},
-			embeddingServer: &mcpv1alpha1.EmbeddingServer{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "shared-embedding",
-					Namespace: "default",
-				},
-				Status: mcpv1alpha1.EmbeddingServerStatus{
-					Phase:         mcpv1alpha1.EmbeddingServerPhaseRunning,
-					ReadyReplicas: 1,
-				},
-			},
-			expectError: false,
-		},
-		{
-			name: "referenced EmbeddingServer not found",
-			vmcp: &mcpv1alpha1.VirtualMCPServer{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      testVmcpName,
-					Namespace: "default",
-				},
-				Spec: mcpv1alpha1.VirtualMCPServerSpec{
-					Config: vmcpconfig.Config{Group: testGroupName},
-					EmbeddingServerRef: &mcpv1alpha1.EmbeddingServerRef{
-						Name: "missing-embedding",
-					},
-				},
-			},
-			expectError:    true,
-			expectedPhase:  mcpv1alpha1.VirtualMCPServerPhaseFailed,
-			expectedReason: mcpv1alpha1.ConditionReasonEmbeddingServerNotFound,
-		},
-		{
-			name: "referenced EmbeddingServer exists but not ready (pending) - existence validated",
-			vmcp: &mcpv1alpha1.VirtualMCPServer{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      testVmcpName,
-					Namespace: "default",
-				},
-				Spec: mcpv1alpha1.VirtualMCPServerSpec{
-					Config: vmcpconfig.Config{Group: testGroupName},
-					EmbeddingServerRef: &mcpv1alpha1.EmbeddingServerRef{
-						Name: "pending-embedding",
-					},
-				},
-			},
-			embeddingServer: &mcpv1alpha1.EmbeddingServer{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "pending-embedding",
-					Namespace: "default",
-				},
-				Status: mcpv1alpha1.EmbeddingServerStatus{
-					Phase:         mcpv1alpha1.EmbeddingServerPhasePending,
-					ReadyReplicas: 0,
-				},
-			},
-			expectError: false,
-		},
-		{
-			name: "referenced EmbeddingServer running but zero ready replicas - existence validated",
-			vmcp: &mcpv1alpha1.VirtualMCPServer{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      testVmcpName,
-					Namespace: "default",
-				},
-				Spec: mcpv1alpha1.VirtualMCPServerSpec{
-					Config: vmcpconfig.Config{Group: testGroupName},
-					EmbeddingServerRef: &mcpv1alpha1.EmbeddingServerRef{
-						Name: "no-replicas-embedding",
-					},
-				},
-			},
-			embeddingServer: &mcpv1alpha1.EmbeddingServer{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "no-replicas-embedding",
-					Namespace: "default",
-				},
-				Status: mcpv1alpha1.EmbeddingServerStatus{
-					Phase:         mcpv1alpha1.EmbeddingServerPhaseRunning,
-					ReadyReplicas: 0,
-				},
-			},
-			expectError: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			// Setup fake client with resources
-			scheme := runtime.NewScheme()
-			_ = mcpv1alpha1.AddToScheme(scheme)
-			_ = corev1.AddToScheme(scheme)
-			_ = appsv1.AddToScheme(scheme)
-			_ = rbacv1.AddToScheme(scheme)
-
-			objs := []client.Object{tt.vmcp}
-			if tt.embeddingServer != nil {
-				objs = append(objs, tt.embeddingServer)
-			}
-
-			fakeClient := fake.NewClientBuilder().
-				WithScheme(scheme).
-				WithObjects(objs...).
-				WithStatusSubresource(
-					&mcpv1alpha1.VirtualMCPServer{},
-					&mcpv1alpha1.EmbeddingServer{},
-				).
-				Build()
-
-			r := &VirtualMCPServerReconciler{
-				Client:           fakeClient,
-				Scheme:           scheme,
-				PlatformDetector: ctrlutil.NewSharedPlatformDetector(),
-			}
-
-			statusManager := virtualmcpserverstatus.NewStatusManager(tt.vmcp)
-			err := r.validateEmbeddingServerRef(context.Background(), tt.vmcp, statusManager)
-			// Apply status updates for test assertions
-			_ = statusManager.UpdateStatus(context.Background(), &tt.vmcp.Status)
-
-			if tt.expectError {
-				assert.Error(t, err)
-				assert.Equal(t, tt.expectedPhase, tt.vmcp.Status.Phase)
-
-				// Check condition reason
-				for _, cond := range tt.vmcp.Status.Conditions {
-					if cond.Type == mcpv1alpha1.ConditionTypeEmbeddingServerReady {
-						assert.Equal(t, tt.expectedReason, cond.Reason)
-						assert.Equal(t, metav1.ConditionFalse, cond.Status)
-					}
-				}
-			} else {
-				assert.NoError(t, err)
-			}
-		})
-	}
 }
