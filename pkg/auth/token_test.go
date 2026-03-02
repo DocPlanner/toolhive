@@ -121,6 +121,15 @@ func TestTokenValidator(t *testing.T) {
 			expectErr: false,
 		},
 		{
+			name: "Valid token without aud using client_id fallback",
+			claims: jwt.MapClaims{
+				"iss":       "test-issuer",
+				"client_id": "test-client",
+				"exp":       time.Now().Add(time.Hour).Unix(),
+			},
+			expectErr: false,
+		},
+		{
 			name: "Invalid issuer",
 			claims: jwt.MapClaims{
 				"iss": "wrong-issuer",
@@ -288,6 +297,17 @@ func TestTokenValidatorMiddleware(t *testing.T) {
 				"aud": "test-audience",
 				"exp": time.Now().Add(time.Hour).Unix(),
 				"sub": "test-user",
+			},
+			expectStatus:   http.StatusOK,
+			expectResponse: true,
+		},
+		{
+			name: "Valid token without aud using client_id fallback",
+			claims: jwt.MapClaims{
+				"iss":       "test-issuer",
+				"client_id": "test-client",
+				"exp":       time.Now().Add(time.Hour).Unix(),
+				"sub":       "test-user",
 			},
 			expectStatus:   http.StatusOK,
 			expectResponse: true,
