@@ -319,6 +319,175 @@ func TestBuildRedisPasswordEnvVar(t *testing.T) {
 	}
 }
 
+func TestBuildOutgoingAuthEnvVars_InlineBackendsDeterministicOrder(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, mcpv1alpha1.AddToScheme(scheme))
+
+	authConfigA := &mcpv1alpha1.MCPExternalAuthConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "auth-a",
+			Namespace: "default",
+		},
+		Spec: mcpv1alpha1.MCPExternalAuthConfigSpec{
+			Type: mcpv1alpha1.ExternalAuthTypeHeaderInjection,
+			HeaderInjection: &mcpv1alpha1.HeaderInjectionConfig{
+				HeaderName: "Authorization",
+				ValueSecretRef: &mcpv1alpha1.SecretKeyRef{
+					Name: "auth-a-secret",
+					Key:  "authorization",
+				},
+			},
+		},
+	}
+
+	authConfigB := &mcpv1alpha1.MCPExternalAuthConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "auth-b",
+			Namespace: "default",
+		},
+		Spec: mcpv1alpha1.MCPExternalAuthConfigSpec{
+			Type: mcpv1alpha1.ExternalAuthTypeHeaderInjection,
+			HeaderInjection: &mcpv1alpha1.HeaderInjectionConfig{
+				HeaderName: "Authorization",
+				ValueSecretRef: &mcpv1alpha1.SecretKeyRef{
+					Name: "auth-b-secret",
+					Key:  "authorization",
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithRuntimeObjects(authConfigB, authConfigA).
+		Build()
+
+	vmcp := &mcpv1alpha1.VirtualMCPServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-vmcp",
+			Namespace: "default",
+		},
+		Spec: mcpv1alpha1.VirtualMCPServerSpec{
+			OutgoingAuth: &mcpv1alpha1.OutgoingAuthConfig{
+				Source: "inline",
+				Backends: map[string]mcpv1alpha1.BackendAuthConfig{
+					"backend-z": {
+						Type: mcpv1alpha1.BackendAuthTypeExternalAuthConfigRef,
+						ExternalAuthConfigRef: &mcpv1alpha1.ExternalAuthConfigRef{
+							Name: "auth-b",
+						},
+					},
+					"backend-a": {
+						Type: mcpv1alpha1.BackendAuthTypeExternalAuthConfigRef,
+						ExternalAuthConfigRef: &mcpv1alpha1.ExternalAuthConfigRef{
+							Name: "auth-a",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	reconciler := &VirtualMCPServerReconciler{Client: fakeClient}
+	envVars := reconciler.buildOutgoingAuthEnvVars(context.Background(), vmcp, nil)
+
+	require.Len(t, envVars, 2)
+	assert.Equal(t, ctrlutil.GenerateUniqueHeaderInjectionEnvVarName("auth-a"), envVars[0].Name)
+	assert.Equal(t, ctrlutil.GenerateUniqueHeaderInjectionEnvVarName("auth-b"), envVars[1].Name)
+}
+
+func TestBuildOutgoingAuthEnvVars_DiscoveredWorkloadsDeterministicOrder(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, mcpv1alpha1.AddToScheme(scheme))
+
+	authConfigA := &mcpv1alpha1.MCPExternalAuthConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "auth-a",
+			Namespace: "default",
+		},
+		Spec: mcpv1alpha1.MCPExternalAuthConfigSpec{
+			Type: mcpv1alpha1.ExternalAuthTypeHeaderInjection,
+			HeaderInjection: &mcpv1alpha1.HeaderInjectionConfig{
+				HeaderName: "Authorization",
+				ValueSecretRef: &mcpv1alpha1.SecretKeyRef{
+					Name: "auth-a-secret",
+					Key:  "authorization",
+				},
+			},
+		},
+	}
+
+	authConfigB := &mcpv1alpha1.MCPExternalAuthConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "auth-b",
+			Namespace: "default",
+		},
+		Spec: mcpv1alpha1.MCPExternalAuthConfigSpec{
+			Type: mcpv1alpha1.ExternalAuthTypeHeaderInjection,
+			HeaderInjection: &mcpv1alpha1.HeaderInjectionConfig{
+				HeaderName: "Authorization",
+				ValueSecretRef: &mcpv1alpha1.SecretKeyRef{
+					Name: "auth-b-secret",
+					Key:  "authorization",
+				},
+			},
+		},
+	}
+
+	mcpServerA := &mcpv1alpha1.MCPServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "backend-a",
+			Namespace: "default",
+		},
+		Spec: mcpv1alpha1.MCPServerSpec{
+			ExternalAuthConfigRef: &mcpv1alpha1.ExternalAuthConfigRef{Name: "auth-a"},
+		},
+	}
+
+	mcpServerB := &mcpv1alpha1.MCPServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "backend-b",
+			Namespace: "default",
+		},
+		Spec: mcpv1alpha1.MCPServerSpec{
+			ExternalAuthConfigRef: &mcpv1alpha1.ExternalAuthConfigRef{Name: "auth-b"},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithRuntimeObjects(authConfigB, authConfigA, mcpServerB, mcpServerA).
+		Build()
+
+	vmcp := &mcpv1alpha1.VirtualMCPServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-vmcp",
+			Namespace: "default",
+		},
+		Spec: mcpv1alpha1.VirtualMCPServerSpec{
+			OutgoingAuth: &mcpv1alpha1.OutgoingAuthConfig{
+				Source: "discovered",
+			},
+		},
+	}
+
+	workloadNames := []workloads.TypedWorkload{
+		{Name: "backend-b", Type: workloads.WorkloadTypeMCPServer},
+		{Name: "backend-a", Type: workloads.WorkloadTypeMCPServer},
+	}
+
+	reconciler := &VirtualMCPServerReconciler{Client: fakeClient}
+	envVars := reconciler.buildOutgoingAuthEnvVars(context.Background(), vmcp, workloadNames)
+
+	require.Len(t, envVars, 2)
+	assert.Equal(t, ctrlutil.GenerateUniqueHeaderInjectionEnvVarName("auth-a"), envVars[0].Name)
+	assert.Equal(t, ctrlutil.GenerateUniqueHeaderInjectionEnvVarName("auth-b"), envVars[1].Name)
+}
+
 // TestBuildDeploymentMetadataForVmcp tests deployment metadata generation
 func TestBuildDeploymentMetadataForVmcp(t *testing.T) {
 	t.Parallel()
