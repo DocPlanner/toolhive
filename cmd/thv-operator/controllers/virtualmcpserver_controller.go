@@ -106,8 +106,6 @@ type VirtualMCPServerReconciler struct {
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=create;get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=create;delete;get;list;patch;update;watch
 // +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=create;delete;get;list;patch;update;watch
-// +kubebuilder:rbac:groups=toolhive.stacklok.dev,resources=embeddingservers,verbs=get;list;watch
-// +kubebuilder:rbac:groups=toolhive.stacklok.dev,resources=embeddingservers/status,verbs=get
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -129,29 +127,46 @@ func (r *VirtualMCPServerReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// Create status manager for batched updates
 	statusManager := virtualmcpserverstatus.NewStatusManager(vmcp)
 
-	// Run all pre-reconciliation validations.
-	// Returns (true, nil) to continue, (false, nil) when validation failed but
-	// should not requeue (user must fix spec), or (false, err) for transient errors
-	// that should trigger requeue.
-	if cont, err := r.runValidations(ctx, vmcp, statusManager); err != nil {
-		return ctrl.Result{}, err
-	} else if !cont {
+	// Validate spec configuration early
+	if err := r.validateSpec(ctx, vmcp, statusManager); err != nil {
+		return ctrl.Result{}, nil // Don't requeue on validation errors - user must fix spec
+	}
+
+	// Validate PodTemplateSpec early - before other validations
+	if !r.validateAndUpdatePodTemplateStatus(ctx, vmcp, statusManager) {
+		// Invalid PodTemplateSpec - apply status updates and return without error to avoid infinite retries
+		// The user must fix the spec and the next reconciliation will retry
+		if err := r.applyStatusUpdates(ctx, vmcp, statusManager); err != nil {
+			ctxLogger.Error(err, "Failed to apply status updates after PodTemplateSpec validation error")
+		}
 		return ctrl.Result{}, nil
 	}
 
-	// Ensure all resources
-	if result, err := r.ensureAllResources(ctx, vmcp, statusManager); err != nil {
+	// Validate GroupRef
+	if err := r.validateGroupRef(ctx, vmcp, statusManager); err != nil {
 		// Apply status changes before returning error
-		if applyErr := r.applyStatusUpdates(ctx, vmcp, statusManager); applyErr != nil {
-			ctxLogger.Error(applyErr, "Failed to apply status updates after resource reconciliation error")
+		if err := r.applyStatusUpdates(ctx, vmcp, statusManager); err != nil {
+			ctxLogger.Error(err, "Failed to apply status updates after GroupRef validation error")
 		}
 		return ctrl.Result{}, err
-	} else if result.RequeueAfter > 0 {
-		// Apply status changes before returning requeue (e.g., waiting for EmbeddingServer)
-		if applyErr := r.applyStatusUpdates(ctx, vmcp, statusManager); applyErr != nil {
-			ctxLogger.Error(applyErr, "Failed to apply status updates before requeue")
+	}
+
+	// Validate CompositeToolRefs
+	if err := r.validateCompositeToolRefs(ctx, vmcp, statusManager); err != nil {
+		// Apply status changes before returning error
+		if err := r.applyStatusUpdates(ctx, vmcp, statusManager); err != nil {
+			ctxLogger.Error(err, "Failed to apply status updates after CompositeToolRefs validation error")
 		}
-		return result, nil
+		return ctrl.Result{}, err
+	}
+
+	// Ensure all resources
+	if err := r.ensureAllResources(ctx, vmcp, statusManager); err != nil {
+		// Apply status changes before returning error
+		if err := r.applyStatusUpdates(ctx, vmcp, statusManager); err != nil {
+			ctxLogger.Error(err, "Failed to apply status updates after resource reconciliation error")
+		}
+		return ctrl.Result{}, err
 	}
 
 	// Backend discovery and health reporting is now delegated to the vMCP runtime (StatusReporter).
@@ -265,63 +280,6 @@ func (r *VirtualMCPServerReconciler) applyStatusUpdates(
 	}
 
 	return nil
-}
-
-// runValidations runs all pre-reconciliation validations (PodTemplateSpec, GroupRef,
-// CompositeToolRefs, EmbeddingServerRef).
-// Returns (true, nil) to continue reconciliation.
-// Returns (false, nil) for spec validation errors that should NOT trigger requeue
-// (user must fix the spec; next reconciliation is triggered by spec changes).
-// Returns (false, error) for transient errors that should trigger requeue.
-func (r *VirtualMCPServerReconciler) runValidations(
-	ctx context.Context,
-	vmcp *mcpv1alpha1.VirtualMCPServer,
-	statusManager virtualmcpserverstatus.StatusManager,
-) (bool, error) {
-	ctxLogger := log.FromContext(ctx)
-
-	// Validate spec configuration early (schema-level validation from types.go).
-	// Don't requeue on validation errors — user must fix spec.
-	if err := r.validateSpec(ctx, vmcp, statusManager); err != nil {
-		return false, nil
-	}
-
-	// Validate PodTemplateSpec early - before other validations.
-	// Don't requeue — user must fix the PodTemplateSpec.
-	if !r.validateAndUpdatePodTemplateStatus(ctx, vmcp, statusManager) {
-		if err := r.applyStatusUpdates(ctx, vmcp, statusManager); err != nil {
-			ctxLogger.Error(err, "Failed to apply status updates after PodTemplateSpec validation error")
-		}
-		return false, nil
-	}
-
-	// Validate GroupRef
-	if err := r.validateGroupRef(ctx, vmcp, statusManager); err != nil {
-		if applyErr := r.applyStatusUpdates(ctx, vmcp, statusManager); applyErr != nil {
-			ctxLogger.Error(applyErr, "Failed to apply status updates after GroupRef validation error")
-		}
-		return false, err
-	}
-
-	// Validate CompositeToolRefs
-	if err := r.validateCompositeToolRefs(ctx, vmcp, statusManager); err != nil {
-		if applyErr := r.applyStatusUpdates(ctx, vmcp, statusManager); applyErr != nil {
-			ctxLogger.Error(applyErr, "Failed to apply status updates after CompositeToolRefs validation error")
-		}
-		return false, err
-	}
-
-	// Validate EmbeddingServerRef (when using reference mode)
-	if vmcp.Spec.EmbeddingServerRef != nil {
-		if err := r.validateEmbeddingServerRef(ctx, vmcp, statusManager); err != nil {
-			if applyErr := r.applyStatusUpdates(ctx, vmcp, statusManager); applyErr != nil {
-				ctxLogger.Error(applyErr, "Failed to apply status updates after EmbeddingServerRef validation error")
-			}
-			return false, err
-		}
-	}
-
-	return true, nil
 }
 
 // validateGroupRef validates that the referenced MCPGroup exists and is ready
@@ -514,14 +472,12 @@ func (r *VirtualMCPServerReconciler) validateAndUpdatePodTemplateStatus(
 	return true
 }
 
-// ensureAllResources ensures all Kubernetes resources for the VirtualMCPServer.
-// Returns a ctrl.Result with RequeueAfter when the controller should retry later
-// (e.g., waiting for EmbeddingServer readiness), and an error for failures.
+// ensureAllResources ensures all Kubernetes resources for the VirtualMCPServer
 func (r *VirtualMCPServerReconciler) ensureAllResources(
 	ctx context.Context,
 	vmcp *mcpv1alpha1.VirtualMCPServer,
 	statusManager virtualmcpserverstatus.StatusManager,
-) (ctrl.Result, error) {
+) error {
 	ctxLogger := log.FromContext(ctx)
 
 	// Validate secret references before creating resources
@@ -540,7 +496,7 @@ func (r *VirtualMCPServerReconciler) ensureAllResources(
 			r.Recorder.Eventf(vmcp, nil, corev1.EventTypeWarning, "SecretValidationFailed", "ValidateSecrets",
 				"Secret validation failed: %v", err)
 		}
-		return ctrl.Result{}, err
+		return err
 	}
 
 	// Authentication secrets validated successfully
@@ -551,34 +507,6 @@ func (r *VirtualMCPServerReconciler) ensureAllResources(
 	)
 	statusManager.SetObservedGeneration(vmcp.Generation)
 
-	// Check EmbeddingServer readiness before proceeding to Deployment.
-	// RequeueAfter provides a safety net in case the Watches() events
-	// are missed (e.g., EmbeddingServer controller not running).
-	esURL, err := r.isEmbeddingServerReady(ctx, vmcp)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	// EmbeddingServer is configured but not yet ready — requeue
-	if esURL == nil && vmcp.Spec.EmbeddingServerRef != nil {
-		statusManager.SetPhase(mcpv1alpha1.VirtualMCPServerPhasePending)
-		statusManager.SetMessage("Waiting for EmbeddingServer to become ready")
-		statusManager.SetEmbeddingServerReadyCondition(
-			mcpv1alpha1.ConditionReasonEmbeddingServerNotReady,
-			"EmbeddingServer is not yet ready",
-			metav1.ConditionFalse,
-		)
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-	}
-
-	// If an embedding server is configured and ready, set the condition
-	if esURL != nil {
-		statusManager.SetEmbeddingServerReadyCondition(
-			mcpv1alpha1.ConditionReasonEmbeddingServerReady,
-			"EmbeddingServer is ready",
-			metav1.ConditionTrue,
-		)
-	}
-
 	// List workloads once and pass to functions that need them
 	// This ensures consistency - all functions use the same workload list
 	// rather than listing at different times which could yield different results
@@ -586,44 +514,44 @@ func (r *VirtualMCPServerReconciler) ensureAllResources(
 	workloadNames, err := workloadDiscoverer.ListWorkloadsInGroup(ctx, vmcp.Spec.Config.Group)
 	if err != nil {
 		ctxLogger.Error(err, "Failed to list workloads in group")
-		return ctrl.Result{}, fmt.Errorf("failed to list workloads in group: %w", err)
+		return fmt.Errorf("failed to list workloads in group: %w", err)
 	}
 
 	// Ensure RBAC resources
 	if err := r.ensureRBACResources(ctx, vmcp); err != nil {
 		ctxLogger.Error(err, "Failed to ensure RBAC resources")
-		return ctrl.Result{}, err
+		return err
 	}
 
 	// Ensure HMAC secret for session token binding (Session Management V2)
 	if err := r.ensureHMACSecret(ctx, vmcp); err != nil {
 		ctxLogger.Error(err, "Failed to ensure HMAC secret")
-		return ctrl.Result{}, err
+		return err
 	}
 
 	// Ensure vmcp Config ConfigMap
 	if err := r.ensureVmcpConfigConfigMap(ctx, vmcp, workloadNames, statusManager); err != nil {
 		ctxLogger.Error(err, "Failed to ensure vmcp Config ConfigMap")
-		return ctrl.Result{}, err
+		return err
 	}
 
 	// Ensure Deployment
 	if result, err := r.ensureDeployment(ctx, vmcp, workloadNames); err != nil {
-		return ctrl.Result{}, err
+		return err
 	} else if result.RequeueAfter > 0 {
-		return result, nil
+		return nil
 	}
 
 	// Ensure Service
 	if result, err := r.ensureService(ctx, vmcp); err != nil {
-		return ctrl.Result{}, err
+		return err
 	} else if result.RequeueAfter > 0 {
-		return result, nil
+		return nil
 	}
 
 	// Update service URL in status
 	r.ensureServiceURL(vmcp, statusManager)
-	return ctrl.Result{}, nil
+	return nil
 }
 
 // ensureRBACResources ensures RBAC resources for VirtualMCPServer.
@@ -894,6 +822,11 @@ func (r *VirtualMCPServerReconciler) ensureDeployment(
 		}
 		ctxLogger.Info("Creating a new Deployment", "Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
 		if err := r.Create(ctx, dep); err != nil {
+			if errors.IsAlreadyExists(err) {
+				ctxLogger.V(1).Info("Deployment already exists after create race, requeueing",
+					"Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
+				return ctrl.Result{Requeue: true}, nil
+			}
 			ctxLogger.Error(err, "Failed to create new Deployment")
 			// Record event for deployment creation failure
 			if r.Recorder != nil {
@@ -938,6 +871,11 @@ func (r *VirtualMCPServerReconciler) ensureDeployment(
 
 		ctxLogger.Info("Updating Deployment", "Deployment.Namespace", deployment.Namespace, "Deployment.Name", deployment.Name)
 		if err := r.Update(ctx, deployment); err != nil {
+			if errors.IsConflict(err) {
+				ctxLogger.V(1).Info("Deployment update conflict, requeueing with latest resource version",
+					"Deployment.Namespace", deployment.Namespace, "Deployment.Name", deployment.Name)
+				return ctrl.Result{Requeue: true}, nil
+			}
 			ctxLogger.Error(err, "Failed to update Deployment")
 			// Record event for deployment update failure
 			if r.Recorder != nil {
@@ -980,6 +918,11 @@ func (r *VirtualMCPServerReconciler) ensureService(
 		}
 		ctxLogger.Info("Creating a new Service", "Service.Namespace", svc.Namespace, "Service.Name", svc.Name)
 		if err := r.Create(ctx, svc); err != nil {
+			if errors.IsAlreadyExists(err) {
+				ctxLogger.V(1).Info("Service already exists after create race, requeueing",
+					"Service.Namespace", svc.Namespace, "Service.Name", svc.Name)
+				return ctrl.Result{Requeue: true}, nil
+			}
 			ctxLogger.Error(err, "Failed to create new Service")
 			// Record event for service creation failure
 			if r.Recorder != nil {
@@ -1024,6 +967,11 @@ func (r *VirtualMCPServerReconciler) ensureService(
 
 		ctxLogger.Info("Updating Service", "Service.Namespace", service.Namespace, "Service.Name", service.Name)
 		if err := r.Update(ctx, service); err != nil {
+			if errors.IsConflict(err) {
+				ctxLogger.V(1).Info("Service update conflict, requeueing with latest resource version",
+					"Service.Namespace", service.Namespace, "Service.Name", service.Name)
+				return ctrl.Result{Requeue: true}, nil
+			}
 			ctxLogger.Error(err, "Failed to update Service")
 			return ctrl.Result{}, err
 		}
@@ -1873,85 +1821,6 @@ func convertBackendsToStaticBackends(
 	return static
 }
 
-// validateEmbeddingServerRef validates that the referenced EmbeddingServer exists.
-// Readiness gating is handled by isEmbeddingServerReady (called from ensureAllResources),
-// ensuring consistent retry behavior (fixed-interval requeue instead of exponential backoff).
-func (r *VirtualMCPServerReconciler) validateEmbeddingServerRef(
-	ctx context.Context,
-	vmcp *mcpv1alpha1.VirtualMCPServer,
-	statusManager virtualmcpserverstatus.StatusManager,
-) error {
-	ctxLogger := log.FromContext(ctx)
-
-	if vmcp.Spec.EmbeddingServerRef == nil {
-		return nil
-	}
-
-	refName := vmcp.Spec.EmbeddingServerRef.Name
-	es := &mcpv1alpha1.EmbeddingServer{}
-	err := r.Get(ctx, types.NamespacedName{
-		Name:      refName,
-		Namespace: vmcp.Namespace,
-	}, es)
-
-	if errors.IsNotFound(err) {
-		message := fmt.Sprintf("Referenced EmbeddingServer %s not found", refName)
-		statusManager.SetPhase(mcpv1alpha1.VirtualMCPServerPhaseFailed)
-		statusManager.SetMessage(message)
-		statusManager.SetEmbeddingServerReadyCondition(
-			mcpv1alpha1.ConditionReasonEmbeddingServerNotFound,
-			message,
-			metav1.ConditionFalse,
-		)
-		statusManager.SetObservedGeneration(vmcp.Generation)
-		if r.Recorder != nil {
-			r.Recorder.Eventf(vmcp, nil, corev1.EventTypeWarning, "EmbeddingServerRefNotFound", "ValidateEmbeddingServerRef",
-				"Referenced EmbeddingServer %s not found", refName)
-		}
-		return err
-	} else if err != nil {
-		ctxLogger.Error(err, "Failed to get referenced EmbeddingServer", "name", refName)
-		return err
-	}
-
-	// Existence validated — readiness is checked later by isEmbeddingServerReady
-	return nil
-}
-
-// mapEmbeddingServerToVirtualMCPServer maps EmbeddingServer changes to VirtualMCPServer
-// reconciliation requests. This triggers reconciliation when a referenced EmbeddingServer's
-// status changes (e.g., becomes ready or fails).
-func (r *VirtualMCPServerReconciler) mapEmbeddingServerToVirtualMCPServer(
-	ctx context.Context,
-	obj client.Object,
-) []reconcile.Request {
-	es, ok := obj.(*mcpv1alpha1.EmbeddingServer)
-	if !ok {
-		return nil
-	}
-
-	vmcpList := &mcpv1alpha1.VirtualMCPServerList{}
-	if err := r.List(ctx, vmcpList, client.InNamespace(es.Namespace)); err != nil {
-		log.FromContext(ctx).Error(err, "Failed to list VirtualMCPServers for EmbeddingServer watch")
-		return nil
-	}
-
-	var requests []reconcile.Request
-	for _, vmcp := range vmcpList.Items {
-		// Only match VirtualMCPServers that reference this EmbeddingServer by name
-		if vmcp.Spec.EmbeddingServerRef != nil && vmcp.Spec.EmbeddingServerRef.Name == es.Name {
-			requests = append(requests, reconcile.Request{
-				NamespacedName: types.NamespacedName{
-					Name:      vmcp.Name,
-					Namespace: vmcp.Namespace,
-				},
-			})
-		}
-	}
-
-	return requests
-}
-
 // SetupWithManager sets up the controller with the Manager
 func (r *VirtualMCPServerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
@@ -1967,12 +1836,6 @@ func (r *VirtualMCPServerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(
 			&mcpv1alpha1.VirtualMCPCompositeToolDefinition{},
 			handler.EnqueueRequestsFromMapFunc(r.mapCompositeToolDefinitionToVirtualMCPServer),
-		).
-		// Watch referenced EmbeddingServers so that readiness/status changes
-		// trigger VirtualMCPServer reconciliation.
-		Watches(
-			&mcpv1alpha1.EmbeddingServer{},
-			handler.EnqueueRequestsFromMapFunc(r.mapEmbeddingServerToVirtualMCPServer),
 		).
 		Complete(r)
 }
