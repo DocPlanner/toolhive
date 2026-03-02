@@ -519,6 +519,27 @@ func TestExtractSubjects(t *testing.T) {
 		assert.Equal(t, "johndoe", subjects[SubjectKeyUser])
 	})
 
+	t.Run("with username fallback", func(t *testing.T) {
+		t.Parallel()
+		claims := jwt.MapClaims{
+			"sub":      "user999",
+			"username": "awssso_matteo.manzoni@docplanner.com",
+		}
+
+		req := httptest.NewRequest("GET", "/test", nil)
+		identity := &auth.Identity{
+			Subject: claims["sub"].(string),
+			Claims:  claims,
+		}
+		ctx := auth.WithIdentity(req.Context(), identity)
+		req = req.WithContext(ctx)
+
+		subjects := auditor.extractSubjects(req)
+
+		assert.Equal(t, "user999", subjects[SubjectKeyUserID])
+		assert.Equal(t, "awssso_matteo.manzoni@docplanner.com", subjects[SubjectKeyUser])
+	})
+
 	t.Run("with email fallback", func(t *testing.T) {
 		t.Parallel()
 		claims := jwt.MapClaims{
