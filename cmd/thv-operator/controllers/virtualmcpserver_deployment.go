@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -234,7 +235,7 @@ func (*VirtualMCPServerReconciler) buildContainerArgsForVmcp(
 
 	// Add --debug flag if log level is set to debug
 	// Note: vmcp binary currently only supports --debug flag, not other log levels
-	// The flag must be passed at startup because logging is initialized early in the process
+	// The flag must be passed at startup because logger.Initialize() runs before config is loaded
 	if vmcp.Spec.Config.Operational != nil && vmcp.Spec.Config.Operational.LogLevel == logLevelDebug {
 		args = append(args, "--debug")
 	}
@@ -467,6 +468,9 @@ func (r *VirtualMCPServerReconciler) buildOutgoingAuthEnvVars(
 		}
 	}
 
+	// Ensure deterministic ordering so reconcile comparisons don't flap when source maps/slices vary.
+	sortEnvVarsByName(env)
+
 	return env
 }
 
@@ -495,7 +499,15 @@ func (r *VirtualMCPServerReconciler) discoverExternalAuthConfigSecrets(
 	}
 
 	// Discover ExternalAuthConfigs from workloads (MCPServers and MCPRemoteProxies)
-	for _, workloadInfo := range typedWorkloads {
+	workloadsForDiscovery := append([]workloads.TypedWorkload(nil), typedWorkloads...)
+	sort.SliceStable(workloadsForDiscovery, func(i, j int) bool {
+		if workloadsForDiscovery[i].Type != workloadsForDiscovery[j].Type {
+			return workloadsForDiscovery[i].Type < workloadsForDiscovery[j].Type
+		}
+		return workloadsForDiscovery[i].Name < workloadsForDiscovery[j].Name
+	})
+
+	for _, workloadInfo := range workloadsForDiscovery {
 		configName := r.getExternalAuthConfigNameFromWorkload(
 			workloadInfo, mcpServerMap, mcpRemoteProxyMap)
 		if configName == "" {
@@ -534,7 +546,14 @@ func (r *VirtualMCPServerReconciler) discoverInlineExternalAuthConfigSecrets(
 	seenConfigs := make(map[string]bool) // Track which ExternalAuthConfigs we've already processed
 
 	// Process per-backend configs
-	for _, backendAuth := range vmcp.Spec.OutgoingAuth.Backends {
+	backendNames := make([]string, 0, len(vmcp.Spec.OutgoingAuth.Backends))
+	for backendName := range vmcp.Spec.OutgoingAuth.Backends {
+		backendNames = append(backendNames, backendName)
+	}
+	sort.Strings(backendNames)
+
+	for _, backendName := range backendNames {
+		backendAuth := vmcp.Spec.OutgoingAuth.Backends[backendName]
 		if backendAuth.ExternalAuthConfigRef == nil {
 			continue
 		}
@@ -642,6 +661,12 @@ func (r *VirtualMCPServerReconciler) getExternalAuthConfigSecretEnvVar(
 			},
 		},
 	}, nil
+}
+
+func sortEnvVarsByName(envVars []corev1.EnvVar) {
+	sort.SliceStable(envVars, func(i, j int) bool {
+		return envVars[i].Name < envVars[j].Name
+	})
 }
 
 // buildDeploymentMetadataForVmcp builds deployment-level labels and annotations
