@@ -19,6 +19,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	equality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1284,7 +1285,7 @@ func (r *VirtualMCPServerReconciler) containerNeedsUpdate(
 	if err != nil {
 		return true // Trigger update to surface the error
 	}
-	if !reflect.DeepEqual(container.Env, expectedEnv) {
+	if !equality.Semantic.DeepEqual(container.Env, expectedEnv) {
 		return true
 	}
 
@@ -1341,12 +1342,18 @@ func (r *VirtualMCPServerReconciler) podTemplateMetadataNeedsUpdate(
 		labelsForVirtualMCPServer(vmcp.Name), vmcp, vmcpConfigChecksum,
 	)
 
-	if !maps.Equal(deployment.Spec.Template.Labels, expectedPodTemplateLabels) {
-		return true
+	// Use subset check so that labels/annotations added by PodTemplateSpec merge
+	// or Kubernetes admission webhooks don't trigger spurious updates.
+	for key, expectedValue := range expectedPodTemplateLabels {
+		if actualValue, exists := deployment.Spec.Template.Labels[key]; !exists || actualValue != expectedValue {
+			return true
+		}
 	}
 
-	if !maps.Equal(deployment.Spec.Template.Annotations, expectedPodTemplateAnnotations) {
-		return true
+	for key, expectedValue := range expectedPodTemplateAnnotations {
+		if actualValue, exists := deployment.Spec.Template.Annotations[key]; !exists || actualValue != expectedValue {
+			return true
+		}
 	}
 
 	return false
