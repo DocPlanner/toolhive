@@ -97,9 +97,26 @@ func TestWriteTimeout_GETOnWrongPathLeavesDeadlineUntouched(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 
-// TestWriteTimeout_POSTLeavesDeadlineUntouched verifies that POST requests are not
-// touched by the middleware — their deadline comes from http.Server.WriteTimeout.
-func TestWriteTimeout_POSTLeavesDeadlineUntouched(t *testing.T) {
+// TestWriteTimeout_POSTWithSSEClearsDeadline verifies that a POST request with
+// Accept: text/event-stream on the MCP endpoint has its write deadline cleared,
+// because Streamable HTTP transport responds to POST with SSE event streams.
+func TestWriteTimeout_POSTWithSSEClearsDeadline(t *testing.T) {
+	t.Parallel()
+
+	w := newDeadlineTracker()
+	r := httptest.NewRequest(http.MethodPost, testEndpointPath, nil)
+	r.Header.Set("Accept", "text/event-stream")
+
+	mw(noopHandler).ServeHTTP(w, r)
+
+	require.True(t, w.deadlineSet, "POST with SSE Accept on MCP endpoint must call SetWriteDeadline")
+	assert.True(t, w.deadline.IsZero(), "deadline must be zero (no deadline) to override server WriteTimeout")
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+// TestWriteTimeout_POSTWithoutSSELeavesDeadlineUntouched verifies that a POST request
+// without Accept: text/event-stream is not touched by the middleware.
+func TestWriteTimeout_POSTWithoutSSELeavesDeadlineUntouched(t *testing.T) {
 	t.Parallel()
 
 	w := newDeadlineTracker()
@@ -107,7 +124,7 @@ func TestWriteTimeout_POSTLeavesDeadlineUntouched(t *testing.T) {
 
 	mw(noopHandler).ServeHTTP(w, r)
 
-	assert.False(t, w.deadlineSet, "POST deadline is managed by http.Server.WriteTimeout, not the middleware")
+	assert.False(t, w.deadlineSet, "POST without SSE Accept is managed by http.Server.WriteTimeout, not the middleware")
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 
@@ -134,10 +151,11 @@ func TestWriteTimeout_HandlerIsAlwaysCalled(t *testing.T) {
 		path   string
 		accept string
 	}{
-		{http.MethodGet, testEndpointPath, "text/event-stream"}, // qualifying SSE
-		{http.MethodGet, testEndpointPath, ""},                  // GET, no Accept
-		{http.MethodGet, "/health", "text/event-stream"},        // GET, wrong path
-		{http.MethodPost, testEndpointPath, ""},
+		{http.MethodGet, testEndpointPath, "text/event-stream"},  // qualifying SSE GET
+		{http.MethodGet, testEndpointPath, ""},                   // GET, no Accept
+		{http.MethodGet, "/health", "text/event-stream"},         // GET, wrong path
+		{http.MethodPost, testEndpointPath, "text/event-stream"}, // qualifying SSE POST
+		{http.MethodPost, testEndpointPath, ""},                  // POST, no Accept
 		{http.MethodDelete, testEndpointPath, ""},
 	}
 
