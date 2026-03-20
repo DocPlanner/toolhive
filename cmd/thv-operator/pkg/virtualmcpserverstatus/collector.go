@@ -40,18 +40,29 @@ func NewStatusManager(vmcp *mcpv1alpha1.VirtualMCPServer) StatusManager {
 
 // SetPhase sets the phase to be updated.
 func (s *StatusCollector) SetPhase(phase mcpv1alpha1.VirtualMCPServerPhase) {
+	if s.vmcp.Status.Phase == phase {
+		return
+	}
 	s.phase = &phase
 	s.hasChanges = true
 }
 
 // SetMessage sets the message to be updated.
 func (s *StatusCollector) SetMessage(message string) {
+	if s.vmcp.Status.Message == message {
+		return
+	}
 	s.message = &message
 	s.hasChanges = true
 }
 
 // SetCondition sets a general condition with the specified type, reason, message, and status
 func (s *StatusCollector) SetCondition(conditionType, reason, message string, status metav1.ConditionStatus) {
+	// Skip if the existing condition already matches
+	existing := meta.FindStatusCondition(s.vmcp.Status.Conditions, conditionType)
+	if existing != nil && existing.Status == status && existing.Reason == reason && existing.Message == message {
+		return
+	}
 	s.conditions[conditionType] = metav1.Condition{
 		Type:    conditionType,
 		Status:  status,
@@ -63,12 +74,18 @@ func (s *StatusCollector) SetCondition(conditionType, reason, message string, st
 
 // SetURL sets the service URL to be updated.
 func (s *StatusCollector) SetURL(url string) {
+	if s.vmcp.Status.URL == url {
+		return
+	}
 	s.url = &url
 	s.hasChanges = true
 }
 
 // SetObservedGeneration sets the observed generation to be updated.
 func (s *StatusCollector) SetObservedGeneration(generation int64) {
+	if s.vmcp.Status.ObservedGeneration == generation {
+		return
+	}
 	s.observedGeneration = &generation
 	s.hasChanges = true
 }
