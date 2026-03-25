@@ -147,62 +147,7 @@ func Middleware(
 // monitor is used (respects circuit breaker state). When nil, falls back to the
 // initial health status from the backend registry.
 func filterHealthyBackends(backends []vmcp.Backend, healthStatusProvider health.StatusProvider) []vmcp.Backend {
-	if len(backends) == 0 {
-		return backends
-	}
-
-	healthy := make([]vmcp.Backend, 0, len(backends))
-	excluded := 0
-
-	for i := range backends {
-		backend := &backends[i]
-
-		// Get current health status from health monitor if available
-		// This ensures circuit breaker state is respected during capability aggregation
-		var healthStatus vmcp.BackendHealthStatus
-		if healthStatusProvider != nil {
-			if status, exists := healthStatusProvider.QueryBackendStatus(backend.ID); exists {
-				healthStatus = status
-			} else {
-				// Backend not tracked by health monitor - use registry status
-				healthStatus = backend.HealthStatus
-			}
-		} else {
-			// Health monitoring disabled - use registry status
-			healthStatus = backend.HealthStatus
-		}
-
-		// Include healthy, degraded, and empty/zero-value (assume healthy) backends.
-		// Explicitly exclude unhealthy, unknown, and unauthenticated backends.
-		if healthStatus == "" ||
-			healthStatus == vmcp.BackendHealthy ||
-			healthStatus == vmcp.BackendDegraded {
-			healthy = append(healthy, *backend)
-		} else {
-			excluded++
-			//nolint:gosec // G706: backend fields are internal, not user-controlled
-			slog.Debug("excluding backend from capability aggregation due to health status",
-				"backend_name", backend.Name,
-				"backend_id", backend.ID,
-				"health_status", healthStatus,
-				"source", func() string {
-					if healthStatusProvider != nil {
-						return "health_monitor"
-					}
-					return "registry"
-				}())
-		}
-	}
-
-	if excluded > 0 {
-		//nolint:gosec // G706: values are internal counts, not user-controlled
-		slog.Debug("filtered backends for capability aggregation",
-			"total_backends", len(backends),
-			"healthy_backends", len(healthy),
-			"excluded_backends", excluded)
-	}
-
-	return healthy
+	return health.FilterBackendsForExposure(backends, healthStatusProvider)
 }
 
 // handleInitializeRequest performs capability discovery for initialize requests.

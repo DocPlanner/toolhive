@@ -131,6 +131,17 @@ type Monitor struct {
 
 	// stopped indicates if the monitor has been stopped (cannot be restarted).
 	stopped bool
+
+	hooksMu           sync.RWMutex
+	statusChangeHooks []func(StatusChangeEvent)
+}
+
+// StatusChangeEvent describes a backend health status transition.
+type StatusChangeEvent struct {
+	BackendID      string
+	BackendName    string
+	PreviousStatus vmcp.BackendHealthStatus
+	Status         vmcp.BackendHealthStatus
 }
 
 // MonitorConfig contains configuration for the health monitor.
@@ -320,6 +331,17 @@ func (m *Monitor) Stop() error {
 	return nil
 }
 
+// AddOnStatusChange registers a callback that is invoked whenever a backend's
+// health status transitions to a different value.
+func (m *Monitor) AddOnStatusChange(hook func(StatusChangeEvent)) {
+	if hook == nil {
+		return
+	}
+	m.hooksMu.Lock()
+	m.statusChangeHooks = append(m.statusChangeHooks, hook)
+	m.hooksMu.Unlock()
+}
+
 // UpdateBackends updates the list of backends being monitored.
 // Starts monitoring new backends and stops monitoring removed backends.
 // This method is safe to call while the monitor is running.
@@ -442,6 +464,8 @@ func (m *Monitor) performHealthCheck(ctx context.Context, backend *vmcp.Backend)
 	// Health checks verify backend availability and should not require user credentials
 	healthCheckCtx := WithHealthCheckMarker(ctx)
 
+	previousStatus, previousExists := m.statusTracker.GetStatus(backend.ID)
+
 	// Perform health check
 	status, err := m.checker.CheckHealth(healthCheckCtx, target)
 
@@ -454,6 +478,26 @@ func (m *Monitor) performHealthCheck(ctx context.Context, backend *vmcp.Backend)
 		// RecordSuccess will further check for recovering state (had recent failures)
 		slog.Debug("health check succeeded for backend", "backend", backend.Name, "status", status)
 		m.statusTracker.RecordSuccess(backend.ID, backend.Name, status)
+	}
+
+	currentStatus, currentExists := m.statusTracker.GetStatus(backend.ID)
+	if previousExists && currentExists && previousStatus != currentStatus {
+		m.notifyStatusChange(StatusChangeEvent{
+			BackendID:      backend.ID,
+			BackendName:    backend.Name,
+			PreviousStatus: previousStatus,
+			Status:         currentStatus,
+		})
+	}
+}
+
+func (m *Monitor) notifyStatusChange(event StatusChangeEvent) {
+	m.hooksMu.RLock()
+	hooks := append([]func(StatusChangeEvent){}, m.statusChangeHooks...)
+	m.hooksMu.RUnlock()
+
+	for _, hook := range hooks {
+		go hook(event)
 	}
 }
 

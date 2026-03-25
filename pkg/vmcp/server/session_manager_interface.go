@@ -27,6 +27,11 @@ type SessionManager interface {
 	// connections and replaces the placeholder with a fully-formed MultiSession.
 	CreateSession(ctx context.Context, sessionID string) (vmcpsession.MultiSession, error)
 
+	// RefreshSession rebuilds the session-scoped backend connections for an
+	// existing session using the current eligible backend set, then replaces the
+	// stored session.
+	RefreshSession(ctx context.Context, sessionID string) (vmcpsession.MultiSession, error)
+
 	// GetAdaptedTools returns SDK-format tools for the given session with session-scoped
 	// handlers. This enables session-scoped routing: each tool call goes through the
 	// session's backend connections rather than the global router.
@@ -55,4 +60,8 @@ type SessionManager interface {
 	// components when they detect that a backend session has expired or been lost.
 	// Storage errors are logged but not returned.
 	NotifyBackendExpired(sessionID, workloadID string)
+
+	// StoreSession replaces the stored MultiSession for a session ID. Used for
+	// refresh rollback when the rebuilt session cannot be fully activated.
+	StoreSession(session vmcpsession.MultiSession) error
 }

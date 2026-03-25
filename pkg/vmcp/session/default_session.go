@@ -66,6 +66,7 @@ type defaultMultiSession struct {
 	resources       []vmcp.Resource
 	prompts         []vmcp.Prompt
 	backendSessions map[string]string
+	creatorIdentity *auth.Identity
 
 	queue AdmissionQueue
 }
@@ -110,6 +111,13 @@ func (s *defaultMultiSession) BackendSessions() map[string]string {
 // The routing table is immutable after session creation, so no locking is needed.
 func (s *defaultMultiSession) GetRoutingTable() *vmcp.RoutingTable {
 	return s.routingTable
+}
+
+// CreatorIdentity returns a defensive copy of the identity that created this
+// session. It is retained in memory only so the session can be refreshed without
+// persisting raw credentials to metadata.
+func (s *defaultMultiSession) CreatorIdentity() *auth.Identity {
+	return cloneIdentity(s.creatorIdentity)
 }
 
 // lookupBackend resolves capName against table, admits the request via the
@@ -217,4 +225,22 @@ func (s *defaultMultiSession) Close() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func cloneIdentity(identity *auth.Identity) *auth.Identity {
+	if identity == nil {
+		return nil
+	}
+
+	cloned := *identity
+	if len(identity.Groups) > 0 {
+		cloned.Groups = append([]string(nil), identity.Groups...)
+	}
+	if identity.Claims != nil {
+		cloned.Claims = maps.Clone(identity.Claims)
+	}
+	if identity.Metadata != nil {
+		cloned.Metadata = maps.Clone(identity.Metadata)
+	}
+	return &cloned
 }

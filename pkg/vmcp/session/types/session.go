@@ -138,6 +138,13 @@ type MultiSession interface {
 	GetRoutingTable() *vmcp.RoutingTable
 }
 
+// CreatorIdentityProvider exposes the creator identity associated with a
+// session. The returned identity is intended for in-memory session refresh and
+// backend reconnection logic; it must not be persisted to metadata.
+type CreatorIdentityProvider interface {
+	CreatorIdentity() *auth.Identity
+}
+
 const (
 	// MetadataKeyTokenHash is the session metadata key that holds the HMAC-SHA256
 	// hash of the bearer token used to create the session. For authenticated sessions
