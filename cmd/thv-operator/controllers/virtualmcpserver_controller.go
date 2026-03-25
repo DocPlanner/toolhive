@@ -1055,6 +1055,11 @@ func (r *VirtualMCPServerReconciler) ensureDeployment(
 		}
 		ctxLogger.Info("Creating a new Deployment", "Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
 		if err := r.Create(ctx, dep); err != nil {
+			if errors.IsAlreadyExists(err) {
+				ctxLogger.V(1).Info("Deployment already exists after create race, requeueing",
+					"Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
+				return ctrl.Result{Requeue: true}, nil
+			}
 			ctxLogger.Error(err, "Failed to create new Deployment")
 			// Record event for deployment creation failure
 			if r.Recorder != nil {
@@ -1103,6 +1108,11 @@ func (r *VirtualMCPServerReconciler) ensureDeployment(
 
 		ctxLogger.Info("Updating Deployment", "Deployment.Namespace", deployment.Namespace, "Deployment.Name", deployment.Name)
 		if err := r.Update(ctx, deployment); err != nil {
+			if errors.IsConflict(err) {
+				ctxLogger.V(1).Info("Deployment update conflict, requeueing with latest resource version",
+					"Deployment.Namespace", deployment.Namespace, "Deployment.Name", deployment.Name)
+				return ctrl.Result{Requeue: true}, nil
+			}
 			ctxLogger.Error(err, "Failed to update Deployment")
 			// Record event for deployment update failure
 			if r.Recorder != nil {
@@ -1145,6 +1155,11 @@ func (r *VirtualMCPServerReconciler) ensureService(
 		}
 		ctxLogger.Info("Creating a new Service", "Service.Namespace", svc.Namespace, "Service.Name", svc.Name)
 		if err := r.Create(ctx, svc); err != nil {
+			if errors.IsAlreadyExists(err) {
+				ctxLogger.V(1).Info("Service already exists after create race, requeueing",
+					"Service.Namespace", svc.Namespace, "Service.Name", svc.Name)
+				return ctrl.Result{Requeue: true}, nil
+			}
 			ctxLogger.Error(err, "Failed to create new Service")
 			// Record event for service creation failure
 			if r.Recorder != nil {
@@ -1189,6 +1204,11 @@ func (r *VirtualMCPServerReconciler) ensureService(
 
 		ctxLogger.Info("Updating Service", "Service.Namespace", service.Namespace, "Service.Name", service.Name)
 		if err := r.Update(ctx, service); err != nil {
+			if errors.IsConflict(err) {
+				ctxLogger.V(1).Info("Service update conflict, requeueing with latest resource version",
+					"Service.Namespace", service.Namespace, "Service.Name", service.Name)
+				return ctrl.Result{Requeue: true}, nil
+			}
 			ctxLogger.Error(err, "Failed to update Service")
 			return ctrl.Result{}, err
 		}
