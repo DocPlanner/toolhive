@@ -71,6 +71,15 @@ func (d *compositeToolsDecorator) Tools() []vmcp.Tool {
 	return append(out, d.compositeTools...)
 }
 
+// CreatorIdentity forwards access to the wrapped session when available.
+func (d *compositeToolsDecorator) CreatorIdentity() *auth.Identity {
+	provider, ok := d.MultiSession.(sessiontypes.CreatorIdentityProvider)
+	if !ok {
+		return nil
+	}
+	return provider.CreatorIdentity()
+}
+
 // CallTool dispatches composite tool names to their workflow executors.
 // Unknown names are delegated to the embedded session.
 func (d *compositeToolsDecorator) CallTool(

@@ -91,6 +91,15 @@ func (d *optimizerDecorator) Tools() []vmcp.Tool {
 	return result
 }
 
+// CreatorIdentity forwards access to the wrapped session when available.
+func (d *optimizerDecorator) CreatorIdentity() *auth.Identity {
+	provider, ok := d.MultiSession.(sessiontypes.CreatorIdentityProvider)
+	if !ok {
+		return nil
+	}
+	return provider.CreatorIdentity()
+}
+
 // CallTool handles find_tool and call_tool. Both route through the optimizer so
 // that all optimizer telemetry is recorded. Any other tool name returns an error.
 func (d *optimizerDecorator) CallTool(

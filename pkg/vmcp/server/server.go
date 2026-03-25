@@ -39,6 +39,7 @@ import (
 	"github.com/stacklok/toolhive/pkg/vmcp/server/adapter"
 	"github.com/stacklok/toolhive/pkg/vmcp/server/sessionmanager"
 	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
+	sessiontypes "github.com/stacklok/toolhive/pkg/vmcp/session/types"
 	vmcpstatus "github.com/stacklok/toolhive/pkg/vmcp/status"
 )
 
@@ -71,6 +72,13 @@ const (
 	// defaultSessionTTL is the default session time-to-live duration.
 	// Sessions that are inactive for this duration will be automatically cleaned up.
 	defaultSessionTTL = 30 * time.Minute
+
+	// defaultSessionRefreshTimeout bounds how long a live session refresh may take.
+	defaultSessionRefreshTimeout = 45 * time.Second
+
+	// defaultSessionCloseGracePeriod delays closing the replaced session so
+	// in-flight handlers that already captured it can drain gracefully.
+	defaultSessionCloseGracePeriod = 2 * time.Second
 )
 
 //go:generate mockgen -destination=mocks/mock_watcher.go -package=mocks -source=server.go Watcher
@@ -243,6 +251,13 @@ type Server struct {
 	// Populated during Start() initialization before blocking; no mutex needed
 	// since Stop() is only called after Start()'s select returns.
 	shutdownFuncs []func(context.Context) error
+
+	// activeClientSessions stores initialized SDK sessions by session ID so
+	// live refresh can replace per-session tools/resources directly.
+	activeClientSessions sync.Map
+
+	// refreshMu serializes session refresh work triggered by health transitions.
+	refreshMu sync.Mutex
 }
 
 // New creates a new Virtual MCP Server instance.
@@ -287,8 +302,8 @@ func New(
 	mcpServer := server.NewMCPServer(
 		cfg.Name,
 		cfg.Version,
-		server.WithToolCapabilities(false), // We'll register tools dynamically
-		server.WithResourceCapabilities(false, false), // We'll register resources dynamically
+		server.WithToolCapabilities(true), // Session-scoped capability updates send list_changed notifications
+		server.WithResourceCapabilities(false, true), // Session-scoped resources may be refreshed live
 		server.WithLogging(),
 		server.WithHooks(hooks),
 	)
@@ -415,7 +430,7 @@ func New(
 		OptimizerFactory:  cfg.OptimizerFactory,
 		TelemetryProvider: cfg.TelemetryProvider,
 	}
-	vmcpSessMgr, optimizerCleanup, err := sessionmanager.New(sessionDataStorage, sessMgrCfg, backendRegistry)
+	vmcpSessMgr, optimizerCleanup, err := sessionmanager.New(sessionDataStorage, sessMgrCfg, backendRegistry, healthMon)
 	if err != nil {
 		return nil, err
 	}
@@ -442,10 +457,17 @@ func New(
 		srv.shutdownFuncs = append(srv.shutdownFuncs, optimizerCleanup)
 	}
 
+	if healthMon != nil {
+		healthMon.AddOnStatusChange(srv.handleBackendStatusChange)
+	}
+
 	// Register OnRegisterSession hook to inject capabilities after SDK registers session.
 	// See handleSessionRegistration for implementation details.
 	hooks.AddOnRegisterSession(func(ctx context.Context, session server.ClientSession) {
 		srv.handleSessionRegistration(ctx, session)
+	})
+	hooks.AddOnUnregisterSession(func(_ context.Context, session server.ClientSession) {
+		srv.activeClientSessions.Delete(session.SessionID())
 	})
 
 	// Disarm the close-on-error guard: Server is fully constructed.
@@ -941,6 +963,34 @@ func setSessionResourcesDirect(session server.ClientSession, resources []server.
 	return nil
 }
 
+// replaceSessionResourcesDirect replaces the session-specific resource set.
+// Returns true when the visible resource URIs changed.
+func replaceSessionResourcesDirect(session server.ClientSession, resources []server.ServerResource) (bool, error) {
+	sessionWithResources, ok := session.(server.SessionWithResources)
+	if !ok {
+		return false, fmt.Errorf("session does not support per-session resources")
+	}
+
+	existing := sessionWithResources.GetSessionResources()
+	newResources := make(map[string]server.ServerResource, len(resources))
+	for _, res := range resources {
+		newResources[res.Resource.URI] = res
+	}
+
+	changed := len(existing) != len(newResources)
+	if !changed {
+		for uri := range existing {
+			if _, ok := newResources[uri]; !ok {
+				changed = true
+				break
+			}
+		}
+	}
+
+	sessionWithResources.SetSessionResources(newResources)
+	return changed, nil
+}
+
 // setSessionToolsDirect sets tools directly on the session via the SessionWithTools
 // interface, bypassing MCPServer.AddSessionTools. This avoids sending notifications
 // through the session's notification channel, which would accumulate as stale
@@ -965,6 +1015,34 @@ func setSessionToolsDirect(session server.ClientSession, tools []server.ServerTo
 	return nil
 }
 
+// replaceSessionToolsDirect replaces the session-specific tool set.
+// Returns true when the visible tool names changed.
+func replaceSessionToolsDirect(session server.ClientSession, tools []server.ServerTool) (bool, error) {
+	sessionWithTools, ok := session.(server.SessionWithTools)
+	if !ok {
+		return false, fmt.Errorf("session does not support per-session tools")
+	}
+
+	existing := sessionWithTools.GetSessionTools()
+	newTools := make(map[string]server.ServerTool, len(tools))
+	for _, tool := range tools {
+		newTools[tool.Tool.Name] = tool
+	}
+
+	changed := len(existing) != len(newTools)
+	if !changed {
+		for name := range existing {
+			if _, ok := newTools[name]; !ok {
+				changed = true
+				break
+			}
+		}
+	}
+
+	sessionWithTools.SetSessionTools(newTools)
+	return changed, nil
+}
+
 // handleSessionRegistration processes a new MCP session registration.
 // It fires AFTER the session is registered in the SDK.
 func (s *Server) handleSessionRegistration(
@@ -973,7 +1051,10 @@ func (s *Server) handleSessionRegistration(
 ) {
 	// Error is logged and handled within handleSessionRegistrationImpl.
 	// The session is terminated on failure; no further action needed here.
-	_ = s.handleSessionRegistrationImpl(ctx, session)
+	if err := s.handleSessionRegistrationImpl(ctx, session); err != nil {
+		return
+	}
+	s.activeClientSessions.Store(session.SessionID(), session)
 }
 
 // handleSessionRegistrationImpl handles session registration.
@@ -1064,6 +1145,169 @@ func (s *Server) handleSessionRegistrationImpl(ctx context.Context, session serv
 	slog.Info("session capabilities injected",
 		"session_id", sessionID,
 		"tool_count", len(adaptedTools))
+	return nil
+}
+
+func (s *Server) handleBackendStatusChange(event health.StatusChangeEvent) {
+	previousEligible := health.IsStatusEligibleForExposure(event.PreviousStatus)
+	currentEligible := health.IsStatusEligibleForExposure(event.Status)
+	if previousEligible == currentEligible {
+		return
+	}
+
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+
+	targets := s.targetSessionsForRefresh(event, currentEligible)
+	if len(targets) == 0 {
+		return
+	}
+
+	slog.Info("refreshing active sessions after backend exposure change",
+		"backend_id", event.BackendID,
+		"backend_name", event.BackendName,
+		"previous_status", event.PreviousStatus,
+		"status", event.Status,
+		"session_count", len(targets))
+
+	for _, target := range targets {
+		refreshCtx, cancel := context.WithTimeout(context.Background(), defaultSessionRefreshTimeout)
+		if err := s.refreshSessionCapabilities(refreshCtx, target.sessionID, target.session); err != nil {
+			slog.Warn("failed to refresh session capabilities",
+				"session_id", target.sessionID,
+				"backend_id", event.BackendID,
+				"error", err)
+		}
+		cancel()
+	}
+}
+
+type refreshTarget struct {
+	sessionID string
+	session   server.ClientSession
+}
+
+func (s *Server) targetSessionsForRefresh(
+	event health.StatusChangeEvent,
+	backendEligible bool,
+) []refreshTarget {
+	targets := make([]refreshTarget, 0)
+	s.activeClientSessions.Range(func(key, value any) bool {
+		sessionID, ok := key.(string)
+		if !ok {
+			return true
+		}
+		clientSession, ok := value.(server.ClientSession)
+		if !ok {
+			return true
+		}
+		if !backendEligible {
+			multiSess, exists := s.vmcpSessionMgr.GetMultiSession(sessionID)
+			if !exists {
+				return true
+			}
+			if !sessionContainsBackend(multiSess, event.BackendID) {
+				return true
+			}
+		}
+		targets = append(targets, refreshTarget{
+			sessionID: sessionID,
+			session:   clientSession,
+		})
+		return true
+	})
+	return targets
+}
+
+func sessionContainsBackend(sess sessiontypes.MultiSession, backendID string) bool {
+	metadata := sess.GetMetadata()
+	if len(metadata) == 0 {
+		return false
+	}
+
+	backendIDs := metadata[vmcpsession.MetadataKeyBackendIDs]
+	if backendIDs == "" {
+		return false
+	}
+
+	for _, current := range strings.Split(backendIDs, ",") {
+		if current == backendID {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) refreshSessionCapabilities(
+	ctx context.Context,
+	sessionID string,
+	clientSession server.ClientSession,
+) error {
+	previous, ok := s.vmcpSessionMgr.GetMultiSession(sessionID)
+	if !ok {
+		return fmt.Errorf("session %q not found", sessionID)
+	}
+
+	if _, err := s.vmcpSessionMgr.RefreshSession(ctx, sessionID); err != nil {
+		return err
+	}
+
+	rollback := func(refreshErr error) error {
+		if storeErr := s.vmcpSessionMgr.StoreSession(previous); storeErr != nil {
+			return fmt.Errorf("%w (rollback failed: %v)", refreshErr, storeErr)
+		}
+		return refreshErr
+	}
+
+	adaptedTools, err := s.vmcpSessionMgr.GetAdaptedTools(sessionID)
+	if err != nil {
+		return rollback(err)
+	}
+	adaptedResources, err := s.vmcpSessionMgr.GetAdaptedResources(sessionID)
+	if err != nil {
+		return rollback(err)
+	}
+
+	resourcesChanged, err := replaceSessionResourcesDirect(clientSession, adaptedResources)
+	if err != nil {
+		return rollback(err)
+	}
+	toolsChanged, err := replaceSessionToolsDirect(clientSession, adaptedTools)
+	if err != nil {
+		return rollback(err)
+	}
+
+	if resourcesChanged {
+		if err := s.mcpServer.SendNotificationToSpecificClient(sessionID, "notifications/resources/list_changed", nil); err != nil {
+			slog.Debug("failed to send session resource refresh notification",
+				"session_id", sessionID,
+				"error", err)
+		}
+	}
+	if toolsChanged {
+		if err := s.mcpServer.SendNotificationToSpecificClient(sessionID, "notifications/tools/list_changed", nil); err != nil {
+			slog.Debug("failed to send session tool refresh notification",
+				"session_id", sessionID,
+				"error", err)
+		}
+	}
+
+	go func(previous sessiontypes.MultiSession) {
+		time.Sleep(defaultSessionCloseGracePeriod)
+		if err := previous.Close(); err != nil {
+			slog.Warn("failed to close replaced session",
+				"session_id", sessionID,
+				"error", err)
+		}
+	}(previous)
+
+	slog.Info("refreshed session capabilities",
+		"session_id", sessionID,
+		"tool_count", len(adaptedTools),
+		"resource_count", len(adaptedResources),
+		"tools_changed", toolsChanged,
+		"resources_changed", resourcesChanged)
+
 	return nil
 }
 

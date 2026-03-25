@@ -17,6 +17,7 @@ import (
 	"github.com/stacklok/toolhive/pkg/auth"
 	transportsession "github.com/stacklok/toolhive/pkg/transport/session"
 	"github.com/stacklok/toolhive/pkg/vmcp"
+	"github.com/stacklok/toolhive/pkg/vmcp/health"
 	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
 	sessionfactorymocks "github.com/stacklok/toolhive/pkg/vmcp/session/mocks"
 	sessiontypes "github.com/stacklok/toolhive/pkg/vmcp/session/types"
@@ -134,6 +135,28 @@ type fakeBackendRegistry struct {
 	backends []vmcp.Backend
 }
 
+type fakeHealthStatusProvider struct {
+	statuses map[string]vmcp.BackendHealthStatus
+}
+
+func (p fakeHealthStatusProvider) QueryBackendStatus(backendID string) (vmcp.BackendHealthStatus, bool) {
+	status, ok := p.statuses[backendID]
+	return status, ok
+}
+
+type identityAwareSession struct {
+	sessiontypes.MultiSession
+	identity *auth.Identity
+}
+
+func (s identityAwareSession) CreatorIdentity() *auth.Identity {
+	if s.identity == nil {
+		return nil
+	}
+	cloned := *s.identity
+	return &cloned
+}
+
 // newFakeRegistry creates a BackendRegistry with no backends.
 // Tests that need backends should set the backends field directly.
 func newFakeRegistry() *fakeBackendRegistry {
@@ -175,7 +198,21 @@ func newTestSessionManager(
 ) (*Manager, transportsession.DataStorage) {
 	t.Helper()
 	storage := newTestSessionDataStorage(t)
-	sm, cleanup, err := New(storage, &FactoryConfig{Base: factory}, registry)
+	sm, cleanup, err := New(storage, &FactoryConfig{Base: factory}, registry, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cleanup(context.Background()) })
+	return sm, storage
+}
+
+func newTestSessionManagerWithHealth(
+	t *testing.T,
+	factory vmcpsession.MultiSessionFactory,
+	registry vmcp.BackendRegistry,
+	healthStatusProvider health.StatusProvider,
+) (*Manager, transportsession.DataStorage) {
+	t.Helper()
+	storage := newTestSessionDataStorage(t)
+	sm, cleanup, err := New(storage, &FactoryConfig{Base: factory}, registry, healthStatusProvider)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cleanup(context.Background()) })
 	return sm, storage
@@ -215,7 +252,7 @@ func TestSessionManager_Generate(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		sess := newMockSession(t, ctrl, "placeholder", nil)
 		factory := newMockFactory(t, ctrl, sess)
-		sm, cleanup, err := New(alwaysFailDataStorage{}, &FactoryConfig{Base: factory}, newFakeRegistry())
+		sm, cleanup, err := New(alwaysFailDataStorage{}, &FactoryConfig{Base: factory}, newFakeRegistry(), nil)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = cleanup(context.Background()) })
 
@@ -444,6 +481,42 @@ func TestSessionManager_CreateSession(t *testing.T) {
 		require.Error(t, createErr)
 		assert.ErrorContains(t, createErr, "was terminated during backend init")
 	})
+
+	t.Run("filters unhealthy backends before creating session", func(t *testing.T) {
+		t.Parallel()
+
+		ctrl := gomock.NewController(t)
+		registry := newFakeRegistry()
+		registry.backends = []vmcp.Backend{
+			{ID: "healthy", Name: "Healthy"},
+			{ID: "degraded", Name: "Degraded"},
+			{ID: "unhealthy", Name: "Unhealthy"},
+		}
+
+		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
+		factory.EXPECT().
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, backends []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+				require.Len(t, backends, 2)
+				assert.Equal(t, "healthy", backends[0].ID)
+				assert.Equal(t, "degraded", backends[1].ID)
+				return newMockSession(t, ctrl, id, nil), nil
+			}).Times(1)
+
+		sm, _ := newTestSessionManagerWithHealth(t, factory, registry, fakeHealthStatusProvider{
+			statuses: map[string]vmcp.BackendHealthStatus{
+				"healthy":   vmcp.BackendHealthy,
+				"degraded":  vmcp.BackendDegraded,
+				"unhealthy": vmcp.BackendUnhealthy,
+			},
+		})
+
+		sessionID := sm.Generate()
+		require.NotEmpty(t, sessionID)
+
+		_, err := sm.CreateSession(context.Background(), sessionID)
+		require.NoError(t, err)
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -521,6 +594,100 @@ func TestSessionManager_Validate(t *testing.T) {
 		isTerminated, err := sm.Validate(sessionID)
 		require.NoError(t, err)
 		assert.True(t, isTerminated)
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Tests: RefreshSession
+// ---------------------------------------------------------------------------
+
+func TestSessionManager_RefreshSession(t *testing.T) {
+	t.Parallel()
+
+	t.Run("rebuilds session with creator identity and eligible backends", func(t *testing.T) {
+		t.Parallel()
+
+		ctrl := gomock.NewController(t)
+		const sessionID = "550e8400-e29b-41d4-a716-446655440001"
+		registry := &fakeBackendRegistry{
+			backends: []vmcp.Backend{
+				{ID: "healthy", Name: "Healthy"},
+				{ID: "degraded", Name: "Degraded"},
+				{ID: "unhealthy", Name: "Unhealthy"},
+			},
+		}
+
+		identity := &auth.Identity{
+			PrincipalInfo: auth.PrincipalInfo{Subject: "user-123"},
+			Token:         "bearer-token",
+		}
+		original := identityAwareSession{
+			MultiSession: newMockSession(t, ctrl, sessionID, nil),
+			identity:     identity,
+		}
+
+		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
+		factory.EXPECT().
+			MakeSessionWithID(gomock.Any(), sessionID, gomock.Any(), false, gomock.Any()).
+			DoAndReturn(func(
+				_ context.Context,
+				id string,
+				gotIdentity *auth.Identity,
+				allowAnonymous bool,
+				backends []*vmcp.Backend,
+			) (vmcpsession.MultiSession, error) {
+				require.False(t, allowAnonymous)
+				require.NotNil(t, gotIdentity)
+				assert.Equal(t, identity.Subject, gotIdentity.Subject)
+				assert.Equal(t, identity.Token, gotIdentity.Token)
+				require.Len(t, backends, 2)
+				assert.Equal(t, "healthy", backends[0].ID)
+				assert.Equal(t, "degraded", backends[1].ID)
+
+				return identityAwareSession{
+					MultiSession: newMockSession(t, ctrl, id, nil),
+					identity:     gotIdentity,
+				}, nil
+			}).Times(1)
+
+		sm, _ := newTestSessionManagerWithHealth(t, factory, registry, fakeHealthStatusProvider{
+			statuses: map[string]vmcp.BackendHealthStatus{
+				"healthy":   vmcp.BackendHealthy,
+				"degraded":  vmcp.BackendDegraded,
+				"unhealthy": vmcp.BackendUnhealthy,
+			},
+		})
+		require.NoError(t, sm.StoreSession(original))
+
+		refreshed, err := sm.RefreshSession(context.Background(), sessionID)
+		require.NoError(t, err)
+		require.NotNil(t, refreshed)
+		assert.Equal(t, sessionID, refreshed.ID())
+
+		stored, ok := sm.GetMultiSession(sessionID)
+		require.True(t, ok)
+
+		identityProvider, ok := stored.(sessiontypes.CreatorIdentityProvider)
+		require.True(t, ok)
+		storedIdentity := identityProvider.CreatorIdentity()
+		require.NotNil(t, storedIdentity)
+		assert.Equal(t, identity.Subject, storedIdentity.Subject)
+		assert.Equal(t, identity.Token, storedIdentity.Token)
+	})
+
+	t.Run("returns error when stored session cannot provide creator identity", func(t *testing.T) {
+		t.Parallel()
+
+		ctrl := gomock.NewController(t)
+		const sessionID = "550e8400-e29b-41d4-a716-446655440002"
+		sm, _ := newTestSessionManager(t, newMockFactory(t, ctrl, newMockSession(t, ctrl, "unused", nil)), newFakeRegistry())
+
+		sessionWithoutIdentity := newMockSession(t, ctrl, sessionID, nil)
+		require.NoError(t, sm.StoreSession(sessionWithoutIdentity))
+
+		_, err := sm.RefreshSession(context.Background(), sessionID)
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "cannot provide creator identity")
 	})
 }
 
@@ -672,7 +839,7 @@ func TestSessionManager_Terminate(t *testing.T) {
 			failStoreAfter: 1, // fail after 1 successful call (Generate's Create)
 			failDelete:     false,
 		}
-		sm, cleanup, err := New(failingStorage, &FactoryConfig{Base: factory}, registry)
+		sm, cleanup, err := New(failingStorage, &FactoryConfig{Base: factory}, registry, nil)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = cleanup(context.Background()) })
 
@@ -710,7 +877,7 @@ func TestSessionManager_Terminate(t *testing.T) {
 			failStoreAfter: 1, // fail after 1 successful call (Generate's Create)
 			failDelete:     true,
 		}
-		sm, cleanup, err := New(failingStorage, &FactoryConfig{Base: factory}, registry)
+		sm, cleanup, err := New(failingStorage, &FactoryConfig{Base: factory}, registry, nil)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = cleanup(context.Background()) })
 

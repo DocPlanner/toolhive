@@ -532,8 +532,10 @@ func TestExtractSubjects(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/test", nil)
 		identity := &auth.Identity{
-			Subject: claims["sub"].(string),
-			Claims:  claims,
+			PrincipalInfo: auth.PrincipalInfo{
+				Subject: claims["sub"].(string),
+				Claims:  claims,
+			},
 		}
 		ctx := auth.WithIdentity(req.Context(), identity)
 		req = req.WithContext(ctx)

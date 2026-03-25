@@ -480,6 +480,7 @@ func (f *defaultMultiSessionFactory) makeBaseSession(
 		resources:       allResources,
 		prompts:         allPrompts,
 		backendSessions: backendSessions,
+		creatorIdentity: cloneIdentity(identity),
 		queue:           newAdmissionQueue(),
 	}, nil
 }

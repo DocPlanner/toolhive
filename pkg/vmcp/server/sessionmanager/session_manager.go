@@ -28,6 +28,7 @@ import (
 	transportsession "github.com/stacklok/toolhive/pkg/transport/session"
 	"github.com/stacklok/toolhive/pkg/vmcp"
 	"github.com/stacklok/toolhive/pkg/vmcp/conversion"
+	"github.com/stacklok/toolhive/pkg/vmcp/health"
 	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
 	sessiontypes "github.com/stacklok/toolhive/pkg/vmcp/session/types"
 )
@@ -84,6 +85,8 @@ type Manager struct {
 	// session from stored metadata; on a cache hit it confirms liveness via
 	// storage.Load, which also refreshes the Redis TTL.
 	sessions *RestorableCache[string, vmcpsession.MultiSession]
+
+	healthStatusProvider health.StatusProvider
 }
 
 // New creates a Manager backed by the given SessionDataStorage and backend
@@ -97,6 +100,7 @@ func New(
 	storage transportsession.DataStorage,
 	cfg *FactoryConfig,
 	backendRegistry vmcp.BackendRegistry,
+	healthStatusProvider health.StatusProvider,
 ) (*Manager, func(context.Context) error, error) {
 	if cfg == nil || cfg.Base == nil {
 		return nil, nil, fmt.Errorf("sessionmanager.New: FactoryConfig.Base (SessionFactory) is required")
@@ -130,8 +134,9 @@ func New(
 	// Build the Manager first so we can reference sm.Terminate and sm.sessions
 	// directly in closures, eliminating the forward-reference variable pattern.
 	sm := &Manager{
-		storage:    storage,
-		backendReg: backendRegistry,
+		storage:              storage,
+		backendReg:           backendRegistry,
+		healthStatusProvider: healthStatusProvider,
 	}
 
 	sm.sessions = newRestorableCache(
@@ -195,6 +200,16 @@ const terminateTimeout = 5 * time.Second
 // DecorateSession is called during session setup (OnRegisterSession hook) and
 // performs a single Redis SET. 5 s is consistent with terminateTimeout.
 const decorateTimeout = 5 * time.Second
+
+func (sm *Manager) currentEligibleBackends(ctx context.Context) []*vmcp.Backend {
+	rawBackends := sm.backendReg.List(ctx)
+	filtered := health.FilterBackendsForExposure(rawBackends, sm.healthStatusProvider)
+	backends := make([]*vmcp.Backend, len(filtered))
+	for i := range filtered {
+		backends[i] = &filtered[i]
+	}
+	return backends
+}
 
 // Generate implements the SDK's SessionIdManager.Generate().
 //
@@ -287,8 +302,8 @@ func (sm *Manager) CreateSession(
 	// (MakeSessionWithID below). Token binding enforcement happens at the session
 	// level via validateCaller(), which uses HMAC-SHA256 with a per-session salt.
 
-	// List all available backends from the registry.
-	backends := sm.listAllBackends(ctx)
+	// List and filter the currently eligible backends.
+	backends := sm.currentEligibleBackends(ctx)
 
 	// Build the fully-formed MultiSession using the SDK-assigned session ID.
 	// Sessions created with an identity are bound to that identity (allowAnonymous=false).
@@ -368,6 +383,55 @@ func (sm *Manager) cleanupFailedPlaceholder(sessionID string, metadata map[strin
 		slog.Warn("Manager.CreateSession: failed to mark failed placeholder as terminated; it will linger until TTL expires",
 			"session_id", sessionID, "error", err)
 	}
+}
+
+// RefreshSession rebuilds an existing session using the current eligible
+// backend set and replaces the stored MultiSession in-place.
+func (sm *Manager) RefreshSession(
+	ctx context.Context,
+	sessionID string,
+) (vmcpsession.MultiSession, error) {
+	if sessionID == "" {
+		return nil, fmt.Errorf("Manager.RefreshSession: session ID must not be empty")
+	}
+
+	current, ok := sm.GetMultiSession(sessionID)
+	if !ok {
+		return nil, fmt.Errorf("Manager.RefreshSession: session %q not found or not a multi-session", sessionID)
+	}
+
+	identityProvider, ok := current.(sessiontypes.CreatorIdentityProvider)
+	if !ok {
+		return nil, fmt.Errorf("Manager.RefreshSession: session %q cannot provide creator identity", sessionID)
+	}
+
+	identity := identityProvider.CreatorIdentity()
+	allowAnonymous := sessiontypes.ShouldAllowAnonymous(identity)
+	backends := sm.currentEligibleBackends(ctx)
+
+	refreshed, err := sm.factory.MakeSessionWithID(ctx, sessionID, identity, allowAnonymous, backends)
+	if err != nil {
+		return nil, fmt.Errorf("Manager.RefreshSession: failed to rebuild multi-session: %w", err)
+	}
+
+	if _, ok = sm.GetMultiSession(sessionID); !ok {
+		_ = refreshed.Close()
+		return nil, fmt.Errorf("Manager.RefreshSession: session %q was terminated during refresh", sessionID)
+	}
+
+	// Update storage metadata and local cache.
+	storeCtx, storeCancel := context.WithTimeout(ctx, createSessionStorageTimeout)
+	defer storeCancel()
+	if err := sm.storage.Upsert(storeCtx, sessionID, refreshed.GetMetadata()); err != nil {
+		_ = refreshed.Close()
+		return nil, fmt.Errorf("Manager.RefreshSession: failed to store refreshed session: %w", err)
+	}
+	sm.sessions.Store(sessionID, refreshed)
+
+	slog.Info("Manager: refreshed multi-session",
+		"session_id", sessionID,
+		"backend_count", len(backends))
+	return refreshed, nil
 }
 
 // Validate implements the SDK's SessionIdManager.Validate().
@@ -600,6 +664,20 @@ func (sm *Manager) loadSession(sessionID string) (vmcpsession.MultiSession, erro
 
 	slog.Debug("Manager.loadSession: restored session from storage", "session_id", sessionID)
 	return restored, nil
+}
+
+// StoreSession replaces the stored MultiSession for a session ID.
+func (sm *Manager) StoreSession(session vmcpsession.MultiSession) error {
+	if session == nil {
+		return fmt.Errorf("StoreSession: session must not be nil")
+	}
+	storeCtx, cancel := context.WithTimeout(context.Background(), createSessionStorageTimeout)
+	defer cancel()
+	if err := sm.storage.Upsert(storeCtx, session.ID(), session.GetMetadata()); err != nil {
+		return fmt.Errorf("StoreSession: failed to store session: %w", err)
+	}
+	sm.sessions.Store(session.ID(), session)
+	return nil
 }
 
 // DecorateSession retrieves the MultiSession for sessionID, applies fn to it,

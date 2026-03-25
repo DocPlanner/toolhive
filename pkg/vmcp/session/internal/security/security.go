@@ -152,6 +152,15 @@ func (d hijackPreventionDecorator) validateCaller(caller *auth.Identity) error {
 	return nil
 }
 
+// CreatorIdentity forwards access to the wrapped session when available.
+func (d hijackPreventionDecorator) CreatorIdentity() *auth.Identity {
+	provider, ok := d.MultiSession.(sessiontypes.CreatorIdentityProvider)
+	if !ok {
+		return nil
+	}
+	return provider.CreatorIdentity()
+}
+
 // CallTool validates the caller identity before delegating to the embedded session.
 func (d hijackPreventionDecorator) CallTool(
 	ctx context.Context,
