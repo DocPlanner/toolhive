@@ -471,6 +471,29 @@ func TestMiddlewareWithGETRequest(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rr.Code, "Response status code should be OK")
 }
 
+func TestMiddlewareAllowsJSONRPCResponsesThrough(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubAuthorizer{allowed: false}
+
+	var handlerCalled bool
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		handlerCalled = true
+		w.WriteHeader(http.StatusAccepted)
+	})
+
+	middleware := mcpparser.ParsingMiddleware(Middleware(stub, handler, nil))
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewBufferString(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	middleware.ServeHTTP(rr, req)
+
+	assert.True(t, handlerCalled, "Client JSON-RPC responses should reach the streamable HTTP handler")
+	assert.Equal(t, http.StatusAccepted, rr.Code)
+}
+
 func TestFactoryCreateMiddleware(t *testing.T) {
 	t.Parallel()
 

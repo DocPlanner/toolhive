@@ -25,6 +25,7 @@ func TestParsingMiddleware(t *testing.T) {
 		contentType    string
 		body           string
 		expectParsed   bool
+		expectedIsReq  bool
 		expectedMethod string
 		expectedID     interface{}
 		expectedResID  string
@@ -36,6 +37,7 @@ func TestParsingMiddleware(t *testing.T) {
 			contentType:    "application/json",
 			body:           `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"weather","arguments":{"location":"NYC"}}}`,
 			expectParsed:   true,
+			expectedIsReq:  true,
 			expectedMethod: "tools/call",
 			expectedID:     int64(1), // JSON-RPC library uses int64 for numeric IDs
 			expectedResID:  "weather",
@@ -47,6 +49,7 @@ func TestParsingMiddleware(t *testing.T) {
 			contentType:    "application/json",
 			body:           `{"jsonrpc":"2.0","id":"init-1","method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"test-client","version":"1.0.0"},"capabilities":{}}}`,
 			expectParsed:   true,
+			expectedIsReq:  true,
 			expectedMethod: "initialize",
 			expectedID:     "init-1",
 			expectedResID:  "test-client",
@@ -58,6 +61,7 @@ func TestParsingMiddleware(t *testing.T) {
 			contentType:    "application/json",
 			body:           `{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"file:///test.txt"}}`,
 			expectParsed:   true,
+			expectedIsReq:  true,
 			expectedMethod: "resources/read",
 			expectedID:     int64(2),
 			expectedResID:  "file:///test.txt",
@@ -69,6 +73,7 @@ func TestParsingMiddleware(t *testing.T) {
 			contentType:    "application/json",
 			body:           `{"jsonrpc":"2.0","id":3,"method":"prompts/get","params":{"name":"greeting","arguments":{"name":"Alice"}}}`,
 			expectParsed:   true,
+			expectedIsReq:  true,
 			expectedMethod: "prompts/get",
 			expectedID:     int64(3),
 			expectedResID:  "greeting",
@@ -80,9 +85,20 @@ func TestParsingMiddleware(t *testing.T) {
 			contentType:    "application/json",
 			body:           `{"jsonrpc":"2.0","id":4,"method":"ping","params":{}}`,
 			expectParsed:   true,
+			expectedIsReq:  true,
 			expectedMethod: "ping",
 			expectedID:     int64(4),
 			expectedResID:  "ping",
+		},
+		{
+			name:          "JSON-RPC response envelope",
+			method:        "POST",
+			path:          "/messages",
+			contentType:   "application/json",
+			body:          `{"jsonrpc":"2.0","id":1,"result":{}}`,
+			expectParsed:  true,
+			expectedIsReq: false,
+			expectedID:    int64(1),
 		},
 		{
 			name:         "GET request - not parsed",
@@ -115,6 +131,7 @@ func TestParsingMiddleware(t *testing.T) {
 			contentType:    "application/json",
 			body:           `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"test"}}`,
 			expectParsed:   true,
+			expectedIsReq:  true,
 			expectedMethod: "tools/call",
 			expectedID:     int64(1),
 			expectedResID:  "test",
@@ -126,6 +143,7 @@ func TestParsingMiddleware(t *testing.T) {
 			contentType:    "application/json",
 			body:           `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"fetch"}}`,
 			expectParsed:   true,
+			expectedIsReq:  true,
 			expectedMethod: "tools/call",
 			expectedID:     int64(7),
 			expectedResID:  "fetch",
@@ -137,6 +155,7 @@ func TestParsingMiddleware(t *testing.T) {
 			contentType:    "application/json",
 			body:           `{"jsonrpc":"2.0","id":8,"method":"resources/read","params":{"uri":"file:///custom.txt"}}`,
 			expectParsed:   true,
+			expectedIsReq:  true,
 			expectedMethod: "resources/read",
 			expectedID:     int64(8),
 			expectedResID:  "file:///custom.txt",
@@ -148,6 +167,7 @@ func TestParsingMiddleware(t *testing.T) {
 			contentType:    "application/json",
 			body:           `{"jsonrpc":"2.0","id":9,"method":"prompts/get","params":{"name":"hello"}}`,
 			expectParsed:   true,
+			expectedIsReq:  true,
 			expectedMethod: "prompts/get",
 			expectedID:     int64(9),
 			expectedResID:  "hello",
@@ -159,6 +179,7 @@ func TestParsingMiddleware(t *testing.T) {
 			contentType:    "application/json",
 			body:           `{"jsonrpc":"2.0","id":5,"method":"tools/list","params":{"cursor":"next-page"}}`,
 			expectParsed:   true,
+			expectedIsReq:  true,
 			expectedMethod: "tools/list",
 			expectedID:     int64(5),
 			expectedResID:  "next-page",
@@ -170,6 +191,7 @@ func TestParsingMiddleware(t *testing.T) {
 			contentType:    "application/json",
 			body:           `{"jsonrpc":"2.0","id":6,"method":"logging/setLevel","params":{"level":"debug"}}`,
 			expectParsed:   true,
+			expectedIsReq:  true,
 			expectedMethod: "logging/setLevel",
 			expectedID:     int64(6),
 			expectedResID:  "debug",
@@ -181,6 +203,7 @@ func TestParsingMiddleware(t *testing.T) {
 			contentType:    "application/json",
 			body:           `{"jsonrpc":"2.0","method":"notifications/elicitation/complete","params":{"elicitationId":"550e8400-e29b-41d4-a716-446655440000"}}`,
 			expectParsed:   true,
+			expectedIsReq:  true,
 			expectedMethod: "notifications/elicitation/complete",
 			expectedID:     nil,
 			expectedResID:  "550e8400-e29b-41d4-a716-446655440000",
@@ -215,7 +238,7 @@ func TestParsingMiddleware(t *testing.T) {
 				assert.Equal(t, tt.expectedMethod, parsed.Method)
 				assert.Equal(t, tt.expectedID, parsed.ID)
 				assert.Equal(t, tt.expectedResID, parsed.ResourceID)
-				assert.True(t, parsed.IsRequest)
+				assert.Equal(t, tt.expectedIsReq, parsed.IsRequest)
 				assert.False(t, parsed.IsBatch)
 			} else {
 				assert.Nil(t, parsed, "Expected MCP request not to be parsed")
@@ -1228,24 +1251,34 @@ func TestShouldParseMCPRequest(t *testing.T) {
 func TestParseMCPRequestWithInvalidJSON(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name string
-		body string
+		name     string
+		body     string
+		wantNil  bool
+		checkReq func(*testing.T, *ParsedMCPRequest)
 	}{
 		{
-			name: "empty body",
-			body: "",
+			name:    "empty body",
+			body:    "",
+			wantNil: true,
 		},
 		{
-			name: "invalid JSON",
-			body: "not json",
+			name:    "invalid JSON",
+			body:    "not json",
+			wantNil: true,
 		},
 		{
 			name: "JSON-RPC response instead of request",
 			body: `{"jsonrpc":"2.0","id":1,"result":{"success":true}}`,
+			checkReq: func(t *testing.T, r *ParsedMCPRequest) {
+				assert.False(t, r.IsRequest)
+			},
 		},
 		{
 			name: "JSON-RPC error instead of request",
 			body: `{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"error"}}`,
+			checkReq: func(t *testing.T, r *ParsedMCPRequest) {
+				assert.False(t, r.IsRequest)
+			},
 		},
 	}
 
@@ -1253,7 +1286,12 @@ func TestParseMCPRequestWithInvalidJSON(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			result := parseMCPRequest([]byte(tt.body))
-			assert.Nil(t, result)
+			if tt.wantNil {
+				assert.Nil(t, result)
+			} else {
+				require.NotNil(t, result)
+				tt.checkReq(t, result)
+			}
 		})
 	}
 }

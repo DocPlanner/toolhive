@@ -196,6 +196,13 @@ func Middleware(a authorizers.Authorizer, next http.Handler, passThroughTools ma
 			return
 		}
 
+		// Streamable HTTP allows clients to POST JSON-RPC responses back to the server.
+		// These are not authorization subjects and must reach the transport handler.
+		if !parsedRequest.IsRequest {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		// Check if we should skip authorization after parsing the message
 		if shouldSkipSubsequentAuthorization(parsedRequest.Method) {
 			next.ServeHTTP(w, r)
