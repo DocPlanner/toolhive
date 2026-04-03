@@ -138,6 +138,8 @@ func shouldParseMCPRequest(r *http.Request) bool {
 }
 
 // parseMCPRequest parses the JSON-RPC message and extracts MCP-specific information.
+// Client responses are also captured so downstream middleware can distinguish them
+// from malformed requests and let the streamable HTTP handler process them.
 func parseMCPRequest(bodyBytes []byte) *ParsedMCPRequest {
 	if len(bodyBytes) == 0 {
 		return nil
@@ -149,31 +151,40 @@ func parseMCPRequest(bodyBytes []byte) *ParsedMCPRequest {
 		return nil
 	}
 
-	// Handle only request messages (both calls with ID and notifications without ID)
-	req, ok := msg.(*jsonrpc2.Request)
-	if !ok {
-		// Response or error messages are not parsed here
+	switch msg := msg.(type) {
+	case *jsonrpc2.Request:
+		// Extract resource ID, arguments, and meta based on the method
+		resourceID, arguments, meta := extractResourceAndArguments(msg.Method, msg.Params)
+
+		// Determine the ID - will be nil for notifications
+		var id interface{}
+		if msg.ID.IsValid() {
+			id = msg.ID.Raw()
+		}
+
+		return &ParsedMCPRequest{
+			Method:     msg.Method,
+			ID:         id,
+			Params:     msg.Params,
+			ResourceID: resourceID,
+			Arguments:  arguments,
+			Meta:       meta,
+			IsRequest:  true,
+			IsBatch:    false, // TODO: Add batch request support if needed
+		}
+	case *jsonrpc2.Response:
+		var id interface{}
+		if msg.ID.IsValid() {
+			id = msg.ID.Raw()
+		}
+
+		return &ParsedMCPRequest{
+			ID:        id,
+			IsRequest: false,
+			IsBatch:   false,
+		}
+	default:
 		return nil
-	}
-
-	// Extract resource ID, arguments, and meta based on the method
-	resourceID, arguments, meta := extractResourceAndArguments(req.Method, req.Params)
-
-	// Determine the ID - will be nil for notifications
-	var id interface{}
-	if req.ID.IsValid() {
-		id = req.ID.Raw()
-	}
-
-	return &ParsedMCPRequest{
-		Method:     req.Method,
-		ID:         id,
-		Params:     req.Params,
-		ResourceID: resourceID,
-		Arguments:  arguments,
-		Meta:       meta,
-		IsRequest:  true,
-		IsBatch:    false, // TODO: Add batch request support if needed
 	}
 }
 

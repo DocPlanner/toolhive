@@ -84,9 +84,9 @@ func CreateMiddleware(config *types.MiddlewareConfig, runner types.MiddlewareRun
 func createValidatingHandler(executors []clientExecutor, serverName, transport string) types.MiddlewareFunction {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Skip if it's not a parsed MCP request (middleware runs after mcp parser)
+			// Skip if it's not a parsed MCP request or if this is a client response.
 			parsedMCP := mcp.GetParsedMCPRequest(r.Context())
-			if parsedMCP == nil {
+			if parsedMCP == nil || !parsedMCP.IsRequest {
 				next.ServeHTTP(w, r)
 				return
 			}

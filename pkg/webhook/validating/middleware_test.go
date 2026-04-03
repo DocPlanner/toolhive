@@ -76,8 +76,9 @@ func TestValidatingMiddleware(t *testing.T) {
 
 		// Add parsed MCP request and auth identity to context
 		parsedMCP := &mcp.ParsedMCPRequest{
-			Method: "tools/call",
-			ID:     1,
+			Method:    "tools/call",
+			ID:        1,
+			IsRequest: true,
 		}
 		ctx := context.WithValue(req.Context(), mcp.MCPRequestContextKey, parsedMCP)
 
@@ -126,7 +127,7 @@ func TestValidatingMiddleware(t *testing.T) {
 
 		reqBody := []byte(`{"jsonrpc":"2.0","method":"tools/call","id":1}`)
 		req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(reqBody))
-		ctx := context.WithValue(req.Context(), mcp.MCPRequestContextKey, &mcp.ParsedMCPRequest{})
+		ctx := context.WithValue(req.Context(), mcp.MCPRequestContextKey, &mcp.ParsedMCPRequest{IsRequest: true})
 		req = req.WithContext(ctx)
 
 		var nextCalled bool
@@ -150,7 +151,7 @@ func TestValidatingMiddleware(t *testing.T) {
 		reqBody := []byte(`{"jsonrpc":"2.0","method":"tools/call","id":1}`)
 		req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(reqBody))
 
-		ctx := context.WithValue(req.Context(), mcp.MCPRequestContextKey, &mcp.ParsedMCPRequest{})
+		ctx := context.WithValue(req.Context(), mcp.MCPRequestContextKey, &mcp.ParsedMCPRequest{IsRequest: true})
 		req = req.WithContext(ctx)
 
 		var nextCalled bool
@@ -182,7 +183,7 @@ func TestValidatingMiddleware(t *testing.T) {
 
 		reqBody := []byte(`{"jsonrpc":"2.0","method":"tools/call","id":1}`)
 		req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(reqBody))
-		ctx := context.WithValue(req.Context(), mcp.MCPRequestContextKey, &mcp.ParsedMCPRequest{})
+		ctx := context.WithValue(req.Context(), mcp.MCPRequestContextKey, &mcp.ParsedMCPRequest{IsRequest: true})
 		req = req.WithContext(ctx)
 
 		var nextCalled bool
@@ -210,7 +211,7 @@ func TestValidatingMiddleware(t *testing.T) {
 
 		reqBody := []byte(`{"jsonrpc":"2.0","method":"tools/call","id":1}`)
 		req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(reqBody))
-		ctx := context.WithValue(req.Context(), mcp.MCPRequestContextKey, &mcp.ParsedMCPRequest{})
+		ctx := context.WithValue(req.Context(), mcp.MCPRequestContextKey, &mcp.ParsedMCPRequest{IsRequest: true})
 		req = req.WithContext(ctx)
 
 		var nextCalled bool
@@ -238,7 +239,7 @@ func TestValidatingMiddleware(t *testing.T) {
 
 		reqBody := []byte(`{"jsonrpc":"2.0","method":"tools/call","id":1}`)
 		req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(reqBody))
-		ctx := context.WithValue(req.Context(), mcp.MCPRequestContextKey, &mcp.ParsedMCPRequest{})
+		ctx := context.WithValue(req.Context(), mcp.MCPRequestContextKey, &mcp.ParsedMCPRequest{IsRequest: true})
 		req = req.WithContext(ctx)
 
 		var nextCalled bool
@@ -266,6 +267,27 @@ func TestValidatingMiddleware(t *testing.T) {
 		mw(nextHandler).ServeHTTP(rr, req)
 
 		assert.True(t, nextCalled, "Next handler should be called for non-MCP requests")
+		assert.Equal(t, http.StatusOK, rr.Code)
+	})
+
+	t.Run("Skip Client JSON-RPC Responses", func(t *testing.T) {
+		reqBody := []byte(`{"jsonrpc":"2.0","id":1,"result":{}}`)
+		req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(reqBody))
+		ctx := context.WithValue(req.Context(), mcp.MCPRequestContextKey, &mcp.ParsedMCPRequest{
+			ID:        1,
+			IsRequest: false,
+		})
+		req = req.WithContext(ctx)
+
+		var nextCalled bool
+		nextHandler := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+			nextCalled = true
+		})
+
+		rr := httptest.NewRecorder()
+		mw(nextHandler).ServeHTTP(rr, req)
+
+		assert.True(t, nextCalled, "Client JSON-RPC responses should bypass validating webhooks")
 		assert.Equal(t, http.StatusOK, rr.Code)
 	})
 }
@@ -304,6 +326,30 @@ func TestMiddlewareParams_Validate(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCreateValidatingHandlerSkipsClientResponses(t *testing.T) {
+	t.Parallel()
+
+	mw := createValidatingHandler(nil, "test-server", "streamable-http")
+
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`)))
+	ctx := context.WithValue(req.Context(), mcp.MCPRequestContextKey, &mcp.ParsedMCPRequest{
+		ID:        1,
+		IsRequest: false,
+	})
+	req = req.WithContext(ctx)
+
+	var nextCalled bool
+	nextHandler := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		nextCalled = true
+	})
+
+	rr := httptest.NewRecorder()
+	mw(nextHandler).ServeHTTP(rr, req)
+
+	assert.True(t, nextCalled, "Client JSON-RPC responses should bypass validating webhooks")
+	assert.Equal(t, http.StatusOK, rr.Code)
 }
 
 type mockRunner struct {
@@ -466,7 +512,7 @@ func TestMultiWebhookChain(t *testing.T) {
 	createReq := func() *http.Request {
 		reqBody := []byte(`{"jsonrpc":"2.0","method":"tools/call","id":1}`)
 		req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(reqBody))
-		ctx := context.WithValue(req.Context(), mcp.MCPRequestContextKey, &mcp.ParsedMCPRequest{})
+		ctx := context.WithValue(req.Context(), mcp.MCPRequestContextKey, &mcp.ParsedMCPRequest{IsRequest: true})
 		return req.WithContext(ctx)
 	}
 
