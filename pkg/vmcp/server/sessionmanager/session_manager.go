@@ -152,10 +152,12 @@ func New(
 				"session_id", id)
 		},
 	)
+	sm.sessions.StartSweep(cfg.SessionTTL, 0)
 
 	sm.factory = buildDecoratingFactory(cfg, optimizerFactory, instruments, sm.Terminate)
 
 	cleanup := func(ctx context.Context) error {
+		sm.sessions.StopSweep()
 		return optimizerCleanup(ctx)
 	}
 	return sm, cleanup, nil
@@ -470,6 +472,7 @@ func (sm *Manager) Validate(sessionID string) (isTerminated bool, err error) {
 		return true, nil
 	}
 
+	sm.sessions.Touch(sessionID)
 	return false, nil
 }
 
@@ -912,6 +915,8 @@ func (sm *Manager) GetAdaptedTools(sessionID string) ([]mcpserver.ServerTool, er
 		capturedSessionID := sessionID
 		capturedToolName := domainTool.Name
 		handler := func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			sm.sessions.Touch(capturedSessionID)
+
 			args, ok := req.Params.Arguments.(map[string]any)
 			if !ok {
 				wrappedErr := fmt.Errorf("%w: arguments must be object, got %T", vmcp.ErrInvalidInput, req.Params.Arguments)
@@ -979,6 +984,8 @@ func (sm *Manager) GetAdaptedResources(sessionID string) ([]mcpserver.ServerReso
 		capturedSessionID := sessionID
 		capturedResourceURI := domainResource.URI
 		handler := func(ctx context.Context, _ mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+			sm.sessions.Touch(capturedSessionID)
+
 			caller, _ := auth.IdentityFromContext(ctx)
 
 			result, readErr := capturedSess.ReadResource(ctx, caller, capturedResourceURI)
@@ -1036,6 +1043,8 @@ func (sm *Manager) GetAdaptedPrompts(sessionID string) ([]mcpserver.ServerPrompt
 		capturedSessionID := sessionID
 		capturedPromptName := domainPrompt.Name
 		handler := func(ctx context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+			sm.sessions.Touch(capturedSessionID)
+
 			caller, _ := auth.IdentityFromContext(ctx)
 
 			args := make(map[string]any, len(req.Params.Arguments))

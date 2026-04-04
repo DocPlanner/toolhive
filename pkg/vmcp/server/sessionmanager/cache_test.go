@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -469,4 +470,61 @@ func TestRestorableCache_Singleflight_DeduplicatesConcurrentMisses(t *testing.T)
 		assert.True(t, oks[i], "all goroutines should get ok=true")
 		assert.Equal(t, "v", results[i])
 	}
+}
+
+func TestRestorableCache_SweepEvictsIdleEntries(t *testing.T) {
+	t.Parallel()
+
+	evicted := make(chan string, 1)
+	c := newStringCache(
+		func(_ string) (string, error) { return "", errors.New("unexpected load") },
+		alwaysAliveCheck,
+		func(key, _ string) {
+			select {
+			case evicted <- key:
+			default:
+			}
+		},
+	)
+	c.Store("k", "v")
+	c.StartSweep(20*time.Millisecond, 5*time.Millisecond)
+	t.Cleanup(c.StopSweep)
+
+	require.Eventually(t, func() bool {
+		_, ok := c.Peek("k")
+		return !ok
+	}, time.Second, 10*time.Millisecond)
+
+	select {
+	case key := <-evicted:
+		assert.Equal(t, "k", key)
+	default:
+		t.Fatal("expected idle entry eviction callback")
+	}
+}
+
+func TestRestorableCache_SweepRespectsTouch(t *testing.T) {
+	t.Parallel()
+
+	c := newStringCache(
+		func(_ string) (string, error) { return "", errors.New("unexpected load") },
+		alwaysAliveCheck,
+		nil,
+	)
+	c.Store("k", "v")
+	c.StartSweep(30*time.Millisecond, 5*time.Millisecond)
+	t.Cleanup(c.StopSweep)
+
+	for i := 0; i < 4; i++ {
+		time.Sleep(10 * time.Millisecond)
+		require.True(t, c.Touch("k"))
+	}
+
+	_, ok := c.Peek("k")
+	require.True(t, ok, "touched entry should remain cached")
+
+	require.Eventually(t, func() bool {
+		_, stillPresent := c.Peek("k")
+		return !stillPresent
+	}, time.Second, 10*time.Millisecond)
 }

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"golang.org/x/sync/singleflight"
 )
@@ -35,6 +37,7 @@ var errSentinelFound = errors.New("sentinel stored in cache")
 // Store expose raw any access for sentinel use.
 type RestorableCache[K comparable, V any] struct {
 	m      sync.Map
+	touch  sync.Map
 	flight singleflight.Group
 
 	// load is called on a cache miss. Return (value, nil) on success.
@@ -51,14 +54,30 @@ type RestorableCache[K comparable, V any] struct {
 	// evicted value is passed to allow resource cleanup (e.g. closing
 	// connections). May be nil.
 	onEvict func(key K, v V)
+
+	sweepStopCh   chan struct{}
+	sweepStopOnce sync.Once
 }
 
-// TODO: add an age-based sweep to bound the lifetime of entries that are
-// never accessed again after their storage TTL expires. The sweep would range
-// over m, compare each entry's insertion time against a caller-supplied maxAge,
-// and call onEvict for entries that are too old — all without touching storage.
-// Until then, entries for idle sessions leak backend connections until the
-// process restarts or the session ID is queried again.
+type cacheTouch struct {
+	lastTouchNano atomic.Int64
+}
+
+func newCacheTouch(now time.Time) *cacheTouch {
+	entry := &cacheTouch{}
+	entry.lastTouchNano.Store(now.UnixNano())
+	return entry
+}
+
+func (c *cacheTouch) touch(now time.Time) {
+	c.lastTouchNano.Store(now.UnixNano())
+}
+
+func (c *cacheTouch) lastTouch() time.Time {
+	return time.Unix(0, c.lastTouchNano.Load())
+}
+
+const minSweepInterval = time.Millisecond
 
 func newRestorableCache[K comparable, V any](
 	load func(K) (V, error),
@@ -70,6 +89,16 @@ func newRestorableCache[K comparable, V any](
 		check:   check,
 		onEvict: onEvict,
 	}
+}
+
+func (c *RestorableCache[K, V]) recordTouch(key K, now time.Time) {
+	if existing, ok := c.touch.Load(key); ok {
+		if tracked, ok := existing.(*cacheTouch); ok {
+			tracked.touch(now)
+			return
+		}
+	}
+	c.touch.Store(key, newCacheTouch(now))
 }
 
 // Get returns the cached V value for key.
@@ -91,6 +120,7 @@ func (c *RestorableCache[K, V]) Get(key K) (V, bool) {
 		if err := c.check(key); err != nil {
 			if errors.Is(err, ErrExpired) {
 				c.m.Delete(key)
+				c.touch.Delete(key)
 				if c.onEvict != nil {
 					c.onEvict(key, v)
 				}
@@ -99,6 +129,7 @@ func (c *RestorableCache[K, V]) Get(key K) (V, bool) {
 			}
 			// Transient error — keep the cached value.
 		}
+		c.recordTouch(key, time.Now())
 		return v, true
 	}
 
@@ -129,6 +160,7 @@ func (c *RestorableCache[K, V]) Get(key K) (V, bool) {
 			}
 			return nil, errSentinelFound
 		}
+		c.recordTouch(key, time.Now())
 		return result{v: v}, nil
 	})
 	if err != nil {
@@ -142,11 +174,17 @@ func (c *RestorableCache[K, V]) Get(key K) (V, bool) {
 // Store sets key to value. value may be any type, including sentinel markers.
 func (c *RestorableCache[K, V]) Store(key K, value any) {
 	c.m.Store(key, value)
+	if _, ok := value.(V); ok {
+		c.recordTouch(key, time.Now())
+		return
+	}
+	c.touch.Delete(key)
 }
 
 // Delete removes key from the cache.
 func (c *RestorableCache[K, V]) Delete(key K) {
 	c.m.Delete(key)
+	c.touch.Delete(key)
 }
 
 // Peek returns the raw value stored under key without type assertion, liveness
@@ -158,5 +196,128 @@ func (c *RestorableCache[K, V]) Peek(key K) (any, bool) {
 // CompareAndSwap atomically replaces the value stored under key from old to
 // new. Both old and new may be any type, including sentinels.
 func (c *RestorableCache[K, V]) CompareAndSwap(key K, old, replacement any) bool {
-	return c.m.CompareAndSwap(key, old, replacement)
+	swapped := c.m.CompareAndSwap(key, old, replacement)
+	if !swapped {
+		return false
+	}
+	if _, ok := replacement.(V); ok {
+		c.recordTouch(key, time.Now())
+	} else {
+		c.touch.Delete(key)
+	}
+	return true
+}
+
+// Touch refreshes the local idle deadline for a cached V entry.
+// It returns false when the key is absent or currently stores a sentinel.
+func (c *RestorableCache[K, V]) Touch(key K) bool {
+	raw, ok := c.m.Load(key)
+	if !ok {
+		return false
+	}
+	if _, isV := raw.(V); !isV {
+		return false
+	}
+	c.recordTouch(key, time.Now())
+	return true
+}
+
+// StartSweep evicts idle cached V entries whose local touch timestamp has aged
+// past maxAge. This bounds the lifetime of node-local runtime state without
+// touching the shared storage backend, so Redis TTLs are not refreshed by the
+// sweep itself.
+func (c *RestorableCache[K, V]) StartSweep(maxAge, interval time.Duration) {
+	if maxAge <= 0 || c.sweepStopCh != nil {
+		return
+	}
+	if interval <= 0 {
+		interval = maxAge / 2
+	}
+	if interval < minSweepInterval {
+		interval = minSweepInterval
+	}
+
+	c.sweepStopCh = make(chan struct{})
+	go c.sweepLoop(maxAge, interval)
+}
+
+// StopSweep stops the background idle-entry sweep when one is running.
+func (c *RestorableCache[K, V]) StopSweep() {
+	if c.sweepStopCh == nil {
+		return
+	}
+	c.sweepStopOnce.Do(func() {
+		close(c.sweepStopCh)
+	})
+}
+
+func (c *RestorableCache[K, V]) sweepLoop(maxAge, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			c.evictIdle(maxAge)
+		case <-c.sweepStopCh:
+			return
+		}
+	}
+}
+
+func (c *RestorableCache[K, V]) evictIdle(maxAge time.Duration) {
+	cutoff := time.Now().Add(-maxAge)
+	type candidate struct {
+		key   K
+		raw   any
+		value V
+		touch *cacheTouch
+	}
+
+	var candidates []candidate
+	c.touch.Range(func(rawKey, rawTouch any) bool {
+		key, ok := rawKey.(K)
+		if !ok {
+			c.touch.Delete(rawKey)
+			return true
+		}
+		touched, ok := rawTouch.(*cacheTouch)
+		if !ok {
+			c.touch.Delete(key)
+			return true
+		}
+		if touched.lastTouch().After(cutoff) {
+			return true
+		}
+		rawValue, ok := c.m.Load(key)
+		if !ok {
+			c.touch.Delete(key)
+			return true
+		}
+		value, ok := rawValue.(V)
+		if !ok {
+			c.touch.Delete(key)
+			return true
+		}
+		candidates = append(candidates, candidate{
+			key:   key,
+			raw:   rawValue,
+			value: value,
+			touch: touched,
+		})
+		return true
+	})
+
+	for _, item := range candidates {
+		if item.touch.lastTouch().After(cutoff) {
+			continue
+		}
+		if !c.m.CompareAndDelete(item.key, item.raw) {
+			continue
+		}
+		c.touch.Delete(item.key)
+		if c.onEvict != nil {
+			c.onEvict(item.key, item.value)
+		}
+	}
 }

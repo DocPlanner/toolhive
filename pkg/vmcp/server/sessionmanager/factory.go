@@ -40,6 +40,10 @@ type FactoryConfig struct {
 	// Base is the underlying session factory. Required.
 	Base vmcpsession.MultiSessionFactory
 
+	// SessionTTL bounds how long a node-local cached MultiSession may remain
+	// idle before the cache evicts and closes it.
+	SessionTTL time.Duration
+
 	// WorkflowDefs are the composite tool workflow definitions.
 	// If empty, composite tool decoration is skipped.
 	WorkflowDefs map[string]*composer.WorkflowDefinition

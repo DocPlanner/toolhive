@@ -198,8 +198,18 @@ func newTestSessionManager(
 	registry vmcp.BackendRegistry,
 ) (*Manager, transportsession.DataStorage) {
 	t.Helper()
+	return newTestSessionManagerWithConfig(t, &FactoryConfig{Base: factory}, registry, nil)
+}
+
+func newTestSessionManagerWithConfig(
+	t *testing.T,
+	cfg *FactoryConfig,
+	registry vmcp.BackendRegistry,
+	healthStatusProvider health.StatusProvider,
+) (*Manager, transportsession.DataStorage) {
+	t.Helper()
 	storage := newTestSessionDataStorage(t)
-	sm, cleanup, err := New(storage, &FactoryConfig{Base: factory}, registry, nil)
+	sm, cleanup, err := New(storage, cfg, registry, healthStatusProvider)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cleanup(context.Background()) })
 	return sm, storage
@@ -212,11 +222,7 @@ func newTestSessionManagerWithHealth(
 	healthStatusProvider health.StatusProvider,
 ) (*Manager, transportsession.DataStorage) {
 	t.Helper()
-	storage := newTestSessionDataStorage(t)
-	sm, cleanup, err := New(storage, &FactoryConfig{Base: factory}, registry, healthStatusProvider)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = cleanup(context.Background()) })
-	return sm, storage
+	return newTestSessionManagerWithConfig(t, &FactoryConfig{Base: factory}, registry, healthStatusProvider)
 }
 
 // ---------------------------------------------------------------------------
@@ -595,6 +601,35 @@ func TestSessionManager_Validate(t *testing.T) {
 		isTerminated, err := sm.Validate(sessionID)
 		require.NoError(t, err)
 		assert.True(t, isTerminated)
+	})
+
+	t.Run("touches cached multi-session on successful validation", func(t *testing.T) {
+		t.Parallel()
+
+		ctrl := gomock.NewController(t)
+		sess := newMockSession(t, ctrl, "placeholder", nil)
+		sess.EXPECT().Close().Return(nil).AnyTimes()
+		factory := newMockFactory(t, ctrl, sess)
+		registry := newFakeRegistry()
+		sm, _ := newTestSessionManagerWithConfig(t, &FactoryConfig{
+			Base:       factory,
+			SessionTTL: 50 * time.Millisecond,
+		}, registry, nil)
+
+		sessionID := sm.Generate()
+		require.NotEmpty(t, sessionID)
+		_, err := sm.CreateSession(context.Background(), sessionID)
+		require.NoError(t, err)
+
+		for i := 0; i < 3; i++ {
+			time.Sleep(20 * time.Millisecond)
+			isTerminated, validateErr := sm.Validate(sessionID)
+			require.NoError(t, validateErr)
+			assert.False(t, isTerminated)
+		}
+
+		_, ok := sm.GetMultiSession(sessionID)
+		assert.True(t, ok, "validated session should remain in the node-local cache")
 	})
 }
 

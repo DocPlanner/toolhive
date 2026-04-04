@@ -78,6 +78,11 @@ const (
 	// defaultSessionRefreshTimeout bounds how long a live session refresh may take.
 	defaultSessionRefreshTimeout = 45 * time.Second
 
+	// defaultSessionRegistrationTimeout bounds how long post-initialize session
+	// registration may take when opening backend connections and injecting
+	// session-scoped capabilities.
+	defaultSessionRegistrationTimeout = 45 * time.Second
+
 	// defaultSessionCloseGracePeriod delays closing the replaced session so
 	// in-flight handlers that already captured it can drain gracefully.
 	defaultSessionCloseGracePeriod = 2 * time.Second
@@ -467,6 +472,7 @@ func New(
 	// it needs (optimizer wiring, composite tool layers, telemetry instruments).
 	sessMgrCfg := &sessionmanager.FactoryConfig{
 		Base:              cfg.SessionFactory,
+		SessionTTL:        cfg.SessionTTL,
 		WorkflowDefs:      workflowDefs,
 		ComposerFactory:   sessionComposerFactory,
 		OptimizerConfig:   cfg.OptimizerConfig,
@@ -1119,6 +1125,19 @@ func (s *Server) handleSessionRegistration(
 //
 //   - Prompts: not supported until the SDK adds AddSessionPrompts.
 func (s *Server) handleSessionRegistrationImpl(ctx context.Context, session server.ClientSession) (retErr error) {
+	// The SDK invokes this hook with the original request context. For
+	// initialize over streamable HTTP, the response has already been written by
+	// the time registration runs, so a fast client-side close can cancel the
+	// request context while backend initialization is still in progress. Detach
+	// from request cancellation, but preserve request-scoped values such as
+	// identity and session, then bound the work with a server-side timeout.
+	registrationCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		defaultSessionRegistrationTimeout,
+	)
+	defer cancel()
+	ctx = registrationCtx
+
 	sessionID := session.SessionID()
 	slog.Debug("creating session-scoped backends", "session_id", sessionID)
 
