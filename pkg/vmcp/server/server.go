@@ -571,6 +571,12 @@ func New(
 		vmcpSessionMgr:     vmcpSessMgr,
 	}
 
+	if cfg.TelemetryProvider != nil {
+		if err := monitorSessionCardinality(cfg.TelemetryProvider.MeterProvider(), srv); err != nil {
+			return nil, fmt.Errorf("failed to monitor session cardinality: %w", err)
+		}
+	}
+
 	if optimizerCleanup != nil {
 		srv.shutdownFuncs = append(srv.shutdownFuncs, optimizerCleanup)
 	}
@@ -616,6 +622,7 @@ func (s *Server) Handler(_ context.Context) (http.Handler, error) {
 		server.WithEndpointPath(s.config.EndpointPath),
 		server.WithSessionIdManager(s.vmcpSessionMgr),
 		server.WithHeartbeatInterval(defaultHeartbeatInterval),
+		server.WithSessionIdleTTL(s.config.SessionTTL),
 	)
 
 	// Create HTTP mux with separated authenticated and unauthenticated routes
@@ -741,6 +748,11 @@ func (s *Server) Handler(_ context.Context) (http.Handler, error) {
 		mcpHandler = s.config.AuthMiddleware(mcpHandler)
 		slog.Info("authentication middleware enabled for MCP endpoints")
 	}
+
+	// Restore the health-check marker from the wire so receiving spokes can
+	// serve inter-vMCP health probes without opening full session-scoped
+	// backend connections.
+	mcpHandler = healthProbeContextMiddleware(mcpHandler)
 
 	// Forward the sticky-only live-session paths (listen/delete and client
 	// replies to server-initiated requests) back to the replica that owns the
@@ -1225,6 +1237,20 @@ func (s *Server) handleSessionRegistrationImpl(ctx context.Context, session serv
 	sessionID := session.SessionID()
 	slog.Debug("creating session-scoped backends", "session_id", sessionID)
 
+	if health.IsHealthCheck(ctx) {
+		if err := s.injectHealthCheckCapabilities(ctx, session, true, true); err != nil {
+			slog.Error("failed to inject health-check capabilities",
+				"session_id", sessionID,
+				"error", err)
+			return err
+		}
+		slog.Info("health-check capabilities injected",
+			"session_id", sessionID,
+			"tool_count", sessionToolCount(session),
+			"resource_count", sessionResourceCount(session))
+		return nil
+	}
+
 	// Defer cleanup: if any error occurs, terminate the session and log failures.
 	defer func() {
 		if retErr != nil {
@@ -1337,6 +1363,17 @@ func (s *Server) handleSessionRequestInitialization(
 		return nil
 	}
 
+	if health.IsHealthCheck(ctx) {
+		if err := s.injectHealthCheckCapabilities(ctx, session, needsTools, needsResources); err != nil {
+			slog.Warn("failed to inject health-check session capabilities",
+				"session_id", session.SessionID(),
+				"method", method,
+				"error", err)
+			return err
+		}
+		return nil
+	}
+
 	if err := s.waitForSessionRegistration(ctx, session.SessionID()); err != nil {
 		slog.Debug("session registration wait finished without full readiness",
 			"session_id", session.SessionID(),
@@ -1352,6 +1389,44 @@ func (s *Server) handleSessionRequestInitialization(
 			"session_id", session.SessionID(),
 			"method", method,
 			"error", err)
+	}
+
+	return nil
+}
+
+func (s *Server) injectHealthCheckCapabilities(
+	ctx context.Context,
+	session server.ClientSession,
+	needsTools bool,
+	needsResources bool,
+) error {
+	capabilities, ok := discovery.DiscoveredCapabilitiesFromContext(ctx)
+	if !ok || capabilities == nil {
+		return fmt.Errorf("discovered capabilities unavailable for health probe")
+	}
+	if s.capabilityAdapter == nil {
+		return fmt.Errorf("capability adapter is not configured")
+	}
+
+	if needsResources {
+		adaptedResources := s.capabilityAdapter.ToSDKResources(capabilities.Resources)
+		if len(adaptedResources) > 0 {
+			if err := setSessionResourcesDirect(session, adaptedResources); err != nil {
+				return err
+			}
+		}
+	}
+
+	if needsTools {
+		adaptedTools, err := s.capabilityAdapter.ToSDKTools(capabilities.Tools)
+		if err != nil {
+			return err
+		}
+		if len(adaptedTools) > 0 {
+			if err := setSessionToolsDirect(session, adaptedTools); err != nil {
+				return err
+			}
+		}
 	}
 
 	return nil
@@ -1489,6 +1564,16 @@ func parseRequestMethod(message any) (mcp.MCPMethod, error) {
 	}
 
 	return envelope.Method, nil
+}
+
+func healthProbeContextMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !health.HasProbeHeader(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(health.WithHealthCheckMarker(r.Context())))
+	})
 }
 
 func (s *Server) rehydrateSessionCapabilities(

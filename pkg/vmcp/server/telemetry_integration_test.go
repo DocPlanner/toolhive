@@ -402,6 +402,14 @@ func TestIntegration_TelemetryMiddleware(t *testing.T) {
 		assert.Contains(t, metrics, "toolhive_vmcp_backends_discovered",
 			"Should record backend discovery count gauge")
 
+		// --- Session cardinality gauges (from vmcp/server/telemetry.go) ---
+		assert.Contains(t, metrics, "toolhive_vmcp_active_transport_sessions",
+			"Should record active transport session cardinality")
+		assert.Contains(t, metrics, "toolhive_vmcp_active_sdk_sessions",
+			"Should record active SDK session cardinality")
+		assert.Contains(t, metrics, "toolhive_vmcp_inflight_session_registrations",
+			"Should record in-flight registration cardinality")
+
 		// --- Custom resource attributes (from Config.CustomAttributes) ---
 		// Custom attributes are added to the OTel resource and surface as labels on the
 		// target_info gauge in Prometheus exposition format.

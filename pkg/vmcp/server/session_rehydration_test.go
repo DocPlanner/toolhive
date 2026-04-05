@@ -4,8 +4,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -14,13 +17,24 @@ import (
 	mcpserver "github.com/mark3labs/mcp-go/server"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 
+	"github.com/stacklok/toolhive/pkg/vmcp"
+	"github.com/stacklok/toolhive/pkg/vmcp/aggregator"
+	"github.com/stacklok/toolhive/pkg/vmcp/discovery"
+	discoverymocks "github.com/stacklok/toolhive/pkg/vmcp/discovery/mocks"
+	"github.com/stacklok/toolhive/pkg/vmcp/health"
+	backendmocks "github.com/stacklok/toolhive/pkg/vmcp/mocks"
+	routermocks "github.com/stacklok/toolhive/pkg/vmcp/router/mocks"
+	"github.com/stacklok/toolhive/pkg/vmcp/server/adapter"
+	adaptermocks "github.com/stacklok/toolhive/pkg/vmcp/server/adapter/mocks"
 	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
 	sessiontypes "github.com/stacklok/toolhive/pkg/vmcp/session/types"
 )
 
 type hydrationTestManager struct {
 	mu                       sync.Mutex
+	createSessionCalls       int
 	getMultiSessionCalls     int
 	getAdaptedToolsCalls     int
 	getAdaptedResourcesCalls int
@@ -41,7 +55,10 @@ func (m *hydrationTestManager) Validate(string) (bool, error) {
 
 func (*hydrationTestManager) Terminate(string) (bool, error) { return false, nil }
 
-func (*hydrationTestManager) CreateSession(context.Context, string) (vmcpsession.MultiSession, error) {
+func (m *hydrationTestManager) CreateSession(context.Context, string) (vmcpsession.MultiSession, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.createSessionCalls++
 	return nil, nil
 }
 
@@ -260,6 +277,111 @@ func TestHandleSessionRequestInitialization_WaitsForInFlightRegistration(t *test
 	assert.Contains(t, session.GetSessionTools(), "echo")
 }
 
+func TestHandleSessionRegistrationImpl_HealthCheckInjectsCapabilitiesWithoutCreateSession(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	handlerFactory := adaptermocks.NewMockHandlerFactory(ctrl)
+	handlerFactory.EXPECT().
+		CreateToolHandler("echo").
+		Return(func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("ok"), nil
+		})
+	handlerFactory.EXPECT().
+		CreateResourceHandler("file://example").
+		Return(func(context.Context, mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+			return nil, nil
+		})
+
+	mgr := &hydrationTestManager{}
+	srv := &Server{
+		vmcpSessionMgr:    mgr,
+		capabilityAdapter: adapter.NewCapabilityAdapter(handlerFactory),
+	}
+	session := &hydrationTestSession{
+		sessionID: "session-health-register",
+		ch:        make(chan mcp.JSONRPCNotification, 1),
+		tools:     map[string]mcpserver.ServerTool{},
+		resources: map[string]mcpserver.ServerResource{},
+	}
+
+	ctx := discovery.WithDiscoveredCapabilities(
+		health.WithHealthCheckMarker(context.Background()),
+		&aggregator.AggregatedCapabilities{
+			Tools: []vmcp.Tool{{
+				Name:        "echo",
+				Description: "echo tool",
+				InputSchema: map[string]any{"type": "object"},
+			}},
+			Resources: []vmcp.Resource{{
+				URI:         "file://example",
+				Name:        "example",
+				Description: "example resource",
+			}},
+		},
+	)
+
+	err := srv.handleSessionRegistrationImpl(ctx, session)
+	require.NoError(t, err)
+
+	require.Len(t, session.GetSessionTools(), 1)
+	require.Len(t, session.GetSessionResources(), 1)
+	assert.Zero(t, mgr.createSessionCalls)
+}
+
+func TestHandleSessionRequestInitialization_HealthCheckInjectsCapabilitiesWithoutSessionManager(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	handlerFactory := adaptermocks.NewMockHandlerFactory(ctrl)
+	handlerFactory.EXPECT().
+		CreateToolHandler("echo").
+		Return(func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("ok"), nil
+		})
+
+	mgr := &hydrationTestManager{}
+	srv := &Server{
+		vmcpSessionMgr:    mgr,
+		capabilityAdapter: adapter.NewCapabilityAdapter(handlerFactory),
+	}
+	session := &hydrationTestSession{
+		sessionID: "session-health-tools-list",
+		ch:        make(chan mcp.JSONRPCNotification, 1),
+		tools:     map[string]mcpserver.ServerTool{},
+		resources: map[string]mcpserver.ServerResource{},
+	}
+
+	ctx := discovery.WithDiscoveredCapabilities(
+		health.WithHealthCheckMarker(
+			mcpserver.NewMCPServer("test", "1.0.0").WithContext(context.Background(), session),
+		),
+		&aggregator.AggregatedCapabilities{
+			Tools: []vmcp.Tool{{
+				Name:        "echo",
+				Description: "echo tool",
+				InputSchema: map[string]any{"type": "object"},
+			}},
+		},
+	)
+
+	err := srv.handleSessionRequestInitialization(
+		ctx,
+		1,
+		json.RawMessage(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`),
+	)
+	require.NoError(t, err)
+
+	require.Len(t, session.GetSessionTools(), 1)
+	assert.Zero(t, mgr.getMultiSessionCalls)
+	assert.Zero(t, mgr.getAdaptedToolsCalls)
+	assert.Zero(t, mgr.getAdaptedResourcesCalls)
+}
+
 func TestHandleSessionRequestInitialization_WaitsForRegistrationMarkerGraceWindow(t *testing.T) {
 	t.Parallel()
 
@@ -295,4 +417,64 @@ func TestHandleSessionRequestInitialization_WaitsForRegistrationMarkerGraceWindo
 	assert.GreaterOrEqual(t, time.Since(start), 60*time.Millisecond)
 	require.Len(t, session.GetSessionTools(), 1)
 	assert.Contains(t, session.GetSessionTools(), "echo")
+}
+
+func TestHandler_HealthProbeSessionIsSweptAfterTTL(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRouter := routermocks.NewMockRouter(ctrl)
+	mockBackendClient := backendmocks.NewMockBackendClient(ctrl)
+	mockDiscoveryMgr := discoverymocks.NewMockManager(ctrl)
+	mockDiscoveryMgr.EXPECT().
+		Discover(gomock.Any(), gomock.Any()).
+		Return(&aggregator.AggregatedCapabilities{}, nil).
+		AnyTimes()
+
+	srv, err := New(
+		context.Background(),
+		&Config{
+			Name:           "test-vmcp",
+			Version:        "1.0.0",
+			EndpointPath:   "/mcp",
+			SessionTTL:     50 * time.Millisecond,
+			SessionFactory: testMinimalFactory(),
+		},
+		mockRouter,
+		mockBackendClient,
+		mockDiscoveryMgr,
+		vmcp.NewImmutableRegistry(nil),
+		nil,
+	)
+	require.NoError(t, err)
+
+	handler, err := srv.Handler(context.Background())
+	require.NoError(t, err)
+
+	reqBody := bytes.NewReader([]byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}`))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, "http://example.com/mcp", reqBody)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(health.ProbeHeader, health.ProbeHeaderValue)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	resp := rec.Result()
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	sessionID := resp.Header.Get("Mcp-Session-Id")
+	require.NotEmpty(t, sessionID)
+
+	require.Eventually(t, func() bool {
+		_, ok := srv.activeClientSessions.Load(sessionID)
+		return ok
+	}, time.Second, 10*time.Millisecond, "probe session should be registered")
+
+	require.Eventually(t, func() bool {
+		_, ok := srv.activeClientSessions.Load(sessionID)
+		return !ok
+	}, 2*time.Second, 10*time.Millisecond, "probe session should be swept after TTL")
 }

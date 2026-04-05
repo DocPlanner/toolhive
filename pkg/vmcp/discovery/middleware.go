@@ -107,7 +107,17 @@ func Middleware(
 			ctx := r.Context()
 			sessionID := r.Header.Get("Mcp-Session-Id")
 
-			if sessionID == "" {
+			if health.IsHealthCheck(ctx) {
+				// Health probes intentionally bypass the session-scoped routing
+				// shortcut so every probe request can derive capabilities from the
+				// current backend health state without opening backend sessions.
+				var err error
+				ctx, err = handleInitializeRequest(ctx, r, manager, registry, healthStatusProvider, cfg.timeout)
+				if err != nil {
+					handleDiscoveryError(w, r, err)
+					return
+				}
+			} else if sessionID == "" {
 				if cfg.sessionScopedRouting {
 					// Session-scoped routing registers capabilities via the OnRegisterSession
 					// hook rather than through discovery. Skip discovery on initialize.

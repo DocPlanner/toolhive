@@ -19,6 +19,7 @@ import (
 	"github.com/stacklok/toolhive/pkg/vmcp"
 	"github.com/stacklok/toolhive/pkg/vmcp/aggregator"
 	"github.com/stacklok/toolhive/pkg/vmcp/discovery/mocks"
+	"github.com/stacklok/toolhive/pkg/vmcp/health"
 	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
 	sessionmocks "github.com/stacklok/toolhive/pkg/vmcp/session/types/mocks"
 )
@@ -312,6 +313,103 @@ func TestMiddleware_DiscoveryFailure(t *testing.T) {
 	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
 	body, _ := io.ReadAll(rec.Body)
 	assert.Contains(t, string(body), http.StatusText(http.StatusServiceUnavailable))
+}
+
+func TestMiddleware_HealthCheckRequest_DiscoversDespiteSessionScopedRouting(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockMgr := mocks.NewMockManager(ctrl)
+	backends := []vmcp.Backend{
+		{ID: "backend1", Name: "Backend 1", HealthStatus: vmcp.BackendHealthy},
+	}
+	expectedCaps := &aggregator.AggregatedCapabilities{
+		Tools: []vmcp.Tool{{Name: "tool1", BackendID: "backend1"}},
+	}
+
+	mockMgr.EXPECT().
+		Discover(gomock.Any(), unorderedBackendsMatcher{backends}).
+		Return(expectedCaps, nil)
+
+	handlerCalled := false
+	testHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlerCalled = true
+		caps, ok := DiscoveredCapabilitiesFromContext(r.Context())
+		require.True(t, ok)
+		require.NotNil(t, caps)
+		assert.Equal(t, expectedCaps, caps)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	backendRegistry := vmcp.NewImmutableRegistry(backends)
+	middleware := Middleware(
+		mockMgr,
+		backendRegistry,
+		newStubMultiSessionGetter(),
+		nil,
+		WithSessionScopedRouting(),
+	)
+	wrappedHandler := middleware(testHandler)
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	req = req.WithContext(health.WithHealthCheckMarker(req.Context()))
+	rec := httptest.NewRecorder()
+
+	wrappedHandler.ServeHTTP(rec, req)
+
+	assert.True(t, handlerCalled)
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+func TestMiddleware_HealthCheckSubsequentRequest_DiscoversFreshCapabilities(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockMgr := mocks.NewMockManager(ctrl)
+	backends := []vmcp.Backend{
+		{ID: "backend1", Name: "Backend 1", HealthStatus: vmcp.BackendHealthy},
+	}
+	expectedCaps := &aggregator.AggregatedCapabilities{
+		Resources: []vmcp.Resource{{URI: "file://example", Name: "example"}},
+	}
+
+	mockMgr.EXPECT().
+		Discover(gomock.Any(), unorderedBackendsMatcher{backends}).
+		Return(expectedCaps, nil)
+
+	handlerCalled := false
+	testHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlerCalled = true
+		caps, ok := DiscoveredCapabilitiesFromContext(r.Context())
+		require.True(t, ok)
+		require.NotNil(t, caps)
+		assert.Equal(t, expectedCaps, caps)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	backendRegistry := vmcp.NewImmutableRegistry(backends)
+	middleware := Middleware(
+		mockMgr,
+		backendRegistry,
+		newStubMultiSessionGetter(),
+		nil,
+		WithSessionScopedRouting(),
+	)
+	wrappedHandler := middleware(testHandler)
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	req.Header.Set("Mcp-Session-Id", "health-probe-session")
+	req = req.WithContext(health.WithHealthCheckMarker(req.Context()))
+	rec := httptest.NewRecorder()
+
+	wrappedHandler.ServeHTTP(rec, req)
+
+	assert.True(t, handlerCalled)
+	assert.Equal(t, http.StatusOK, rec.Code)
 }
 
 func TestMiddleware_CapabilitiesInContext(t *testing.T) {

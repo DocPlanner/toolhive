@@ -32,6 +32,7 @@ import (
 	vmcpauth "github.com/stacklok/toolhive/pkg/vmcp/auth"
 	authtypes "github.com/stacklok/toolhive/pkg/vmcp/auth/types"
 	"github.com/stacklok/toolhive/pkg/vmcp/conversion"
+	"github.com/stacklok/toolhive/pkg/vmcp/health"
 	healthcontext "github.com/stacklok/toolhive/pkg/vmcp/health/context"
 )
 
@@ -215,6 +216,22 @@ func (t *tracePropagatingRoundTripper) RoundTrip(req *http.Request) (*http.Respo
 	return t.base.RoundTrip(clonedReq)
 }
 
+// healthProbePropagatingRoundTripper annotates wire-level health probe requests
+// so the receiving vMCP can serve them via a lightweight capability-only path.
+type healthProbePropagatingRoundTripper struct {
+	base http.RoundTripper
+}
+
+// RoundTrip implements http.RoundTripper by adding the health probe header for
+// requests whose contexts were marked by the health checker.
+func (h *healthProbePropagatingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	clonedReq := req.Clone(req.Context())
+	if health.IsHealthCheck(clonedReq.Context()) {
+		clonedReq.Header.Set(health.ProbeHeader, health.ProbeHeaderValue)
+	}
+	return h.base.RoundTrip(clonedReq)
+}
+
 // authRoundTripper is an http.RoundTripper that adds authentication to backend requests.
 // The authentication strategy is pre-resolved and validated at client creation time,
 // eliminating per-request lookups and validation overhead.
@@ -306,6 +323,12 @@ func (h *httpBackendClient) defaultClientFactory(ctx context.Context, target *vm
 		base:          baseTransport,
 		identity:      identity,
 		isHealthCheck: healthcontext.IsHealthCheck(ctx),
+	}
+
+	// Mark inter-vMCP health probe traffic on the wire so the receiving vMCP can
+	// skip heavyweight session-scoped backend creation.
+	baseTransport = &healthProbePropagatingRoundTripper{
+		base: baseTransport,
 	}
 
 	// Inject W3C Trace Context headers (traceparent/tracestate) into outgoing requests.

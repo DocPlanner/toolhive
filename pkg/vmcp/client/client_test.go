@@ -39,6 +39,7 @@ import (
 	authmocks "github.com/stacklok/toolhive/pkg/vmcp/auth/mocks"
 	"github.com/stacklok/toolhive/pkg/vmcp/auth/strategies"
 	authtypes "github.com/stacklok/toolhive/pkg/vmcp/auth/types"
+	"github.com/stacklok/toolhive/pkg/vmcp/health"
 	healthcontext "github.com/stacklok/toolhive/pkg/vmcp/health/context"
 )
 
@@ -697,6 +698,42 @@ func TestAuthRoundTripper_RoundTrip(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHealthProbePropagatingRoundTripper_RoundTrip(t *testing.T) {
+	t.Parallel()
+
+	t.Run("adds probe header for marked contexts", func(t *testing.T) {
+		t.Parallel()
+
+		baseTransport := &mockRoundTripper{
+			response: &http.Response{StatusCode: http.StatusOK},
+		}
+		rt := &healthProbePropagatingRoundTripper{base: baseTransport}
+		req := httptest.NewRequest(http.MethodPost, "http://backend.example.com/mcp", nil)
+		req = req.WithContext(health.WithHealthCheckMarker(req.Context()))
+
+		_, err := rt.RoundTrip(req)
+		require.NoError(t, err)
+		require.NotNil(t, baseTransport.capturedReq)
+		assert.Equal(t, health.ProbeHeaderValue, baseTransport.capturedReq.Header.Get(health.ProbeHeader))
+		assert.Empty(t, req.Header.Get(health.ProbeHeader))
+	})
+
+	t.Run("leaves non-health requests unchanged", func(t *testing.T) {
+		t.Parallel()
+
+		baseTransport := &mockRoundTripper{
+			response: &http.Response{StatusCode: http.StatusOK},
+		}
+		rt := &healthProbePropagatingRoundTripper{base: baseTransport}
+		req := httptest.NewRequest(http.MethodPost, "http://backend.example.com/mcp", nil)
+
+		_, err := rt.RoundTrip(req)
+		require.NoError(t, err)
+		require.NotNil(t, baseTransport.capturedReq)
+		assert.Empty(t, baseTransport.capturedReq.Header.Get(health.ProbeHeader))
+	})
 }
 
 func TestNewHTTPBackendClient_NilRegistry(t *testing.T) {
