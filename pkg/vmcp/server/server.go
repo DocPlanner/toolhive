@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/stacklok/toolhive/pkg/audit"
@@ -82,6 +83,24 @@ const (
 	// registration may take when opening backend connections and injecting
 	// session-scoped capabilities.
 	defaultSessionRegistrationTimeout = 45 * time.Second
+
+	// defaultSessionRegistrationWaitTimeout bounds how long an early
+	// session-scoped request will wait for post-initialize registration to
+	// finish before falling back to best-effort hydration.
+	defaultSessionRegistrationWaitTimeout = 10 * time.Second
+
+	// defaultSessionRegistrationGracePeriod gives the OnRegisterSession hook a
+	// brief chance to publish its in-flight marker after initialize returns the
+	// session ID to the client.
+	defaultSessionRegistrationGracePeriod = 500 * time.Millisecond
+
+	// defaultSessionRegistrationPollInterval is the cadence used while waiting
+	// for an in-flight registration marker to appear.
+	defaultSessionRegistrationPollInterval = 25 * time.Millisecond
+
+	// defaultSessionHydrationTimeout bounds best-effort repair of pod-local SDK
+	// session state when a valid session ID lands on a different vMCP replica.
+	defaultSessionHydrationTimeout = 10 * time.Second
 
 	// defaultSessionCloseGracePeriod delays closing the replaced session so
 	// in-flight handlers that already captured it can drain gracefully.
@@ -270,6 +289,11 @@ type Server struct {
 	// live refresh can replace per-session tools/resources directly.
 	activeClientSessions sync.Map
 
+	// inFlightRegistrations tracks sessions currently executing the
+	// post-initialize registration hook so early session-scoped requests can
+	// wait briefly instead of racing a still-empty SDK session.
+	inFlightRegistrations sync.Map
+
 	// refreshMu serializes session refresh work triggered by health transitions.
 	refreshMu sync.Mutex
 }
@@ -310,6 +334,21 @@ func buildSessionDataStorage(ctx context.Context, cfg *Config) (transportsession
 	return transportsession.NewRedisSessionDataStorage(ctx, redisCfg, cfg.SessionTTL)
 }
 
+type sessionRegistrationState struct {
+	done chan struct{}
+	once sync.Once
+}
+
+func newSessionRegistrationState() *sessionRegistrationState {
+	return &sessionRegistrationState{done: make(chan struct{})}
+}
+
+func (s *sessionRegistrationState) close() {
+	s.once.Do(func() {
+		close(s.done)
+	})
+}
+
 // New creates a new Virtual MCP Server instance.
 //
 // The backendRegistry parameter provides the list of available backends:
@@ -344,7 +383,6 @@ func New(
 	if cfg.SessionTTL == 0 {
 		cfg.SessionTTL = defaultSessionTTL
 	}
-
 	// Create hooks for SDK integration
 	hooks := &server.Hooks{}
 
@@ -417,8 +455,7 @@ func New(
 	}
 
 	// Validate workflows (fail fast on invalid definitions)
-	var err error
-	workflowDefs, err = validateWorkflows(workflowComposer, workflowDefs)
+	workflowDefs, err := validateWorkflows(workflowComposer, workflowDefs)
 	if err != nil {
 		return nil, fmt.Errorf("workflow validation failed: %w", err)
 	}
@@ -509,6 +546,12 @@ func New(
 	if healthMon != nil {
 		healthMon.AddOnStatusChange(srv.handleBackendStatusChange)
 	}
+
+	// Repair session-scoped SDK state for valid sessions that arrive on a
+	// different replica than the one that originally registered them.
+	hooks.AddOnRequestInitialization(func(ctx context.Context, id any, message any) error {
+		return srv.handleSessionRequestInitialization(ctx, id, message)
+	})
 
 	// Register OnRegisterSession hook to inject capabilities after SDK registers session.
 	// See handleSessionRegistration for implementation details.
@@ -1098,6 +1141,9 @@ func (s *Server) handleSessionRegistration(
 	ctx context.Context,
 	session server.ClientSession,
 ) {
+	registration := s.beginSessionRegistration(session.SessionID())
+	defer s.finishSessionRegistration(session.SessionID(), registration)
+
 	// Error is logged and handled within handleSessionRegistrationImpl.
 	// The session is terminated on failure; no further action needed here.
 	if err := s.handleSessionRegistrationImpl(ctx, session); err != nil {
@@ -1171,7 +1217,6 @@ func (s *Server) handleSessionRegistrationImpl(ctx context.Context, session serv
 			"error", retErr)
 		return retErr
 	}
-
 	// Uniform registration — same code path regardless of which decorators are active.
 	// session.Tools() returns the final decorated tool list.
 	adaptedTools, retErr := s.vmcpSessionMgr.GetAdaptedTools(sessionID)
@@ -1208,6 +1253,238 @@ func (s *Server) handleSessionRegistrationImpl(ctx context.Context, session serv
 		"session_id", sessionID,
 		"tool_count", len(adaptedTools))
 	return nil
+}
+
+func (s *Server) handleSessionRequestInitialization(
+	ctx context.Context,
+	_ any,
+	message any,
+) error {
+	method, err := parseRequestMethod(message)
+	if err != nil {
+		slog.Debug("failed to parse MCP method during session hydration", "error", err)
+		return nil
+	}
+
+	needsTools, needsResources := requestHydrationNeeds(method)
+	if !needsTools && !needsResources {
+		return nil
+	}
+
+	session := server.ClientSessionFromContext(ctx)
+	if session == nil || session.SessionID() == "" {
+		return nil
+	}
+
+	needsTools = needsTools && sessionToolCount(session) == 0
+	needsResources = needsResources && sessionResourceCount(session) == 0
+	if !needsTools && !needsResources {
+		return nil
+	}
+
+	if err := s.waitForSessionRegistration(ctx, session.SessionID()); err != nil {
+		slog.Debug("session registration wait finished without full readiness",
+			"session_id", session.SessionID(),
+			"method", method,
+			"error", err)
+	}
+
+	hydrationCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultSessionHydrationTimeout)
+	defer cancel()
+
+	if err := s.rehydrateSessionCapabilities(hydrationCtx, session, needsTools, needsResources); err != nil {
+		slog.Warn("failed to rehydrate session-scoped capabilities",
+			"session_id", session.SessionID(),
+			"method", method,
+			"error", err)
+	}
+
+	return nil
+}
+
+func (s *Server) beginSessionRegistration(sessionID string) *sessionRegistrationState {
+	if sessionID == "" {
+		return nil
+	}
+
+	state := newSessionRegistrationState()
+	actual, loaded := s.inFlightRegistrations.LoadOrStore(sessionID, state)
+	if loaded {
+		if existing, ok := actual.(*sessionRegistrationState); ok {
+			return existing
+		}
+		return nil
+	}
+	return state
+}
+
+func (s *Server) finishSessionRegistration(sessionID string, state *sessionRegistrationState) {
+	if sessionID == "" || state == nil {
+		return
+	}
+
+	state.close()
+	s.inFlightRegistrations.CompareAndDelete(sessionID, state)
+}
+
+func (s *Server) lookupSessionRegistration(sessionID string) *sessionRegistrationState {
+	if sessionID == "" {
+		return nil
+	}
+
+	value, ok := s.inFlightRegistrations.Load(sessionID)
+	if !ok {
+		return nil
+	}
+	state, ok := value.(*sessionRegistrationState)
+	if !ok {
+		return nil
+	}
+	return state
+}
+
+func (s *Server) waitForSessionRegistration(ctx context.Context, sessionID string) error {
+	if sessionID == "" {
+		return nil
+	}
+	if _, ok := s.vmcpSessionMgr.GetMultiSession(sessionID); ok {
+		return nil
+	}
+
+	registration := s.lookupSessionRegistration(sessionID)
+	if registration == nil {
+		isTerminated, err := s.vmcpSessionMgr.Validate(sessionID)
+		if err != nil || isTerminated {
+			return nil
+		}
+
+		graceCtx, cancel := context.WithTimeout(ctx, defaultSessionRegistrationGracePeriod)
+		defer cancel()
+
+		registration, err = s.waitForRegistrationMarker(graceCtx, sessionID)
+		if err != nil || registration == nil {
+			return err
+		}
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, defaultSessionRegistrationWaitTimeout)
+	defer cancel()
+
+	select {
+	case <-registration.done:
+		return nil
+	case <-waitCtx.Done():
+		return waitCtx.Err()
+	}
+}
+
+func (s *Server) waitForRegistrationMarker(
+	ctx context.Context,
+	sessionID string,
+) (*sessionRegistrationState, error) {
+	registration := s.lookupSessionRegistration(sessionID)
+	if registration != nil {
+		return registration, nil
+	}
+
+	ticker := time.NewTicker(defaultSessionRegistrationPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+			registration = s.lookupSessionRegistration(sessionID)
+			if registration != nil {
+				return registration, nil
+			}
+		}
+	}
+}
+
+func requestHydrationNeeds(method mcp.MCPMethod) (bool, bool) {
+	switch method {
+	case mcp.MethodToolsList, mcp.MethodToolsCall:
+		return true, false
+	case mcp.MethodResourcesList, mcp.MethodResourcesRead, mcp.MethodResourcesTemplatesList:
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+func parseRequestMethod(message any) (mcp.MCPMethod, error) {
+	var raw json.RawMessage
+
+	switch msg := message.(type) {
+	case json.RawMessage:
+		raw = msg
+	case []byte:
+		raw = json.RawMessage(msg)
+	default:
+		return "", fmt.Errorf("unexpected request hook message type %T", message)
+	}
+
+	var envelope struct {
+		Method mcp.MCPMethod `json:"method"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return "", err
+	}
+
+	return envelope.Method, nil
+}
+
+func (s *Server) rehydrateSessionCapabilities(
+	ctx context.Context,
+	session server.ClientSession,
+	hydrateTools bool,
+	hydrateResources bool,
+) error {
+	sessionID := session.SessionID()
+
+	if _, ok := s.vmcpSessionMgr.GetMultiSession(sessionID); !ok {
+		return fmt.Errorf("session %q not found", sessionID)
+	}
+
+	if hydrateResources {
+		adaptedResources, err := s.vmcpSessionMgr.GetAdaptedResources(sessionID)
+		if err != nil {
+			return fmt.Errorf("get adapted resources: %w", err)
+		}
+		if _, err := replaceSessionResourcesDirect(session, adaptedResources); err != nil {
+			return fmt.Errorf("replace session resources: %w", err)
+		}
+	}
+
+	if hydrateTools {
+		adaptedTools, err := s.vmcpSessionMgr.GetAdaptedTools(sessionID)
+		if err != nil {
+			return fmt.Errorf("get adapted tools: %w", err)
+		}
+		if _, err := replaceSessionToolsDirect(session, adaptedTools); err != nil {
+			return fmt.Errorf("replace session tools: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func sessionToolCount(session server.ClientSession) int {
+	sessionWithTools, ok := session.(server.SessionWithTools)
+	if !ok {
+		return 0
+	}
+	return len(sessionWithTools.GetSessionTools())
+}
+
+func sessionResourceCount(session server.ClientSession) int {
+	sessionWithResources, ok := session.(server.SessionWithResources)
+	if !ok {
+		return 0
+	}
+	return len(sessionWithResources.GetSessionResources())
 }
 
 func (s *Server) handleBackendStatusChange(event health.StatusChangeEvent) {
