@@ -242,9 +242,10 @@ func TestBuildEnvVarsForVmcp(t *testing.T) {
 	env, err := r.buildEnvVarsForVmcp(context.Background(), vmcp, []workloads.TypedWorkload{})
 	require.NoError(t, err)
 
-	// Should have VMCP_NAME and VMCP_NAMESPACE
+	// Should have VMCP_NAME, VMCP_NAMESPACE, and POD_IP
 	foundName := false
 	foundNamespace := false
+	foundPodIP := false
 
 	for _, e := range env {
 		if e.Name == "VMCP_NAME" {
@@ -255,10 +256,18 @@ func TestBuildEnvVarsForVmcp(t *testing.T) {
 			foundNamespace = true
 			assert.Equal(t, "test-namespace", e.Value)
 		}
+		if e.Name == "POD_IP" {
+			foundPodIP = true
+			require.NotNil(t, e.ValueFrom)
+			require.NotNil(t, e.ValueFrom.FieldRef)
+			assert.Equal(t, "v1", e.ValueFrom.FieldRef.APIVersion)
+			assert.Equal(t, "status.podIP", e.ValueFrom.FieldRef.FieldPath)
+		}
 	}
 
 	assert.True(t, foundName, "Should have VMCP_NAME env var")
 	assert.True(t, foundNamespace, "Should have VMCP_NAMESPACE env var")
+	assert.True(t, foundPodIP, "Should have POD_IP env var")
 }
 
 // TestBuildRedisPasswordEnvVar tests conditional Redis password env var injection.

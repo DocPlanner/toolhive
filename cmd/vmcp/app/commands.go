@@ -9,8 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -43,6 +45,11 @@ import (
 	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
 	"github.com/stacklok/toolhive/pkg/vmcp/session/optimizerdec"
 	vmcpstatus "github.com/stacklok/toolhive/pkg/vmcp/status"
+)
+
+const (
+	envVMCPSessionOwnerURL = "THV_VMCP_SESSION_OWNER_URL"
+	envPodIP               = "POD_IP"
 )
 
 var rootCmd = &cobra.Command{
@@ -633,8 +640,13 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		Watcher:                 backendWatcher,
 		StatusReporter:          statusReporter,
 		OptimizerConfig:         optCfg,
-		SessionFactory:          sessionFactory,
 		SessionStorage:          cfg.SessionStorage,
+		SessionOwnerAdvertiseURL: resolveSessionOwnerAdvertiseURL(
+			os.Getenv(envVMCPSessionOwnerURL),
+			os.Getenv(envPodIP),
+			port,
+		),
+		SessionFactory:          sessionFactory,
 	}
 
 	// Convert composite tool configurations to workflow definitions
@@ -655,4 +667,14 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	// Start server (blocks until shutdown signal)
 	slog.Info(fmt.Sprintf("Starting Virtual MCP Server at %s", srv.Address()))
 	return srv.Start(ctx)
+}
+
+func resolveSessionOwnerAdvertiseURL(explicit, podIP string, port int) string {
+	if explicit = strings.TrimSpace(explicit); explicit != "" {
+		return explicit
+	}
+	if podIP == "" || port <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("http://%s/mcp", net.JoinHostPort(podIP, fmt.Sprintf("%d", port)))
 }

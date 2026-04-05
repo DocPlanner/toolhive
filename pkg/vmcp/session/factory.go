@@ -574,6 +574,7 @@ func (f *defaultMultiSessionFactory) RestoreSession(
 	// stored values would make metadata inconsistent if any backend failed to
 	// reconnect during restore.
 	for _, key := range []string{
+		sessiontypes.MetadataKeyOwnerURL,
 		sessiontypes.MetadataKeyTokenHash,
 		sessiontypes.MetadataKeyTokenSalt,
 	} {

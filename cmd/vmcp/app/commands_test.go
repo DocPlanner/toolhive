@@ -77,3 +77,28 @@ func TestLoadAuthServerConfig(t *testing.T) {
 	})
 
 }
+
+func TestResolveSessionOwnerAdvertiseURL(t *testing.T) {
+	t.Parallel()
+
+	t.Run("uses explicit URL when configured", func(t *testing.T) {
+		t.Parallel()
+
+		got := resolveSessionOwnerAdvertiseURL(" https://owner.example.com/mcp ", "10.0.0.12", 4483)
+		assert.Equal(t, "https://owner.example.com/mcp", got)
+	})
+
+	t.Run("builds pod-local URL from pod IP", func(t *testing.T) {
+		t.Parallel()
+
+		got := resolveSessionOwnerAdvertiseURL("", "10.0.0.12", 4483)
+		assert.Equal(t, "http://10.0.0.12:4483/mcp", got)
+	})
+
+	t.Run("returns empty string without explicit URL or pod IP", func(t *testing.T) {
+		t.Parallel()
+
+		got := resolveSessionOwnerAdvertiseURL("", "", 4483)
+		assert.Empty(t, got)
+	})
+}

@@ -331,6 +331,16 @@ func (r *VirtualMCPServerReconciler) buildEnvVarsForVmcp(
 		Value: vmcp.Namespace,
 	})
 
+	env = append(env, corev1.EnvVar{
+		Name: "POD_IP",
+		ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{
+				APIVersion: "v1",
+				FieldPath:  "status.podIP",
+			},
+		},
+	})
+
 	// Mount OIDC client secret
 	oidcEnv, err := r.buildOIDCEnvVars(ctx, vmcp)
 	if err != nil {

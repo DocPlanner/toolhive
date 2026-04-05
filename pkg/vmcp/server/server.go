@@ -9,13 +9,16 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -102,10 +105,20 @@ const (
 	// session state when a valid session ID lands on a different vMCP replica.
 	defaultSessionHydrationTimeout = 10 * time.Second
 
+	// defaultSessionOwnerLookupTimeout bounds loading owner metadata from the
+	// shared session metadata storage when deciding whether a request must be
+	// forwarded back to the owning replica.
+	defaultSessionOwnerLookupTimeout = 5 * time.Second
+
 	// defaultSessionCloseGracePeriod delays closing the replaced session so
 	// in-flight handlers that already captured it can drain gracefully.
 	defaultSessionCloseGracePeriod = 2 * time.Second
+
+	sessionOwnerForwardedHeader = "X-ToolHive-Session-Forwarded"
+	sessionOwnerForwardedValue  = "1"
 )
+
+var errSessionOwnerUnavailable = errors.New("session owner unavailable")
 
 //go:generate mockgen -destination=mocks/mock_watcher.go -package=mocks -source=server.go Watcher
 
@@ -202,6 +215,10 @@ type Config struct {
 	// If nil, status reporting is disabled.
 	StatusReporter vmcpstatus.Reporter
 
+	// SessionOwnerAdvertiseURL is the pod-local HTTP endpoint used by sibling
+	// replicas to forward live-session traffic (SSE listen/delete and methodless
+	// client replies) back to the pod that owns the SDK session state.
+	SessionOwnerAdvertiseURL string
 	// SessionFactory creates MultiSessions for session management.
 	// Required; must not be nil.
 	SessionFactory vmcpsession.MultiSessionFactory
@@ -257,6 +274,14 @@ type Server struct {
 	// Currently always LocalSessionDataStorage (in-memory, single-process).
 	// Redis-backed storage for multi-pod deployments is not yet wired.
 	sessionDataStorage transportsession.DataStorage
+
+	// sessionOwnerURL is the canonical pod-local URL advertised to sibling
+	// replicas for owner-aware forwarding of live-session traffic.
+	sessionOwnerURL string
+
+	// ownerForwardClient is used to proxy live-session traffic back to the pod
+	// that owns the SDK session state.
+	ownerForwardClient *http.Client
 
 	// Capability adapter for converting aggregator types to SDK types
 	capabilityAdapter *adapter.CapabilityAdapter
@@ -383,6 +408,11 @@ func New(
 	if cfg.SessionTTL == 0 {
 		cfg.SessionTTL = defaultSessionTTL
 	}
+	sessionOwnerURL, err := normalizeSessionOwnerURL(cfg.SessionOwnerAdvertiseURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid session owner advertise URL: %w", err)
+	}
+
 	// Create hooks for SDK integration
 	hooks := &server.Hooks{}
 
@@ -455,7 +485,7 @@ func New(
 	}
 
 	// Validate workflows (fail fast on invalid definitions)
-	workflowDefs, err := validateWorkflows(workflowComposer, workflowDefs)
+	workflowDefs, err = validateWorkflows(workflowComposer, workflowDefs)
 	if err != nil {
 		return nil, fmt.Errorf("workflow validation failed: %w", err)
 	}
@@ -532,6 +562,8 @@ func New(
 		backendRegistry:    backendRegistry,
 		sessionManager:     sessionManager,
 		sessionDataStorage: sessionDataStorage,
+		sessionOwnerURL:    sessionOwnerURL,
+		ownerForwardClient: &http.Client{Transport: http.DefaultTransport},
 		capabilityAdapter:  capabilityAdapter,
 		ready:              make(chan struct{}),
 		healthMonitor:      healthMon,
@@ -709,6 +741,12 @@ func (s *Server) Handler(_ context.Context) (http.Handler, error) {
 		mcpHandler = s.config.AuthMiddleware(mcpHandler)
 		slog.Info("authentication middleware enabled for MCP endpoints")
 	}
+
+	// Forward the sticky-only live-session paths (listen/delete and client
+	// replies to server-initiated requests) back to the replica that owns the
+	// SDK session state. Regular tool/resource requests stay local and rely on
+	// session rehydration instead.
+	mcpHandler = s.ownerForwardingMiddleware(mcpHandler)
 
 	// Apply Accept header validation (rejects GET requests without Accept: text/event-stream)
 	mcpHandler = headerValidatingMiddleware(mcpHandler)
@@ -1211,12 +1249,29 @@ func (s *Server) handleSessionRegistrationImpl(ctx context.Context, session serv
 	// after initialize may receive a "tool not found" error before AddSessionTools
 	// completes. Conforming MCP clients call tools/list before tools/call, so this
 	// window is expected to be harmless in practice.
-	if _, retErr = s.vmcpSessionMgr.CreateSession(ctx, sessionID); retErr != nil {
+	multiSession, retErr := s.vmcpSessionMgr.CreateSession(ctx, sessionID)
+	if retErr != nil {
 		slog.Error("failed to create session-scoped backends",
 			"session_id", sessionID,
 			"error", retErr)
 		return retErr
 	}
+	if s.sessionOwnerURL != "" {
+		if retErr = s.vmcpSessionMgr.SetSessionMetadataValue(
+			ctx,
+			sessionID,
+			multiSession,
+			sessiontypes.MetadataKeyOwnerURL,
+			s.sessionOwnerURL,
+		); retErr != nil {
+			slog.Error("failed to persist session owner metadata",
+				"session_id", sessionID,
+				"owner_url", s.sessionOwnerURL,
+				"error", retErr)
+			return retErr
+		}
+	}
+
 	// Uniform registration — same code path regardless of which decorators are active.
 	// session.Tools() returns the final decorated tool list.
 	adaptedTools, retErr := s.vmcpSessionMgr.GetAdaptedTools(sessionID)
@@ -1469,6 +1524,252 @@ func (s *Server) rehydrateSessionCapabilities(
 	}
 
 	return nil
+}
+
+func (s *Server) ownerForwardingMiddleware(next http.Handler) http.Handler {
+	if s.sessionDataStorage == nil {
+		return next
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwarded, err := s.tryForwardSessionRequest(w, r)
+		if err != nil {
+			slog.Warn("failed to forward live session request to owner",
+				"method", r.Method,
+				"path", r.URL.Path,
+				"error", err)
+			if !forwarded {
+				next.ServeHTTP(w, r)
+			}
+			return
+		}
+		if forwarded {
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) tryForwardSessionRequest(w http.ResponseWriter, r *http.Request) (bool, error) {
+	if s.sessionOwnerURL == "" {
+		return false, nil
+	}
+	if r.Header.Get(sessionOwnerForwardedHeader) == sessionOwnerForwardedValue {
+		return false, nil
+	}
+
+	sessionID := r.Header.Get(server.HeaderKeySessionID)
+	if sessionID == "" {
+		return false, nil
+	}
+
+	shouldForward, err := shouldForwardToSessionOwner(r)
+	if err != nil {
+		return false, err
+	}
+	if !shouldForward {
+		return false, nil
+	}
+
+	if _, ok := s.activeClientSessions.Load(sessionID); ok {
+		return false, nil
+	}
+
+	ownerURL, err := s.loadSessionOwnerURL(r.Context(), sessionID)
+	if err != nil {
+		return false, fmt.Errorf("load session owner URL for %q: %w", sessionID, err)
+	}
+	if ownerURL == "" || ownerURL == s.sessionOwnerURL {
+		return false, nil
+	}
+
+	if err := s.forwardRequestToSessionOwner(w, r, ownerURL); err != nil {
+		if errors.Is(err, errSessionOwnerUnavailable) {
+			return false, err
+		}
+		return true, err
+	}
+	return true, nil
+}
+
+func shouldForwardToSessionOwner(r *http.Request) (bool, error) {
+	switch r.Method {
+	case http.MethodGet, http.MethodDelete:
+		return true, nil
+	case http.MethodPost:
+		envelope, err := parseForwardableEnvelope(r)
+		if err != nil {
+			return false, nil
+		}
+		if isSessionScopedClientResponse(envelope) {
+			return true, nil
+		}
+		return envelope.Method == mcp.MethodSetLogLevel || envelope.Method == mcp.MethodNotificationElicitationComplete, nil
+	default:
+		return false, nil
+	}
+}
+
+type forwardableEnvelope struct {
+	Method mcp.MCPMethod   `json:"method"`
+	ID     json.RawMessage `json:"id,omitempty"`
+	Result json.RawMessage `json:"result,omitempty"`
+	Error  json.RawMessage `json:"error,omitempty"`
+}
+
+func parseForwardableEnvelope(r *http.Request) (forwardableEnvelope, error) {
+	var envelope forwardableEnvelope
+
+	if r.Body == nil {
+		return envelope, io.EOF
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return envelope, err
+	}
+
+	if closeErr := r.Body.Close(); closeErr != nil {
+		slog.Debug("failed to close request body after peek", "error", closeErr)
+	}
+
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
+	r.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
+
+	if len(bytes.TrimSpace(body)) == 0 {
+		return envelope, io.EOF
+	}
+
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return envelope, err
+	}
+
+	return envelope, nil
+}
+
+func isSessionScopedClientResponse(envelope forwardableEnvelope) bool {
+	return envelope.Method == "" &&
+		len(envelope.ID) > 0 &&
+		(len(envelope.Result) > 0 || len(envelope.Error) > 0)
+}
+
+func (s *Server) loadSessionOwnerURL(ctx context.Context, sessionID string) (string, error) {
+	loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultSessionOwnerLookupTimeout)
+	defer cancel()
+
+	metadata, err := s.sessionDataStorage.Load(loadCtx, sessionID)
+	if err != nil {
+		return "", err
+	}
+
+	ownerURL, err := normalizeSessionOwnerURL(metadata[sessiontypes.MetadataKeyOwnerURL])
+	if err != nil {
+		return "", fmt.Errorf("normalize stored owner URL: %w", err)
+	}
+	return ownerURL, nil
+}
+
+func (s *Server) forwardRequestToSessionOwner(
+	w http.ResponseWriter,
+	r *http.Request,
+	ownerURL string,
+) error {
+	targetReq, err := cloneRequestForOwner(r, ownerURL)
+	if err != nil {
+		return err
+	}
+
+	client := s.ownerForwardClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+
+	resp, err := client.Do(targetReq)
+	if err != nil {
+		return fmt.Errorf("%w: %w", errSessionOwnerUnavailable, err)
+	}
+	defer resp.Body.Close()
+
+	copyHeader(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+
+	writer := io.Writer(w)
+	if flusher, ok := w.(http.Flusher); ok {
+		writer = &flushingWriter{writer: w, flusher: flusher}
+	}
+	if _, err := io.Copy(writer, resp.Body); err != nil {
+		return err
+	}
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return nil
+}
+
+func cloneRequestForOwner(r *http.Request, ownerURL string) (*http.Request, error) {
+	targetURL, err := normalizeOwnerURLForRequest(ownerURL)
+	if err != nil {
+		return nil, err
+	}
+
+	outReq := r.Clone(r.Context())
+	outReq.URL = targetURL
+	outReq.URL.RawQuery = r.URL.RawQuery
+	outReq.Host = targetURL.Host
+	outReq.RequestURI = ""
+	outReq.Header = r.Header.Clone()
+	outReq.Header.Set(sessionOwnerForwardedHeader, sessionOwnerForwardedValue)
+	return outReq, nil
+}
+
+func normalizeSessionOwnerURL(raw string) (string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return "", nil
+	}
+
+	normalizedURL, err := normalizeOwnerURLForRequest(raw)
+	if err != nil {
+		return "", err
+	}
+	return normalizedURL.String(), nil
+}
+
+func normalizeOwnerURLForRequest(raw string) (*url.URL, error) {
+	targetURL, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return nil, err
+	}
+	if !targetURL.IsAbs() || targetURL.Host == "" {
+		return nil, fmt.Errorf("owner URL %q must be absolute", raw)
+	}
+	if targetURL.Path == "" {
+		targetURL.Path = "/"
+	}
+	return targetURL, nil
+}
+
+type flushingWriter struct {
+	writer  io.Writer
+	flusher http.Flusher
+}
+
+func (w *flushingWriter) Write(p []byte) (int, error) {
+	n, err := w.writer.Write(p)
+	if n > 0 {
+		w.flusher.Flush()
+	}
+	return n, err
+}
+
+func copyHeader(dst, src http.Header) {
+	for key, values := range src {
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
 }
 
 func sessionToolCount(session server.ClientSession) int {
