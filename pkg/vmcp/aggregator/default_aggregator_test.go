@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -130,6 +131,48 @@ func TestDefaultAggregator_QueryAllCapabilities(t *testing.T) {
 		require.Len(t, result, 1)
 		assert.Contains(t, result, testBackendID1)
 		assert.NotContains(t, result, "backend2")
+	})
+
+	t.Run("slow backend fails fast without timing out aggregate request", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		previousTimeout := capabilityQueryTimeout
+		capabilityQueryTimeout = 50 * time.Millisecond
+		t.Cleanup(func() {
+			capabilityQueryTimeout = previousTimeout
+		})
+
+		mockClient := mocks.NewMockBackendClient(ctrl)
+		backends := []vmcp.Backend{
+			newTestBackend(testBackendID1),
+			newTestBackend("backend2", withBackendURL("http://localhost:8081")),
+		}
+
+		caps1 := newTestCapabilityList(withTools(newTestTool("tool1", testBackendID1)))
+
+		mockClient.EXPECT().ListCapabilities(gomock.Any(), gomock.Any()).
+			DoAndReturn(func(ctx context.Context, target *vmcp.BackendTarget) (*vmcp.CapabilityList, error) {
+				if target.WorkloadID == testBackendID1 {
+					return caps1, nil
+				}
+
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}).Times(2)
+
+		agg := NewDefaultAggregator(mockClient, nil, nil, nil)
+
+		start := time.Now()
+		result, err := agg.QueryAllCapabilities(context.Background(), backends)
+		duration := time.Since(start)
+
+		require.NoError(t, err)
+		require.Len(t, result, 1)
+		assert.Contains(t, result, testBackendID1)
+		assert.NotContains(t, result, "backend2")
+		assert.Less(t, duration, 500*time.Millisecond)
 	})
 
 	t.Run("all backends fail", func(t *testing.T) {

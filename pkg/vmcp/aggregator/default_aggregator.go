@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -18,6 +19,8 @@ import (
 	"github.com/stacklok/toolhive/pkg/vmcp"
 	"github.com/stacklok/toolhive/pkg/vmcp/config"
 )
+
+var capabilityQueryTimeout = 3 * time.Second
 
 // defaultAggregator implements the Aggregator interface for capability aggregation.
 // It queries backends in parallel, handles failures gracefully, and merges capabilities.
@@ -92,7 +95,10 @@ func (a *defaultAggregator) QueryCapabilities(ctx context.Context, backend vmcp.
 	target := vmcp.BackendToTarget(&backend)
 
 	// Query capabilities using the backend client
-	capabilities, err := a.backendClient.ListCapabilities(ctx, target)
+	queryCtx, cancel := context.WithTimeout(ctx, capabilityQueryTimeout)
+	defer cancel()
+
+	capabilities, err := a.backendClient.ListCapabilities(queryCtx, target)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s: %w", ErrBackendQueryFailed, backend.ID, err)
 	}
