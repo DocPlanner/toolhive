@@ -727,6 +727,56 @@ func TestSessionManager_RefreshSession(t *testing.T) {
 	})
 }
 
+func TestSessionManager_ReplaceSession(t *testing.T) {
+	t.Parallel()
+
+	t.Run("replaces stored session when current matches", func(t *testing.T) {
+		t.Parallel()
+
+		ctrl := gomock.NewController(t)
+		const sessionID = "550e8400-e29b-41d4-a716-446655440003"
+		sm, storage := newTestSessionManager(t, newMockFactory(t, ctrl, newMockSession(t, ctrl, "unused", nil)), newFakeRegistry())
+
+		original := newMockSession(t, ctrl, sessionID, nil)
+		replacement := newMockSession(t, ctrl, sessionID, nil)
+		require.NoError(t, sm.StoreSession(original))
+
+		err := sm.ReplaceSession(context.Background(), sessionID, original, replacement)
+		require.NoError(t, err)
+
+		stored, ok := sm.GetMultiSession(sessionID)
+		require.True(t, ok)
+		assert.Same(t, replacement, stored)
+
+		_, loadErr := storage.Load(context.Background(), sessionID)
+		assert.NoError(t, loadErr)
+	})
+
+	t.Run("does not recreate a terminated session", func(t *testing.T) {
+		t.Parallel()
+
+		ctrl := gomock.NewController(t)
+		const sessionID = "550e8400-e29b-41d4-a716-446655440004"
+		sm, storage := newTestSessionManager(t, newMockFactory(t, ctrl, newMockSession(t, ctrl, "unused", nil)), newFakeRegistry())
+
+		original := newMockSession(t, ctrl, sessionID, nil)
+		original.EXPECT().Close().Return(nil).Times(1)
+		replacement := newMockSession(t, ctrl, sessionID, nil)
+		require.NoError(t, sm.StoreSession(original))
+
+		_, err := sm.Terminate(sessionID)
+		require.NoError(t, err)
+
+		err = sm.ReplaceSession(context.Background(), sessionID, original, replacement)
+		require.Error(t, err)
+
+		_, loadErr := storage.Load(context.Background(), sessionID)
+		assert.ErrorIs(t, loadErr, transportsession.ErrSessionNotFound)
+		_, ok := sm.GetMultiSession(sessionID)
+		assert.False(t, ok)
+	})
+}
+
 // ---------------------------------------------------------------------------
 // Tests: Terminate
 // ---------------------------------------------------------------------------
@@ -2090,7 +2140,7 @@ func TestSessionManager_DecorateSession(t *testing.T) {
 			return sess
 		})
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "was terminated or concurrently modified during decoration")
+		assert.Contains(t, err.Error(), "was terminated or concurrently modified")
 
 		// The session must not be resurrected.
 		_, ok := sm.GetMultiSession(sessionID)

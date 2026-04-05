@@ -86,7 +86,22 @@ func (*registrationContextRecordingManager) DecorateSession(
 	return nil
 }
 
-func (*registrationContextRecordingManager) StoreSession(vmcpsession.MultiSession) error {
+func (*registrationContextRecordingManager) ReplaceSession(
+	context.Context,
+	string,
+	vmcpsession.MultiSession,
+	vmcpsession.MultiSession,
+) error {
+	return nil
+}
+
+func (*registrationContextRecordingManager) SetSessionMetadataValue(
+	context.Context,
+	string,
+	vmcpsession.MultiSession,
+	string,
+	string,
+) error {
 	return nil
 }
 

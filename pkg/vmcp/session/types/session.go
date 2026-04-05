@@ -146,6 +146,12 @@ type CreatorIdentityProvider interface {
 }
 
 const (
+	// MetadataKeyOwnerURL is the transport-session metadata key that holds the
+	// pod-local HTTP endpoint URL currently owning the live SDK session state
+	// for this vMCP session. Replicas use it to forward live-session traffic
+	// (SSE listen/delete and methodless client replies) back to the owning pod.
+	MetadataKeyOwnerURL = "vmcp.session.owner_url"
+
 	// MetadataKeyTokenHash is the session metadata key that holds the HMAC-SHA256
 	// hash of the bearer token used to create the session. For authenticated sessions
 	// this is hex(HMAC-SHA256(bearerToken)). For anonymous sessions this is the empty

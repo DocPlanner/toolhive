@@ -1310,14 +1310,25 @@ func (s *Server) refreshSessionCapabilities(
 		return fmt.Errorf("session %q not found", sessionID)
 	}
 
-	if _, err := s.vmcpSessionMgr.RefreshSession(ctx, sessionID); err != nil {
+	refreshed, err := s.vmcpSessionMgr.RefreshSession(ctx, sessionID)
+	if err != nil {
 		return err
 	}
 
 	rollback := func(refreshErr error) error {
-		if storeErr := s.vmcpSessionMgr.StoreSession(previous); storeErr != nil {
+		if storeErr := s.vmcpSessionMgr.ReplaceSession(context.Background(), sessionID, refreshed, previous); storeErr != nil {
 			return fmt.Errorf("%w (rollback failed: %v)", refreshErr, storeErr)
 		}
+
+		go func(rebuilt sessiontypes.MultiSession) {
+			time.Sleep(defaultSessionCloseGracePeriod)
+			if closeErr := rebuilt.Close(); closeErr != nil {
+				slog.Warn("failed to close rolled back refreshed session",
+					"session_id", sessionID,
+					"error", closeErr)
+			}
+		}(refreshed)
+
 		return refreshErr
 	}
 

@@ -61,7 +61,19 @@ type SessionManager interface {
 	// Storage errors are logged but not returned.
 	NotifyBackendExpired(sessionID, workloadID string)
 
-	// StoreSession replaces the stored MultiSession for a session ID. Used for
-	// refresh rollback when the rebuilt session cannot be fully activated.
-	StoreSession(session vmcpsession.MultiSession) error
+	// ReplaceSession swaps the stored MultiSession for sessionID from current to
+	// replacement. Used for refresh rollback when the rebuilt session cannot be
+	// fully activated.
+	ReplaceSession(ctx context.Context, sessionID string, current, replacement vmcpsession.MultiSession) error
+
+	// SetSessionMetadataValue persists a single metadata key/value pair for the
+	// current live session without recreating the session. Used for owner-pod
+	// advertisement after session registration.
+	SetSessionMetadataValue(
+		ctx context.Context,
+		sessionID string,
+		current vmcpsession.MultiSession,
+		key string,
+		value string,
+	) error
 }

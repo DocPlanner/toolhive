@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -46,10 +47,12 @@ const (
 
 // terminatedSentinel is stored in sessions when Terminate() begins tearing
 // down a MultiSession. sessions.Get returns (nil, false) for sentinel entries
-// (non-V values), and DecorateSession's CAS-based re-check will fail,
-// preventing concurrent writers from resurrecting a storage record that
-// Terminate() has already deleted.
+// (non-V values), and the per-session mutation lock serializes storage/cache
+// writers so refreshes and decorations cannot recreate metadata after
+// Terminate() has deleted it.
 type terminatedSentinel struct{}
+
+const sessionMutationStripeCount = 64
 
 // Manager bridges the domain session lifecycle (MultiSession / MultiSessionFactory)
 // to the mark3labs SDK's SessionIdManager interface.
@@ -88,6 +91,7 @@ type Manager struct {
 	sessions *RestorableCache[string, vmcpsession.MultiSession]
 
 	healthStatusProvider health.StatusProvider
+	sessionMutationMu    [sessionMutationStripeCount]sync.Mutex
 }
 
 // New creates a Manager backed by the given SessionDataStorage and backend
@@ -405,38 +409,38 @@ func (sm *Manager) RefreshSession(
 		return nil, fmt.Errorf("Manager.RefreshSession: session ID must not be empty")
 	}
 
+	unlock := sm.lockSessionMutation(sessionID)
 	current, ok := sm.GetMultiSession(sessionID)
 	if !ok {
+		unlock()
 		return nil, fmt.Errorf("Manager.RefreshSession: session %q not found or not a multi-session", sessionID)
 	}
 
 	identityProvider, ok := current.(sessiontypes.CreatorIdentityProvider)
 	if !ok {
+		unlock()
 		return nil, fmt.Errorf("Manager.RefreshSession: session %q cannot provide creator identity", sessionID)
 	}
 
 	identity := identityProvider.CreatorIdentity()
 	allowAnonymous := sessiontypes.ShouldAllowAnonymous(identity)
-	backends := sm.currentEligibleBackends(ctx)
+	unlock()
 
+	backends := sm.currentEligibleBackends(ctx)
 	refreshed, err := sm.factory.MakeSessionWithID(ctx, sessionID, identity, allowAnonymous, backends)
 	if err != nil {
 		return nil, fmt.Errorf("Manager.RefreshSession: failed to rebuild multi-session: %w", err)
 	}
-
-	if _, ok = sm.GetMultiSession(sessionID); !ok {
-		_ = refreshed.Close()
-		return nil, fmt.Errorf("Manager.RefreshSession: session %q was terminated during refresh", sessionID)
+	if ownerURL, ok := current.GetMetadata()[sessiontypes.MetadataKeyOwnerURL]; ok && ownerURL != "" {
+		refreshed.SetMetadata(sessiontypes.MetadataKeyOwnerURL, ownerURL)
 	}
 
-	// Update storage metadata and local cache.
-	storeCtx, storeCancel := context.WithTimeout(ctx, createSessionStorageTimeout)
-	defer storeCancel()
-	if err := sm.storage.Upsert(storeCtx, sessionID, refreshed.GetMetadata()); err != nil {
+	unlock = sm.lockSessionMutation(sessionID)
+	defer unlock()
+	if err := sm.replaceSessionLocked(ctx, sessionID, current, refreshed); err != nil {
 		_ = refreshed.Close()
-		return nil, fmt.Errorf("Manager.RefreshSession: failed to store refreshed session: %w", err)
+		return nil, fmt.Errorf("Manager.RefreshSession: failed to publish refreshed session: %w", err)
 	}
-	sm.sessions.Store(sessionID, refreshed)
 
 	slog.Info("Manager: refreshed multi-session",
 		"session_id", sessionID,
@@ -502,6 +506,9 @@ func (sm *Manager) Terminate(sessionID string) (isNotAllowed bool, err error) {
 		return false, fmt.Errorf("Manager.Terminate: empty session ID")
 	}
 
+	unlock := sm.lockSessionMutation(sessionID)
+	defer unlock()
+
 	ctx, cancel := context.WithTimeout(context.Background(), terminateTimeout)
 	defer cancel()
 
@@ -520,8 +527,8 @@ func (sm *Manager) Terminate(sessionID string) (isNotAllowed bool, err error) {
 		if multiSess, ok := v.(vmcpsession.MultiSession); ok {
 			// Publish the tombstone before deleting from storage. Any concurrent
 			// GetMultiSession call will see the terminatedSentinel and return
-			// (nil, false), and DecorateSession's CAS-based re-check will fail,
-			// preventing both from recreating the storage record after we delete it.
+			// (nil, false), while the per-session mutation lock keeps refresh and
+			// decoration writers from racing the storage delete.
 			sm.sessions.Store(sessionID, terminatedSentinel{})
 
 			if deleteErr := sm.storage.Delete(ctx, sessionID); deleteErr != nil {
@@ -815,6 +822,8 @@ func (sm *Manager) StoreSession(session vmcpsession.MultiSession) error {
 	if session == nil {
 		return fmt.Errorf("StoreSession: session must not be nil")
 	}
+	unlock := sm.lockSessionMutation(session.ID())
+	defer unlock()
 	storeCtx, cancel := context.WithTimeout(context.Background(), createSessionStorageTimeout)
 	defer cancel()
 	if err := sm.storage.Upsert(storeCtx, session.ID(), session.GetMetadata()); err != nil {
@@ -824,20 +833,103 @@ func (sm *Manager) StoreSession(session vmcpsession.MultiSession) error {
 	return nil
 }
 
+// ReplaceSession atomically swaps the stored MultiSession for sessionID from
+// current to replacement. It fails if the current live session was terminated
+// or changed before the swap could be published.
+func (sm *Manager) ReplaceSession(
+	ctx context.Context,
+	sessionID string,
+	current vmcpsession.MultiSession,
+	replacement vmcpsession.MultiSession,
+) error {
+	if sessionID == "" {
+		return fmt.Errorf("ReplaceSession: session ID must not be empty")
+	}
+	if current == nil {
+		return fmt.Errorf("ReplaceSession: current session must not be nil")
+	}
+	if replacement == nil {
+		return fmt.Errorf("ReplaceSession: replacement session must not be nil")
+	}
+	if current.ID() != sessionID {
+		return fmt.Errorf("ReplaceSession: current session ID %q does not match %q", current.ID(), sessionID)
+	}
+	if replacement.ID() != sessionID {
+		return fmt.Errorf("ReplaceSession: replacement session ID %q does not match %q", replacement.ID(), sessionID)
+	}
+
+	unlock := sm.lockSessionMutation(sessionID)
+	defer unlock()
+	return sm.replaceSessionLocked(ctx, sessionID, current, replacement)
+}
+
+// SetSessionMetadataValue stores a single metadata key/value pair for the
+// current live session. The storage write happens before the in-memory session
+// is updated so a failed persist does not leave local/runtime metadata ahead of
+// the shared storage state.
+func (sm *Manager) SetSessionMetadataValue(
+	ctx context.Context,
+	sessionID string,
+	current vmcpsession.MultiSession,
+	key string,
+	value string,
+) error {
+	if sessionID == "" {
+		return fmt.Errorf("SetSessionMetadataValue: session ID must not be empty")
+	}
+	if current == nil {
+		return fmt.Errorf("SetSessionMetadataValue: current session must not be nil")
+	}
+	if current.ID() != sessionID {
+		return fmt.Errorf("SetSessionMetadataValue: current session ID %q does not match %q", current.ID(), sessionID)
+	}
+	if key == "" {
+		return fmt.Errorf("SetSessionMetadataValue: metadata key must not be empty")
+	}
+
+	unlock := sm.lockSessionMutation(sessionID)
+	defer unlock()
+
+	liveValue, ok := sm.sessions.Peek(sessionID)
+	if !ok {
+		return fmt.Errorf("SetSessionMetadataValue: session %q not found", sessionID)
+	}
+	if _, isSentinel := liveValue.(terminatedSentinel); isSentinel {
+		return fmt.Errorf("SetSessionMetadataValue: session %q is terminating", sessionID)
+	}
+
+	liveSession, ok := liveValue.(vmcpsession.MultiSession)
+	if !ok {
+		return fmt.Errorf("SetSessionMetadataValue: session %q is not a multi-session", sessionID)
+	}
+	if liveSession != current {
+		return fmt.Errorf("SetSessionMetadataValue: session %q was concurrently replaced", sessionID)
+	}
+
+	metadata := cloneStringMap(current.GetMetadata())
+	metadata[key] = value
+
+	storeCtx, storeCancel := context.WithTimeout(ctx, createSessionStorageTimeout)
+	defer storeCancel()
+	if err := sm.storage.Upsert(storeCtx, sessionID, metadata); err != nil {
+		return fmt.Errorf("SetSessionMetadataValue: failed to store metadata: %w", err)
+	}
+
+	current.SetMetadata(key, value)
+	return nil
+}
+
 // DecorateSession retrieves the MultiSession for sessionID, applies fn to it,
 // and stores the result back. Returns an error if the session is not found or
 // has not yet been upgraded from placeholder to MultiSession.
 //
-// A re-check is performed immediately before storing to guard against a
-// race with Terminate(): if the session is deleted between GetMultiSession and
-// the store, the store would silently resurrect a terminated session.
-// The re-check catches that window. A narrow TOCTOU gap remains between the
-// re-check and the store, but its consequence is bounded: Terminate() already
-// called Close() on the underlying MultiSession before deleting it, so any
-// resurrected decorator wraps an already-closed session and will fail on first
-// use rather than leaking backend connections.
+// The publish step is serialized per session so decoration cannot race with
+// Terminate() or refresh publication. The decorator callback itself runs
+// outside the mutation lock so it can safely call back into the manager.
 func (sm *Manager) DecorateSession(sessionID string, fn func(sessiontypes.MultiSession) sessiontypes.MultiSession) error {
+	unlock := sm.lockSessionMutation(sessionID)
 	sess, ok := sm.GetMultiSession(sessionID)
+	unlock()
 	if !ok {
 		return fmt.Errorf("DecorateSession: session %q not found or not a multi-session", sessionID)
 	}
@@ -848,25 +940,59 @@ func (sm *Manager) DecorateSession(sessionID string, fn func(sessiontypes.MultiS
 	if decorated.ID() != sessionID {
 		return fmt.Errorf("DecorateSession: decorator changed session ID from %q to %q", sessionID, decorated.ID())
 	}
-	// Atomically replace the original entry with the decorated one.
-	// If Terminate() has stored a terminatedSentinel between the first
-	// GetMultiSession call above and here, CompareAndSwap returns false and
-	// we bail out before touching storage — preventing resurrection of a
-	// terminated session's storage record.
-	if !sm.sessions.CompareAndSwap(sessionID, sess, decorated) {
-		return fmt.Errorf("DecorateSession: session %q was terminated or concurrently modified during decoration", sessionID)
-	}
-	// Persist updated metadata to storage. On failure, attempt to rollback
-	// the local-map entry so the caller can retry. If Terminate() has since
-	// replaced the decorated entry with a sentinel, the rollback CAS returns
-	// false and we leave the sentinel in place.
 	decorateCtx, decorateCancel := context.WithTimeout(context.Background(), decorateTimeout)
 	defer decorateCancel()
-	if err := sm.storage.Upsert(decorateCtx, sessionID, decorated.GetMetadata()); err != nil {
-		_ = sm.sessions.CompareAndSwap(sessionID, decorated, sess)
-		return fmt.Errorf("DecorateSession: failed to store decorated session metadata: %w", err)
+	unlock = sm.lockSessionMutation(sessionID)
+	defer unlock()
+	if err := sm.replaceSessionLocked(decorateCtx, sessionID, sess, decorated); err != nil {
+		return fmt.Errorf("DecorateSession: %w", err)
 	}
 	return nil
+}
+
+func (sm *Manager) replaceSessionLocked(
+	ctx context.Context,
+	sessionID string,
+	current vmcpsession.MultiSession,
+	replacement vmcpsession.MultiSession,
+) error {
+	if !sm.sessions.CompareAndSwap(sessionID, current, replacement) {
+		return fmt.Errorf("session %q was terminated or concurrently modified during replacement", sessionID)
+	}
+
+	storeCtx, storeCancel := context.WithTimeout(ctx, createSessionStorageTimeout)
+	defer storeCancel()
+	if err := sm.storage.Upsert(storeCtx, sessionID, replacement.GetMetadata()); err != nil {
+		sm.sessions.Store(sessionID, current)
+		return fmt.Errorf("failed to store replacement session metadata: %w", err)
+	}
+	return nil
+}
+
+func (sm *Manager) lockSessionMutation(sessionID string) func() {
+	mu := &sm.sessionMutationMu[sessionMutationStripeIndex(sessionID)]
+	mu.Lock()
+	return mu.Unlock
+}
+
+func sessionMutationStripeIndex(sessionID string) int {
+	var hash uint32 = 2166136261
+	for i := 0; i < len(sessionID); i++ {
+		hash ^= uint32(sessionID[i])
+		hash *= 16777619
+	}
+	return int(hash % sessionMutationStripeCount)
+}
+
+func cloneStringMap(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return map[string]string{}
+	}
+	cloned := make(map[string]string, len(src))
+	for k, v := range src {
+		cloned[k] = v
+	}
+	return cloned
 }
 
 // GetAdaptedTools returns SDK-format tools for the given session, with handlers
