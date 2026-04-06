@@ -195,7 +195,14 @@ func (c *mcpSession) GetPrompt(
 //
 // registry provides the authentication strategy for outgoing backend requests.
 // Pass a registry configured with the "unauthenticated" strategy to disable auth.
-func NewHTTPConnector(registry vmcpauth.OutgoingAuthRegistry) func(
+//
+// onCapabilityChange is an optional callback invoked (in a separate goroutine)
+// when the backend sends a tools/list_changed or resources/list_changed
+// notification. Pass nil to ignore capability change notifications.
+func NewHTTPConnector(
+	registry vmcpauth.OutgoingAuthRegistry,
+	onCapabilityChange func(backendID string),
+) func(
 	ctx context.Context,
 	target *vmcp.BackendTarget,
 	identity *auth.Identity,
@@ -214,6 +221,18 @@ func NewHTTPConnector(registry vmcpauth.OutgoingAuthRegistry) func(
 		if err != nil {
 			_ = c.Close()
 			return nil, nil, fmt.Errorf("failed to initialise backend %s: %w", target.WorkloadID, err)
+		}
+
+		// Forward capability-change notifications from the backend so the
+		// hub can refresh its sessions when a spoke's tool list changes.
+		if onCapabilityChange != nil {
+			backendID := target.WorkloadID
+			c.OnNotification(func(n mcp.JSONRPCNotification) {
+				if n.Method == "notifications/tools/list_changed" ||
+					n.Method == "notifications/resources/list_changed" {
+					go onCapabilityChange(backendID)
+				}
+			})
 		}
 
 		// Extract the backend-assigned session ID when the transport supports it.

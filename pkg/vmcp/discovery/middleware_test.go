@@ -315,31 +315,27 @@ func TestMiddleware_DiscoveryFailure(t *testing.T) {
 	assert.Contains(t, string(body), http.StatusText(http.StatusServiceUnavailable))
 }
 
-func TestMiddleware_HealthCheckRequest_DiscoversDespiteSessionScopedRouting(t *testing.T) {
+func TestMiddleware_HealthCheckRequest_SkipsDiscovery(t *testing.T) {
 	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
+	// Discover must NOT be called — health probes skip backend
+	// discovery to avoid slow backends inflating probe response time.
 	mockMgr := mocks.NewMockManager(ctrl)
 	backends := []vmcp.Backend{
 		{ID: "backend1", Name: "Backend 1", HealthStatus: vmcp.BackendHealthy},
 	}
-	expectedCaps := &aggregator.AggregatedCapabilities{
-		Tools: []vmcp.Tool{{Name: "tool1", BackendID: "backend1"}},
-	}
-
-	mockMgr.EXPECT().
-		Discover(gomock.Any(), unorderedBackendsMatcher{backends}).
-		Return(expectedCaps, nil)
 
 	handlerCalled := false
 	testHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handlerCalled = true
-		caps, ok := DiscoveredCapabilitiesFromContext(r.Context())
-		require.True(t, ok)
-		require.NotNil(t, caps)
-		assert.Equal(t, expectedCaps, caps)
+		// Health probes pass through without capabilities in context.
+		_, ok := DiscoveredCapabilitiesFromContext(r.Context())
+		assert.False(t, ok, "health probe should not have capabilities in context")
+		// Health check marker must be preserved.
+		assert.True(t, health.IsHealthCheck(r.Context()))
 		w.WriteHeader(http.StatusOK)
 	})
 
@@ -363,31 +359,25 @@ func TestMiddleware_HealthCheckRequest_DiscoversDespiteSessionScopedRouting(t *t
 	assert.Equal(t, http.StatusOK, rec.Code)
 }
 
-func TestMiddleware_HealthCheckSubsequentRequest_DiscoversFreshCapabilities(t *testing.T) {
+func TestMiddleware_HealthCheckSubsequentRequest_SkipsDiscovery(t *testing.T) {
 	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
+	// Discover must NOT be called even for subsequent health probe requests
+	// (those with Mcp-Session-Id). Health probes always pass through directly.
 	mockMgr := mocks.NewMockManager(ctrl)
 	backends := []vmcp.Backend{
 		{ID: "backend1", Name: "Backend 1", HealthStatus: vmcp.BackendHealthy},
 	}
-	expectedCaps := &aggregator.AggregatedCapabilities{
-		Resources: []vmcp.Resource{{URI: "file://example", Name: "example"}},
-	}
-
-	mockMgr.EXPECT().
-		Discover(gomock.Any(), unorderedBackendsMatcher{backends}).
-		Return(expectedCaps, nil)
 
 	handlerCalled := false
 	testHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handlerCalled = true
-		caps, ok := DiscoveredCapabilitiesFromContext(r.Context())
-		require.True(t, ok)
-		require.NotNil(t, caps)
-		assert.Equal(t, expectedCaps, caps)
+		_, ok := DiscoveredCapabilitiesFromContext(r.Context())
+		assert.False(t, ok, "health probe should not have capabilities in context")
+		assert.True(t, health.IsHealthCheck(r.Context()))
 		w.WriteHeader(http.StatusOK)
 	})
 

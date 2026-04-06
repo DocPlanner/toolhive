@@ -108,15 +108,16 @@ func Middleware(
 			sessionID := r.Header.Get("Mcp-Session-Id")
 
 			if health.IsHealthCheck(ctx) {
-				// Health probes intentionally bypass the session-scoped routing
-				// shortcut so every probe request can derive capabilities from the
-				// current backend health state without opening backend sessions.
-				var err error
-				ctx, err = handleInitializeRequest(ctx, r, manager, registry, healthStatusProvider, cfg.timeout)
-				if err != nil {
-					handleDiscoveryError(w, r, err)
-					return
-				}
+				// Health probes verify spoke connectivity only. Skip backend
+				// discovery entirely so a slow backend cannot inflate the
+				// probe response time and cause the hub to mark this spoke
+				// as unhealthy. The session registered for the probe will
+				// have no tools — that is fine because the hub's health
+				// checker only inspects response time and errors, not tool
+				// counts. Normal (non-probe) sessions still run full
+				// health-filtered discovery below.
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
 			} else if sessionID == "" {
 				if cfg.sessionScopedRouting {
 					// Session-scoped routing registers capabilities via the OnRegisterSession

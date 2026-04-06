@@ -120,6 +120,14 @@ type backendConnector func(
 	identity *auth.Identity,
 ) (backend.Session, *vmcp.CapabilityList, error)
 
+// CapabilityChangeRegistrar is an optional interface implemented by session
+// factories that support backend capability-change notifications. When a
+// backend sends tools/list_changed or resources/list_changed, the registered
+// callback is invoked with the backend ID so the caller can refresh sessions.
+type CapabilityChangeRegistrar interface {
+	SetOnCapabilityChange(fn func(backendID string))
+}
+
 // defaultMultiSessionFactory is the production MultiSessionFactory implementation.
 type defaultMultiSessionFactory struct {
 	connector          backendConnector
@@ -127,6 +135,7 @@ type defaultMultiSessionFactory struct {
 	backendInitTimeout time.Duration
 	hmacSecret         []byte                // Server-managed secret for HMAC-SHA256 token hashing
 	aggregator         aggregator.Aggregator // Optional: applies tool transforms (overrides, conflict resolution, filter)
+	onCapabilityChange func(backendID string) // Late-bound callback for capability-change notifications
 }
 
 // MultiSessionFactoryOption configures a defaultMultiSessionFactory.
@@ -182,10 +191,37 @@ func WithAggregator(agg aggregator.Aggregator) MultiSessionFactoryOption {
 	}
 }
 
+// SetOnCapabilityChange registers a callback that fires when any backend
+// session created by this factory receives a tools/list_changed or
+// resources/list_changed notification from its backend. The callback is
+// invoked asynchronously with the backend ID.
+//
+// Designed for late-binding: the factory is created before the server, and
+// the server sets the callback after construction (same pattern as
+// healthMon.AddOnStatusChange).
+func (f *defaultMultiSessionFactory) SetOnCapabilityChange(fn func(backendID string)) {
+	f.onCapabilityChange = fn
+}
+
 // NewSessionFactory creates a MultiSessionFactory that connects to backends
 // over HTTP using the given outgoing auth registry.
 func NewSessionFactory(registry vmcpauth.OutgoingAuthRegistry, opts ...MultiSessionFactoryOption) MultiSessionFactory {
-	return newSessionFactoryWithConnector(backend.NewHTTPConnector(registry), opts...)
+	f := &defaultMultiSessionFactory{
+		maxConcurrency:     defaultMaxBackendInitConcurrency,
+		backendInitTimeout: defaultBackendInitTimeout,
+		hmacSecret:         defaultHMACSecret,
+	}
+	for _, opt := range opts {
+		opt(f)
+	}
+	// The closure captures f so that SetOnCapabilityChange works after
+	// factory creation (late-binding for the server callback).
+	f.connector = backend.NewHTTPConnector(registry, func(backendID string) {
+		if f.onCapabilityChange != nil {
+			f.onCapabilityChange(backendID)
+		}
+	})
+	return f
 }
 
 // newSessionFactoryWithConnector creates a MultiSessionFactory backed by an

@@ -585,6 +585,12 @@ func New(
 		healthMon.AddOnStatusChange(srv.handleBackendStatusChange)
 	}
 
+	// Late-bind capability-change notifications: when a backend sends
+	// tools/list_changed the server refreshes all sessions that contain it.
+	if reg, ok := cfg.SessionFactory.(vmcpsession.CapabilityChangeRegistrar); ok {
+		reg.SetOnCapabilityChange(srv.handleBackendCapabilityChange)
+	}
+
 	// Repair session-scoped SDK state for valid sessions that arrive on a
 	// different replica than the one that originally registered them.
 	hooks.AddOnRequestInitialization(func(ctx context.Context, id any, message any) error {
@@ -1238,16 +1244,21 @@ func (s *Server) handleSessionRegistrationImpl(ctx context.Context, session serv
 	slog.Debug("creating session-scoped backends", "session_id", sessionID)
 
 	if health.IsHealthCheck(ctx) {
+		// Health probes validate connectivity, not tool completeness.
+		// Discovery is intentionally skipped for probes to avoid slow
+		// backends inflating probe response time. If cached capabilities
+		// happen to be available in the context they are injected;
+		// otherwise the session remains empty, which is fine — the hub's
+		// health checker only inspects timing and errors.
 		if err := s.injectHealthCheckCapabilities(ctx, session, true, true); err != nil {
-			slog.Error("failed to inject health-check capabilities",
+			slog.Debug("health probe registered without capabilities (discovery skipped)",
+				"session_id", sessionID)
+		} else {
+			slog.Debug("health probe registered with cached capabilities",
 				"session_id", sessionID,
-				"error", err)
-			return err
+				"tool_count", sessionToolCount(session),
+				"resource_count", sessionResourceCount(session))
 		}
-		slog.Info("health-check capabilities injected",
-			"session_id", sessionID,
-			"tool_count", sessionToolCount(session),
-			"resource_count", sessionResourceCount(session))
 		return nil
 	}
 
@@ -1364,12 +1375,15 @@ func (s *Server) handleSessionRequestInitialization(
 	}
 
 	if health.IsHealthCheck(ctx) {
+		// Best-effort injection: if cached capabilities are available in the
+		// context they are injected; otherwise the request proceeds with an
+		// empty list. This is safe because health probes only validate
+		// connectivity and timing — the hub's health checker discards the
+		// actual tool/resource list.
 		if err := s.injectHealthCheckCapabilities(ctx, session, needsTools, needsResources); err != nil {
-			slog.Warn("failed to inject health-check session capabilities",
+			slog.Debug("health probe request proceeding without capabilities (discovery skipped)",
 				"session_id", session.SessionID(),
-				"method", method,
-				"error", err)
-			return err
+				"method", method)
 		}
 		return nil
 	}
@@ -1901,6 +1915,40 @@ func (s *Server) handleBackendStatusChange(event health.StatusChangeEvent) {
 			slog.Warn("failed to refresh session capabilities",
 				"session_id", target.sessionID,
 				"backend_id", event.BackendID,
+				"error", err)
+		}
+		cancel()
+	}
+}
+
+// handleBackendCapabilityChange is called (asynchronously) when a backend
+// sends a tools/list_changed or resources/list_changed notification via the
+// persistent MCP session. It refreshes every hub session that includes the
+// backend so clients see the updated tool/resource list.
+func (s *Server) handleBackendCapabilityChange(backendID string) {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+
+	// backendEligible=true: the backend's tool list changed but it is still
+	// reachable, so refresh ALL sessions (same as a backend recovering).
+	targets := s.targetSessionsForRefresh(
+		health.StatusChangeEvent{BackendID: backendID},
+		true,
+	)
+	if len(targets) == 0 {
+		return
+	}
+
+	slog.Info("refreshing sessions after backend capability change notification",
+		"backend_id", backendID,
+		"session_count", len(targets))
+
+	for _, target := range targets {
+		refreshCtx, cancel := context.WithTimeout(context.Background(), defaultSessionRefreshTimeout)
+		if err := s.refreshSessionCapabilities(refreshCtx, target.sessionID, target.session); err != nil {
+			slog.Warn("failed to refresh session after capability change",
+				"session_id", target.sessionID,
+				"backend_id", backendID,
 				"error", err)
 		}
 		cancel()
