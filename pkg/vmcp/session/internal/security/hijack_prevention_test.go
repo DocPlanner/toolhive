@@ -84,29 +84,36 @@ func TestValidateCaller_EdgeCases(t *testing.T) {
 		{
 			name:           "bound session with nil caller",
 			allowAnonymous: false,
-			boundTokenHash: hashToken("correct-token", testSecret, testTokenSalt),
+			boundTokenHash: hashSubject("alice", testSecret, testTokenSalt),
 			caller:         nil,
 			wantErr:        sessiontypes.ErrNilCaller,
 		},
 		{
-			name:           "bound session with matching token",
+			name:           "bound session with matching subject",
 			allowAnonymous: false,
-			boundTokenHash: hashToken("correct-token", testSecret, testTokenSalt),
-			caller:         &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: "user"}, Token: "correct-token"},
-			wantErr:        nil, // Should succeed
+			boundTokenHash: hashSubject("alice", testSecret, testTokenSalt),
+			caller:         &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: "alice"}, Token: "any-token"},
+			wantErr:        nil, // Should succeed — subject matches regardless of token
 		},
 		{
-			name:           "bound session with wrong token",
+			name:           "bound session with wrong subject",
 			allowAnonymous: false,
-			boundTokenHash: hashToken("correct-token", testSecret, testTokenSalt),
-			caller:         &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: "user"}, Token: "wrong-token"},
+			boundTokenHash: hashSubject("alice", testSecret, testTokenSalt),
+			caller:         &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: "eve"}, Token: "any-token"},
 			wantErr:        sessiontypes.ErrUnauthorizedCaller,
 		},
 		{
-			name:           "bound session with empty token in identity",
+			name:           "bound session survives token refresh (same subject, different token)",
 			allowAnonymous: false,
-			boundTokenHash: hashToken("correct-token", testSecret, testTokenSalt),
-			caller:         &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: "user"}, Token: ""},
+			boundTokenHash: hashSubject("alice", testSecret, testTokenSalt),
+			caller:         &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: "alice"}, Token: "refreshed-token"},
+			wantErr:        nil, // Subject matches — token refresh must not break session
+		},
+		{
+			name:           "bound session with empty subject in identity",
+			allowAnonymous: false,
+			boundTokenHash: hashSubject("alice", testSecret, testTokenSalt),
+			caller:         &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: ""}, Token: "some-token"},
 			wantErr:        sessiontypes.ErrUnauthorizedCaller,
 		},
 		{
@@ -117,10 +124,10 @@ func TestValidateCaller_EdgeCases(t *testing.T) {
 			wantErr:        nil, // Empty token is equivalent to no token
 		},
 		{
-			name:           "misconfigured bound session with empty hash rejects empty token",
+			name:           "misconfigured bound session with empty hash rejects caller",
 			allowAnonymous: false,
 			boundTokenHash: "", // Misconfiguration: bound but no hash
-			caller:         &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: "user"}, Token: ""},
+			caller:         &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: "user"}, Token: "token"},
 			wantErr:        sessiontypes.ErrSessionOwnerUnknown, // Fail closed
 		},
 		{

@@ -228,12 +228,12 @@ func TestSessionFactory_Integration_MultipleBackends(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Token-binding integration tests — HMAC rejection for ReadResource / GetPrompt
+// Subject-binding integration tests — HMAC rejection for ReadResource / GetPrompt
 // ---------------------------------------------------------------------------
 
 // TestTokenBinding_CallerRejection verifies that the hijack-prevention decorator
 // is applied to all three protected methods (CallTool, ReadResource, GetPrompt):
-// each rejects a wrong token (ErrUnauthorizedCaller) and a nil caller
+// each rejects a wrong subject (ErrUnauthorizedCaller) and a nil caller
 // (ErrNilCaller) before any backend routing occurs, so nilBackendConnector suffices.
 func TestTokenBinding_CallerRejection(t *testing.T) {
 	t.Parallel()

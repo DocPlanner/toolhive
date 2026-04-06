@@ -34,24 +34,24 @@ func nilBackendConnector() backendConnector {
 func TestMakeSession_StoresTokenHash(t *testing.T) {
 	t.Parallel()
 
-	t.Run("authenticated session stores HMAC-SHA256 hash", func(t *testing.T) {
+	t.Run("authenticated session stores HMAC-SHA256 hash of subject", func(t *testing.T) {
 		t.Parallel()
 
-		const rawToken = "test-bearer-token"
-		identity := &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: "alice"}, Token: rawToken}
+		const subject = "alice"
+		identity := &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: subject}, Token: "test-bearer-token"}
 
 		factory := newSessionFactoryWithConnector(nilBackendConnector())
 		sess, err := factory.MakeSessionWithID(t.Context(), uuid.New().String(), identity, false, nil)
 		require.NoError(t, err)
 		require.NotNil(t, sess)
 
-		// Verify token hash is stored
+		// Verify subject hash is stored
 		storedHash, present := sess.GetMetadata()[MetadataKeyTokenHash]
 		require.True(t, present, "MetadataKeyTokenHash must be set")
-		assert.NotEmpty(t, storedHash, "Token hash must be non-empty for authenticated session")
+		assert.NotEmpty(t, storedHash, "Subject hash must be non-empty for authenticated session")
 		assert.Len(t, storedHash, 64, "HMAC-SHA256 hex-encoded hash should be 64 characters")
-		// Raw token must never appear in metadata.
-		assert.NotEqual(t, rawToken, storedHash)
+		// Raw subject must never appear in metadata.
+		assert.NotEqual(t, subject, storedHash)
 
 		// Verify salt is stored for authenticated sessions
 		storedSalt, saltPresent := sess.GetMetadata()[sessiontypes.MetadataKeyTokenSalt]
@@ -93,21 +93,20 @@ func TestMakeSession_StoresTokenHash(t *testing.T) {
 		assert.Empty(t, storedSalt, "empty-token identity must not store a salt")
 	})
 
-	t.Run("MakeSessionWithID also stores token hash", func(t *testing.T) {
+	t.Run("MakeSessionWithID also stores subject hash", func(t *testing.T) {
 		t.Parallel()
 
-		const rawToken = "id-specific-token"
-		identity := &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: "bob"}, Token: rawToken}
+		identity := &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: "bob"}, Token: "id-specific-token"}
 
 		factory := newSessionFactoryWithConnector(nilBackendConnector())
 		sess, err := factory.MakeSessionWithID(t.Context(), "explicit-session-id", identity, false, nil)
 		require.NoError(t, err)
 		require.NotNil(t, sess)
 
-		// Verify token hash
+		// Verify subject hash
 		storedHash, present := sess.GetMetadata()[MetadataKeyTokenHash]
 		require.True(t, present, "MetadataKeyTokenHash must be set")
-		assert.NotEmpty(t, storedHash, "Token hash must be non-empty")
+		assert.NotEmpty(t, storedHash, "Subject hash must be non-empty")
 		assert.Len(t, storedHash, 64, "HMAC-SHA256 hex-encoded hash should be 64 characters")
 
 		// Verify salt is stored for authenticated sessions

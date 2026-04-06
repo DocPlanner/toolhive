@@ -47,28 +47,32 @@ func generateSalt() ([]byte, error) {
 	return salt, nil
 }
 
-// hashToken returns the hex-encoded HMAC-SHA256 hash of a raw bearer token string.
-// Uses HMAC with a server-managed secret and per-session salt to prevent offline
-// attacks if session storage is compromised.
+// hashSubject returns the hex-encoded HMAC-SHA256 hash of the caller's subject
+// (the OIDC "sub" claim). Uses HMAC with a server-managed secret and per-session
+// salt to prevent offline attacks if session storage is compromised.
 //
-// For empty tokens (anonymous sessions) it returns the empty string, which is
+// Binding to the subject instead of the raw bearer token makes session ownership
+// survive OAuth token refreshes: the "sub" claim is stable across token renewals
+// while the raw JWT string changes on every refresh (different exp/iat/jti).
+//
+// For empty subjects (anonymous sessions) it returns the empty string, which is
 // the sentinel value used to identify sessions created without credentials.
-// The raw token is never stored — only the hash.
+// The raw subject is never stored — only the hash.
 //
 // Parameters:
-//   - token: The bearer token to hash
+//   - subject: The caller's subject identifier (OIDC "sub" claim)
 //   - secret: Server-managed HMAC secret (should be 32+ bytes)
 //   - salt: Per-session random salt (typically 16 bytes)
 //
 // Security: Uses HMAC-SHA256 instead of plain SHA256 to prevent rainbow table
 // attacks and offline brute force if session state leaks from Redis/Valkey.
-func hashToken(token string, secret, salt []byte) string {
-	if token == "" {
+func hashSubject(subject string, secret, salt []byte) string {
+	if subject == "" {
 		return ""
 	}
 	h := hmac.New(sha256.New, secret)
 	h.Write(salt)
-	h.Write([]byte(token))
+	h.Write([]byte(subject))
 	return hex.EncodeToString(h.Sum(nil))
 }
 
@@ -87,10 +91,11 @@ func hashToken(token string, secret, salt []byte) string {
 type hijackPreventionDecorator struct {
 	sessiontypes.MultiSession // Embedded interface - provides automatic delegation for most methods
 
-	// Token binding fields: enforce that subsequent requests come from the same
-	// identity that created the session.
+	// Subject binding fields: enforce that subsequent requests come from the same
+	// identity (OIDC "sub" claim) that created the session. Binding to sub rather
+	// than the raw JWT makes ownership survive OAuth token refreshes.
 	// These fields are immutable after decorator creation (no mutex needed).
-	boundTokenHash string // HMAC-SHA256 hash of creator's token (empty for anonymous)
+	boundTokenHash string // HMAC-SHA256 hash of creator's subject (empty for anonymous)
 	tokenSalt      []byte // Random salt used for HMAC (empty for anonymous)
 	hmacSecret     []byte // Server-managed secret for HMAC-SHA256
 	allowAnonymous bool   // Whether to allow nil caller
@@ -99,19 +104,19 @@ type hijackPreventionDecorator struct {
 // validateCaller checks if the provided caller identity matches the session owner.
 // Returns nil if validation succeeds, or an error if:
 //   - The session requires a bound identity but caller is nil (ErrNilCaller)
-//   - The caller's token hash doesn't match the session owner (ErrUnauthorizedCaller)
+//   - The caller's subject hash doesn't match the session owner (ErrUnauthorizedCaller)
 //   - An anonymous session receives a caller with a non-empty token (ErrUnauthorizedCaller)
 //
 // For anonymous sessions (allowAnonymous=true, boundTokenHash=""), validation succeeds
 // only when the caller is nil or has an empty token (prevents session upgrade attacks).
 func (d hijackPreventionDecorator) validateCaller(caller *auth.Identity) error {
-	// No lock needed - token binding fields are immutable after decorator creation
+	// No lock needed - subject binding fields are immutable after decorator creation
 
 	// Anonymous sessions: reject callers that present tokens
 	if d.allowAnonymous && d.boundTokenHash == "" {
 		// Prevent session upgrade attack: anonymous sessions cannot accept tokens
 		if caller != nil && caller.Token != "" {
-			slog.Warn("token validation failed: session upgrade attack prevented",
+			slog.Warn("subject validation failed: session upgrade attack prevented",
 				"reason", "token_presented_to_anonymous_session",
 			)
 			return sessiontypes.ErrUnauthorizedCaller
@@ -121,30 +126,30 @@ func (d hijackPreventionDecorator) validateCaller(caller *auth.Identity) error {
 
 	// Bound sessions require a caller
 	if caller == nil {
-		slog.Warn("token validation failed: nil caller for bound session",
+		slog.Warn("subject validation failed: nil caller for bound session",
 			"reason", "nil_caller",
 		)
 		return sessiontypes.ErrNilCaller
 	}
 
-	// Defensive check: bound sessions must have a non-empty token hash.
-	// This prevents misconfigured sessions from accepting empty tokens.
-	// Scenario: if boundTokenHash="" and caller.Token="", both would hash to "",
+	// Defensive check: bound sessions must have a non-empty subject hash.
+	// This prevents misconfigured sessions from accepting empty subjects.
+	// Scenario: if boundTokenHash="" and caller.Subject="", both would hash to "",
 	// and ConstantTimeHashCompare would return true (both empty case).
 	if d.boundTokenHash == "" {
-		slog.Error("token validation failed: bound session has empty token hash",
+		slog.Error("subject validation failed: bound session has empty subject hash",
 			"reason", "misconfigured_session",
 		)
 		return sessiontypes.ErrSessionOwnerUnknown
 	}
 
-	// Compute caller's token hash using the same HMAC secret and salt
-	callerHash := hashToken(caller.Token, d.hmacSecret, d.tokenSalt)
+	// Compute caller's subject hash using the same HMAC secret and salt
+	callerHash := hashSubject(caller.Subject, d.hmacSecret, d.tokenSalt)
 
 	// Constant-time comparison to prevent timing attacks
 	if !pkgsecurity.ConstantTimeHashCompare(d.boundTokenHash, callerHash, SHA256HexLen) {
-		slog.Warn("token validation failed: token hash mismatch",
-			"reason", "token_hash_mismatch",
+		slog.Warn("subject validation failed: subject hash mismatch",
+			"reason", "subject_hash_mismatch",
 		)
 		return sessiontypes.ErrUnauthorizedCaller
 	}
@@ -269,17 +274,24 @@ func RestoreHijackPrevention(
 }
 
 // PreventSessionHijacking wraps a session with hijack prevention security measures.
-// It computes token binding hashes, stores them in session metadata, and returns
+// It computes subject binding hashes, stores them in session metadata, and returns
 // a decorated session that validates caller identity on every operation.
+//
+// Session ownership is bound to the caller's OIDC "sub" claim (Identity.Subject)
+// rather than the raw bearer token. This makes session ownership survive OAuth
+// token refreshes: the "sub" is stable across renewals while the JWT string
+// changes on every refresh (different exp/iat/jti). The auth middleware still
+// validates the JWT on every request, so only callers with valid tokens reach
+// the subject-binding check.
 //
 // Whether the session is anonymous is derived from the identity: nil identity or
 // empty token means anonymous, a non-empty token means bound/authenticated.
 //
-// For authenticated sessions (identity.Token != ""):
+// For authenticated sessions (identity.Subject != ""):
 //   - Generates a unique random salt
-//   - Computes HMAC-SHA256 hash of the bearer token
+//   - Computes HMAC-SHA256 hash of the subject claim
 //   - Stores hash and salt in session metadata
-//   - Returns decorator that validates every request against the creator's token
+//   - Returns decorator that validates every request against the creator's subject
 //
 // For anonymous sessions (identity == nil or identity.Token == ""):
 //   - Stores an empty string sentinel for the token hash metadata key
@@ -290,7 +302,7 @@ func RestoreHijackPrevention(
 //   - Makes defensive copies of secret and salt to prevent external mutation
 //   - Uses constant-time comparison to prevent timing attacks
 //   - Prevents session upgrade attacks (anonymous → authenticated)
-//   - Raw tokens are never stored, only HMAC-SHA256 hashes
+//   - Raw subjects are never stored, only HMAC-SHA256 hashes
 //
 // Returns an error if:
 //   - session is nil
@@ -313,15 +325,15 @@ func PreventSessionHijacking(
 	var tokenSalt []byte
 	var err error
 
-	// Compute token binding for authenticated sessions
-	if !allowAnonymous && identity != nil && identity.Token != "" {
+	// Compute subject binding for authenticated sessions
+	if !allowAnonymous && identity != nil && identity.Subject != "" {
 		// Generate unique salt for this session
 		tokenSalt, err = generateSalt()
 		if err != nil {
 			return nil, fmt.Errorf("failed to generate token salt: %w", err)
 		}
-		// Compute HMAC-SHA256 hash with server secret and per-session salt
-		boundTokenHash = hashToken(identity.Token, hmacSecret, tokenSalt)
+		// Compute HMAC-SHA256 hash of subject with server secret and per-session salt
+		boundTokenHash = hashSubject(identity.Subject, hmacSecret, tokenSalt)
 	}
 
 	// Store hash and salt in session metadata for persistence, auditing,
