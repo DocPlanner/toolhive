@@ -641,6 +641,7 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		StatusReporter:          statusReporter,
 		OptimizerConfig:         optCfg,
 		SessionStorage:          cfg.SessionStorage,
+		SessionTTL:              time.Duration(cfg.SessionTTL),
 		SessionOwnerAdvertiseURL: resolveSessionOwnerAdvertiseURL(
 			os.Getenv(envVMCPSessionOwnerURL),
 			os.Getenv(envPodIP),

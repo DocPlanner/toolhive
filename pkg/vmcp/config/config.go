@@ -175,6 +175,11 @@ type Config struct {
 	// the THV_SESSION_REDIS_PASSWORD environment variable.
 	// +optional
 	SessionStorage *SessionStorageConfig `json:"sessionStorage,omitempty" yaml:"sessionStorage,omitempty"`
+
+	// SessionTTL configures the idle TTL for vMCP sessions.
+	// When omitted, the server default is used.
+	// +optional
+	SessionTTL Duration `json:"sessionTTL,omitempty" yaml:"sessionTTL,omitempty"`
 }
 
 // IncomingAuthConfig configures client authentication to the virtual MCP server.

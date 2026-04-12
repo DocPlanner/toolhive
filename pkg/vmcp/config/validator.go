@@ -103,6 +103,10 @@ func (*DefaultValidator) validateBasicFields(cfg *Config) error {
 		return fmt.Errorf("group reference is required")
 	}
 
+	if cfg.SessionTTL < 0 {
+		return fmt.Errorf("sessionTTL must be greater than 0 when set")
+	}
+
 	return nil
 }
 
