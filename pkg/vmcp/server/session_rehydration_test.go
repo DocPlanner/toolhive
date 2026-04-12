@@ -55,6 +55,8 @@ func (m *hydrationTestManager) Validate(string) (bool, error) {
 
 func (*hydrationTestManager) Terminate(string) (bool, error) { return false, nil }
 
+func (*hydrationTestManager) NotifyBackendExpired(string, string) {}
+
 func (m *hydrationTestManager) CreateSession(context.Context, string) (vmcpsession.MultiSession, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

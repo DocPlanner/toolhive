@@ -45,6 +45,21 @@ func (r *VirtualMCPServerReconciler) ensureVmcpConfigConfigMap(
 		return fmt.Errorf("failed to create vmcp Config from VirtualMCPServer: %w", err)
 	}
 
+	// When an EmbeddingServerRef is configured, resolve the ready server's URL and
+	// write it into the runtime config so the optimizer can call it directly.
+	if vmcp.Spec.EmbeddingServerRef != nil {
+		embeddingServiceURL, err := r.resolveEmbeddingServiceURL(ctx, vmcp)
+		if err != nil {
+			return fmt.Errorf("failed to resolve embedding service URL: %w", err)
+		}
+		if embeddingServiceURL != "" {
+			if config.Optimizer == nil {
+				config.Optimizer = &vmcpconfig.OptimizerConfig{}
+			}
+			config.Optimizer.EmbeddingService = embeddingServiceURL
+		}
+	}
+
 	// Process outgoing auth configuration for both inline and discovered modes
 	if err := r.processOutgoingAuth(ctx, vmcp, config, typedWorkloads, statusManager); err != nil {
 		return err

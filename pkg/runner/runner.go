@@ -33,7 +33,7 @@ import (
 	"github.com/stacklok/toolhive/pkg/secrets"
 	"github.com/stacklok/toolhive/pkg/telemetry"
 	"github.com/stacklok/toolhive/pkg/transport"
-	"github.com/stacklok/toolhive/pkg/transport/session"
+	transportsession "github.com/stacklok/toolhive/pkg/transport/session"
 	"github.com/stacklok/toolhive/pkg/transport/types"
 	vmcpconfig "github.com/stacklok/toolhive/pkg/vmcp/config"
 	"github.com/stacklok/toolhive/pkg/workloads/statuses"

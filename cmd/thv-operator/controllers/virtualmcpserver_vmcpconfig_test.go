@@ -1609,7 +1609,7 @@ func TestConfigMapContent_StaticMode_MergesDiscoveredAndExplicitBackends(t *test
 			Transport: vmcpconfig.TransportSSE,
 		},
 		Status: mcpv1alpha1.MCPServerStatus{
-			Phase: mcpv1alpha1.MCPServerPhaseRunning,
+			Phase: mcpv1alpha1.MCPServerPhaseReady,
 			URL:   "http://discovered-backend.default.svc.cluster.local:8080",
 		},
 	}

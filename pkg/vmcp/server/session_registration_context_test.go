@@ -41,6 +41,8 @@ func (*registrationContextRecordingManager) Terminate(string) (bool, error) {
 	return false, nil
 }
 
+func (*registrationContextRecordingManager) NotifyBackendExpired(string, string) {}
+
 func (m *registrationContextRecordingManager) CreateSession(
 	ctx context.Context,
 	_ string,
