@@ -43,6 +43,7 @@ import (
 	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/validation"
 	"github.com/stacklok/toolhive/pkg/container/kubernetes"
 	"github.com/stacklok/toolhive/pkg/transport"
+	vmcpconfig "github.com/stacklok/toolhive/pkg/vmcp/config"
 )
 
 // MCPServerReconciler reconciles a MCPServer object
@@ -52,6 +53,38 @@ type MCPServerReconciler struct {
 	Recorder         events.EventRecorder
 	PlatformDetector *ctrlutil.SharedPlatformDetector
 	ImageValidation  validation.ImageValidation
+}
+
+func (*MCPServerReconciler) buildSessionRedisCredentialEnvVars(mcpServer *mcpv1alpha1.MCPServer) []corev1.EnvVar {
+	if mcpServer.Spec.SessionStorage == nil ||
+		mcpServer.Spec.SessionStorage.Provider != mcpv1alpha1.SessionStorageProviderRedis {
+		return nil
+	}
+
+	env := []corev1.EnvVar{}
+	if mcpServer.Spec.SessionStorage.UsernameRef != nil {
+		env = append(env, corev1.EnvVar{
+			Name: vmcpconfig.RedisUsernameEnvVar,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: mcpServer.Spec.SessionStorage.UsernameRef.Name},
+					Key:                  mcpServer.Spec.SessionStorage.UsernameRef.Key,
+				},
+			},
+		})
+	}
+	if mcpServer.Spec.SessionStorage.PasswordRef != nil {
+		env = append(env, corev1.EnvVar{
+			Name: vmcpconfig.RedisPasswordEnvVar,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: mcpServer.Spec.SessionStorage.PasswordRef.Name},
+					Key:                  mcpServer.Spec.SessionStorage.PasswordRef.Key,
+				},
+			},
+		})
+	}
+	return env
 }
 
 // defaultRBACRules are the default RBAC rules that the
@@ -1149,6 +1182,7 @@ func (r *MCPServerReconciler) deploymentForMCPServer(
 		}
 	}
 
+	env = append(env, r.buildSessionRedisCredentialEnvVars(m)...)
 	// Add user-specified proxy environment variables from ResourceOverrides
 	if m.Spec.ResourceOverrides != nil && m.Spec.ResourceOverrides.ProxyDeployment != nil {
 		for _, envVar := range m.Spec.ResourceOverrides.ProxyDeployment.Env {
@@ -1762,6 +1796,7 @@ func (r *MCPServerReconciler) deploymentNeedsUpdate(
 			}
 		}
 
+		expectedProxyEnv = append(expectedProxyEnv, r.buildSessionRedisCredentialEnvVars(mcpServer)...)
 		// Add user-specified environment variables
 		if mcpServer.Spec.ResourceOverrides != nil && mcpServer.Spec.ResourceOverrides.ProxyDeployment != nil {
 			for _, envVar := range mcpServer.Spec.ResourceOverrides.ProxyDeployment.Env {

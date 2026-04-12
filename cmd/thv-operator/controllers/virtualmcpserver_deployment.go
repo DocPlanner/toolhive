@@ -355,7 +355,7 @@ func (r *VirtualMCPServerReconciler) buildEnvVarsForVmcp(
 	env = append(env, r.buildHMACSecretEnvVar(vmcp))
 
 	// Mount Redis password secret when session storage provider is Redis.
-	env = append(env, r.buildRedisPasswordEnvVar(vmcp)...)
+	env = append(env, r.buildRedisCredentialEnvVars(vmcp)...)
 
 	return ctrlutil.EnsureRequiredEnvVars(ctx, env), nil
 }
@@ -436,25 +436,42 @@ func (*VirtualMCPServerReconciler) buildHMACSecretEnvVar(vmcp *mcpv1alpha1.Virtu
 	}
 }
 
-// buildRedisPasswordEnvVar returns the THV_SESSION_REDIS_PASSWORD env var when
-// sessionStorage.provider == "redis" and passwordRef is set; returns nil otherwise.
-func (*VirtualMCPServerReconciler) buildRedisPasswordEnvVar(vmcp *mcpv1alpha1.VirtualMCPServer) []corev1.EnvVar {
+// buildRedisCredentialEnvVars returns the session Redis credential env vars when
+// sessionStorage.provider == "redis" and usernameRef/passwordRef are set.
+func (*VirtualMCPServerReconciler) buildRedisCredentialEnvVars(vmcp *mcpv1alpha1.VirtualMCPServer) []corev1.EnvVar {
 	if vmcp.Spec.SessionStorage == nil ||
-		vmcp.Spec.SessionStorage.Provider != mcpv1alpha1.SessionStorageProviderRedis ||
-		vmcp.Spec.SessionStorage.PasswordRef == nil {
+		vmcp.Spec.SessionStorage.Provider != mcpv1alpha1.SessionStorageProviderRedis {
 		return nil
 	}
-	return []corev1.EnvVar{{
-		Name: vmcpconfig.RedisPasswordEnvVar,
-		ValueFrom: &corev1.EnvVarSource{
-			SecretKeyRef: &corev1.SecretKeySelector{
-				LocalObjectReference: corev1.LocalObjectReference{
-					Name: vmcp.Spec.SessionStorage.PasswordRef.Name,
+
+	env := []corev1.EnvVar{}
+	if vmcp.Spec.SessionStorage.UsernameRef != nil {
+		env = append(env, corev1.EnvVar{
+			Name: vmcpconfig.RedisUsernameEnvVar,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: vmcp.Spec.SessionStorage.UsernameRef.Name,
+					},
+					Key: vmcp.Spec.SessionStorage.UsernameRef.Key,
 				},
-				Key: vmcp.Spec.SessionStorage.PasswordRef.Key,
 			},
-		},
-	}}
+		})
+	}
+	if vmcp.Spec.SessionStorage.PasswordRef != nil {
+		env = append(env, corev1.EnvVar{
+			Name: vmcpconfig.RedisPasswordEnvVar,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: vmcp.Spec.SessionStorage.PasswordRef.Name,
+					},
+					Key: vmcp.Spec.SessionStorage.PasswordRef.Key,
+				},
+			},
+		})
+	}
+	return env
 }
 
 // buildOutgoingAuthEnvVars builds environment variables for outgoing auth secrets.

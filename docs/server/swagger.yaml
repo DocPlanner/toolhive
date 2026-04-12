@@ -1285,7 +1285,8 @@ components:
       description: |-
         SessionRedis holds non-sensitive Redis connection parameters for distributed session storage.
         Populated only when MCPServer.spec.sessionStorage.provider == "redis".
-        The Redis password is not included — it is injected as env var THV_SESSION_REDIS_PASSWORD.
+        Redis credentials are not included — they are injected as env vars
+        THV_SESSION_REDIS_USERNAME and THV_SESSION_REDIS_PASSWORD when configured.
         +optional
       properties:
         address:

@@ -493,12 +493,18 @@ type AuthServerStorageConfig struct {
 	Redis *RedisStorageConfig `json:"redis,omitempty"`
 }
 
-// RedisStorageConfig configures Redis connection for auth server storage.
-// Redis is deployed in Sentinel mode with ACL user authentication (the only supported configuration).
+// RedisStorageConfig configures Redis-compatible storage for auth server state.
+// Use Address for a direct backend such as DragonflyDB, or SentinelConfig for HA Redis.
 type RedisStorageConfig struct {
-	// SentinelConfig holds Redis Sentinel configuration.
-	// +kubebuilder:validation:Required
-	SentinelConfig *RedisSentinelConfig `json:"sentinelConfig"`
+	// Address is the Redis-compatible server address for direct mode (host:port).
+	// Mutually exclusive with SentinelConfig.
+	// +optional
+	Address string `json:"address,omitempty"`
+
+	// SentinelConfig holds Redis Sentinel configuration for HA mode.
+	// Mutually exclusive with Address.
+	// +optional
+	SentinelConfig *RedisSentinelConfig `json:"sentinelConfig,omitempty"`
 
 	// ACLUserConfig configures Redis ACL user authentication.
 	// +kubebuilder:validation:Required
@@ -870,6 +876,10 @@ func (r *MCPExternalAuthConfig) validateEmbeddedAuthServer() error {
 		}
 	}
 
+	if err := r.validateAuthServerStorage(cfg.Storage); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -885,6 +895,33 @@ func (*MCPExternalAuthConfig) validateUpstreamProvider(index int, provider *Upst
 	}
 	if provider.Type != UpstreamProviderTypeOIDC && provider.Type != UpstreamProviderTypeOAuth2 {
 		return fmt.Errorf("%s: unsupported provider type: %s", prefix, provider.Type)
+	}
+
+	return nil
+}
+
+func (*MCPExternalAuthConfig) validateAuthServerStorage(cfg *AuthServerStorageConfig) error {
+	if cfg == nil || cfg.Type == AuthServerStorageTypeMemory {
+		return nil
+	}
+	if cfg.Type != AuthServerStorageTypeRedis {
+		return nil
+	}
+	if cfg.Redis == nil {
+		return fmt.Errorf("embeddedAuthServer.storage.redis is required when storage.type is 'redis'")
+	}
+
+	hasAddress := cfg.Redis.Address != ""
+	hasSentinel := cfg.Redis.SentinelConfig != nil
+
+	if !hasAddress && !hasSentinel {
+		return fmt.Errorf("embeddedAuthServer.storage.redis: address or sentinelConfig is required")
+	}
+	if hasAddress && hasSentinel {
+		return fmt.Errorf("embeddedAuthServer.storage.redis: address and sentinelConfig are mutually exclusive")
+	}
+	if hasAddress && cfg.Redis.SentinelTLS != nil {
+		return fmt.Errorf("embeddedAuthServer.storage.redis: sentinelTls requires sentinelConfig")
 	}
 
 	return nil

@@ -530,6 +530,10 @@ type SessionStorageConfig struct {
 	// PasswordRef is a reference to a Secret key containing the Redis password
 	// +optional
 	PasswordRef *SecretKeyRef `json:"passwordRef,omitempty"`
+
+	// UsernameRef is a reference to a Secret key containing the Redis ACL username
+	// +optional
+	UsernameRef *SecretKeyRef `json:"usernameRef,omitempty"`
 }
 
 // RateLimitConfig defines rate limiting configuration for an MCP server.

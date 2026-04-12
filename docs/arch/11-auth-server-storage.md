@@ -162,7 +162,8 @@ MCPExternalAuthConfig
   └── spec.embeddedAuthServer.storage
         ├── type: "memory" | "redis"
         └── redis
-              ├── sentinelConfig
+              ├── address (direct Redis-compatible mode)
+              ├── sentinelConfig (HA mode)
               │     ├── masterName
               │     ├── sentinelAddrs[] (or sentinelService)
               │     └── db

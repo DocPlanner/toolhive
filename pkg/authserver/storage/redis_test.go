@@ -101,9 +101,19 @@ func TestRedisConfig_Validation(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name:    "missing sentinel config",
+			name:    "missing redis connection config",
 			cfg:     RedisConfig{ACLUserConfig: &ACLUserConfig{}, KeyPrefix: "test:"},
-			wantErr: "sentinel configuration is required",
+			wantErr: "redis address or sentinel configuration is required",
+		},
+		{
+			name: "address and sentinel config are mutually exclusive",
+			cfg: RedisConfig{
+				Address:        "dragonfly:6379",
+				SentinelConfig: &SentinelConfig{MasterName: "mymaster", SentinelAddrs: []string{"localhost:26379"}},
+				ACLUserConfig:  &ACLUserConfig{},
+				KeyPrefix:      "test:",
+			},
+			wantErr: "redis address and sentinel configuration are mutually exclusive",
 		},
 		{
 			name:    "missing sentinel master name",
@@ -135,6 +145,16 @@ func TestRedisConfig_Validation(t *testing.T) {
 			cfg:     RedisConfig{SentinelConfig: &SentinelConfig{MasterName: "mymaster", SentinelAddrs: []string{"localhost:26379"}}, ACLUserConfig: &ACLUserConfig{Username: "user", Password: "pass"}},
 			wantErr: "key prefix is required",
 		},
+		{
+			name: "sentinel TLS requires sentinel mode",
+			cfg: RedisConfig{
+				Address:       "dragonfly:6379",
+				ACLUserConfig: &ACLUserConfig{Username: "user", Password: "pass"},
+				KeyPrefix:     "test:",
+				SentinelTLS:   &RedisTLSConfig{},
+			},
+			wantErr: "sentinel TLS configuration requires sentinel mode",
+		},
 	}
 
 	for _, tt := range tests {
@@ -147,6 +167,21 @@ func TestRedisConfig_Validation(t *testing.T) {
 	}
 }
 
+func TestRedisConfig_Validation_AcceptsDirectAddress(t *testing.T) {
+	t.Parallel()
+
+	cfg := RedisConfig{
+		Address: "dragonfly.default.svc.cluster.local:6379",
+		ACLUserConfig: &ACLUserConfig{
+			Username: "user",
+			Password: "pass",
+		},
+		KeyPrefix: "test:",
+	}
+
+	require.NoError(t, validateConfig(&cfg))
+}
+
 func TestNewRedisStorage_ConnectionFailure(t *testing.T) {
 	t.Parallel()
 
@@ -155,6 +190,27 @@ func TestNewRedisStorage_ConnectionFailure(t *testing.T) {
 			MasterName:    "mymaster",
 			SentinelAddrs: []string{"localhost:99999"}, // Invalid port
 		},
+		ACLUserConfig: &ACLUserConfig{
+			Username: "user",
+			Password: "pass",
+		},
+		KeyPrefix:   "test:",
+		DialTimeout: 100 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	_, err := NewRedisStorage(ctx, cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to connect to redis")
+}
+
+func TestNewRedisStorage_DirectConnectionFailure(t *testing.T) {
+	t.Parallel()
+
+	cfg := RedisConfig{
+		Address: "localhost:99999", // Invalid port
 		ACLUserConfig: &ACLUserConfig{
 			Username: "user",
 			Password: "pass",

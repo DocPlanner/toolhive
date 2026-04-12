@@ -978,7 +978,7 @@ func TestCreateStorage(t *testing.T) {
 		assert.Contains(t, err.Error(), "redis config is required")
 	})
 
-	t.Run("redis type with missing sentinel config returns error", func(t *testing.T) {
+	t.Run("redis type with missing connection config returns error", func(t *testing.T) {
 		t.Parallel()
 
 		_, err := createStorage(ctx, &storage.RunConfig{
@@ -992,7 +992,7 @@ func TestCreateStorage(t *testing.T) {
 			},
 		})
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "sentinel config is required")
+		assert.Contains(t, err.Error(), "redis address or sentinel config is required")
 	})
 }
 
@@ -1006,7 +1006,7 @@ func TestConvertRedisRunConfig(t *testing.T) {
 		assert.Contains(t, err.Error(), "redis config is required")
 	})
 
-	t.Run("missing sentinel config returns error", func(t *testing.T) {
+	t.Run("missing connection config returns error", func(t *testing.T) {
 		t.Parallel()
 		_, err := convertRedisRunConfig(&storage.RedisRunConfig{
 			KeyPrefix: "test:",
@@ -1016,7 +1016,25 @@ func TestConvertRedisRunConfig(t *testing.T) {
 			},
 		})
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "sentinel config is required")
+		assert.Contains(t, err.Error(), "redis address or sentinel config is required")
+	})
+
+	t.Run("address and sentinel config returns error", func(t *testing.T) {
+		t.Parallel()
+		_, err := convertRedisRunConfig(&storage.RedisRunConfig{
+			Address:   "dragonfly:6379",
+			KeyPrefix: "test:",
+			SentinelConfig: &storage.SentinelRunConfig{
+				MasterName:    "mymaster",
+				SentinelAddrs: []string{"localhost:26379"},
+			},
+			ACLUserConfig: &storage.ACLUserRunConfig{
+				UsernameEnvVar: "USER",
+				PasswordEnvVar: "PASS",
+			},
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "redis address and sentinel config are mutually exclusive")
 	})
 
 	t.Run("missing ACL user config returns error", func(t *testing.T) {
@@ -1088,6 +1106,34 @@ func TestConvertRedisRunConfig_WithEnvVars(t *testing.T) {
 		assert.Equal(t, 3*time.Second, cfg.WriteTimeout)
 	})
 
+	t.Run("direct address config with env vars resolves correctly", func(t *testing.T) {
+		t.Setenv("TEST_REDIS_USER_DIRECT", "myuser")
+		t.Setenv("TEST_REDIS_PASS_DIRECT", "mypass")
+
+		cfg, err := convertRedisRunConfig(&storage.RedisRunConfig{
+			Address:   "dragonfly.default.svc.cluster.local:6379",
+			KeyPrefix: "thv:auth:ns:name:",
+			ACLUserConfig: &storage.ACLUserRunConfig{
+				UsernameEnvVar: "TEST_REDIS_USER_DIRECT",
+				PasswordEnvVar: "TEST_REDIS_PASS_DIRECT",
+			},
+			DialTimeout:  "10s",
+			ReadTimeout:  "5s",
+			WriteTimeout: "3s",
+		})
+		require.NoError(t, err)
+		require.NotNil(t, cfg)
+
+		assert.Equal(t, "dragonfly.default.svc.cluster.local:6379", cfg.Address)
+		assert.Nil(t, cfg.SentinelConfig)
+		require.NotNil(t, cfg.ACLUserConfig)
+		assert.Equal(t, "myuser", cfg.ACLUserConfig.Username)
+		assert.Equal(t, "mypass", cfg.ACLUserConfig.Password)
+		assert.Equal(t, 10*time.Second, cfg.DialTimeout)
+		assert.Equal(t, 5*time.Second, cfg.ReadTimeout)
+		assert.Equal(t, 3*time.Second, cfg.WriteTimeout)
+	})
+
 	t.Run("invalid timeout duration returns error", func(t *testing.T) {
 		t.Setenv("TEST_REDIS_USER_TO", "myuser")
 		t.Setenv("TEST_REDIS_PASS_TO", "mypass")
@@ -1128,6 +1174,23 @@ func TestConvertRedisRunConfig_WithEnvVars(t *testing.T) {
 		assert.Zero(t, cfg.DialTimeout)
 		assert.Zero(t, cfg.ReadTimeout)
 		assert.Zero(t, cfg.WriteTimeout)
+	})
+
+	t.Run("direct address with sentinel TLS returns error", func(t *testing.T) {
+		t.Setenv("TEST_REDIS_USER_STLS", "myuser")
+		t.Setenv("TEST_REDIS_PASS_STLS", "mypass")
+
+		_, err := convertRedisRunConfig(&storage.RedisRunConfig{
+			Address:   "dragonfly.default.svc.cluster.local:6379",
+			KeyPrefix: "test:",
+			ACLUserConfig: &storage.ACLUserRunConfig{
+				UsernameEnvVar: "TEST_REDIS_USER_STLS",
+				PasswordEnvVar: "TEST_REDIS_PASS_STLS",
+			},
+			SentinelTLS: &storage.RedisTLSRunConfig{},
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "sentinel TLS config requires sentinel mode")
 	})
 }
 

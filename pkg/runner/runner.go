@@ -35,6 +35,7 @@ import (
 	"github.com/stacklok/toolhive/pkg/transport"
 	"github.com/stacklok/toolhive/pkg/transport/session"
 	"github.com/stacklok/toolhive/pkg/transport/types"
+	vmcpconfig "github.com/stacklok/toolhive/pkg/vmcp/config"
 	"github.com/stacklok/toolhive/pkg/workloads/statuses"
 )
 
@@ -112,6 +113,30 @@ func NewRunner(runConfig *RunConfig, statusManager statuses.StatusManager) *Runn
 		statusManager:       statusManager,
 		supportedMiddleware: GetSupportedMiddlewareFactories(),
 	}
+}
+
+func newTransportSessionStorage(
+	ctx context.Context,
+	scalingConfig *ScalingConfig,
+) (transportsession.Storage, error) {
+	if scalingConfig == nil || scalingConfig.SessionRedis == nil {
+		return nil, nil
+	}
+
+	redisCfg := transportsession.RedisConfig{
+		Addr:      scalingConfig.SessionRedis.Address,
+		Username:  os.Getenv(vmcpconfig.RedisUsernameEnvVar),
+		Password:  os.Getenv(vmcpconfig.RedisPasswordEnvVar),
+		DB:        int(scalingConfig.SessionRedis.DB),
+		KeyPrefix: scalingConfig.SessionRedis.KeyPrefix,
+	}
+
+	storage, err := transportsession.NewRedisStorage(ctx, redisCfg, transportsession.DefaultSessionTTL)
+	if err != nil {
+		return nil, fmt.Errorf("creating redis session storage: %w", err)
+	}
+
+	return storage, nil
 }
 
 // AddMiddleware adds a middleware instance and its function to the runner with a name
@@ -354,28 +379,13 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}
 
-	// When Redis session storage is configured, create a Redis-backed session store
-	// so sessions are shared across proxy replicas instead of being pod-local.
+	// When Redis session storage is configured, create a Redis-backed session
+	// store so sessions are shared across proxy replicas instead of being pod-local.
 	if r.Config.ScalingConfig != nil && r.Config.ScalingConfig.SessionRedis != nil {
-		redisCfg := r.Config.ScalingConfig.SessionRedis
-		keyPrefix := redisCfg.KeyPrefix
-		if keyPrefix == "" {
-			keyPrefix = "thv:proxy:session:"
-		}
-		storage, err := session.NewRedisStorage(ctx, session.RedisConfig{
-			Addr:      redisCfg.Address,
-			Password:  os.Getenv(session.RedisPasswordEnvVar),
-			DB:        int(redisCfg.DB),
-			KeyPrefix: keyPrefix,
-		}, session.DefaultSessionTTL)
+		storage, err := newTransportSessionStorage(ctx, r.Config.ScalingConfig)
 		if err != nil {
 			return fmt.Errorf("failed to create Redis session storage: %w", err)
 		}
-		slog.Info("using Redis session storage",
-			"address", redisCfg.Address,
-			"db", redisCfg.DB,
-			"key_prefix", keyPrefix,
-		)
 		transportConfig.SessionStorage = storage
 	}
 

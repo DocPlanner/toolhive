@@ -1433,6 +1433,27 @@ func TestBuildStorageRunConfig(t *testing.T) {
 			},
 		},
 		{
+			name: "Redis storage with direct address builds correctly",
+			authConfig: &mcpv1alpha1.EmbeddedAuthServerConfig{
+				Issuer: "https://auth.example.com",
+				Storage: &mcpv1alpha1.AuthServerStorageConfig{
+					Type: mcpv1alpha1.AuthServerStorageTypeRedis,
+					Redis: &mcpv1alpha1.RedisStorageConfig{
+						Address: "dragonfly.toolhive-operator-stg.svc.cluster.local:6379",
+						ACLUserConfig: &mcpv1alpha1.RedisACLUserConfig{
+							UsernameSecretRef: &mcpv1alpha1.SecretKeyRef{Name: "s", Key: "u"},
+							PasswordSecretRef: &mcpv1alpha1.SecretKeyRef{Name: "s", Key: "p"},
+						},
+					},
+				},
+			},
+			checkFunc: func(t *testing.T, cfg *storage.RunConfig) {
+				t.Helper()
+				assert.Equal(t, "dragonfly.toolhive-operator-stg.svc.cluster.local:6379", cfg.RedisConfig.Address)
+				assert.Nil(t, cfg.RedisConfig.SentinelConfig)
+			},
+		},
+		{
 			name: "Redis storage without redis config returns error",
 			authConfig: &mcpv1alpha1.EmbeddedAuthServerConfig{
 				Issuer: "https://auth.example.com",
@@ -1444,7 +1465,7 @@ func TestBuildStorageRunConfig(t *testing.T) {
 			errContains: "redis config is required",
 		},
 		{
-			name: "Redis storage without sentinel config returns error",
+			name: "Redis storage without address or sentinel config returns error",
 			authConfig: &mcpv1alpha1.EmbeddedAuthServerConfig{
 				Issuer: "https://auth.example.com",
 				Storage: &mcpv1alpha1.AuthServerStorageConfig{
@@ -1458,7 +1479,29 @@ func TestBuildStorageRunConfig(t *testing.T) {
 				},
 			},
 			wantErr:     true,
-			errContains: "sentinel config is required",
+			errContains: "redis address or sentinel config is required",
+		},
+		{
+			name: "Redis storage with address and sentinel config returns error",
+			authConfig: &mcpv1alpha1.EmbeddedAuthServerConfig{
+				Issuer: "https://auth.example.com",
+				Storage: &mcpv1alpha1.AuthServerStorageConfig{
+					Type: mcpv1alpha1.AuthServerStorageTypeRedis,
+					Redis: &mcpv1alpha1.RedisStorageConfig{
+						Address: "dragonfly:6379",
+						SentinelConfig: &mcpv1alpha1.RedisSentinelConfig{
+							MasterName:    "mymaster",
+							SentinelAddrs: []string{"10.0.0.1:26379"},
+						},
+						ACLUserConfig: &mcpv1alpha1.RedisACLUserConfig{
+							UsernameSecretRef: &mcpv1alpha1.SecretKeyRef{Name: "s", Key: "u"},
+							PasswordSecretRef: &mcpv1alpha1.SecretKeyRef{Name: "s", Key: "p"},
+						},
+					},
+				},
+			},
+			wantErr:     true,
+			errContains: "redis address and sentinel config are mutually exclusive",
 		},
 		{
 			name: "Redis storage without ACL user config returns error",
@@ -1476,6 +1519,25 @@ func TestBuildStorageRunConfig(t *testing.T) {
 			},
 			wantErr:     true,
 			errContains: "ACL user config is required",
+		},
+		{
+			name: "Redis storage with direct address and sentinel TLS returns error",
+			authConfig: &mcpv1alpha1.EmbeddedAuthServerConfig{
+				Issuer: "https://auth.example.com",
+				Storage: &mcpv1alpha1.AuthServerStorageConfig{
+					Type: mcpv1alpha1.AuthServerStorageTypeRedis,
+					Redis: &mcpv1alpha1.RedisStorageConfig{
+						Address: "dragonfly:6379",
+						ACLUserConfig: &mcpv1alpha1.RedisACLUserConfig{
+							UsernameSecretRef: &mcpv1alpha1.SecretKeyRef{Name: "s", Key: "u"},
+							PasswordSecretRef: &mcpv1alpha1.SecretKeyRef{Name: "s", Key: "p"},
+						},
+						SentinelTLS: &mcpv1alpha1.RedisTLSConfig{},
+					},
+				},
+			},
+			wantErr:     true,
+			errContains: "sentinel TLS requires sentinel config",
 		},
 	}
 
@@ -1546,6 +1608,45 @@ func TestBuildAuthServerRunConfig_WithRedisStorage(t *testing.T) {
 	assert.Equal(t, string(storage.TypeRedis), config.Storage.Type)
 	require.NotNil(t, config.Storage.RedisConfig)
 	assert.Equal(t, "mymaster", config.Storage.RedisConfig.SentinelConfig.MasterName)
+	assert.Equal(t, authrunner.RedisUsernameEnvVar, config.Storage.RedisConfig.ACLUserConfig.UsernameEnvVar)
+}
+
+func TestBuildAuthServerRunConfig_WithDirectRedisStorage(t *testing.T) {
+	t.Parallel()
+
+	authConfig := &mcpv1alpha1.EmbeddedAuthServerConfig{
+		Issuer: "https://auth.example.com",
+		SigningKeySecretRefs: []mcpv1alpha1.SecretKeyRef{
+			{Name: "signing-key", Key: "private.pem"},
+		},
+		HMACSecretRefs: []mcpv1alpha1.SecretKeyRef{
+			{Name: "hmac-secret", Key: "hmac"},
+		},
+		Storage: &mcpv1alpha1.AuthServerStorageConfig{
+			Type: mcpv1alpha1.AuthServerStorageTypeRedis,
+			Redis: &mcpv1alpha1.RedisStorageConfig{
+				Address: "dragonfly.toolhive-operator-stg.svc.cluster.local:6379",
+				ACLUserConfig: &mcpv1alpha1.RedisACLUserConfig{
+					UsernameSecretRef: &mcpv1alpha1.SecretKeyRef{Name: "redis-creds", Key: "username"},
+					PasswordSecretRef: &mcpv1alpha1.SecretKeyRef{Name: "redis-creds", Key: "password"},
+				},
+			},
+		},
+	}
+
+	config, err := BuildAuthServerRunConfig(
+		"default", "my-mcp-server", authConfig,
+		[]string{"http://test-server.default.svc.cluster.local:8080"},
+		[]string{"openid"},
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, config)
+	require.NotNil(t, config.Storage)
+	assert.Equal(t, string(storage.TypeRedis), config.Storage.Type)
+	require.NotNil(t, config.Storage.RedisConfig)
+	assert.Equal(t, "dragonfly.toolhive-operator-stg.svc.cluster.local:6379", config.Storage.RedisConfig.Address)
+	assert.Nil(t, config.Storage.RedisConfig.SentinelConfig)
 	assert.Equal(t, authrunner.RedisUsernameEnvVar, config.Storage.RedisConfig.ACLUserConfig.UsernameEnvVar)
 }
 
@@ -1827,8 +1928,6 @@ func TestValidateAndAddAuthServerRefOptions(t *testing.T) {
 				builder = builder.WithRuntimeObjects(tt.objects()...)
 			}
 
-			// For the "non-NotFound fetch error" test case, inject a Get interceptor
-			// that returns a transient error for the specific resource name.
 			if tt.name == "non-NotFound fetch error for externalAuthConfigRef is returned" {
 				builder = builder.WithInterceptorFuncs(interceptor.Funcs{
 					Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {

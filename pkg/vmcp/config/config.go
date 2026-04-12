@@ -20,6 +20,12 @@ import (
 	authtypes "github.com/stacklok/toolhive/pkg/vmcp/auth/types"
 )
 
+// RedisUsernameEnvVar is the environment variable name for the Redis session storage username.
+// The operator injects this as a SecretKeyRef when sessionStorage.provider is "redis"
+// and usernameRef is set. The vMCP process reads this at startup to authenticate to Redis.
+// #nosec G101 -- This is an environment variable name, not a hardcoded credential
+const RedisUsernameEnvVar = "THV_SESSION_REDIS_USERNAME"
+
 // RedisPasswordEnvVar is the environment variable name for the Redis session storage password.
 // The operator injects this as a SecretKeyRef when sessionStorage.provider is "redis"
 // and passwordRef is set. The vMCP process reads this at startup to authenticate to Redis.
@@ -903,8 +909,9 @@ type OptimizerConfig struct {
 }
 
 // SessionStorageConfig configures session storage for stateful horizontal scaling.
-// The Redis password is not stored here; it is injected as the THV_SESSION_REDIS_PASSWORD
-// environment variable by the operator when spec.sessionStorage.passwordRef is set.
+// Redis credentials are not stored here; they are injected as the
+// THV_SESSION_REDIS_USERNAME / THV_SESSION_REDIS_PASSWORD environment variables
+// by the operator when spec.sessionStorage.usernameRef / passwordRef are set.
 // +kubebuilder:object:generate=true
 // +gendoc
 type SessionStorageConfig struct {

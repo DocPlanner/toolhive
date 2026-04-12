@@ -347,6 +347,7 @@ func buildSessionDataStorage(ctx context.Context, cfg *Config) (transportsession
 	}
 	redisCfg := transportsession.RedisConfig{
 		Addr:      cfg.SessionStorage.Address,
+		Username:  os.Getenv(vmcpconfig.RedisUsernameEnvVar),
 		Password:  os.Getenv(vmcpconfig.RedisPasswordEnvVar),
 		DB:        int(cfg.SessionStorage.DB),
 		KeyPrefix: keyPrefix,

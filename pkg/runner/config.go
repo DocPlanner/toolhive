@@ -268,14 +268,15 @@ type ScalingConfig struct {
 
 	// SessionRedis holds non-sensitive Redis connection parameters for distributed session storage.
 	// Populated only when MCPServer.spec.sessionStorage.provider == "redis".
-	// The Redis password is not included — it is injected as env var THV_SESSION_REDIS_PASSWORD.
+	// Redis credentials are not included — they are injected as env vars
+	// THV_SESSION_REDIS_USERNAME / THV_SESSION_REDIS_PASSWORD.
 	// +optional
 	SessionRedis *SessionRedisConfig `json:"session_redis,omitempty" yaml:"session_redis,omitempty"`
 }
 
 // SessionRedisConfig contains non-sensitive Redis connection parameters used for distributed
 // session storage when the operator is configured with sessionStorage.provider == "redis".
-// The Redis password is excluded and injected separately as env var THV_SESSION_REDIS_PASSWORD.
+// Redis credentials are excluded and injected separately as env vars.
 type SessionRedisConfig struct {
 	// Address is the Redis server address (host:port).
 	Address string `json:"address,omitempty" yaml:"address,omitempty"`

@@ -470,16 +470,23 @@ func convertRedisRunConfig(rc *storage.RedisRunConfig) (*storage.RedisConfig, er
 
 	cfg := &storage.RedisConfig{
 		KeyPrefix: rc.KeyPrefix,
+		Address:   rc.Address,
 	}
 
-	// Convert Sentinel config
-	if rc.SentinelConfig == nil {
-		return nil, fmt.Errorf("sentinel config is required")
-	}
-	cfg.SentinelConfig = &storage.SentinelConfig{
-		MasterName:    rc.SentinelConfig.MasterName,
-		SentinelAddrs: rc.SentinelConfig.SentinelAddrs,
-		DB:            rc.SentinelConfig.DB,
+	hasAddress := rc.Address != ""
+	hasSentinel := rc.SentinelConfig != nil
+
+	switch {
+	case !hasAddress && !hasSentinel:
+		return nil, fmt.Errorf("redis address or sentinel config is required")
+	case hasAddress && hasSentinel:
+		return nil, fmt.Errorf("redis address and sentinel config are mutually exclusive")
+	case hasSentinel:
+		cfg.SentinelConfig = &storage.SentinelConfig{
+			MasterName:    rc.SentinelConfig.MasterName,
+			SentinelAddrs: rc.SentinelConfig.SentinelAddrs,
+			DB:            rc.SentinelConfig.DB,
+		}
 	}
 
 	// Resolve ACL credentials from environment variables
@@ -528,6 +535,9 @@ func convertRedisRunConfig(rc *storage.RedisRunConfig) (*storage.RedisConfig, er
 	}
 	cfg.TLS = tlsCfg
 
+	if !hasSentinel && rc.SentinelTLS != nil {
+		return nil, fmt.Errorf("sentinel TLS config requires sentinel mode")
+	}
 	sentinelTLSCfg, err := convertRedisTLSRunConfig(rc.SentinelTLS)
 	if err != nil {
 		return nil, fmt.Errorf("sentinel TLS config: %w", err)

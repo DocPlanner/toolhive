@@ -389,6 +389,31 @@ func TestMCPExternalAuthConfig_validateEmbeddedAuthServer(t *testing.T) {
 			expectErr: false,
 		},
 		{
+			name: "direct redis storage - valid",
+			config: &MCPExternalAuthConfig{
+				Spec: MCPExternalAuthConfigSpec{
+					Type: ExternalAuthTypeEmbeddedAuthServer,
+					EmbeddedAuthServer: &EmbeddedAuthServerConfig{
+						Issuer: "https://auth.example.com",
+						UpstreamProviders: []UpstreamProviderConfig{
+							{
+								Name:       "github",
+								Type:       UpstreamProviderTypeOIDC,
+								OIDCConfig: &OIDCUpstreamConfig{IssuerURL: "https://github.com", ClientID: "client-id"},
+							},
+						},
+						Storage: &AuthServerStorageConfig{
+							Type: AuthServerStorageTypeRedis,
+							Redis: &RedisStorageConfig{
+								Address: "dragonfly.default.svc.cluster.local:6379",
+							},
+						},
+					},
+				},
+			},
+			expectErr: false,
+		},
+		{
 			name: "empty providers array - invalid",
 			config: &MCPExternalAuthConfig{
 				Spec: MCPExternalAuthConfigSpec{
@@ -403,6 +428,59 @@ func TestMCPExternalAuthConfig_validateEmbeddedAuthServer(t *testing.T) {
 			errMsg:    "at least one upstream provider is required",
 		},
 		{
+			name: "redis storage without address or sentinel config - invalid",
+			config: &MCPExternalAuthConfig{
+				Spec: MCPExternalAuthConfigSpec{
+					Type: ExternalAuthTypeEmbeddedAuthServer,
+					EmbeddedAuthServer: &EmbeddedAuthServerConfig{
+						Issuer: "https://auth.example.com",
+						UpstreamProviders: []UpstreamProviderConfig{
+							{
+								Name:       "github",
+								Type:       UpstreamProviderTypeOIDC,
+								OIDCConfig: &OIDCUpstreamConfig{IssuerURL: "https://github.com", ClientID: "client-id"},
+							},
+						},
+						Storage: &AuthServerStorageConfig{
+							Type:  AuthServerStorageTypeRedis,
+							Redis: &RedisStorageConfig{},
+						},
+					},
+				},
+			},
+			expectErr: true,
+			errMsg:    "embeddedAuthServer.storage.redis: address or sentinelConfig is required",
+		},
+		{
+			name: "redis storage with address and sentinel config - invalid",
+			config: &MCPExternalAuthConfig{
+				Spec: MCPExternalAuthConfigSpec{
+					Type: ExternalAuthTypeEmbeddedAuthServer,
+					EmbeddedAuthServer: &EmbeddedAuthServerConfig{
+						Issuer: "https://auth.example.com",
+						UpstreamProviders: []UpstreamProviderConfig{
+							{
+								Name:       "github",
+								Type:       UpstreamProviderTypeOIDC,
+								OIDCConfig: &OIDCUpstreamConfig{IssuerURL: "https://github.com", ClientID: "client-id"},
+							},
+						},
+						Storage: &AuthServerStorageConfig{
+							Type: AuthServerStorageTypeRedis,
+							Redis: &RedisStorageConfig{
+								Address: "dragonfly:6379",
+								SentinelConfig: &RedisSentinelConfig{
+									MasterName: "mymaster",
+								},
+							},
+						},
+					},
+				},
+			},
+			expectErr: true,
+			errMsg:    "embeddedAuthServer.storage.redis: address and sentinelConfig are mutually exclusive",
+		},
+		{
 			name: "nil embedded auth server config",
 			config: &MCPExternalAuthConfig{
 				Spec: MCPExternalAuthConfigSpec{
@@ -411,6 +489,33 @@ func TestMCPExternalAuthConfig_validateEmbeddedAuthServer(t *testing.T) {
 				},
 			},
 			expectErr: false, // validateEmbeddedAuthServer returns nil if config is nil
+		},
+		{
+			name: "redis storage with direct address and sentinel TLS - invalid",
+			config: &MCPExternalAuthConfig{
+				Spec: MCPExternalAuthConfigSpec{
+					Type: ExternalAuthTypeEmbeddedAuthServer,
+					EmbeddedAuthServer: &EmbeddedAuthServerConfig{
+						Issuer: "https://auth.example.com",
+						UpstreamProviders: []UpstreamProviderConfig{
+							{
+								Name:       "github",
+								Type:       UpstreamProviderTypeOIDC,
+								OIDCConfig: &OIDCUpstreamConfig{IssuerURL: "https://github.com", ClientID: "client-id"},
+							},
+						},
+						Storage: &AuthServerStorageConfig{
+							Type: AuthServerStorageTypeRedis,
+							Redis: &RedisStorageConfig{
+								Address:     "dragonfly:6379",
+								SentinelTLS: &RedisTLSConfig{},
+							},
+						},
+					},
+				},
+			},
+			expectErr: true,
+			errMsg:    "embeddedAuthServer.storage.redis: sentinelTls requires sentinelConfig",
 		},
 	}
 

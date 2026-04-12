@@ -1,20 +1,20 @@
-# Redis Sentinel Storage for Auth Server
+# Redis-Compatible Storage for Auth Server
 
-This guide explains how to configure Redis Sentinel as the storage backend for ToolHive's embedded authorization server, enabling horizontal scaling across multiple auth server replicas.
+This guide explains how to configure Redis-compatible storage as the backend for ToolHive's embedded authorization server, enabling horizontal scaling across multiple auth server replicas.
 
 ## Overview
 
-By default, ToolHive's embedded auth server uses in-memory storage. This works well for single-instance deployments but does not support horizontal scaling since each replica has its own isolated state. Redis Sentinel provides a shared, highly available storage backend that enables multiple auth server replicas to share OAuth 2.0 state (tokens, authorization codes, clients, and user data).
+By default, ToolHive's embedded auth server uses in-memory storage. This works well for single-instance deployments but does not support horizontal scaling since each replica has its own isolated state. Redis-compatible storage provides a shared backend that enables multiple auth server replicas to share OAuth 2.0 state (tokens, authorization codes, clients, and user data).
 
 **Key design decisions:**
 
-- **Sentinel-only**: Only Redis Sentinel deployments are supported (not standalone or cluster mode). Sentinel provides automatic failover and high availability without the complexity of Redis Cluster.
+- **Direct or Sentinel mode**: ToolHive supports either a direct Redis-compatible address (for example DragonflyDB) or a Redis Sentinel deployment for automatic failover and high availability.
 - **ACL user authentication**: Only Redis ACL user authentication is supported. This is the modern Redis authentication mechanism (Redis 6+) that provides fine-grained access control.
 - **Multi-tenancy via key prefixes**: Each auth server instance uses a unique key prefix (`thv:auth:{namespace:name}:`) to isolate its data, allowing multiple auth servers to share the same Redis deployment.
 
 ## Prerequisites
 
-- A running Redis Sentinel deployment (Redis 6+ for ACL support)
+- A running Redis-compatible backend (Redis 6+ for ACL support)
 - Redis ACL user configured with appropriate permissions
 - For Kubernetes: Secrets containing Redis credentials
 
@@ -26,6 +26,37 @@ By default, ToolHive's embedded auth server uses in-memory storage. This works w
 ### Kubernetes (MCPExternalAuthConfig CRD)
 
 When using the ToolHive operator, Redis storage is configured through the `storage` field in the embedded auth server section of `MCPExternalAuthConfig`.
+
+Use `address` for direct Redis-compatible deployments such as DragonflyDB:
+
+```yaml
+apiVersion: toolhive.stacklok.dev/v1alpha1
+kind: MCPExternalAuthConfig
+metadata:
+  name: my-auth-config
+  namespace: default
+spec:
+  type: embeddedAuthServer
+  embeddedAuthServer:
+    storage:
+      type: redis
+      redis:
+        address: dragonfly.default.svc.cluster.local:6379
+        aclUserConfig:
+          usernameSecretRef:
+            name: redis-credentials
+            key: username
+          passwordSecretRef:
+            name: redis-credentials
+            key: password
+
+        # Optional timeouts (shown with defaults)
+        dialTimeout: "5s"
+        readTimeout: "3s"
+        writeTimeout: "3s"
+```
+
+Use `sentinelConfig` for HA Redis deployments:
 
 ```yaml
 apiVersion: toolhive.stacklok.dev/v1alpha1
@@ -72,14 +103,14 @@ Instead of listing Sentinel addresses directly, you can reference a Kubernetes S
 storage:
   type: redis
   redis:
-    sentinelConfig:
-      masterName: mymaster
-      # Option 2: Kubernetes Service discovery
-      sentinelService:
-        name: rfs-redis-sentinel
-        namespace: redis    # defaults to same namespace if omitted
-        port: 26379         # defaults to 26379 if omitted
-      db: 0
+        sentinelConfig:
+          masterName: mymaster
+          # Option 2: Kubernetes Service discovery
+          sentinelService:
+            name: rfs-redis-sentinel
+            namespace: redis    # defaults to same namespace if omitted
+            port: 26379         # defaults to 26379 if omitted
+          db: 0
 
     aclUserConfig:
       usernameSecretRef:
@@ -90,7 +121,7 @@ storage:
         key: password
 ```
 
-> **Note:** `sentinelAddrs` and `sentinelService` are mutually exclusive. Specify one or the other.
+> **Note:** `address` and `sentinelConfig` are mutually exclusive. Within `sentinelConfig`, `sentinelAddrs` and `sentinelService` are also mutually exclusive.
 
 #### Redis Credentials Secret
 
@@ -116,15 +147,7 @@ When the auth server configuration is serialized for passing across process boun
 {
   "type": "redis",
   "redisConfig": {
-    "sentinelConfig": {
-      "masterName": "mymaster",
-      "sentinelAddrs": [
-        "redis-sentinel-0:26379",
-        "redis-sentinel-1:26379",
-        "redis-sentinel-2:26379"
-      ],
-      "db": 0
-    },
+    "address": "dragonfly.default.svc.cluster.local:6379",
     "authType": "aclUser",
     "aclUserConfig": {
       "usernameEnvVar": "TOOLHIVE_AS_REDIS_USERNAME",
@@ -221,7 +244,7 @@ This ACL entry:
 
 ### Step 4: Create the ToolHive Auth Config
 
-With the Redis Sentinel cluster running, configure ToolHive to use it:
+With the Redis backend running, configure ToolHive to use it:
 
 ```yaml
 # Redis credentials Secret
@@ -257,11 +280,7 @@ spec:
     storage:
       type: redis
       redis:
-        sentinelConfig:
-          masterName: mymaster
-          sentinelService:
-            name: rfs-redis-sentinel
-            namespace: redis
+        address: dragonfly.default.svc.cluster.local:6379
         aclUserConfig:
           usernameSecretRef:
             name: redis-credentials
@@ -388,7 +407,8 @@ Secondary index cleanup is best-effort: stale entries may remain temporarily but
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `sentinelConfig` | `RedisSentinelConfig` | Yes | — | Sentinel connection settings |
+| `address` | `string` | One of address/sentinelConfig | — | Direct Redis-compatible host:port address |
+| `sentinelConfig` | `RedisSentinelConfig` | One of address/sentinelConfig | — | Sentinel connection settings |
 | `aclUserConfig` | `RedisACLUserConfig` | Yes | — | ACL user credentials |
 | `dialTimeout` | `string` | No | `5s` | Connection establishment timeout |
 | `readTimeout` | `string` | No | `3s` | Socket read timeout |

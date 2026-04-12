@@ -91,11 +91,12 @@ func TestDeploymentForVirtualMCPServer(t *testing.T) {
 	assert.Equal(t, resource.MustParse("512Mi"), container.Resources.Limits[corev1.ResourceMemory])
 }
 
-// TestDeploymentForVirtualMCPServer_WithRedisPassword tests that the deployment pod
-// spec includes THV_SESSION_REDIS_PASSWORD when spec.sessionStorage has a passwordRef.
-func TestDeploymentForVirtualMCPServer_WithRedisPassword(t *testing.T) {
+// TestDeploymentForVirtualMCPServer_WithRedisCredentials tests that the deployment pod
+// spec includes Redis ACL env vars when sessionStorage references Redis credentials.
+func TestDeploymentForVirtualMCPServer_WithRedisCredentials(t *testing.T) {
 	t.Parallel()
 
+	usernameRef := &mcpv1alpha1.SecretKeyRef{Name: "session-redis-credentials", Key: "username"}
 	passwordRef := &mcpv1alpha1.SecretKeyRef{Name: "redis-secret", Key: "password"}
 
 	vmcp := &mcpv1alpha1.VirtualMCPServer{
@@ -108,6 +109,7 @@ func TestDeploymentForVirtualMCPServer_WithRedisPassword(t *testing.T) {
 			SessionStorage: &mcpv1alpha1.SessionStorageConfig{
 				Provider:    mcpv1alpha1.SessionStorageProviderRedis,
 				Address:     "redis:6379",
+				UsernameRef: usernameRef,
 				PasswordRef: passwordRef,
 			},
 		},
@@ -126,10 +128,19 @@ func TestDeploymentForVirtualMCPServer_WithRedisPassword(t *testing.T) {
 	require.Len(t, deployment.Spec.Template.Spec.Containers, 1)
 
 	container := deployment.Spec.Template.Spec.Containers[0]
-	var found bool
+	var foundUsername bool
+	var foundPassword bool
 	for _, e := range container.Env {
+		if e.Name == vmcpconfig.RedisUsernameEnvVar {
+			foundUsername = true
+			assert.Empty(t, e.Value, "username must not appear as plaintext")
+			require.NotNil(t, e.ValueFrom)
+			require.NotNil(t, e.ValueFrom.SecretKeyRef)
+			assert.Equal(t, usernameRef.Name, e.ValueFrom.SecretKeyRef.Name)
+			assert.Equal(t, usernameRef.Key, e.ValueFrom.SecretKeyRef.Key)
+		}
 		if e.Name == vmcpconfig.RedisPasswordEnvVar {
-			found = true
+			foundPassword = true
 			assert.Empty(t, e.Value, "password must not appear as plaintext")
 			require.NotNil(t, e.ValueFrom)
 			require.NotNil(t, e.ValueFrom.SecretKeyRef)
@@ -137,7 +148,8 @@ func TestDeploymentForVirtualMCPServer_WithRedisPassword(t *testing.T) {
 			assert.Equal(t, passwordRef.Key, e.ValueFrom.SecretKeyRef.Key)
 		}
 	}
-	assert.True(t, found, "deployment should contain %s env var", vmcpconfig.RedisPasswordEnvVar)
+	assert.True(t, foundUsername, "deployment should contain %s env var", vmcpconfig.RedisUsernameEnvVar)
+	assert.True(t, foundPassword, "deployment should contain %s env var", vmcpconfig.RedisPasswordEnvVar)
 }
 
 // TestBuildContainerArgsForVmcp tests container argument generation
@@ -270,38 +282,53 @@ func TestBuildEnvVarsForVmcp(t *testing.T) {
 	assert.True(t, foundPodIP, "Should have POD_IP env var")
 }
 
-// TestBuildRedisPasswordEnvVar tests conditional Redis password env var injection.
-func TestBuildRedisPasswordEnvVar(t *testing.T) {
+// TestBuildRedisCredentialEnvVars tests conditional Redis session credential env var injection.
+func TestBuildRedisCredentialEnvVars(t *testing.T) {
 	t.Parallel()
 
 	r := &VirtualMCPServerReconciler{}
 
+	usernameRef := &mcpv1alpha1.SecretKeyRef{Name: "session-redis-credentials", Key: "username"}
 	passwordRef := &mcpv1alpha1.SecretKeyRef{Name: "redis-secret", Key: "password"}
 
 	tests := []struct {
-		name        string
-		storage     *mcpv1alpha1.SessionStorageConfig
-		expectEnVar bool
+		name          string
+		storage       *mcpv1alpha1.SessionStorageConfig
+		expectedNames []string
 	}{
 		{
-			name:        "nil sessionStorage produces no env var",
-			storage:     nil,
-			expectEnVar: false,
+			name:          "nil sessionStorage produces no env var",
+			storage:       nil,
+			expectedNames: nil,
 		},
 		{
-			name:        "memory provider produces no env var",
-			storage:     &mcpv1alpha1.SessionStorageConfig{Provider: "memory"},
-			expectEnVar: false,
+			name:          "memory provider produces no env var",
+			storage:       &mcpv1alpha1.SessionStorageConfig{Provider: "memory"},
+			expectedNames: nil,
 		},
 		{
-			name:        "redis without passwordRef produces no env var",
-			storage:     &mcpv1alpha1.SessionStorageConfig{Provider: mcpv1alpha1.SessionStorageProviderRedis, Address: "redis:6379"},
-			expectEnVar: false,
+			name:          "redis without credential refs produces no env var",
+			storage:       &mcpv1alpha1.SessionStorageConfig{Provider: mcpv1alpha1.SessionStorageProviderRedis, Address: "redis:6379"},
+			expectedNames: nil,
 		},
 		{
-			name:        "redis with passwordRef produces THV_SESSION_REDIS_PASSWORD",
-			storage:     &mcpv1alpha1.SessionStorageConfig{Provider: mcpv1alpha1.SessionStorageProviderRedis, Address: "redis:6379", PasswordRef: passwordRef},
-			expectEnVar: true,
+			name: "redis with passwordRef produces THV_SESSION_REDIS_PASSWORD",
+			storage: &mcpv1alpha1.SessionStorageConfig{
+				Provider:    mcpv1alpha1.SessionStorageProviderRedis,
+				Address:     "redis:6379",
+				PasswordRef: passwordRef,
+			},
+			expectedNames: []string{vmcpconfig.RedisPasswordEnvVar},
+		},
+		{
+			name: "redis with usernameRef and passwordRef produces both env vars",
+			storage: &mcpv1alpha1.SessionStorageConfig{
+				Provider:    mcpv1alpha1.SessionStorageProviderRedis,
+				Address:     "redis:6379",
+				UsernameRef: usernameRef,
+				PasswordRef: passwordRef,
+			},
+			expectedNames: []string{vmcpconfig.RedisUsernameEnvVar, vmcpconfig.RedisPasswordEnvVar},
 		},
 	}
 
@@ -312,17 +339,24 @@ func TestBuildRedisPasswordEnvVar(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Name: "test-vmcp", Namespace: "default"},
 				Spec:       mcpv1alpha1.VirtualMCPServerSpec{SessionStorage: tc.storage},
 			}
-			env := r.buildRedisPasswordEnvVar(vmcp)
-			if tc.expectEnVar {
-				require.Len(t, env, 1)
-				assert.Equal(t, vmcpconfig.RedisPasswordEnvVar, env[0].Name)
-				assert.Empty(t, env[0].Value, "must not use plaintext Value")
-				require.NotNil(t, env[0].ValueFrom)
-				require.NotNil(t, env[0].ValueFrom.SecretKeyRef)
-				assert.Equal(t, passwordRef.Name, env[0].ValueFrom.SecretKeyRef.Name)
-				assert.Equal(t, passwordRef.Key, env[0].ValueFrom.SecretKeyRef.Key)
-			} else {
-				assert.Empty(t, env)
+			env := r.buildRedisCredentialEnvVars(vmcp)
+			require.Len(t, env, len(tc.expectedNames))
+
+			for i, envName := range tc.expectedNames {
+				assert.Equal(t, envName, env[i].Name)
+				assert.Empty(t, env[i].Value, "must not use plaintext Value")
+				require.NotNil(t, env[i].ValueFrom)
+				require.NotNil(t, env[i].ValueFrom.SecretKeyRef)
+			}
+
+			if len(tc.expectedNames) == 2 {
+				assert.Equal(t, usernameRef.Name, env[0].ValueFrom.SecretKeyRef.Name)
+				assert.Equal(t, usernameRef.Key, env[0].ValueFrom.SecretKeyRef.Key)
+			}
+			if len(tc.expectedNames) > 0 {
+				last := env[len(env)-1]
+				assert.Equal(t, passwordRef.Name, last.ValueFrom.SecretKeyRef.Name)
+				assert.Equal(t, passwordRef.Key, last.ValueFrom.SecretKeyRef.Key)
 			}
 		})
 	}

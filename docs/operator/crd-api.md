@@ -275,7 +275,7 @@ _Appears in:_
 | `telemetry` _[pkg.telemetry.Config](#pkgtelemetryconfig)_ | Telemetry configures OpenTelemetry-based observability for the Virtual MCP server<br />including distributed tracing, OTLP metrics export, and Prometheus metrics endpoint. |  | Optional: \{\} <br /> |
 | `audit` _[pkg.audit.Config](#pkgauditconfig)_ | Audit configures audit logging for the Virtual MCP server.<br />When present, audit logs include MCP protocol operations.<br />See audit.Config for available configuration options. |  | Optional: \{\} <br /> |
 | `optimizer` _[vmcp.config.OptimizerConfig](#vmcpconfigoptimizerconfig)_ | Optimizer configures the MCP optimizer for context optimization on large toolsets.<br />When enabled, vMCP exposes only find_tool and call_tool operations to clients<br />instead of all backend tools directly. This reduces token usage by allowing<br />LLMs to discover relevant tools on demand rather than receiving all tool definitions. |  | Optional: \{\} <br /> |
-| `sessionStorage` _[vmcp.config.SessionStorageConfig](#vmcpconfigsessionstorageconfig)_ | SessionStorage configures session storage for stateful horizontal scaling.<br />When provider is "redis", the operator injects Redis connection parameters<br />(address, db, keyPrefix) here. The Redis password is provided separately via<br />the THV_SESSION_REDIS_PASSWORD environment variable. |  | Optional: \{\} <br /> |
+| `sessionStorage` _[vmcp.config.SessionStorageConfig](#vmcpconfigsessionstorageconfig)_ | SessionStorage configures session storage for stateful horizontal scaling.<br />When provider is "redis", the operator injects Redis connection parameters<br />(address, db, keyPrefix) here. Redis credentials are provided separately via<br />the THV_SESSION_REDIS_USERNAME and THV_SESSION_REDIS_PASSWORD environment variables<br />when usernameRef/passwordRef are configured. |  | Optional: \{\} <br /> |
 
 
 #### vmcp.config.ConflictResolutionConfig
@@ -504,8 +504,9 @@ _Appears in:_
 
 
 SessionStorageConfig configures session storage for stateful horizontal scaling.
-The Redis password is not stored here; it is injected as the THV_SESSION_REDIS_PASSWORD
-environment variable by the operator when spec.sessionStorage.passwordRef is set.
+Redis credentials are not stored here; they are injected as the THV_SESSION_REDIS_USERNAME
+and THV_SESSION_REDIS_PASSWORD environment variables by the operator when
+spec.sessionStorage.usernameRef and/or spec.sessionStorage.passwordRef are set.
 
 
 
@@ -2730,7 +2731,8 @@ _Appears in:_
 
 
 RedisStorageConfig configures Redis connection for auth server storage.
-Redis is deployed in Sentinel mode with ACL user authentication (the only supported configuration).
+Use `address` for a direct Redis-compatible backend such as DragonflyDB, or `sentinelConfig`
+for an HA Redis Sentinel deployment. ACL user authentication is required in both modes.
 
 
 
@@ -2739,7 +2741,8 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `sentinelConfig` _[api.v1alpha1.RedisSentinelConfig](#apiv1alpha1redissentinelconfig)_ | SentinelConfig holds Redis Sentinel configuration. |  | Required: \{\} <br /> |
+| `address` _string_ | Address is the Redis-compatible server address for direct mode (host:port).<br />Mutually exclusive with SentinelConfig. |  | Optional: \{\} <br /> |
+| `sentinelConfig` _[api.v1alpha1.RedisSentinelConfig](#apiv1alpha1redissentinelconfig)_ | SentinelConfig holds Redis Sentinel configuration for HA mode.<br />Mutually exclusive with Address. |  | Optional: \{\} <br /> |
 | `aclUserConfig` _[api.v1alpha1.RedisACLUserConfig](#apiv1alpha1redisacluserconfig)_ | ACLUserConfig configures Redis ACL user authentication. |  | Required: \{\} <br /> |
 | `dialTimeout` _string_ | DialTimeout is the timeout for establishing connections.<br />Format: Go duration string (e.g., "5s", "1m"). | 5s | Pattern: `^([0-9]+(\.[0-9]+)?(ns\|us\|µs\|ms\|s\|m\|h))+$` <br />Optional: \{\} <br /> |
 | `readTimeout` _string_ | ReadTimeout is the timeout for socket reads.<br />Format: Go duration string (e.g., "3s", "1m"). | 3s | Pattern: `^([0-9]+(\.[0-9]+)?(ns\|us\|µs\|ms\|s\|m\|h))+$` <br />Optional: \{\} <br /> |
@@ -2966,6 +2969,7 @@ _Appears in:_
 | `address` _string_ | Address is the Redis server address (required when provider is redis) |  | MinLength: 1 <br />Optional: \{\} <br /> |
 | `db` _integer_ | DB is the Redis database number | 0 | Minimum: 0 <br />Optional: \{\} <br /> |
 | `keyPrefix` _string_ | KeyPrefix is an optional prefix for all Redis keys used by ToolHive |  | Optional: \{\} <br /> |
+| `usernameRef` _[api.v1alpha1.SecretKeyRef](#apiv1alpha1secretkeyref)_ | UsernameRef is a reference to a Secret key containing the Redis username |  | Optional: \{\} <br /> |
 | `passwordRef` _[api.v1alpha1.SecretKeyRef](#apiv1alpha1secretkeyref)_ | PasswordRef is a reference to a Secret key containing the Redis password |  | Optional: \{\} <br /> |
 
 
@@ -3486,5 +3490,3 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `kind` _string_ | Kind is the type of workload resource |  | Enum: [MCPServer VirtualMCPServer MCPRemoteProxy] <br />Required: \{\} <br /> |
 | `name` _string_ | Name is the name of the workload resource |  | MinLength: 1 <br />Required: \{\} <br /> |
-
-

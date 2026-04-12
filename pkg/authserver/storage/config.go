@@ -12,7 +12,7 @@ const (
 	// TypeMemory uses in-memory storage (default).
 	TypeMemory Type = "memory"
 
-	// TypeRedis uses Redis Sentinel-backed storage for distributed deployments.
+	// TypeRedis uses Redis-compatible storage for distributed deployments.
 	TypeRedis Type = "redis"
 
 	// AuthTypeACLUser is the Redis ACL user authentication type.
@@ -67,9 +67,15 @@ type RunConfig struct {
 }
 
 // RedisRunConfig is the serializable Redis configuration for RunConfig.
-// This is designed for Sentinel-only deployments with ACL user authentication.
+// This supports either direct Redis-compatible endpoints (for example DragonflyDB)
+// or Redis Sentinel deployments with ACL user authentication.
 type RedisRunConfig struct {
-	// SentinelConfig contains Sentinel-specific configuration.
+	// Address is the Redis-compatible server address for direct mode (host:port).
+	// Mutually exclusive with SentinelConfig.
+	Address string `json:"address,omitempty" yaml:"address,omitempty"`
+
+	// SentinelConfig contains Sentinel-specific configuration for HA deployments.
+	// Mutually exclusive with Address.
 	SentinelConfig *SentinelRunConfig `json:"sentinel_config,omitempty" yaml:"sentinel_config,omitempty"`
 
 	// AuthType must be "aclUser" - only ACL user authentication is supported.

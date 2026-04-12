@@ -52,7 +52,12 @@ func warnOnCleanupErr(err error, operation, key string) {
 
 // RedisConfig holds Redis connection configuration for runtime use.
 type RedisConfig struct {
-	// SentinelConfig is required - Sentinel-only deployment.
+	// Address is the Redis-compatible server address for direct mode (e.g. DragonflyDB).
+	// Mutually exclusive with SentinelConfig.
+	Address string
+
+	// SentinelConfig activates Sentinel mode for HA deployments.
+	// Mutually exclusive with Address.
 	SentinelConfig *SentinelConfig
 
 	// ACLUserConfig is required - ACL user authentication only.
@@ -100,7 +105,7 @@ type ACLUserConfig struct {
 	Password string //nolint:gosec // G117: field legitimately holds sensitive data
 }
 
-// RedisStorage implements the Storage interface with Redis Sentinel backend.
+// RedisStorage implements the Storage interface with a Redis-compatible backend.
 // It provides distributed storage for OAuth2 tokens, authorization codes,
 // user data, and pending authorizations, enabling horizontal scaling.
 type RedisStorage struct {
@@ -200,13 +205,7 @@ func configureTLSDialer(opts *redis.FailoverOptions, masterCfg, sentinelCfg *Red
 	return nil
 }
 
-// NewRedisStorage creates Redis-backed storage with Sentinel failover support.
-// Returns error if configuration validation fails or connection cannot be established.
-func NewRedisStorage(ctx context.Context, cfg RedisConfig) (*RedisStorage, error) {
-	if err := validateConfig(&cfg); err != nil {
-		return nil, fmt.Errorf("invalid redis configuration: %w", err)
-	}
-
+func buildRedisClient(ctx context.Context, cfg *RedisConfig) (redis.UniversalClient, error) {
 	// Apply defaults
 	if cfg.DialTimeout == 0 {
 		cfg.DialTimeout = DefaultDialTimeout
@@ -218,29 +217,62 @@ func NewRedisStorage(ctx context.Context, cfg RedisConfig) (*RedisStorage, error
 		cfg.WriteTimeout = DefaultWriteTimeout
 	}
 
-	opts := &redis.FailoverOptions{
-		MasterName:    cfg.SentinelConfig.MasterName,
-		SentinelAddrs: cfg.SentinelConfig.SentinelAddrs,
-		DB:            cfg.SentinelConfig.DB,
-		Username:      cfg.ACLUserConfig.Username,
-		Password:      cfg.ACLUserConfig.Password,
-		DialTimeout:   cfg.DialTimeout,
-		ReadTimeout:   cfg.ReadTimeout,
-		WriteTimeout:  cfg.WriteTimeout,
+	if cfg.SentinelConfig != nil {
+		opts := &redis.FailoverOptions{
+			MasterName:    cfg.SentinelConfig.MasterName,
+			SentinelAddrs: cfg.SentinelConfig.SentinelAddrs,
+			DB:            cfg.SentinelConfig.DB,
+			Username:      cfg.ACLUserConfig.Username,
+			Password:      cfg.ACLUserConfig.Password,
+			DialTimeout:   cfg.DialTimeout,
+			ReadTimeout:   cfg.ReadTimeout,
+			WriteTimeout:  cfg.WriteTimeout,
+		}
+
+		// Configure TLS dialer if either master or sentinel TLS is enabled.
+		if err := configureTLSDialer(opts, cfg.TLS, cfg.SentinelTLS); err != nil {
+			return nil, err
+		}
+
+		client := redis.NewFailoverClient(opts)
+		if err := client.Ping(ctx).Err(); err != nil {
+			_ = client.Close()
+			return nil, fmt.Errorf("failed to connect to redis: %w", err)
+		}
+		return client, nil
 	}
 
-	// Configure TLS dialer if either master or sentinel TLS is enabled.
-	if err := configureTLSDialer(opts, cfg.TLS, cfg.SentinelTLS); err != nil {
-		return nil, err
+	tlsCfg, err := buildTLSConfig(cfg.TLS)
+	if err != nil {
+		return nil, fmt.Errorf("master TLS config: %w", err)
 	}
 
-	client := redis.NewFailoverClient(opts)
-
-	// Test connection
+	client := redis.NewClient(&redis.Options{
+		Addr:         cfg.Address,
+		Username:     cfg.ACLUserConfig.Username,
+		Password:     cfg.ACLUserConfig.Password,
+		DialTimeout:  cfg.DialTimeout,
+		ReadTimeout:  cfg.ReadTimeout,
+		WriteTimeout: cfg.WriteTimeout,
+		TLSConfig:    tlsCfg,
+	})
 	if err := client.Ping(ctx).Err(); err != nil {
-		// Close the client to prevent resource leak
 		_ = client.Close()
 		return nil, fmt.Errorf("failed to connect to redis: %w", err)
+	}
+	return client, nil
+}
+
+// NewRedisStorage creates Redis-backed storage with optional Sentinel failover support.
+// Returns error if configuration validation fails or connection cannot be established.
+func NewRedisStorage(ctx context.Context, cfg RedisConfig) (*RedisStorage, error) {
+	if err := validateConfig(&cfg); err != nil {
+		return nil, fmt.Errorf("invalid redis configuration: %w", err)
+	}
+
+	client, err := buildRedisClient(ctx, &cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	return &RedisStorage{
@@ -266,14 +298,25 @@ func defaultSessionFactory(subject, idpSessionID, clientID string) fosite.Sessio
 }
 
 func validateConfig(cfg *RedisConfig) error {
-	if cfg.SentinelConfig == nil {
-		return errors.New("sentinel configuration is required")
+	hasAddress := cfg.Address != ""
+	hasSentinel := cfg.SentinelConfig != nil
+
+	if !hasAddress && !hasSentinel {
+		return errors.New("redis address or sentinel configuration is required")
 	}
-	if cfg.SentinelConfig.MasterName == "" {
-		return errors.New("sentinel master name is required")
+	if hasAddress && hasSentinel {
+		return errors.New("redis address and sentinel configuration are mutually exclusive")
 	}
-	if len(cfg.SentinelConfig.SentinelAddrs) == 0 {
-		return errors.New("at least one sentinel address is required")
+	if hasSentinel {
+		if cfg.SentinelConfig.MasterName == "" {
+			return errors.New("sentinel master name is required")
+		}
+		if len(cfg.SentinelConfig.SentinelAddrs) == 0 {
+			return errors.New("at least one sentinel address is required")
+		}
+	}
+	if hasAddress && cfg.SentinelTLS != nil {
+		return errors.New("sentinel TLS configuration requires sentinel mode")
 	}
 	if cfg.ACLUserConfig == nil {
 		return errors.New("ACL user configuration is required")

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
@@ -19,7 +20,9 @@ import (
 	authserverrunner "github.com/stacklok/toolhive/pkg/authserver/runner"
 	storagemocks "github.com/stacklok/toolhive/pkg/authserver/storage/mocks"
 	rt "github.com/stacklok/toolhive/pkg/container/runtime"
+	transportsession "github.com/stacklok/toolhive/pkg/transport/session"
 	"github.com/stacklok/toolhive/pkg/transport/types"
+	vmcpconfig "github.com/stacklok/toolhive/pkg/vmcp/config"
 	statusesmocks "github.com/stacklok/toolhive/pkg/workloads/statuses/mocks"
 )
 
@@ -338,6 +341,59 @@ func TestHandleRemoteAuthentication(t *testing.T) {
 		tokenSource, err := runner.handleRemoteAuthentication(context.Background())
 		assert.NoError(t, err)
 		assert.Nil(t, tokenSource)
+	})
+}
+
+func TestNewTransportSessionStorage(t *testing.T) {
+	t.Run("returns nil when scaling config is absent", func(t *testing.T) {
+		t.Parallel()
+
+		storage, err := newTransportSessionStorage(context.Background(), nil)
+		require.NoError(t, err)
+		assert.Nil(t, storage)
+	})
+
+	t.Run("returns nil when redis session storage is not configured", func(t *testing.T) {
+		t.Parallel()
+
+		storage, err := newTransportSessionStorage(context.Background(), &ScalingConfig{})
+		require.NoError(t, err)
+		assert.Nil(t, storage)
+	})
+
+	t.Run("uses redis storage when configured", func(t *testing.T) {
+		mr := miniredis.RunT(t)
+		mr.RequireUserAuth("toolhive-sessions", "topsecret")
+
+		t.Setenv(vmcpconfig.RedisUsernameEnvVar, "toolhive-sessions")
+		t.Setenv(vmcpconfig.RedisPasswordEnvVar, "topsecret")
+
+		storage, err := newTransportSessionStorage(context.Background(), &ScalingConfig{
+			SessionRedis: &SessionRedisConfig{
+				Address:   mr.Addr(),
+				KeyPrefix: "test:mcp:",
+			},
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			_ = storage.Close()
+		})
+
+		_, ok := storage.(*transportsession.RedisStorage)
+		assert.True(t, ok)
+	})
+
+	t.Run("returns error for invalid redis config", func(t *testing.T) {
+		t.Parallel()
+
+		storage, err := newTransportSessionStorage(context.Background(), &ScalingConfig{
+			SessionRedis: &SessionRedisConfig{
+				Address: "localhost:6379",
+			},
+		})
+		require.Error(t, err)
+		assert.Nil(t, storage)
+		assert.Contains(t, err.Error(), "creating redis session storage")
 	})
 }
 
