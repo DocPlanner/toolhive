@@ -420,7 +420,6 @@ spec:
                             type: string
                         required:
                         - aclUserConfig
-                        - sentinelConfig
                         type: object
                       type:
                         default: memory
