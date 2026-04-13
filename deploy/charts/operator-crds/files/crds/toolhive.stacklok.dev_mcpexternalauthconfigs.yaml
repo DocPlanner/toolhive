@@ -263,6 +263,11 @@ spec:
                           Redis configures the Redis storage backend.
                           Required when type is "redis".
                         properties:
+                          address:
+                            description: |-
+                              Address is the Redis-compatible server address for direct mode (host:port).
+                              Mutually exclusive with SentinelConfig.
+                            type: string
                           aclUserConfig:
                             description: ACLUserConfig configures Redis ACL user authentication.
                             properties:
