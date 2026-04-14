@@ -678,6 +678,33 @@ func TestRedisStorage_UpstreamTokens(t *testing.T) {
 		})
 	})
 
+	t.Run("overwrite moves user reverse index", func(t *testing.T) {
+		withRedisStorage(t, func(ctx context.Context, s *RedisStorage, _ *miniredis.Miniredis) {
+			tokenKey := redisUpstreamKey(s.keyPrefix, "session", "provider-a")
+			user1SetKey := redisSetKey(s.keyPrefix, KeyTypeUserUpstream, "user1")
+			user2SetKey := redisSetKey(s.keyPrefix, KeyTypeUserUpstream, "user2")
+
+			require.NoError(t, s.StoreUpstreamTokens(ctx, "session", "provider-a", &UpstreamTokens{
+				AccessToken: "token-1",
+				UserID:      "user1",
+				ExpiresAt:   time.Now().Add(time.Hour),
+			}))
+			require.NoError(t, s.StoreUpstreamTokens(ctx, "session", "provider-a", &UpstreamTokens{
+				AccessToken: "token-2",
+				UserID:      "user2",
+				ExpiresAt:   time.Now().Add(time.Hour),
+			}))
+
+			user1HasKey, err := s.client.SIsMember(ctx, user1SetKey, tokenKey).Result()
+			require.NoError(t, err)
+			assert.False(t, user1HasKey, "old user reverse index should be cleaned up")
+
+			user2HasKey, err := s.client.SIsMember(ctx, user2SetKey, tokenKey).Result()
+			require.NoError(t, err)
+			assert.True(t, user2HasKey, "new user reverse index should contain the provider token key")
+		})
+	})
+
 	t.Run("get expired tokens returns ErrExpired with token data", func(t *testing.T) {
 		withRedisStorage(t, func(ctx context.Context, s *RedisStorage, _ *miniredis.Miniredis) {
 			// Store with an ExpiresAt that's already in the past.

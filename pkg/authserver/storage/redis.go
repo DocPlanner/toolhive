@@ -847,57 +847,24 @@ type storedUpstreamTokens struct {
 	ClientID        string `json:"client_id"`
 }
 
-// storeUpstreamTokensScript atomically reads the existing UserID, writes new token
-// data, updates the session index set, and updates user reverse-index sets.
-// This prevents a race condition where concurrent writes for the same session
-// could leave orphaned entries in user sets.
-//
-// KEYS[1] = per-provider token key (e.g. "thv:auth:{ns:name}:upstream:{sessionID}:{providerName}")
-// KEYS[2] = session index set key (e.g. "thv:auth:{ns:name}:upstream:idx:{sessionID}")
-// ARGV[1] = new token data (JSON or "null" marker)
-// ARGV[2] = TTL in milliseconds
-// ARGV[3] = new UserID ("" if no user)
-// ARGV[4] = user upstream set key prefix (e.g. "thv:auth:{ns:name}:user:upstream:")
-var storeUpstreamTokensScript = redis.NewScript(`
-local oldUserID = ""
-local existing = redis.call('GET', KEYS[1])
-if existing and existing ~= "null" then
-    local ok, decoded = pcall(cjson.decode, existing)
-    if ok and type(decoded) == "table" and decoded.user_id and decoded.user_id ~= "" then
-        oldUserID = decoded.user_id
-    end
-end
+const maxStoreUpstreamTokensRetries = 5
 
-local ttlMs = tonumber(ARGV[2])
-if ttlMs > 0 then
-    redis.call('SET', KEYS[1], ARGV[1], 'PX', ttlMs)
-else
-    redis.call('SET', KEYS[1], ARGV[1])
-end
+// extractStoredUpstreamUserID returns the stored UserID from a token payload.
+// Corrupt payloads are tolerated here because older writes may have already
+// succeeded; in that case we skip reverse-index cleanup and let TTL expiry bound
+// the stale entry.
+func extractStoredUpstreamUserID(data string) string {
+	if data == "" || data == nullMarker {
+		return ""
+	}
 
--- Add the per-provider key to the session index set
-redis.call('SADD', KEYS[2], KEYS[1])
--- Keep the index set alive at least as long as the token
-if ttlMs > 0 then
-    local currentTTL = redis.call('PTTL', KEYS[2])
-    if currentTTL < ttlMs then
-        redis.call('PEXPIRE', KEYS[2], ttlMs)
-    end
-end
+	var stored storedUpstreamTokens
+	if err := json.Unmarshal([]byte(data), &stored); err != nil {
+		return ""
+	}
 
-local newUserID = ARGV[3]
-local setPrefix = ARGV[4]
-
-if oldUserID ~= "" and oldUserID ~= newUserID then
-    redis.call('SREM', setPrefix .. oldUserID, KEYS[1])
-end
-
-if newUserID ~= "" then
-    redis.call('SADD', setPrefix .. newUserID, KEYS[1])
-end
-
-return 1
-`)
+	return stored.UserID
+}
 
 // marshalUpstreamTokensWithTTL marshals tokens and calculates TTL.
 func marshalUpstreamTokensWithTTL(tokens *UpstreamTokens) ([]byte, time.Duration, error) {
@@ -942,8 +909,8 @@ func marshalUpstreamTokensWithTTL(tokens *UpstreamTokens) ([]byte, time.Duration
 }
 
 // StoreUpstreamTokens stores the upstream IDP tokens for a session and provider.
-// Uses a Lua script to atomically write token data, update the session index set,
-// and update user reverse-index sets, preventing race conditions on concurrent writes.
+// The write is coordinated with WATCH/MULTI so Dragonfly sees every accessed key
+// explicitly and reverse-index maintenance stays consistent under concurrent writes.
 func (s *RedisStorage) StoreUpstreamTokens(ctx context.Context, sessionID, providerName string, tokens *UpstreamTokens) error {
 	if sessionID == "" {
 		return fosite.ErrInvalidRequest.WithHint("session ID cannot be empty")
@@ -967,18 +934,60 @@ func (s *RedisStorage) StoreUpstreamTokens(ctx context.Context, sessionID, provi
 
 	userSetKeyPrefix := s.keyPrefix + KeyTypeUserUpstream + ":"
 
-	_, err = storeUpstreamTokensScript.Run(ctx, s.client,
-		[]string{key, idxKey},
-		string(data),
-		ttl.Milliseconds(),
-		newUserID,
-		userSetKeyPrefix,
-	).Result()
-	if err != nil {
-		return fmt.Errorf("failed to store upstream tokens: %w", err)
+	for attempt := 0; attempt < maxStoreUpstreamTokensRetries; attempt++ {
+		err = s.client.Watch(ctx, func(tx *redis.Tx) error {
+			existing, getErr := tx.Get(ctx, key).Result()
+			if getErr != nil && !errors.Is(getErr, redis.Nil) {
+				return fmt.Errorf("failed to read existing upstream tokens: %w", getErr)
+			}
+
+			oldUserID := extractStoredUpstreamUserID(existing)
+
+			currentTTL, ttlErr := tx.PTTL(ctx, idxKey).Result()
+			if ttlErr != nil && !errors.Is(ttlErr, redis.Nil) {
+				return fmt.Errorf("failed to read upstream token index TTL: %w", ttlErr)
+			}
+
+			oldUserSetKey := ""
+			if oldUserID != "" && oldUserID != newUserID {
+				oldUserSetKey = userSetKeyPrefix + oldUserID
+			}
+
+			newUserSetKey := ""
+			if newUserID != "" {
+				newUserSetKey = userSetKeyPrefix + newUserID
+			}
+
+			_, pipeErr := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.Set(ctx, key, data, ttl)
+				pipe.SAdd(ctx, idxKey, key)
+
+				if ttl > 0 && currentTTL < ttl {
+					pipe.PExpire(ctx, idxKey, ttl)
+				}
+
+				if oldUserSetKey != "" {
+					pipe.SRem(ctx, oldUserSetKey, key)
+				}
+
+				if newUserSetKey != "" {
+					pipe.SAdd(ctx, newUserSetKey, key)
+				}
+
+				return nil
+			})
+
+			return pipeErr
+		}, key, idxKey)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, redis.TxFailedErr) {
+			return fmt.Errorf("failed to store upstream tokens: %w", err)
+		}
 	}
 
-	return nil
+	return fmt.Errorf("failed to store upstream tokens: %w", redis.TxFailedErr)
 }
 
 // GetUpstreamTokens retrieves the upstream IDP tokens for a session and provider.
