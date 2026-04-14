@@ -515,11 +515,16 @@ func TestValidateScopes(t *testing.T) {
 			expectedScopes: []string{"openid", "profile"},
 		},
 		{
-			name:           "empty input rejected when defaults not in allowed set",
+			name:           "empty input returns server-supported scopes when customized",
 			requestedScope: "",
-			allowedScopes:  []string{"custom_scope"},
-			expectError:    true,
-			errorCode:      DCRErrorInvalidClientMetadata,
+			allowedScopes:  []string{"openid", "email", "toolhive-mcp/access"},
+			expectedScopes: []string{"openid", "email", "toolhive-mcp/access"},
+		},
+		{
+			name:           "empty input deduplicates customized defaults",
+			requestedScope: "",
+			allowedScopes:  []string{"openid", "email", "openid", "", "toolhive-mcp/access"},
+			expectedScopes: []string{"openid", "email", "toolhive-mcp/access"},
 		},
 	}
 

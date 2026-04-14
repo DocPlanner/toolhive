@@ -261,6 +261,13 @@ func ValidateRedirectURI(uri string) *DCRError {
 // ValidateScopes validates that all requested scopes are in the allowed set.
 // Returns the validated scopes (or defaults if empty) and any error.
 // This enforces server-side scope restrictions per RFC 7591 Section 2.
+//
+// When the client omits the scope field, RFC 7591 leaves scope selection to the
+// server's defaults. ToolHive does not currently expose a separate "default
+// scopes" setting, so if the server advertises an explicit supported-scope set
+// we treat that as the default grant set for DCR. This keeps dynamic
+// registration aligned with the protected-resource metadata and avoids hard
+// failures when deployments intentionally narrow the supported scopes.
 func ValidateScopes(requestedScope string, allowedScopes []string) ([]string, *DCRError) {
 	// Build allowed scope set for O(1) lookup
 	allowed := make(map[string]bool, len(allowedScopes))
@@ -288,20 +295,37 @@ func ValidateScopes(requestedScope string, allowedScopes []string) ([]string, *D
 		}
 	}
 
-	// If no scopes requested, use defaults validated against allowed scopes
+	// If no scopes were requested, use the server defaults derived from the
+	// advertised supported scopes. When no explicit supported scopes are
+	// configured, fall back to the built-in registration defaults.
 	if len(scopes) == 0 {
-		for _, s := range DefaultScopes {
-			if !allowed[s] {
-				return nil, &DCRError{
-					Error:            DCRErrorInvalidClientMetadata,
-					ErrorDescription: "default scope not supported by server: " + s,
-				}
-			}
-		}
-		return DefaultScopes, nil
+		return defaultScopesForServer(allowedScopes), nil
 	}
 
 	return scopes, nil
+}
+
+func defaultScopesForServer(allowedScopes []string) []string {
+	if len(allowedScopes) == 0 {
+		return slices.Clone(DefaultScopes)
+	}
+
+	// Preserve the configured order while removing duplicates and empty values.
+	seen := make(map[string]bool, len(allowedScopes))
+	defaults := make([]string, 0, len(allowedScopes))
+	for _, scope := range allowedScopes {
+		if scope == "" || seen[scope] {
+			continue
+		}
+		seen[scope] = true
+		defaults = append(defaults, scope)
+	}
+
+	if len(defaults) == 0 {
+		return slices.Clone(DefaultScopes)
+	}
+
+	return defaults
 }
 
 // FormatScopes formats a scope slice as a space-separated string.
