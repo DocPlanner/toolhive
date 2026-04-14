@@ -404,10 +404,11 @@ func (a *Authorizer) resolveClaims(identity *auth.Identity) (jwt.MapClaims, erro
 		// Embedded auth server path: use the upstream IDP token's claims.
 		upstreamToken, tokenFound := identity.UpstreamTokens[a.primaryUpstreamProvider]
 		if !tokenFound || upstreamToken == "" {
-			// The upstream token must be present if the authorizer is configured to use it.
-			// Missing token means the session has no upstream credential; deny.
-			return nil, fmt.Errorf("upstream token for provider %q not found in identity",
-				a.primaryUpstreamProvider)
+			reason := "token_unavailable"
+			if status, ok := identity.UpstreamTokenStatuses[a.primaryUpstreamProvider]; ok && status != "" {
+				reason = string(status)
+			}
+			return nil, authorizers.NewUpstreamAuthenticationRequiredError(a.primaryUpstreamProvider, reason)
 		}
 		parsedClaims, err := parseUpstreamJWTClaims(upstreamToken)
 		if err != nil {

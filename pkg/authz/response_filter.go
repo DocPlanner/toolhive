@@ -316,7 +316,10 @@ func (rfw *ResponseFilteringWriter) filterToolsResponse(response *jsonrpc2.Respo
 	// filterToolsByPolicy checks each tool against the caller's Cedar policies
 	// (injecting annotations into context for when-clause evaluation) and returns
 	// only tools the caller is authorized to call.
-	policyFiltered := filterToolsByPolicy(rfw.request.Context(), rfw.authorizer, regular)
+	policyFiltered, err := filterToolsByPolicy(rfw.request.Context(), rfw.authorizer, regular)
+	if err != nil {
+		return nil, err
+	}
 	filteredTools := make([]mcp.Tool, 0, len(passThrough)+len(policyFiltered))
 	filteredTools = append(filteredTools, passThrough...)
 	filteredTools = append(filteredTools, policyFiltered...)
@@ -344,6 +347,10 @@ func (rfw *ResponseFilteringWriter) filterToolsResponse(response *jsonrpc2.Respo
 
 // filterPromptsResponse filters prompts based on get_prompt authorization
 func (rfw *ResponseFilteringWriter) filterPromptsResponse(response *jsonrpc2.Response) (*jsonrpc2.Response, error) {
+	if rfw.authorizer == nil {
+		return response, nil
+	}
+
 	// Parse the result as a ListPromptsResult
 	var listResult mcp.ListPromptsResult
 	if err := json.Unmarshal(response.Result, &listResult); err != nil {
@@ -364,9 +371,7 @@ func (rfw *ResponseFilteringWriter) filterPromptsResponse(response *jsonrpc2.Res
 			nil, // No arguments for the authorization check
 		)
 		if err != nil {
-			slog.Warn("Authorization check failed for prompt, skipping",
-				"prompt", prompt.Name, "error", err)
-			continue
+			return nil, err
 		}
 
 		if authorized {
@@ -405,6 +410,10 @@ func (rfw *ResponseFilteringWriter) filterPromptsResponse(response *jsonrpc2.Res
 
 // filterResourcesResponse filters resources based on read_resource authorization
 func (rfw *ResponseFilteringWriter) filterResourcesResponse(response *jsonrpc2.Response) (*jsonrpc2.Response, error) {
+	if rfw.authorizer == nil {
+		return response, nil
+	}
+
 	// Parse the result as a ListResourcesResult
 	var listResult mcp.ListResourcesResult
 	if err := json.Unmarshal(response.Result, &listResult); err != nil {
@@ -425,9 +434,7 @@ func (rfw *ResponseFilteringWriter) filterResourcesResponse(response *jsonrpc2.R
 			nil, // No arguments for the authorization check
 		)
 		if err != nil {
-			slog.Warn("Authorization check failed for resource, skipping",
-				"resource", resource.URI, "error", err)
-			continue
+			return nil, err
 		}
 
 		if authorized {
@@ -466,9 +473,11 @@ func (rfw *ResponseFilteringWriter) filterResourcesResponse(response *jsonrpc2.R
 
 // writeErrorResponse writes an error response
 func (rfw *ResponseFilteringWriter) writeErrorResponse(id jsonrpc2.ID, err error) error {
+	httpStatus, rpcCode, errorMsg, wwwAuthenticate := classifyAuthorizationError(err)
+
 	errorResponse := &jsonrpc2.Response{
 		ID:    id,
-		Error: jsonrpc2.NewError(500, fmt.Sprintf("Error filtering response: %v", err)),
+		Error: jsonrpc2.NewError(int64(rpcCode), errorMsg),
 	}
 
 	errorData, marshalErr := json.Marshal(errorResponse)
@@ -479,7 +488,11 @@ func (rfw *ResponseFilteringWriter) writeErrorResponse(id jsonrpc2.ID, err error
 		return writeErr
 	}
 
-	rfw.ResponseWriter.WriteHeader(http.StatusInternalServerError)
+	rfw.ResponseWriter.Header().Set("Content-Type", "application/json")
+	if wwwAuthenticate != "" {
+		rfw.ResponseWriter.Header().Set("WWW-Authenticate", wwwAuthenticate)
+	}
+	rfw.ResponseWriter.WriteHeader(httpStatus)
 	_, writeErr := rfw.ResponseWriter.Write(errorData)
 	return writeErr
 }
@@ -527,7 +540,11 @@ func (rfw *ResponseFilteringWriter) filterFindToolResponse(response *jsonrpc2.Re
 	// that annotations are available even for tools that Cedar will deny.
 	rfw.annotationCache.SetFromToolsList(output.Tools)
 
-	output.Tools = filterToolsByPolicy(rfw.request.Context(), rfw.authorizer, output.Tools)
+	filteredTools, err := filterToolsByPolicy(rfw.request.Context(), rfw.authorizer, output.Tools)
+	if err != nil {
+		return nil, err
+	}
+	output.Tools = filteredTools
 
 	filteredText, err := json.Marshal(output)
 	if err != nil {

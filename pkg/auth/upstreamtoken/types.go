@@ -15,23 +15,54 @@ import "context"
 // which defines "sid" for different purposes (RFC 7519, OIDC Session Management).
 const TokenSessionIDClaimKey = "tsid"
 
-// UpstreamCredential is the opaque result of GetValidTokens.
-// The caller only needs the access token to inject into upstream requests.
+// UpstreamCredentialStatus describes the current state of an upstream credential.
+// StatusValid means AccessToken is present and usable. The other statuses mean
+// the provider still exists in session storage, but the caller must not treat the
+// access token as usable without user re-authentication.
+type UpstreamCredentialStatus string
+
+const (
+	// StatusValid indicates the access token is present and usable.
+	StatusValid UpstreamCredentialStatus = "valid"
+	// StatusNoRefreshToken indicates the access token expired and no refresh token exists.
+	StatusNoRefreshToken UpstreamCredentialStatus = "no_refresh_token"
+	// StatusRefreshFailed indicates the refresh token existed, but refresh failed.
+	StatusRefreshFailed UpstreamCredentialStatus = "refresh_failed"
+	// StatusInvalidBinding indicates the stored upstream token no longer matches
+	// the authenticated session (subject/client mismatch).
+	StatusInvalidBinding UpstreamCredentialStatus = "invalid_binding"
+)
+
+// RequiresReauthentication reports whether the credential state means the caller
+// must perform a fresh upstream login to recover.
+func (s UpstreamCredentialStatus) RequiresReauthentication() bool {
+	switch s {
+	case StatusNoRefreshToken, StatusRefreshFailed, StatusInvalidBinding:
+		return true
+	default:
+		return false
+	}
+}
+
+// UpstreamCredential is the opaque result of GetValidTokens/GetAllValidTokens.
+// The caller only needs the access token for upstream injection, but the status
+// is preserved so authz can distinguish between a missing provider and an
+// upstream session that now requires re-authentication.
 type UpstreamCredential struct {
 	AccessToken string
+	Status      UpstreamCredentialStatus
 }
 
 // TokenReader retrieves upstream provider access tokens for a session.
 // This narrow interface decouples the auth middleware from storage internals.
-//
-// TODO(auth): Consider enriching the return type from map[string]string to
-// map[string]UpstreamCredential to carry per-provider freshness/error metadata.
 type TokenReader interface {
-	// GetAllValidTokens returns access tokens for all upstream providers in a session.
-	// Expired tokens are refreshed transparently when possible; if refresh fails,
-	// the provider is omitted from the result.
+	// GetAllValidTokens returns the current upstream credential state for all
+	// providers in a session. Expired access tokens are refreshed transparently
+	// when possible. If refresh fails, the provider remains in the result with a
+	// non-valid status so downstream middleware can surface a precise error
+	// instead of silently acting as if the provider never existed.
 	// Returns an empty map (not error) for unknown sessions.
-	GetAllValidTokens(ctx context.Context, sessionID string) (map[string]string, error)
+	GetAllValidTokens(ctx context.Context, sessionID string) (map[string]UpstreamCredential, error)
 }
 
 // Service owns the upstream token lifecycle: read, refresh, error handling.

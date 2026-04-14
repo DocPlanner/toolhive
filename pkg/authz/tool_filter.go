@@ -16,9 +16,11 @@ import (
 // For each tool, it checks whether the caller (identified by JWT claims in ctx)
 // is authorized to call that tool. Only authorized tools are returned.
 // If authorizer is nil, all tools are returned unmodified.
-func filterToolsByPolicy(ctx context.Context, a authorizers.Authorizer, tools []mcp.Tool) []mcp.Tool {
+// Returns an error when policy evaluation itself fails; denials still filter
+// normally without failing the whole list operation.
+func filterToolsByPolicy(ctx context.Context, a authorizers.Authorizer, tools []mcp.Tool) ([]mcp.Tool, error) {
 	if a == nil {
-		return tools
+		return tools, nil
 	}
 
 	// Note: instantiating the list ensures that no null value is sent over the wire.
@@ -37,9 +39,7 @@ func filterToolsByPolicy(ctx context.Context, a authorizers.Authorizer, tools []
 
 		authorized, err := authorizeToolCall(toolCtx, a, tool.Name, nil)
 		if err != nil {
-			slog.Warn("Authorization check failed for tool, skipping",
-				"tool", tool.Name, "error", err)
-			continue
+			return nil, err
 		}
 
 		if authorized {
@@ -55,7 +55,7 @@ func filterToolsByPolicy(ctx context.Context, a authorizers.Authorizer, tools []
 			"total", len(tools), "allowed", len(filtered), "denied", denied)
 	}
 
-	return filtered
+	return filtered, nil
 }
 
 // authorizeToolCall checks whether the caller is authorized to call a specific tool

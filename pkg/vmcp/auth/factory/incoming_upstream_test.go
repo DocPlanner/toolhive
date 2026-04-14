@@ -111,7 +111,9 @@ func TestNewOIDCAuthMiddleware_UpstreamTokenReaderWiring(t *testing.T) {
 		reader := upstreamtokenmocks.NewMockTokenReader(ctrl)
 		reader.EXPECT().
 			GetAllValidTokens(gomock.Any(), "session-abc").
-			Return(map[string]string{"google": "gcp-access-token"}, nil)
+			Return(map[string]upstreamtoken.UpstreamCredential{
+				"google": {AccessToken: "gcp-access-token", Status: upstreamtoken.StatusValid},
+			}, nil)
 
 		authMw, _, err := newOIDCAuthMiddleware(t.Context(), oidcCfg, reader, nil)
 		require.NoError(t, err, "middleware creation should succeed with non-nil reader")
@@ -140,6 +142,8 @@ func TestNewOIDCAuthMiddleware_UpstreamTokenReaderWiring(t *testing.T) {
 		require.NotNil(t, capturedIdentity, "identity should be present in context")
 		assert.Equal(t, map[string]string{"google": "gcp-access-token"}, capturedIdentity.UpstreamTokens,
 			"upstream tokens should be populated from the reader")
+		assert.Nil(t, capturedIdentity.UpstreamTokenStatuses,
+			"upstream token statuses should be nil when all providers are valid")
 	})
 
 	t.Run("upstream tokens nil when reader is nil", func(t *testing.T) {

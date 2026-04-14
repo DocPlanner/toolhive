@@ -1313,6 +1313,7 @@ func TestAuthorizeAndServe(t *testing.T) {
 		expectHandlerHit  bool
 		expectStatus      int
 		expectAnnotations bool // whether annotations should be in handler context
+		expectChallenge   string
 	}{
 		{
 			name:             "authorized with cache miss — next called, no annotations",
@@ -1335,11 +1336,19 @@ func TestAuthorizeAndServe(t *testing.T) {
 			expectStatus:     http.StatusForbidden,
 		},
 		{
-			name:             "authorizer error — 403, next not called",
+			name:             "authorizer error — 500, next not called",
 			allowed:          false,
 			authErr:          errors.New("policy evaluation failed"),
 			expectHandlerHit: false,
-			expectStatus:     http.StatusForbidden,
+			expectStatus:     http.StatusInternalServerError,
+		},
+		{
+			name:             "upstream auth required error — 401, next not called",
+			allowed:          false,
+			authErr:          authorizers.NewUpstreamAuthenticationRequiredError("cognito", "refresh_failed"),
+			expectHandlerHit: false,
+			expectStatus:     http.StatusUnauthorized,
+			expectChallenge:  `Bearer error="invalid_token", error_description="upstream token is no longer valid; re-authentication required"`,
 		},
 	}
 
@@ -1372,6 +1381,7 @@ func TestAuthorizeAndServe(t *testing.T) {
 
 			assert.Equal(t, tc.expectHandlerHit, handlerCalled)
 			assert.Equal(t, tc.expectStatus, rr.Code)
+			assert.Equal(t, tc.expectChallenge, rr.Header().Get("WWW-Authenticate"))
 			if tc.expectAnnotations {
 				ann := authorizers.ToolAnnotationsFromContext(ctxInHandler)
 				require.NotNil(t, ann)

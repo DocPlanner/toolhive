@@ -110,26 +110,25 @@ func shouldSkipSubsequentAuthorization(method string) bool {
 
 // handleUnauthorized handles unauthorized requests.
 func handleUnauthorized(w http.ResponseWriter, msgID interface{}, err error) {
-	// Create an error response
-	errorMsg := "Unauthorized"
-	if err != nil {
-		errorMsg = err.Error()
-	}
-
 	// Create a JSON-RPC error response
-	id, err := mcp.ConvertToJSONRPC2ID(msgID)
-	if err != nil {
+	id, idErr := mcp.ConvertToJSONRPC2ID(msgID)
+	if idErr != nil {
 		id = jsonrpc2.ID{} // Use empty ID if conversion fails
 	}
 
+	httpStatus, rpcCode, errorMsg, wwwAuthenticate := classifyAuthorizationError(err)
+
 	errorResponse := &jsonrpc2.Response{
 		ID:    id,
-		Error: jsonrpc2.NewError(403, errorMsg),
+		Error: jsonrpc2.NewError(int64(rpcCode), errorMsg),
 	}
 
 	// Set the response headers
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusForbidden)
+	if wwwAuthenticate != "" {
+		w.Header().Set("WWW-Authenticate", wwwAuthenticate)
+	}
+	w.WriteHeader(httpStatus)
 
 	// Write the error response
 	if err := json.NewEncoder(w).Encode(errorResponse); err != nil {
@@ -194,7 +193,10 @@ func Middleware(a authorizers.Authorizer, next http.Handler, passThroughTools ma
 			// Unknown method - deny by default for security
 			// Methods must be explicitly added to MCPMethodToFeatureOperation to be allowed
 			handleUnauthorized(w, parsedRequest.ID,
-				fmt.Errorf("unknown MCP method: %s (not configured for authorization)", parsedRequest.Method))
+				newForbiddenAuthorizationError(
+					fmt.Sprintf("unknown MCP method: %s (not configured for authorization)", parsedRequest.Method),
+				),
+			)
 			return
 		}
 

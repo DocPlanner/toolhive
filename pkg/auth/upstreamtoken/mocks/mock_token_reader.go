@@ -13,6 +13,7 @@ import (
 	context "context"
 	reflect "reflect"
 
+	upstreamtoken "github.com/stacklok/toolhive/pkg/auth/upstreamtoken"
 	gomock "go.uber.org/mock/gomock"
 )
 
@@ -41,10 +42,10 @@ func (m *MockTokenReader) EXPECT() *MockTokenReaderMockRecorder {
 }
 
 // GetAllValidTokens mocks base method.
-func (m *MockTokenReader) GetAllValidTokens(ctx context.Context, sessionID string) (map[string]string, error) {
+func (m *MockTokenReader) GetAllValidTokens(ctx context.Context, sessionID string) (map[string]upstreamtoken.UpstreamCredential, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "GetAllValidTokens", ctx, sessionID)
-	ret0, _ := ret[0].(map[string]string)
+	ret0, _ := ret[0].(map[string]upstreamtoken.UpstreamCredential)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }

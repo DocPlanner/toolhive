@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/stacklok/toolhive/pkg/auth"
+	"github.com/stacklok/toolhive/pkg/auth/upstreamtoken"
 	"github.com/stacklok/toolhive/pkg/authz/authorizers"
 )
 
@@ -1126,7 +1127,22 @@ func TestAuthorizeWithJWTClaims_UpstreamProvider(t *testing.T) {
 				UpstreamTokens: map[string]string{},
 			},
 			wantErr:     true,
-			errContains: "upstream token for provider",
+			errContains: "upstream authentication required",
+		},
+		{
+			name: "upstream_token_missing_with_status_reason",
+			identity: &auth.Identity{
+				PrincipalInfo: auth.PrincipalInfo{
+					Subject: "thv-user",
+					Claims:  map[string]any{"sub": "thv-user"},
+				},
+				UpstreamTokens: map[string]string{},
+				UpstreamTokenStatuses: map[string]upstreamtoken.UpstreamCredentialStatus{
+					providerName: upstreamtoken.StatusRefreshFailed,
+				},
+			},
+			wantErr:     true,
+			errContains: string(upstreamtoken.StatusRefreshFailed),
 		},
 		{
 			name: "upstream_token_opaque_not_parseable",
@@ -1152,7 +1168,7 @@ func TestAuthorizeWithJWTClaims_UpstreamProvider(t *testing.T) {
 				UpstreamTokens: nil,
 			},
 			wantErr:     true,
-			errContains: "upstream token for provider",
+			errContains: "upstream authentication required",
 		},
 		{
 			name: "upstream_token_has_no_sub_claim",

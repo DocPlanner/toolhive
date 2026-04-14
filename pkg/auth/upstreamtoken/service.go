@@ -77,23 +77,27 @@ func (s *InProcessService) GetValidTokens(ctx context.Context, sessionID, provid
 		return s.refreshOrFail(ctx, sessionID, providerName, tokens)
 	}
 
-	return &UpstreamCredential{AccessToken: tokens.AccessToken}, nil
+	return &UpstreamCredential{
+		AccessToken: tokens.AccessToken,
+		Status:      StatusValid,
+	}, nil
 }
 
-// GetAllValidTokens returns access tokens for all upstream providers in a session.
-// Expired tokens are refreshed transparently; if refresh fails, the provider is
-// omitted from the result so downstream middleware can return a clean 401.
-func (s *InProcessService) GetAllValidTokens(ctx context.Context, sessionID string) (map[string]string, error) {
+// GetAllValidTokens returns credential state for all upstream providers in a
+// session. Expired tokens are refreshed transparently; if refresh fails, the
+// provider remains in the result with a non-valid status so downstream authz can
+// produce an explicit re-authentication error instead of silently dropping it.
+func (s *InProcessService) GetAllValidTokens(ctx context.Context, sessionID string) (map[string]UpstreamCredential, error) {
 	allTokens, err := s.storage.GetAllUpstreamTokens(ctx, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("bulk read upstream tokens: %w", err)
 	}
 
 	if len(allTokens) == 0 {
-		return map[string]string{}, nil
+		return map[string]UpstreamCredential{}, nil
 	}
 
-	result := make(map[string]string, len(allTokens))
+	result := make(map[string]UpstreamCredential, len(allTokens))
 	// TODO(auth): Refresh providers in parallel using errgroup to avoid
 	// worst-case latency of N * refreshTimeout when multiple providers need refresh.
 	for providerName, tokens := range allTokens {
@@ -103,22 +107,27 @@ func (s *InProcessService) GetAllValidTokens(ctx context.Context, sessionID stri
 
 		// If token is not expired, use it directly.
 		if tokens.ExpiresAt.IsZero() || !tokens.IsExpired(time.Now()) {
-			result[providerName] = tokens.AccessToken
+			result[providerName] = UpstreamCredential{
+				AccessToken: tokens.AccessToken,
+				Status:      StatusValid,
+			}
 			continue
 		}
 
 		// Token is expired — attempt refresh.
 		refreshed, refreshErr := s.refreshOrFail(ctx, sessionID, providerName, tokens)
 		if refreshErr != nil {
-			// Refresh failed — omit provider so downstream middleware returns 401.
-			slog.WarnContext(ctx, "omitting provider with unrefreshable expired token",
+			status := statusFromError(refreshErr)
+			slog.WarnContext(ctx, "provider has unrefreshable expired upstream token",
 				"session_id", sessionID,
 				"provider", providerName,
+				"status", status,
 				"error", refreshErr,
 			)
+			result[providerName] = UpstreamCredential{Status: status}
 			continue
 		}
-		result[providerName] = refreshed.AccessToken
+		result[providerName] = *refreshed
 	}
 
 	return result, nil
@@ -170,5 +179,21 @@ func (s *InProcessService) refreshOrFail(
 		return nil, ErrRefreshFailed
 	}
 
-	return &UpstreamCredential{AccessToken: refreshed.AccessToken}, nil
+	return &UpstreamCredential{
+		AccessToken: refreshed.AccessToken,
+		Status:      StatusValid,
+	}, nil
+}
+
+func statusFromError(err error) UpstreamCredentialStatus {
+	switch {
+	case errors.Is(err, ErrNoRefreshToken):
+		return StatusNoRefreshToken
+	case errors.Is(err, ErrInvalidBinding):
+		return StatusInvalidBinding
+	case errors.Is(err, ErrRefreshFailed):
+		return StatusRefreshFailed
+	default:
+		return StatusRefreshFailed
+	}
 }

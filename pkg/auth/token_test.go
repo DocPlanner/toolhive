@@ -2256,7 +2256,10 @@ func TestLoadUpstreamTokens(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		reader := upstreamtokenmocks.NewMockTokenReader(ctrl)
 		reader.EXPECT().GetAllValidTokens(gomock.Any(), "session-abc").
-			Return(map[string]string{"github": "gh-token", "atlassian": "atl-token"}, nil)
+			Return(map[string]upstreamtoken.UpstreamCredential{
+				"github":    {AccessToken: "gh-token", Status: upstreamtoken.StatusValid},
+				"atlassian": {AccessToken: "atl-token", Status: upstreamtoken.StatusValid},
+			}, nil)
 
 		v := &TokenValidator{upstreamTokenReader: reader}
 		result, err := v.loadUpstreamTokens(context.Background(), jwt.MapClaims{
@@ -2264,7 +2267,9 @@ func TestLoadUpstreamTokens(t *testing.T) {
 			upstreamtoken.TokenSessionIDClaimKey: "session-abc",
 		})
 		require.NoError(t, err)
-		require.Equal(t, map[string]string{"github": "gh-token", "atlassian": "atl-token"}, result)
+		require.NotNil(t, result)
+		require.Equal(t, map[string]string{"github": "gh-token", "atlassian": "atl-token"}, result.tokens)
+		require.Nil(t, result.statuses)
 	})
 
 	t.Run("returns nil when no tsid claim", func(t *testing.T) {
@@ -2328,7 +2333,7 @@ func TestLoadUpstreamTokens(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		reader := upstreamtokenmocks.NewMockTokenReader(ctrl)
 		reader.EXPECT().GetAllValidTokens(gomock.Any(), "session-abc").
-			Return(map[string]string{}, nil)
+			Return(map[string]upstreamtoken.UpstreamCredential{}, nil)
 
 		v := &TokenValidator{upstreamTokenReader: reader}
 		result, err := v.loadUpstreamTokens(context.Background(), jwt.MapClaims{
@@ -2336,7 +2341,31 @@ func TestLoadUpstreamTokens(t *testing.T) {
 			upstreamtoken.TokenSessionIDClaimKey: "session-abc",
 		})
 		require.NoError(t, err)
-		require.Equal(t, map[string]string{}, result)
+		require.NotNil(t, result)
+		require.Nil(t, result.tokens)
+		require.Nil(t, result.statuses)
+	})
+
+	t.Run("preserves unusable upstream token status", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+		reader := upstreamtokenmocks.NewMockTokenReader(ctrl)
+		reader.EXPECT().GetAllValidTokens(gomock.Any(), "session-abc").
+			Return(map[string]upstreamtoken.UpstreamCredential{
+				"cognito": {Status: upstreamtoken.StatusRefreshFailed},
+			}, nil)
+
+		v := &TokenValidator{upstreamTokenReader: reader}
+		result, err := v.loadUpstreamTokens(context.Background(), jwt.MapClaims{
+			"sub":                                "user123",
+			upstreamtoken.TokenSessionIDClaimKey: "session-abc",
+		})
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		require.Nil(t, result.tokens)
+		require.Equal(t, map[string]upstreamtoken.UpstreamCredentialStatus{
+			"cognito": upstreamtoken.StatusRefreshFailed,
+		}, result.statuses)
 	})
 }
 
@@ -2406,7 +2435,9 @@ func TestMiddleware_UpstreamTokenEnrichment(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		reader := upstreamtokenmocks.NewMockTokenReader(ctrl)
 		reader.EXPECT().GetAllValidTokens(gomock.Any(), "session-xyz").
-			Return(map[string]string{"github": "gh-tok"}, nil)
+			Return(map[string]upstreamtoken.UpstreamCredential{
+				"github": {AccessToken: "gh-tok", Status: upstreamtoken.StatusValid},
+			}, nil)
 		v := makeValidator(t, WithUpstreamTokenReader(reader))
 
 		var captured *Identity
@@ -2421,6 +2452,7 @@ func TestMiddleware_UpstreamTokenEnrichment(t *testing.T) {
 
 		require.Equal(t, http.StatusOK, rr.Code)
 		require.Equal(t, map[string]string{"github": "gh-tok"}, captured.UpstreamTokens)
+		require.Nil(t, captured.UpstreamTokenStatuses)
 	})
 
 	t.Run("returns 503 when storage fails", func(t *testing.T) {
@@ -2468,6 +2500,7 @@ func TestMiddleware_UpstreamTokenEnrichment(t *testing.T) {
 
 		require.Equal(t, http.StatusOK, rr.Code)
 		require.Nil(t, captured.UpstreamTokens)
+		require.Nil(t, captured.UpstreamTokenStatuses)
 	})
 
 	t.Run("no enrichment when reader is nil", func(t *testing.T) {
@@ -2486,6 +2519,34 @@ func TestMiddleware_UpstreamTokenEnrichment(t *testing.T) {
 
 		require.Equal(t, http.StatusOK, rr.Code)
 		require.Nil(t, captured.UpstreamTokens)
+		require.Nil(t, captured.UpstreamTokenStatuses)
+	})
+
+	t.Run("propagates upstream token status for later authz decisions", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+		reader := upstreamtokenmocks.NewMockTokenReader(ctrl)
+		reader.EXPECT().GetAllValidTokens(gomock.Any(), "session-xyz").
+			Return(map[string]upstreamtoken.UpstreamCredential{
+				"cognito": {Status: upstreamtoken.StatusRefreshFailed},
+			}, nil)
+		v := makeValidator(t, WithUpstreamTokenReader(reader))
+
+		var captured *Identity
+		handler := v.Middleware(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			captured, _ = IdentityFromContext(r.Context())
+		}))
+
+		req := httptest.NewRequest("GET", "/", nil)
+		req.Header.Set("Authorization", "Bearer "+signToken(claimsWithTsid))
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		require.Nil(t, captured.UpstreamTokens)
+		require.Equal(t, map[string]upstreamtoken.UpstreamCredentialStatus{
+			"cognito": upstreamtoken.StatusRefreshFailed,
+		}, captured.UpstreamTokenStatuses)
 	})
 }
 

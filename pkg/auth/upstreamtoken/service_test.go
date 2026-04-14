@@ -264,7 +264,7 @@ func TestInProcessService_GetAllValidTokens(t *testing.T) {
 		sessionID      string
 		setupStorage   func(*storagemocks.MockUpstreamTokenStorage)
 		setupRefresher func(*storagemocks.MockUpstreamTokenRefresher)
-		wantResult     map[string]string
+		wantResult     map[string]UpstreamCredential
 		wantErr        bool
 	}{
 		{
@@ -278,9 +278,9 @@ func TestInProcessService_GetAllValidTokens(t *testing.T) {
 					}, nil)
 			},
 			setupRefresher: func(_ *storagemocks.MockUpstreamTokenRefresher) {},
-			wantResult: map[string]string{
-				"github":    "github-access-token",
-				"atlassian": "atlassian-access-token",
+			wantResult: map[string]UpstreamCredential{
+				"github":    {AccessToken: "github-access-token", Status: StatusValid},
+				"atlassian": {AccessToken: "atlassian-access-token", Status: StatusValid},
 			},
 		},
 		{
@@ -297,13 +297,13 @@ func TestInProcessService_GetAllValidTokens(t *testing.T) {
 				r.EXPECT().RefreshAndStore(gomock.Any(), "session-2", expiredTokens).
 					Return(refreshedTokens, nil)
 			},
-			wantResult: map[string]string{
-				"atlassian": "atlassian-access-token",
-				"github":    "new-github-token",
+			wantResult: map[string]UpstreamCredential{
+				"atlassian": {AccessToken: "atlassian-access-token", Status: StatusValid},
+				"github":    {AccessToken: "new-github-token", Status: StatusValid},
 			},
 		},
 		{
-			name:      "expired refresh fails omits provider",
+			name:      "expired refresh failure preserves provider status",
 			sessionID: "session-3",
 			setupStorage: func(s *storagemocks.MockUpstreamTokenStorage) {
 				s.EXPECT().GetAllUpstreamTokens(gomock.Any(), "session-3").
@@ -315,7 +315,9 @@ func TestInProcessService_GetAllValidTokens(t *testing.T) {
 				r.EXPECT().RefreshAndStore(gomock.Any(), "session-3", expiredTokens).
 					Return(nil, errors.New("upstream IDP unavailable"))
 			},
-			wantResult: map[string]string{},
+			wantResult: map[string]UpstreamCredential{
+				"github": {Status: StatusRefreshFailed},
+			},
 		},
 		{
 			name:      "empty session returns empty map",
@@ -325,7 +327,7 @@ func TestInProcessService_GetAllValidTokens(t *testing.T) {
 					Return(map[string]*storage.UpstreamTokens{}, nil)
 			},
 			setupRefresher: func(_ *storagemocks.MockUpstreamTokenRefresher) {},
-			wantResult:     map[string]string{},
+			wantResult:     map[string]UpstreamCredential{},
 		},
 		{
 			name:      "storage error propagated",
@@ -348,12 +350,12 @@ func TestInProcessService_GetAllValidTokens(t *testing.T) {
 					}, nil)
 			},
 			setupRefresher: func(_ *storagemocks.MockUpstreamTokenRefresher) {},
-			wantResult: map[string]string{
-				"github": "github-access-token",
+			wantResult: map[string]UpstreamCredential{
+				"github": {AccessToken: "github-access-token", Status: StatusValid},
 			},
 		},
 		{
-			name:      "expired with no refresh token omits provider",
+			name:      "expired with no refresh token preserves provider status",
 			sessionID: "session-7",
 			setupStorage: func(s *storagemocks.MockUpstreamTokenStorage) {
 				s.EXPECT().GetAllUpstreamTokens(gomock.Any(), "session-7").
@@ -367,7 +369,9 @@ func TestInProcessService_GetAllValidTokens(t *testing.T) {
 					}, nil)
 			},
 			setupRefresher: func(_ *storagemocks.MockUpstreamTokenRefresher) {},
-			wantResult:     map[string]string{},
+			wantResult: map[string]UpstreamCredential{
+				"github": {Status: StatusNoRefreshToken},
+			},
 		},
 		{
 			name:      "zero ExpiresAt treated as non-expiring",
@@ -383,8 +387,8 @@ func TestInProcessService_GetAllValidTokens(t *testing.T) {
 					}, nil)
 			},
 			setupRefresher: func(_ *storagemocks.MockUpstreamTokenRefresher) {},
-			wantResult: map[string]string{
-				"github": "no-expiry-token",
+			wantResult: map[string]UpstreamCredential{
+				"github": {AccessToken: "no-expiry-token", Status: StatusValid},
 			},
 		},
 	}
@@ -418,7 +422,8 @@ func TestInProcessService_GetAllValidTokens(t *testing.T) {
 }
 
 // TestInProcessService_GetAllValidTokens_NilRefresher verifies that when the
-// refresher is nil, expired tokens in the bulk path are omitted (not panicking).
+// refresher is nil, expired tokens in the bulk path are preserved as
+// re-authentication-required statuses (not panicking).
 func TestInProcessService_GetAllValidTokens_NilRefresher(t *testing.T) {
 	t.Parallel()
 
@@ -441,5 +446,7 @@ func TestInProcessService_GetAllValidTokens_NilRefresher(t *testing.T) {
 	result, err := svc.GetAllValidTokens(context.Background(), "session-1")
 
 	require.NoError(t, err)
-	assert.Equal(t, map[string]string{}, result)
+	assert.Equal(t, map[string]UpstreamCredential{
+		"github": {Status: StatusNoRefreshToken},
+	}, result)
 }

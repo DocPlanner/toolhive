@@ -6,6 +6,7 @@ package authz
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +23,7 @@ import (
 	"golang.org/x/exp/jsonrpc2"
 
 	"github.com/stacklok/toolhive/pkg/auth"
+	"github.com/stacklok/toolhive/pkg/authz/authorizers"
 	"github.com/stacklok/toolhive/pkg/authz/authorizers/cedar"
 	mcpparser "github.com/stacklok/toolhive/pkg/mcp"
 	"github.com/stacklok/toolhive/pkg/vmcp/optimizer"
@@ -513,6 +515,87 @@ func TestResponseFilteringWriter_ErrorResponse(t *testing.T) {
 
 	// Verify the error response passed through unchanged
 	assert.Equal(t, responseBytes, rr.Body.Bytes(), "Error response should pass through unchanged")
+}
+
+func TestResponseFilteringWriter_ListAuthorizationErrorsReturnExplicitResponses(t *testing.T) {
+	t.Parallel()
+
+	listResult := mcp.ListToolsResult{
+		Tools: []mcp.Tool{
+			{Name: "weather", Description: "Get weather information"},
+		},
+	}
+	resultJSON, err := json.Marshal(listResult)
+	require.NoError(t, err)
+
+	jsonrpcResponse := &jsonrpc2.Response{
+		ID:     jsonrpc2.Int64ID(1),
+		Result: json.RawMessage(resultJSON),
+	}
+	responseBytes, err := jsonrpc2.EncodeMessage(jsonrpcResponse)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name          string
+		authErr       error
+		wantStatus    int
+		wantCode      int64
+		wantMessage   string
+		wantChallenge string
+	}{
+		{
+			name:          "upstream auth required becomes 401",
+			authErr:       authorizers.NewUpstreamAuthenticationRequiredError("cognito", "refresh_failed"),
+			wantStatus:    http.StatusUnauthorized,
+			wantCode:      http.StatusUnauthorized,
+			wantMessage:   upstreamAuthRequiredDescription,
+			wantChallenge: `Bearer error="invalid_token", error_description="upstream token is no longer valid; re-authentication required"`,
+		},
+		{
+			name:        "generic authz failure becomes 500",
+			authErr:     errors.New("policy evaluation failed"),
+			wantStatus:  http.StatusInternalServerError,
+			wantCode:    http.StatusInternalServerError,
+			wantMessage: "policy evaluation failed",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			req, err := http.NewRequest(http.MethodPost, "/messages", nil)
+			require.NoError(t, err)
+
+			rr := httptest.NewRecorder()
+			filteringWriter := NewResponseFilteringWriter(
+				rr,
+				&stubAuthorizer{allowed: false, err: tc.authErr},
+				req,
+				string(mcp.MethodToolsList),
+				nil,
+				nil,
+			)
+			filteringWriter.ResponseWriter.Header().Set("Content-Type", "application/json")
+
+			_, err = filteringWriter.Write(responseBytes)
+			require.NoError(t, err)
+			require.NoError(t, filteringWriter.FlushAndFilter())
+
+			assert.Equal(t, tc.wantStatus, rr.Code)
+			assert.Equal(t, tc.wantChallenge, rr.Header().Get("WWW-Authenticate"))
+
+			var rpcResp struct {
+				Error struct {
+					Code    int64  `json:"code"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &rpcResp))
+			assert.Equal(t, tc.wantCode, rpcResp.Error.Code)
+			assert.Equal(t, tc.wantMessage, rpcResp.Error.Message)
+		})
+	}
 }
 
 // TestResponseFilteringWriter_ContentLengthMismatch reproduces a bug where

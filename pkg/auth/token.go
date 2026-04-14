@@ -1168,22 +1168,47 @@ func writeOAuthError(w http.ResponseWriter, errorCode, description string, statu
 	_, _ = w.Write(body)
 }
 
+type upstreamTokenLoadResult struct {
+	tokens   map[string]string
+	statuses map[string]upstreamtoken.UpstreamCredentialStatus
+}
+
 // loadUpstreamTokens extracts the token session ID from claims and loads
 // all upstream provider tokens for that session. Returns (nil, nil) if no
 // tsid claim exists. Returns a non-nil error when a tsid claim is present
 // but token loading fails (infrastructure error).
-func (v *TokenValidator) loadUpstreamTokens(ctx context.Context, claims jwt.MapClaims) (map[string]string, error) {
+func (v *TokenValidator) loadUpstreamTokens(ctx context.Context, claims jwt.MapClaims) (*upstreamTokenLoadResult, error) {
 	tsid, ok := claims[upstreamtoken.TokenSessionIDClaimKey].(string)
 	if !ok || tsid == "" {
 		return nil, nil
 	}
 
-	tokens, err := v.upstreamTokenReader.GetAllValidTokens(ctx, tsid)
+	credentials, err := v.upstreamTokenReader.GetAllValidTokens(ctx, tsid)
 	if err != nil {
 		return nil, fmt.Errorf("load upstream tokens for session %s: %w", tsid, err)
 	}
 
-	return tokens, nil
+	result := &upstreamTokenLoadResult{}
+	for providerName, credential := range credentials {
+		if credential.Status == "" {
+			credential.Status = upstreamtoken.StatusValid
+		}
+
+		if credential.AccessToken != "" {
+			if result.tokens == nil {
+				result.tokens = make(map[string]string)
+			}
+			result.tokens[providerName] = credential.AccessToken
+		}
+		if credential.Status != upstreamtoken.StatusValid {
+			if result.statuses == nil {
+				result.statuses = make(map[string]upstreamtoken.UpstreamCredentialStatus)
+			}
+			result.statuses[providerName] = credential.Status
+		}
+	}
+
+	return result, nil
 }
 
 // Middleware creates an HTTP middleware that validates JWT tokens and creates Identity.
@@ -1217,7 +1242,7 @@ func (v *TokenValidator) Middleware(next http.Handler) http.Handler {
 		// Enrich Identity with upstream provider tokens when an embedded
 		// auth server is active (reader configured via WithUpstreamTokenReader).
 		if v.upstreamTokenReader != nil {
-			tokens, loadErr := v.loadUpstreamTokens(r.Context(), claims)
+			loaded, loadErr := v.loadUpstreamTokens(r.Context(), claims)
 			if loadErr != nil {
 				slog.WarnContext(r.Context(), "upstream token storage unavailable",
 					"error", loadErr,
@@ -1225,7 +1250,10 @@ func (v *TokenValidator) Middleware(next http.Handler) http.Handler {
 				http.Error(w, "authentication service temporarily unavailable", http.StatusServiceUnavailable)
 				return
 			}
-			identity.UpstreamTokens = tokens
+			if loaded != nil {
+				identity.UpstreamTokens = loaded.tokens
+				identity.UpstreamTokenStatuses = loaded.statuses
+			}
 		}
 
 		// Add the Identity to the request context

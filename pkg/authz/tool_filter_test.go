@@ -75,6 +75,7 @@ func TestFilterToolsByPolicy(t *testing.T) {
 		authorizer authorizers.Authorizer
 		tools      []mcp.Tool
 		wantNames  []string
+		wantErr    error
 	}{
 		{
 			name:       "nil authorizer returns all tools unchanged",
@@ -106,7 +107,7 @@ func TestFilterToolsByPolicy(t *testing.T) {
 			wantNames: []string{"allowed", "allowed2"},
 		},
 		{
-			name: "skips tools where authorizer returns error",
+			name: "returns error when policy evaluation fails",
 			authorizer: &mockAuthorizer{results: map[string]mockResult{
 				"good":  {authorized: true},
 				"error": {err: errAuth},
@@ -115,7 +116,7 @@ func TestFilterToolsByPolicy(t *testing.T) {
 				makeTool("good", nil),
 				makeTool("error", nil),
 			},
-			wantNames: []string{"good"},
+			wantErr: errAuth,
 		},
 		{
 			name: "tools with annotations are still filtered",
@@ -135,7 +136,14 @@ func TestFilterToolsByPolicy(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := filterToolsByPolicy(context.Background(), tc.authorizer, tc.tools)
+			got, err := filterToolsByPolicy(context.Background(), tc.authorizer, tc.tools)
+			if tc.wantErr != nil {
+				require.Error(t, err)
+				assert.ErrorIs(t, err, tc.wantErr)
+				assert.Nil(t, got)
+				return
+			}
+			require.NoError(t, err)
 
 			gotNames := make([]string, len(got))
 			for i, tool := range got {
@@ -154,7 +162,8 @@ func TestFilterToolsByPolicy_CallsAuthorizerCorrectly(t *testing.T) {
 	}}
 
 	tools := []mcp.Tool{makeTool("tool1", nil)}
-	filterToolsByPolicy(context.Background(), mock, tools)
+	_, err := filterToolsByPolicy(context.Background(), mock, tools)
+	require.NoError(t, err)
 
 	require.Len(t, mock.calls, 1)
 	assert.Equal(t, authorizers.MCPFeatureTool, mock.calls[0].feature)
@@ -193,7 +202,8 @@ func TestFilterToolsByPolicy_WithCedarAuthorizer(t *testing.T) {
 			{Name: "translator", Description: "Translate text"},
 		}
 
-		got := filterToolsByPolicy(cedarCtx(t), cedarAuth, tools)
+		got, err := filterToolsByPolicy(cedarCtx(t), cedarAuth, tools)
+		require.NoError(t, err)
 
 		require.Len(t, got, 1)
 		assert.Equal(t, "weather", got[0].Name)
@@ -208,7 +218,8 @@ func TestFilterToolsByPolicy_WithCedarAuthorizer(t *testing.T) {
 			{Name: "translator", Description: "Translate text"},
 		}
 
-		got := filterToolsByPolicy(cedarCtx(t), cedarAuth, tools)
+		got, err := filterToolsByPolicy(cedarCtx(t), cedarAuth, tools)
+		require.NoError(t, err)
 
 		assert.Empty(t, got)
 	})

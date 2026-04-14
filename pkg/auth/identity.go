@@ -7,6 +7,8 @@ package auth
 import (
 	"encoding/json"
 	"fmt"
+
+	"github.com/stacklok/toolhive/pkg/auth/upstreamtoken"
 )
 
 // PrincipalInfo contains the non-sensitive identity fields safe for external consumption.
@@ -63,6 +65,12 @@ type Identity struct {
 	// Redacted in MarshalJSON() to prevent token leakage.
 	// MUST NOT be mutated after the Identity is placed in the request context.
 	UpstreamTokens map[string]string
+
+	// UpstreamTokenStatuses stores non-sensitive status for upstream providers
+	// whose credentials are present in session storage but currently unusable.
+	// This allows authorization middleware to distinguish a normal deny from a
+	// re-authentication-required condition when a primary upstream provider is in use.
+	UpstreamTokenStatuses map[string]upstreamtoken.UpstreamCredentialStatus
 }
 
 // String returns a string representation of the Identity with sensitive fields redacted.
@@ -84,15 +92,16 @@ func (i *Identity) MarshalJSON() ([]byte, error) {
 
 	// Create a safe representation with lowercase field names and redacted token
 	type SafeIdentity struct {
-		Subject        string            `json:"subject"`
-		Name           string            `json:"name"`
-		Email          string            `json:"email"`
-		Groups         []string          `json:"groups"`
-		Claims         map[string]any    `json:"claims"`
-		Token          string            `json:"token"`
-		TokenType      string            `json:"tokenType"`
-		Metadata       map[string]string `json:"metadata"`
-		UpstreamTokens map[string]string `json:"upstreamTokens,omitempty"`
+		Subject               string                                            `json:"subject"`
+		Name                  string                                            `json:"name"`
+		Email                 string                                            `json:"email"`
+		Groups                []string                                          `json:"groups"`
+		Claims                map[string]any                                    `json:"claims"`
+		Token                 string                                            `json:"token"`
+		TokenType             string                                            `json:"tokenType"`
+		Metadata              map[string]string                                 `json:"metadata"`
+		UpstreamTokens        map[string]string                                 `json:"upstreamTokens,omitempty"`
+		UpstreamTokenStatuses map[string]upstreamtoken.UpstreamCredentialStatus `json:"upstreamTokenStatuses,omitempty"`
 	}
 
 	token := i.Token
@@ -115,16 +124,25 @@ func (i *Identity) MarshalJSON() ([]byte, error) {
 		}
 	}
 
+	var upstreamTokenStatuses map[string]upstreamtoken.UpstreamCredentialStatus
+	if len(i.UpstreamTokenStatuses) > 0 {
+		upstreamTokenStatuses = make(map[string]upstreamtoken.UpstreamCredentialStatus, len(i.UpstreamTokenStatuses))
+		for k, v := range i.UpstreamTokenStatuses {
+			upstreamTokenStatuses[k] = v
+		}
+	}
+
 	return json.Marshal(&SafeIdentity{
-		Subject:        i.Subject,
-		Name:           i.Name,
-		Email:          i.Email,
-		Groups:         i.Groups,
-		Claims:         i.Claims,
-		Token:          token,
-		TokenType:      i.TokenType,
-		Metadata:       i.Metadata,
-		UpstreamTokens: redactedUpstreamTokens,
+		Subject:               i.Subject,
+		Name:                  i.Name,
+		Email:                 i.Email,
+		Groups:                i.Groups,
+		Claims:                i.Claims,
+		Token:                 token,
+		TokenType:             i.TokenType,
+		Metadata:              i.Metadata,
+		UpstreamTokens:        redactedUpstreamTokens,
+		UpstreamTokenStatuses: upstreamTokenStatuses,
 	})
 }
 
