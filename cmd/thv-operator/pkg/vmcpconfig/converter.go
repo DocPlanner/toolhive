@@ -197,6 +197,7 @@ func (c *Converter) convertIncomingAuth(
 		// Handle inline policies
 		if vmcp.Spec.IncomingAuth.AuthzConfig.Type == authzLabelValueInline && vmcp.Spec.IncomingAuth.AuthzConfig.Inline != nil {
 			incoming.Authz.Policies = vmcp.Spec.IncomingAuth.AuthzConfig.Inline.Policies
+			incoming.Authz.PrimaryUpstreamProvider = vmcp.Spec.IncomingAuth.AuthzConfig.Inline.PrimaryUpstreamProvider
 		}
 		// TODO: Load policies from ConfigMap if Type is "configMap"
 	}

@@ -937,6 +937,14 @@ type InlineAuthzConfig struct {
 	// +kubebuilder:default="[]"
 	// +optional
 	EntitiesJSON string `json:"entitiesJson,omitempty"`
+
+	// PrimaryUpstreamProvider names the upstream IDP provider whose access
+	// token should be used as the source of JWT claims for Cedar evaluation.
+	// When empty, claims from the ToolHive-issued token are used.
+	// Must match an upstream provider name configured in the embedded auth server
+	// (e.g. "default", "github"). Only relevant when the embedded auth server is active.
+	// +optional
+	PrimaryUpstreamProvider string `json:"primaryUpstreamProvider,omitempty"`
 }
 
 // AuditConfig defines audit logging configuration for the MCP server

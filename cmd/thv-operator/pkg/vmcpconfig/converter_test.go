@@ -402,6 +402,58 @@ func TestConverter_IncomingAuthRequired(t *testing.T) {
 	}
 }
 
+func TestConverter_InlineAuthzPrimaryUpstreamProvider(t *testing.T) {
+	t.Parallel()
+
+	vmcpServer := &mcpv1alpha1.VirtualMCPServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-vmcp",
+			Namespace: "default",
+		},
+		Spec: mcpv1alpha1.VirtualMCPServerSpec{
+			Config: vmcpconfig.Config{Group: "test-group"},
+			IncomingAuth: &mcpv1alpha1.IncomingAuthConfig{
+				Type: "oidc",
+				OIDCConfig: &mcpv1alpha1.OIDCConfigRef{
+					Type: "inline",
+					Inline: &mcpv1alpha1.InlineOIDCConfig{
+						Issuer:   "https://issuer.example.com",
+						ClientID: "test-client",
+						Audience: "test-audience",
+					},
+				},
+				AuthzConfig: &mcpv1alpha1.AuthzConfigRef{
+					Type: authzLabelValueInline,
+					Inline: &mcpv1alpha1.InlineAuthzConfig{
+						Policies:                []string{"permit(principal, action, resource);"},
+						PrimaryUpstreamProvider: "cognito",
+					},
+				},
+			},
+		},
+	}
+
+	ctrl := gomock.NewController(t)
+	mockResolver := oidcmocks.NewMockResolver(ctrl)
+	mockResolver.EXPECT().Resolve(gomock.Any(), gomock.Any()).Return(&oidc.OIDCConfig{
+		Issuer:   "https://issuer.example.com",
+		ClientID: "test-client",
+		Audience: "test-audience",
+	}, nil)
+
+	converter := newTestConverter(t, mockResolver)
+	ctx := log.IntoContext(context.Background(), logr.Discard())
+	config, _, err := converter.Convert(ctx, vmcpServer)
+
+	require.NoError(t, err)
+	require.NotNil(t, config)
+	require.NotNil(t, config.IncomingAuth)
+	require.NotNil(t, config.IncomingAuth.Authz)
+	assert.Equal(t, "cedar", config.IncomingAuth.Authz.Type)
+	assert.Equal(t, []string{"permit(principal, action, resource);"}, config.IncomingAuth.Authz.Policies)
+	assert.Equal(t, "cognito", config.IncomingAuth.Authz.PrimaryUpstreamProvider)
+}
+
 // createTestScheme creates a test scheme with required types
 func createTestScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
