@@ -4,6 +4,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -11,11 +12,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-jose/go-jose/v4"
+	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	servercrypto "github.com/stacklok/toolhive/pkg/authserver/server/crypto"
 	"github.com/stacklok/toolhive/pkg/authserver/storage"
+	"github.com/stacklok/toolhive/pkg/authserver/upstream"
 )
 
 func TestTokenHandler_MissingGrantType(t *testing.T) {
@@ -204,6 +208,87 @@ func TestTokenHandler_ResourceParameter(t *testing.T) {
 	assert.Contains(t, body, "access_token")
 }
 
+func TestTokenHandler_DefaultsSingleAudienceWhenResourceOmitted(t *testing.T) {
+	t.Parallel()
+	handler, storState, _ := handlerTestSetup(t)
+
+	authorizeCode := simulateAuthorizeFlow(t, handler, storState)
+
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {testAuthClientID},
+		"redirect_uri":  {testAuthRedirectURI},
+		"code":          {authorizeCode},
+		"code_verifier": {testPKCEVerifier},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	handler.TokenHandler(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, "expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+
+	tokenData := parseTokenResponse(t, rec.Body.String())
+	accessToken, ok := tokenData["access_token"].(string)
+	require.True(t, ok, "access_token should be a string")
+	require.NotEmpty(t, accessToken, "access_token should not be empty")
+
+	parsedToken, err := jwt.ParseSigned(accessToken, []jose.SignatureAlgorithm{jose.RS256})
+	require.NoError(t, err, "should be able to parse JWT")
+
+	var claims map[string]interface{}
+	err = parsedToken.Claims(handler.config.SigningKey.Public(), &claims)
+	require.NoError(t, err, "JWT signature should be valid")
+
+	aud, ok := claims["aud"].([]interface{})
+	require.True(t, ok, "aud claim should be an array")
+	require.Len(t, aud, 1, "aud should have exactly one audience")
+	assert.Equal(t, "https://api.example.com", aud[0], "default audience should match the sole allowed audience")
+}
+
+func TestTokenHandler_RequiresResourceWhenMultipleAudiencesConfigured(t *testing.T) {
+	t.Parallel()
+
+	provider, oauth2Config, stor, storState := baseTestSetup(t)
+	oauth2Config.AllowedAudiences = []string{"https://api.example.com", "https://mcp.example.com"}
+
+	mockUpstream := &mockIDPProvider{
+		providerType:     upstream.ProviderTypeOAuth2,
+		authorizationURL: "https://idp.example.com/authorize",
+		exchangeResult: &upstream.Identity{
+			Tokens: &upstream.Tokens{
+				AccessToken:  "upstream-access-token",
+				RefreshToken: "upstream-refresh-token",
+				IDToken:      "upstream-id-token",
+				ExpiresAt:    time.Now().Add(time.Hour),
+			},
+			Subject: "user-123",
+		},
+	}
+	handler, err := NewHandler(provider, oauth2Config, stor, []NamedUpstream{{Name: "test-upstream", Provider: mockUpstream}})
+	require.NoError(t, err)
+
+	authorizeCode := simulateAuthorizeFlow(t, handler, storState)
+
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {testAuthClientID},
+		"redirect_uri":  {testAuthRedirectURI},
+		"code":          {authorizeCode},
+		"code_verifier": {testPKCEVerifier},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	handler.TokenHandler(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "invalid_target")
+	assert.Contains(t, rec.Body.String(), "Token request must include resource")
+}
+
 func TestTokenHandler_RouteRegistered(t *testing.T) {
 	t.Parallel()
 	handler, _, _ := handlerTestSetup(t)
@@ -268,4 +353,13 @@ func simulateAuthorizeFlow(t *testing.T, handler *Handler, storState *testStorag
 	require.NotEmpty(t, code, "callback redirect should include authorization code")
 
 	return code
+}
+
+func parseTokenResponse(t *testing.T, body string) map[string]interface{} {
+	t.Helper()
+
+	var tokenData map[string]interface{}
+	err := json.Unmarshal([]byte(body), &tokenData)
+	require.NoError(t, err, "token response should be valid JSON")
+	return tokenData
 }

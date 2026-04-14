@@ -49,7 +49,8 @@ func (h *Handler) TokenHandler(w http.ResponseWriter, req *http.Request) {
 			server.ErrInvalidTarget.WithHint("Multiple resource parameters are not supported"))
 		return
 	}
-	if len(resources) == 1 {
+	switch {
+	case len(resources) == 1:
 		resource := resources[0]
 		// Validate URI format per RFC 8707
 		if err := server.ValidateAudienceURI(resource); err != nil {
@@ -75,6 +76,19 @@ func (h *Handler) TokenHandler(w http.ResponseWriter, req *http.Request) {
 			"resource", resource,
 		)
 		accessRequest.GrantAudience(resource)
+	case len(h.config.AllowedAudiences) == 1:
+		defaultAudience := h.config.AllowedAudiences[0]
+		slog.Debug("granting default audience for token request without resource", //nolint:gosec // G706: configured audience URI
+			"audience", defaultAudience,
+		)
+		accessRequest.GrantAudience(defaultAudience)
+	case len(h.config.AllowedAudiences) > 1:
+		slog.Debug("resource parameter required when multiple audiences are configured", //nolint:gosec // G706: count is an integer
+			"count", len(h.config.AllowedAudiences),
+		)
+		h.provider.WriteAccessError(ctx, w, accessRequest,
+			server.ErrInvalidTarget.WithHint("Token request must include resource when multiple audiences are configured"))
+		return
 	}
 
 	// Generate the access response (tokens)

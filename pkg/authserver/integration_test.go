@@ -138,6 +138,7 @@ func setupTestServer(t *testing.T, opts ...testServerOption) *testServer {
 		RedirectURIs:  []string{testRedirectURI},
 		ResponseTypes: []string{"code"},
 		GrantTypes:    []string{"authorization_code", "refresh_token"},
+		Audience:      []string{testAudience},
 		Scopes:        options.scopes,
 		Public:        true,
 	})
