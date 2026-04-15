@@ -882,6 +882,39 @@ func TestDefaultAggregator_ProcessPreQueriedCapabilities(t *testing.T) {
 			"OriginalCapabilityName must be wired to the original backend tool name")
 	})
 
+	t.Run("routing table preserves output schema for tools", func(t *testing.T) {
+		t.Parallel()
+
+		outputSchema := map[string]any{
+			"type":     "object",
+			"required": []any{"result"},
+			"properties": map[string]any{
+				"result": map[string]any{"type": "string"},
+			},
+		}
+
+		toolsByBackend := map[string][]vmcp.Tool{
+			"backend1": {{
+				Name:         "schema_tool",
+				Description:  "schema tool",
+				BackendID:    "backend1",
+				OutputSchema: outputSchema,
+			}},
+		}
+		targets := map[string]*vmcp.BackendTarget{
+			"backend1": newTarget("backend1"),
+		}
+
+		agg := NewDefaultAggregator(nil, nil, nil, nil)
+		_, _, routingTable, err := agg.ProcessPreQueriedCapabilities(
+			context.Background(), toolsByBackend, targets,
+		)
+
+		require.NoError(t, err)
+		require.Contains(t, routingTable, "schema_tool")
+		assert.Equal(t, outputSchema, routingTable["schema_tool"].OutputSchema)
+	})
+
 	t.Run("override rename: routing table keyed by overridden name with OriginalCapabilityName set", func(t *testing.T) {
 		t.Parallel()
 

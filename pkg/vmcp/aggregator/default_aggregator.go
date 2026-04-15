@@ -347,6 +347,7 @@ func (a *defaultAggregator) MergeCapabilities(
 			routingTable.Tools[resolvedTool.ResolvedName] = &vmcp.BackendTarget{
 				WorkloadID:             resolvedTool.BackendID,
 				OriginalCapabilityName: actualBackendCapabilityName(a.toolConfigMap, resolvedTool.BackendID, resolvedTool.OriginalName),
+				OutputSchema:           resolvedTool.OutputSchema,
 			}
 		} else {
 			// Use the backendToTarget helper from registry package
@@ -355,6 +356,7 @@ func (a *defaultAggregator) MergeCapabilities(
 			// resolvedTool.OriginalName is the post-override name; reverse the override
 			// to get the name the backend itself uses.
 			target.OriginalCapabilityName = actualBackendCapabilityName(a.toolConfigMap, resolvedTool.BackendID, resolvedTool.OriginalName)
+			target.OutputSchema = resolvedTool.OutputSchema
 			routingTable.Tools[resolvedTool.ResolvedName] = target
 		}
 	}
@@ -545,6 +547,7 @@ func (a *defaultAggregator) ProcessPreQueriedCapabilities(
 		// actual name the backend itself uses.
 		t := *target
 		t.OriginalCapabilityName = actualBackendCapabilityName(a.toolConfigMap, rt.BackendID, rt.OriginalName)
+		t.OutputSchema = rt.OutputSchema
 		routingTable[rt.ResolvedName] = &t
 
 		resolved := vmcp.Tool{

@@ -164,6 +164,58 @@ func TestConvertToolOutputSchema(t *testing.T) {
 	}
 }
 
+func TestToolResultStructuredContent(t *testing.T) {
+	t.Parallel()
+
+	content := []vmcp.Content{{Type: vmcp.ContentTypeText, Text: "hello"}}
+
+	tests := []struct {
+		name            string
+		raw             any
+		hasOutputSchema bool
+		want            map[string]any
+	}{
+		{
+			name:            "uses backend structured object as-is",
+			raw:             map[string]any{"result": "ok"},
+			hasOutputSchema: true,
+			want:            map[string]any{"result": "ok"},
+		},
+		{
+			name:            "falls back to content map when schema is absent",
+			raw:             nil,
+			hasOutputSchema: false,
+			want:            map[string]any{"text": "hello"},
+		},
+		{
+			name:            "does not synthesize structured content for schema-bearing tools",
+			raw:             nil,
+			hasOutputSchema: true,
+			want:            nil,
+		},
+		{
+			name:            "ignores non-object structured content when schema is present",
+			raw:             "plain-text",
+			hasOutputSchema: true,
+			want:            nil,
+		},
+		{
+			name:            "falls back for non-object structured content when schema is absent",
+			raw:             "plain-text",
+			hasOutputSchema: false,
+			want:            map[string]any{"text": "hello"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := ToolResultStructuredContent(tt.raw, content, tt.hasOutputSchema)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestToMCPToolAnnotations(t *testing.T) {
 	t.Parallel()
 

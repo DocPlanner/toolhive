@@ -440,12 +440,13 @@ func (e *workflowEngine) executeToolStep(
 		return e.handleToolStepFailure(step, workflowCtx, retryCount, err)
 	}
 
-	// Extract output map from result.
-	// Prefer StructuredContent (already a map), fall back to Content array conversion.
-	output := result.StructuredContent
-	if output == nil {
-		output = conversion.ContentArrayToMap(result.Content)
-	}
+	// Extract output map from result while preserving schema-conformant
+	// structured content for tools that advertise an output schema.
+	output := conversion.ToolResultStructuredContent(
+		result.StructuredContent,
+		result.Content,
+		target.OutputSchema != nil,
+	)
 
 	return e.handleToolStepSuccess(ctx, step, workflowCtx, output, result.Content, retryCount)
 }
@@ -862,10 +863,11 @@ func (e *workflowEngine) executeForEachIteration(
 		}
 	}
 
-	output := result.StructuredContent
-	if output == nil {
-		output = conversion.ContentArrayToMap(result.Content)
-	}
+	output := conversion.ToolResultStructuredContent(
+		result.StructuredContent,
+		result.Content,
+		target.OutputSchema != nil,
+	)
 
 	return iterationResult{
 		Index: index, Item: item, Status: "completed", Output: output,

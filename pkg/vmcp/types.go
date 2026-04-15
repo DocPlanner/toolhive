@@ -66,6 +66,12 @@ type BackendTarget struct {
 	//   client.CallTool(ctx, target, target.GetBackendCapabilityName(toolName), args)
 	OriginalCapabilityName string
 
+	// OutputSchema is the declared JSON schema for a routed tool's output.
+	// It is populated for tool targets so downstream execution paths can avoid
+	// synthesizing structured content that would violate the advertised schema.
+	// Nil for resources, prompts, and tools without an output schema.
+	OutputSchema map[string]any
+
 	// AuthConfig contains the typed authentication configuration for this backend.
 	// The actual authentication is handled by OutgoingAuthRegistry interface.
 	// If nil, the backend requires no authentication.

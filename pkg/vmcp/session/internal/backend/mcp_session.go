@@ -119,15 +119,11 @@ func (c *mcpSession) CallTool(
 
 	contentArray := conversion.ConvertMCPContents(result.Content)
 
-	var structuredContent map[string]any
-	if result.StructuredContent != nil {
-		if m, ok := result.StructuredContent.(map[string]any); ok {
-			structuredContent = m
-		}
-	}
-	if structuredContent == nil {
-		structuredContent = conversion.ContentArrayToMap(contentArray)
-	}
+	structuredContent := conversion.ToolResultStructuredContent(
+		result.StructuredContent,
+		contentArray,
+		c.target.OutputSchema != nil,
+	)
 
 	return &vmcp.ToolCallResult{
 		Content:           contentArray,

@@ -738,26 +738,13 @@ func (h *httpBackendClient) CallTool(
 	// Convert MCP content to vmcp.Content array.
 	contentArray := conversion.ConvertMCPContents(result.Content)
 
-	// Check for structured content first (preferred for composite tool step chaining).
-	// StructuredContent allows templates to access nested fields directly via {{.steps.stepID.output.field}}.
-	// Note: StructuredContent must be an object (map). Arrays or primitives are not supported.
-	var structuredContent map[string]any
-	if result.StructuredContent != nil {
-		if structuredMap, ok := result.StructuredContent.(map[string]any); ok {
-			slog.Debug("using structured content from tool", "tool", toolName, "backend", target.WorkloadID)
-			structuredContent = structuredMap
-		} else {
-			// StructuredContent is not an object - fall through to Content processing
-			slog.Debug("structuredContent is not an object, falling back to Content",
-				"tool", toolName, "backend", target.WorkloadID)
-		}
-	}
-
-	// If no structured content, convert result contents to a map for backward compatibility.
-	// MCP tools return an array of Content interface (TextContent, ImageContent, etc.).
-	// Text content is stored under "text" key, accessible via {{.steps.stepID.output.text}}.
-	if structuredContent == nil {
-		structuredContent = conversion.ContentArrayToMap(contentArray)
+	structuredContent := conversion.ToolResultStructuredContent(
+		result.StructuredContent,
+		contentArray,
+		target.OutputSchema != nil,
+	)
+	if structuredContent != nil {
+		slog.Debug("resolved structured content for tool", "tool", toolName, "backend", target.WorkloadID)
 	}
 
 	return &vmcp.ToolCallResult{

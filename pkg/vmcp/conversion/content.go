@@ -432,3 +432,30 @@ func ContentArrayToMap(content []vmcp.Content) map[string]any {
 
 	return result
 }
+
+// ToolResultStructuredContent resolves the structured output ToolHive should expose
+// for a tool result.
+//
+// If the backend provided a structured object, it is always preferred. When no
+// structured object is present, ToolHive may synthesize a fallback object from the
+// content array for backward compatibility. That fallback must be disabled for
+// tools with an advertised output schema, otherwise clients can reject the
+// synthesized payload as schema-invalid.
+func ToolResultStructuredContent(
+	rawStructuredContent any,
+	content []vmcp.Content,
+	hasOutputSchema bool,
+) map[string]any {
+	if rawStructuredContent != nil {
+		if structuredMap, ok := rawStructuredContent.(map[string]any); ok {
+			return structuredMap
+		}
+		slog.Debug("structuredContent is not an object, falling back to content handling")
+	}
+
+	if hasOutputSchema {
+		return nil
+	}
+
+	return ContentArrayToMap(content)
+}
