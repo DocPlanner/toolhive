@@ -479,6 +479,12 @@ spec:
                 - audience
                 - name
                 type: object
+              podTemplateSpec:
+                description: |-
+                  PodTemplateSpec allows customizing the pod template for the proxy deployment.
+                  Scheduling fields (nodeSelector, tolerations, affinity) are applied to the proxy pods.
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
               proxyPort:
                 default: 8080
                 description: ProxyPort is the port to expose the MCP proxy on
@@ -490,6 +496,13 @@ spec:
                 description: RemoteURL is the URL of the remote MCP server to proxy
                 pattern: ^https?://
                 type: string
+              replicas:
+                description: |-
+                  Replicas is the number of proxy deployment replicas.
+                  When nil, defaults to 1. Set to nil when using an external HPA.
+                format: int32
+                minimum: 1
+                type: integer
               resourceOverrides:
                 description: ResourceOverrides allows overriding annotations and labels
                   for resources created by the operator

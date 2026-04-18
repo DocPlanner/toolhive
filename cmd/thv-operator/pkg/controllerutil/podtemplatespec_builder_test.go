@@ -253,6 +253,44 @@ func TestPodTemplateSpecBuilder_Chaining(t *testing.T) {
 	assert.Equal(t, testContainerName, result.Spec.Containers[0].Name)
 }
 
+func TestPodTemplateSpecBuilder_SchedulingSpec(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil input returns nil scheduling", func(t *testing.T) {
+		t.Parallel()
+		builder, err := NewPodTemplateSpecBuilder(nil, testContainerName)
+		require.NoError(t, err)
+
+		ns, tol, aff := builder.SchedulingSpec()
+		assert.Nil(t, ns)
+		assert.Nil(t, tol)
+		assert.Nil(t, aff)
+	})
+
+	t.Run("returns scheduling fields from spec", func(t *testing.T) {
+		t.Parallel()
+		raw := &runtime.RawExtension{
+			Raw: []byte(`{
+				"spec": {
+					"nodeSelector": {"roleType": "workload-toolhive"},
+					"tolerations": [{"key": "roleType", "value": "workload-toolhive", "effect": "NoSchedule"}],
+					"affinity": {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [{"matchExpressions": [{"key": "kubernetes.io/arch", "operator": "In", "values": ["arm64"]}]}]}}}
+				}
+			}`),
+		}
+		builder, err := NewPodTemplateSpecBuilder(raw, testContainerName)
+		require.NoError(t, err)
+
+		ns, tol, aff := builder.SchedulingSpec()
+		require.NotNil(t, ns)
+		assert.Equal(t, "workload-toolhive", ns["roleType"])
+		require.Len(t, tol, 1)
+		assert.Equal(t, "roleType", tol[0].Key)
+		require.NotNil(t, aff)
+		require.NotNil(t, aff.NodeAffinity)
+	})
+}
+
 // ptr is a helper to create a pointer to a string.
 func ptr(s string) *string {
 	return &s

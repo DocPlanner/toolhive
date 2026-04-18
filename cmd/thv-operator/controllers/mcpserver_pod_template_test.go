@@ -109,6 +109,16 @@ func TestDeploymentForMCPServerWithPodTemplateSpec(t *testing.T) {
 	proxyLabels := deployment.Spec.Template.Labels
 	assert.Equal(t, "true", proxyLabels["podspec-testlabel"], "podTemplateMetadataOverrides labels should be merged with Spec.Template.Labels")
 
+	// Scheduling fields from podTemplateSpec must propagate to the proxy runner Deployment
+	// so both proxy and backend land on the same node pool.
+	proxySpec := deployment.Spec.Template.Spec
+	require.NotNil(t, proxySpec.NodeSelector, "Proxy runner should inherit nodeSelector from podTemplateSpec")
+	assert.Equal(t, "linux", proxySpec.NodeSelector["kubernetes.io/os"])
+	assert.Equal(t, "mcp-server", proxySpec.NodeSelector["node-type"])
+	require.Len(t, proxySpec.Tolerations, 1, "Proxy runner should inherit tolerations from podTemplateSpec")
+	assert.Equal(t, "dedicated", proxySpec.Tolerations[0].Key)
+	assert.Equal(t, corev1.TaintEffectNoSchedule, proxySpec.Tolerations[0].Effect)
+
 	// Check if the pod template patch is included in the args
 	podTemplatePatchFound := false
 	for _, arg := range deployment.Spec.Template.Spec.Containers[0].Args {

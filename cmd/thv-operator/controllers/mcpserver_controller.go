@@ -1061,6 +1061,10 @@ func (r *MCPServerReconciler) deploymentForMCPServer(
 
 	// Using ConfigMap mode for all configuration
 	// Pod template patch for secrets and service account
+	var proxyNodeSelector map[string]string
+	var proxyTolerations []corev1.Toleration
+	var proxyAffinity *corev1.Affinity
+
 	builder, err := ctrlutil.NewPodTemplateSpecBuilder(m.Spec.PodTemplateSpec, mcpContainerName)
 	if err != nil {
 		// NOTE: This should be unreachable - early validation in Reconcile() blocks invalid specs
@@ -1068,6 +1072,8 @@ func (r *MCPServerReconciler) deploymentForMCPServer(
 		ctxLogger := log.FromContext(ctx)
 		ctxLogger.Error(err, "UNEXPECTED: Invalid PodTemplateSpec passed early validation")
 	} else {
+		proxyNodeSelector, proxyTolerations, proxyAffinity = builder.SchedulingSpec()
+
 		// If service account is not specified, use the default MCP server service account
 		serviceAccount := m.Spec.ServiceAccount
 		if serviceAccount == nil {
@@ -1379,6 +1385,9 @@ func (r *MCPServerReconciler) deploymentForMCPServer(
 				Spec: corev1.PodSpec{
 					ServiceAccountName:            ctrlutil.ProxyRunnerServiceAccountName(m.Name),
 					ImagePullSecrets:              imagePullSecrets,
+					NodeSelector:                  proxyNodeSelector,
+					Tolerations:                   proxyTolerations,
+					Affinity:                      proxyAffinity,
 					TerminationGracePeriodSeconds: int64Ptr(defaultTerminationGracePeriodSeconds),
 					Containers: []corev1.Container{{
 						Image:        getToolhiveRunnerImage(),

@@ -109,6 +109,16 @@ func (b *PodTemplateSpecBuilder) WithSecrets(secrets []mcpv1alpha1.SecretRef) *P
 	return b
 }
 
+// SchedulingSpec returns the pod scheduling fields (nodeSelector, tolerations, affinity)
+// from the user-provided PodTemplateSpec. Controllers use this to co-locate the proxy
+// runner Deployment with the backend StatefulSet on the same node pool.
+func (b *PodTemplateSpecBuilder) SchedulingSpec() (map[string]string, []corev1.Toleration, *corev1.Affinity) {
+	if b.spec == nil {
+		return nil, nil, nil
+	}
+	return b.spec.Spec.NodeSelector, b.spec.Spec.Tolerations, b.spec.Spec.Affinity
+}
+
 // Build returns the final PodTemplateSpec, or nil if no customizations were made.
 func (b *PodTemplateSpecBuilder) Build() *corev1.PodTemplateSpec {
 	if b.isEmpty() {

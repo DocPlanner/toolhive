@@ -5,6 +5,7 @@ package v1alpha1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 // HeaderForwardConfig defines header forward configuration for remote servers.
@@ -127,6 +128,17 @@ type MCPRemoteProxySpec struct {
 	// strips a path prefix before forwarding to the backend.
 	// +optional
 	EndpointPrefix string `json:"endpointPrefix,omitempty"`
+
+	// Replicas is the number of proxy deployment replicas.
+	// When nil, defaults to 1. Set to nil when using an external HPA.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	Replicas *int32 `json:"replicas,omitempty"`
+
+	// PodTemplateSpec allows customizing the pod template for the proxy deployment.
+	// Scheduling fields (nodeSelector, tolerations, affinity) are applied to the proxy pods.
+	// +optional
+	PodTemplateSpec *runtime.RawExtension `json:"podTemplateSpec,omitempty"`
 
 	// ResourceOverrides allows overriding annotations and labels for resources created by the operator
 	// +optional

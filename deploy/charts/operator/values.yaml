@@ -87,6 +87,13 @@ operator:
     initialDelaySeconds: 5
     periodSeconds: 10
 
+  # -- PodDisruptionBudget for the operator
+  pdb:
+    # -- Enable PDB for the operator
+    enabled: false
+    # -- Maximum number of pods that can be unavailable during disruption
+    maxUnavailable: 1
+
   # -- Configuration for horizontal pod autoscaling
   autoscaling:
     # -- Enable autoscaling for the operator

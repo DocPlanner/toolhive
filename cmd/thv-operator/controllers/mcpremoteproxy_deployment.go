@@ -26,6 +26,21 @@ func (r *MCPRemoteProxyReconciler) deploymentForMCPRemoteProxy(
 ) *appsv1.Deployment {
 	ls := labelsForMCPRemoteProxy(proxy.Name)
 	replicas := int32(1)
+	if proxy.Spec.Replicas != nil {
+		replicas = *proxy.Spec.Replicas
+	}
+
+	// Extract scheduling from PodTemplateSpec
+	var proxyNodeSelector map[string]string
+	var proxyTolerations []corev1.Toleration
+	var proxyAffinity *corev1.Affinity
+	builder, ptsErr := ctrlutil.NewPodTemplateSpecBuilder(proxy.Spec.PodTemplateSpec, "toolhive")
+	if ptsErr != nil {
+		ctxLogger := log.FromContext(ctx)
+		ctxLogger.Error(ptsErr, "Invalid PodTemplateSpec on MCPRemoteProxy")
+	} else {
+		proxyNodeSelector, proxyTolerations, proxyAffinity = builder.SchedulingSpec()
+	}
 
 	// Build deployment components using helper functions
 	args := r.buildContainerArgs()
@@ -71,6 +86,9 @@ func (r *MCPRemoteProxyReconciler) deploymentForMCPRemoteProxy(
 				},
 				Spec: corev1.PodSpec{
 					ServiceAccountName: serviceAccountNameForRemoteProxy(proxy),
+					NodeSelector:       proxyNodeSelector,
+					Tolerations:        proxyTolerations,
+					Affinity:           proxyAffinity,
 					Containers: []corev1.Container{{
 						Image:           getToolhiveRunnerImage(),
 						Name:            "toolhive",

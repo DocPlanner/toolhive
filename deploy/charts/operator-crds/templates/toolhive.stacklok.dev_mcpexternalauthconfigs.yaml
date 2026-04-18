@@ -266,11 +266,6 @@ spec:
                           Redis configures the Redis storage backend.
                           Required when type is "redis".
                         properties:
-                          address:
-                            description: |-
-                              Address is the Redis-compatible server address for direct mode (host:port).
-                              Mutually exclusive with SentinelConfig.
-                            type: string
                           aclUserConfig:
                             description: ACLUserConfig configures Redis ACL user authentication.
                             properties:
@@ -306,6 +301,11 @@ spec:
                             - passwordSecretRef
                             - usernameSecretRef
                             type: object
+                          address:
+                            description: |-
+                              Address is the Redis-compatible server address for direct mode (host:port).
+                              Mutually exclusive with SentinelConfig.
+                            type: string
                           dialTimeout:
                             default: 5s
                             description: |-
@@ -321,7 +321,9 @@ spec:
                             pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
                             type: string
                           sentinelConfig:
-                            description: SentinelConfig holds Redis Sentinel configuration.
+                            description: |-
+                              SentinelConfig holds Redis Sentinel configuration for HA mode.
+                              Mutually exclusive with Address.
                             properties:
                               db:
                                 default: 0
