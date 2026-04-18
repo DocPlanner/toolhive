@@ -1634,6 +1634,9 @@ func (s *Server) ownerForwardingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		forwarded, err := s.tryForwardSessionRequest(w, r)
 		if err != nil {
+			if errors.Is(err, errSessionOwnerUnavailable) {
+				s.handleOwnerUnavailable(r)
+			}
 			slog.Warn("failed to forward live session request to owner",
 				"method", r.Method,
 				"path", r.URL.Path,
@@ -1648,6 +1651,43 @@ func (s *Server) ownerForwardingMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// handleOwnerUnavailable restores an orphaned session and claims ownership
+// so subsequent requests route directly to this pod.
+func (s *Server) handleOwnerUnavailable(r *http.Request) {
+	if s.sessionOwnerURL == "" || s.vmcpSessionMgr == nil {
+		return
+	}
+	sessionID := r.Header.Get(server.HeaderKeySessionID)
+	if sessionID == "" {
+		return
+	}
+
+	ms, ok := s.vmcpSessionMgr.GetMultiSession(sessionID)
+	if !ok || ms == nil {
+		return
+	}
+
+	currentOwner := ms.GetMetadata()[sessiontypes.MetadataKeyOwnerURL]
+	if currentOwner == s.sessionOwnerURL {
+		return
+	}
+
+	if err := s.vmcpSessionMgr.SetSessionMetadataValue(
+		r.Context(), sessionID, ms,
+		sessiontypes.MetadataKeyOwnerURL,
+		s.sessionOwnerURL,
+	); err != nil {
+		slog.Warn("failed to claim session ownership after restore",
+			"session_id", sessionID, "error", err)
+		return
+	}
+
+	slog.Info("session ownership claimed after pod loss",
+		"session_id", sessionID,
+		"previous_owner", currentOwner,
+		"new_owner", s.sessionOwnerURL)
 }
 
 func (s *Server) tryForwardSessionRequest(w http.ResponseWriter, r *http.Request) (bool, error) {
