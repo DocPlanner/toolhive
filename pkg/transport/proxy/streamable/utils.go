@@ -6,6 +6,7 @@ package streamable
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 
 	"golang.org/x/exp/jsonrpc2"
@@ -22,6 +23,25 @@ func isNotification(msg jsonrpc2.Message) bool {
 // writeHTTPError writes a plain HTTP error with status.
 func writeHTTPError(w http.ResponseWriter, status int, msg string) {
 	http.Error(w, msg, status)
+}
+
+// writeJSONRPCError writes a structured JSON-RPC error response.
+// For notifications (no ID), it returns 202 Accepted instead of
+// synthesizing a response, which would be a protocol violation.
+func writeJSONRPCError(w http.ResponseWriter, id jsonrpc2.ID, code int64, msg string) {
+	if id.Raw() == nil {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	resp, err := jsonrpc2.NewResponse(id, nil, jsonrpc2.NewError(code, msg))
+	if err != nil {
+		slog.Error("failed to create JSON-RPC error response", "error", err)
+		writeHTTPError(w, http.StatusInternalServerError, "Failed to create error response")
+		return
+	}
+	if err := writeJSONRPC(w, resp); err != nil {
+		slog.Error("failed to write JSON-RPC error response", "error", err)
+	}
 }
 
 // writeJSONRPC writes a jsonrpc2.Message using the library's encoder to ensure proper serialization.

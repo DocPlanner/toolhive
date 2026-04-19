@@ -6,6 +6,7 @@ package streamable
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
@@ -206,6 +207,41 @@ func TestNewHTTPProxyDefaultTimeout(t *testing.T) { //nolint:paralleltest
 	proxy := NewHTTPProxy("localhost", 0, nil, nil)
 	assert.Equal(t, defaultRequestTimeout, proxy.requestTimeout)
 }
+
+func TestWriteJSONRPCError_WithID(t *testing.T) {
+	t.Parallel()
+
+	w := &httpRecorder{header: make(map[string][]string)}
+	writeJSONRPCError(w, jsonrpc2.StringID("req-1"), -32603, "Timeout waiting for response from container")
+
+	assert.Equal(t, "application/json", w.header.Get("Content-Type"))
+	assert.Contains(t, string(w.body), `"error"`)
+	assert.Contains(t, string(w.body), "Timeout waiting for response from container")
+}
+
+func TestWriteJSONRPCError_Notification(t *testing.T) {
+	t.Parallel()
+
+	w := &httpRecorder{header: make(map[string][]string)}
+	writeJSONRPCError(w, jsonrpc2.ID{}, -32603, "Timeout")
+
+	assert.Equal(t, 202, w.statusCode)
+	assert.Empty(t, w.body)
+}
+
+// httpRecorder is a minimal http.ResponseWriter for unit tests.
+type httpRecorder struct {
+	header     http.Header
+	statusCode int
+	body       []byte
+}
+
+func (r *httpRecorder) Header() http.Header { return r.header }
+func (r *httpRecorder) Write(b []byte) (int, error) {
+	r.body = append(r.body, b...)
+	return len(b), nil
+}
+func (r *httpRecorder) WriteHeader(code int) { r.statusCode = code }
 
 func TestNewHTTPProxyWithSessionStorage(t *testing.T) {
 	t.Parallel()

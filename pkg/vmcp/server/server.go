@@ -60,7 +60,9 @@ const (
 	// It protects all routes (health, metrics, well-known, etc.) from slow-write clients.
 	// For qualifying SSE (GET) connections, transportmiddleware.WriteTimeout clears this
 	// per-request via http.ResponseController.SetWriteDeadline(time.Time{}) (golang/go#16100).
-	defaultWriteTimeout = 30 * time.Second
+	// Must exceed the backend client HTTP timeout (90s) plus overhead so the handler
+	// can write its response before the server kills the connection.
+	defaultWriteTimeout = 120 * time.Second
 
 	// defaultIdleTimeout is the maximum amount of time to wait for the next request when keep-alive's are enabled.
 	defaultIdleTimeout = 120 * time.Second

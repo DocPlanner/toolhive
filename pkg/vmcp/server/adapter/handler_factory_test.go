@@ -223,6 +223,35 @@ func TestDefaultHandlerFactory_CreateToolHandler(t *testing.T) {
 			},
 		},
 		{
+			name:     "backend timeout returns timeout error result",
+			toolName: "test_tool",
+			setupMocks: func(mockRouter *routermocks.MockRouter, mockClient *vmcpmocks.MockBackendClient) {
+				target := &vmcp.BackendTarget{
+					WorkloadID: "backend1",
+				}
+
+				mockRouter.EXPECT().
+					RouteTool(gomock.Any(), "test_tool").
+					Return(target, nil)
+
+				mockClient.EXPECT().
+					CallTool(gomock.Any(), target, "test_tool", map[string]any{"input": "test"}, gomock.Any()).
+					Return(nil, vmcp.ErrTimeout)
+			},
+			request: mcp.CallToolRequest{
+				Params: mcp.CallToolParams{
+					Name:      "test_tool",
+					Arguments: map[string]any{"input": "test"},
+				},
+			},
+			wantErr: false,
+			checkResult: func(t *testing.T, result *mcp.CallToolResult) {
+				t.Helper()
+				assert.True(t, result.IsError)
+				assert.Contains(t, result.Content[0].(mcp.TextContent).Text, "Backend request timed out")
+			},
+		},
+		{
 			name:     "backend other error returns error result",
 			toolName: "test_tool",
 			setupMocks: func(mockRouter *routermocks.MockRouter, mockClient *vmcpmocks.MockBackendClient) {
@@ -444,6 +473,38 @@ func TestDefaultHandlerFactory_CreateResourceHandler(t *testing.T) {
 				t.Helper()
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), "backend unavailable")
+				assert.Nil(t, contents)
+			},
+		},
+		{
+			name: "backend timeout returns timeout error",
+			uri:  "file:///test",
+			setupMocks: func(mockRouter *routermocks.MockRouter, mockClient *vmcpmocks.MockBackendClient) {
+				target := &vmcp.BackendTarget{
+					WorkloadID: "backend1",
+				}
+
+				mockRouter.EXPECT().
+					RouteResource(gomock.Any(), "file:///test").
+					Return(target, nil)
+
+				mockClient.EXPECT().
+					ReadResource(gomock.Any(), target, "file:///test").
+					Return(nil, vmcp.ErrTimeout)
+			},
+			setupCtx: func() context.Context {
+				return context.Background()
+			},
+			request: mcp.ReadResourceRequest{
+				Params: mcp.ReadResourceParams{
+					URI: "file:///test",
+				},
+			},
+			wantErr: true,
+			checkResult: func(t *testing.T, contents []mcp.ResourceContents, err error) {
+				t.Helper()
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "backend request timed out")
 				assert.Nil(t, contents)
 			},
 		},
@@ -782,6 +843,38 @@ func TestDefaultHandlerFactory_CreatePromptHandler(t *testing.T) {
 				t.Helper()
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), "backend unavailable")
+				assert.Nil(t, result)
+			},
+		},
+		{
+			name:       "backend timeout returns timeout error",
+			promptName: "test_prompt",
+			setupMocks: func(mockRouter *routermocks.MockRouter, mockClient *vmcpmocks.MockBackendClient) {
+				target := &vmcp.BackendTarget{
+					WorkloadID: "backend1",
+				}
+
+				expectedArgs := map[string]any{"input": "test"}
+
+				mockRouter.EXPECT().
+					RoutePrompt(gomock.Any(), "test_prompt").
+					Return(target, nil)
+
+				mockClient.EXPECT().
+					GetPrompt(gomock.Any(), target, "test_prompt", expectedArgs).
+					Return(nil, vmcp.ErrTimeout)
+			},
+			request: mcp.GetPromptRequest{
+				Params: mcp.GetPromptParams{
+					Name:      "test_prompt",
+					Arguments: map[string]string{"input": "test"},
+				},
+			},
+			wantErr: true,
+			checkResult: func(t *testing.T, result *mcp.GetPromptResult, err error) {
+				t.Helper()
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "backend request timed out")
 				assert.Nil(t, result)
 			},
 		},

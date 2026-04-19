@@ -101,6 +101,10 @@ func (f *DefaultHandlerFactory) CreateToolHandler(
 				slog.Warn("backend unavailable for tool", "tool", toolName, "error", err)
 				return mcp.NewToolResultError(fmt.Sprintf("Backend unavailable: %v", err)), nil
 			}
+			if errors.Is(err, vmcp.ErrTimeout) {
+				slog.Warn("backend request timed out", "tool", toolName, "error", err)
+				return mcp.NewToolResultError(fmt.Sprintf("Backend request timed out: %v", err)), nil
+			}
 			slog.Warn("backend tool call failed", "tool", toolName, "error", err)
 			return mcp.NewToolResultError(fmt.Sprintf("Tool call failed: %v", err)), nil
 		}
@@ -152,6 +156,10 @@ func (f *DefaultHandlerFactory) CreateResourceHandler(uri string) func(
 				slog.Warn("backend unavailable for resource", "uri", uri, "error", err)
 				return nil, fmt.Errorf("backend unavailable: %w", err)
 			}
+			if errors.Is(err, vmcp.ErrTimeout) {
+				slog.Warn("backend request timed out", "resource", uri, "error", err)
+				return nil, fmt.Errorf("backend request timed out: %w", err)
+			}
 			slog.Warn("backend resource read failed", "uri", uri, "error", err)
 			return nil, fmt.Errorf("resource read failed: %w", err)
 		}
@@ -193,6 +201,10 @@ func (f *DefaultHandlerFactory) CreatePromptHandler(promptName string) func(
 			if errors.Is(err, vmcp.ErrBackendUnavailable) {
 				slog.Warn("backend unavailable for prompt", "prompt", promptName, "error", err)
 				return nil, fmt.Errorf("backend unavailable: %w", err)
+			}
+			if errors.Is(err, vmcp.ErrTimeout) {
+				slog.Warn("backend request timed out", "prompt", promptName, "error", err)
+				return nil, fmt.Errorf("backend request timed out: %w", err)
 			}
 			slog.Warn("backend prompt request failed", "prompt", promptName, "error", err)
 			return nil, fmt.Errorf("prompt request failed: %w", err)

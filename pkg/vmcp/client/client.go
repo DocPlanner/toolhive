@@ -362,11 +362,11 @@ func (h *httpBackendClient) defaultClientFactory(ctx context.Context, target *vm
 		})
 		httpClient := &http.Client{
 			Transport: sizeLimitedTransport,
-			Timeout:   30 * time.Second,
+			Timeout:   90 * time.Second,
 		}
 		c, err = client.NewStreamableHttpClient(
 			target.BaseURL,
-			transport.WithHTTPTimeout(30*time.Second),
+			transport.WithHTTPTimeout(90*time.Second),
 			transport.WithHTTPBasicClient(httpClient),
 		)
 		if err != nil {
@@ -704,8 +704,7 @@ func (h *httpBackendClient) CallTool(
 		},
 	})
 	if err != nil {
-		// Network/connection errors are operational errors
-		return nil, fmt.Errorf("%w: tool call failed on backend %s: %w", vmcp.ErrBackendUnavailable, target.WorkloadID, err)
+		return nil, wrapBackendError(err, target.WorkloadID, "call tool")
 	}
 
 	// Extract _meta field from backend response
@@ -791,7 +790,7 @@ func (h *httpBackendClient) ReadResource(
 		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("resource read failed on backend %s: %w", target.WorkloadID, err)
+		return nil, wrapBackendError(err, target.WorkloadID, "read resource")
 	}
 
 	// Extract _meta field from backend response
@@ -847,7 +846,7 @@ func (h *httpBackendClient) GetPrompt(
 		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("prompt get failed on backend %s: %w", target.WorkloadID, err)
+		return nil, wrapBackendError(err, target.WorkloadID, "get prompt")
 	}
 
 	return &vmcp.PromptGetResult{

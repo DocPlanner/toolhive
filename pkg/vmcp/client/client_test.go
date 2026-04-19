@@ -1038,6 +1038,16 @@ func TestWrapBackendError(t *testing.T) {
 			err:          context.DeadlineExceeded,
 			wantSentinel: vmcp.ErrTimeout,
 		},
+		{
+			name:         "mcp-go SDK 502 error maps to ErrBackendUnavailable",
+			err:          fmt.Errorf("request failed with status 502: Bad Gateway"),
+			wantSentinel: vmcp.ErrBackendUnavailable,
+		},
+		{
+			name:         "mcp-go SDK 504 error maps to ErrTimeout",
+			err:          fmt.Errorf("request failed with status 504: Gateway Timeout"),
+			wantSentinel: vmcp.ErrTimeout,
+		},
 	}
 
 	for _, tt := range tests {
