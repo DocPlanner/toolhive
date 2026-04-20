@@ -6,7 +6,9 @@ package handlers
 import (
 	"log/slog"
 	"net/http"
+	"strings"
 
+	"github.com/ory/fosite"
 	"github.com/stacklok/toolhive/pkg/authserver/server"
 	"github.com/stacklok/toolhive/pkg/authserver/server/session"
 )
@@ -27,9 +29,7 @@ func (h *Handler) TokenHandler(w http.ResponseWriter, req *http.Request) {
 	// Parse and validate the access request
 	accessRequest, err := h.provider.NewAccessRequest(ctx, req, sess)
 	if err != nil {
-		slog.Error("failed to create access request",
-			"error", err,
-		)
+		logTokenEndpointError("request_validation", req, err)
 		h.provider.WriteAccessError(ctx, w, accessRequest, err)
 		return
 	}
@@ -94,13 +94,65 @@ func (h *Handler) TokenHandler(w http.ResponseWriter, req *http.Request) {
 	// Generate the access response (tokens)
 	response, err := h.provider.NewAccessResponse(ctx, accessRequest)
 	if err != nil {
-		slog.Error("failed to create access response",
-			"error", err,
-		)
+		logTokenEndpointError("response_generation", req, err)
 		h.provider.WriteAccessError(ctx, w, accessRequest, err)
 		return
 	}
 
 	// Write the token response
 	h.provider.WriteAccessResponse(ctx, w, accessRequest, response)
+}
+
+func logTokenEndpointError(phase string, req *http.Request, err error) {
+	oauthErr := fosite.ErrorToRFC6749Error(err)
+	grantType := req.PostFormValue("grant_type")
+
+	attrs := []any{
+		"phase", phase,
+		"error", err,
+		"oauth_error", oauthErr.ErrorField,
+	}
+	if grantType != "" {
+		attrs = append(attrs, "grant_type", grantType)
+	}
+	if clientID := req.PostFormValue("client_id"); clientID != "" {
+		attrs = append(attrs, "client_id", clientID)
+	}
+	if oauthErr.HintField != "" {
+		attrs = append(attrs, "oauth_hint", oauthErr.HintField)
+	}
+	if oauthErr.DebugField != "" {
+		attrs = append(attrs, "oauth_debug", oauthErr.DebugField)
+	}
+	if grantType == "refresh_token" {
+		attrs = append(attrs, "refresh_failure_classification", classifyRefreshTokenFailure(oauthErr))
+	}
+
+	slog.Error("token endpoint request failed", attrs...)
+}
+
+func classifyRefreshTokenFailure(err *fosite.RFC6749Error) string {
+	if err == nil {
+		return "unknown"
+	}
+
+	hint := strings.ToLower(err.HintField)
+	switch {
+	case strings.Contains(hint, "already used"):
+		return "rotated_or_replayed"
+	case strings.Contains(hint, "malformed or not valid"):
+		return "storage_lookup_miss"
+	case strings.Contains(hint, "expired"):
+		return "expired"
+	case strings.Contains(hint, "does not match the id during the initial token issuance"):
+		return "client_mismatch"
+	case strings.Contains(hint, "multiple concurrent requests"):
+		return "concurrent_refresh_race"
+	case strings.Contains(hint, "failed to refresh token"):
+		return "refresh_rotation_retryable_failure"
+	case err.ErrorField != "":
+		return err.ErrorField
+	default:
+		return "unknown"
+	}
 }

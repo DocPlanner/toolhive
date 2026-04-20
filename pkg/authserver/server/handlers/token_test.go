@@ -4,7 +4,9 @@
 package handlers
 
 import (
+	"bytes"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
+	"github.com/ory/fosite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -144,6 +147,81 @@ func TestTokenHandler_InvalidClient(t *testing.T) {
 	// fosite returns invalid_client for unknown clients
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 	assert.Contains(t, rec.Body.String(), "invalid_client")
+}
+
+func TestClassifyRefreshTokenFailure(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name     string
+		err      *fosite.RFC6749Error
+		expected string
+	}{
+		{
+			name:     "reuse detected",
+			err:      fosite.ErrInvalidGrant.WithHint("The refresh token was already used."),
+			expected: "rotated_or_replayed",
+		},
+		{
+			name:     "lookup miss",
+			err:      fosite.ErrInvalidGrant.WithHint("The refresh token is malformed or not valid."),
+			expected: "storage_lookup_miss",
+		},
+		{
+			name:     "expired",
+			err:      fosite.ErrInvalidGrant.WithHint("The refresh token expired."),
+			expected: "expired",
+		},
+		{
+			name:     "client mismatch",
+			err:      fosite.ErrInvalidGrant.WithHint("The OAuth 2.0 Client ID from this request does not match the ID during the initial token issuance."),
+			expected: "client_mismatch",
+		},
+		{
+			name:     "concurrent race",
+			err:      fosite.ErrInvalidRequest.WithHint("Failed to refresh token because of multiple concurrent requests using the same token. Please retry the request."),
+			expected: "concurrent_refresh_race",
+		},
+		{
+			name:     "generic fallback",
+			err:      fosite.ErrUnauthorizedClient.WithHint("The OAuth 2.0 Client is not allowed to use authorization grant 'refresh_token'."),
+			expected: "unauthorized_client",
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.expected, classifyRefreshTokenFailure(tc.err))
+		})
+	}
+}
+
+func TestTokenHandler_InvalidRefreshTokenLogsClassification(t *testing.T) {
+	handler, _, _ := handlerTestSetup(t)
+	logBuf := setTestLogger(t)
+
+	form := url.Values{
+		"grant_type":    {"refresh_token"},
+		"client_id":     {testAuthClientID},
+		"refresh_token": {"invalid-refresh-token"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	handler.TokenHandler(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "invalid_grant")
+
+	logOutput := logBuf.String()
+	assert.Contains(t, logOutput, "token endpoint request failed")
+	assert.Contains(t, logOutput, "phase=request_validation")
+	assert.Contains(t, logOutput, "grant_type=refresh_token")
+	assert.Contains(t, logOutput, "oauth_error=invalid_grant")
+	assert.Contains(t, logOutput, "refresh_failure_classification=storage_lookup_miss")
 }
 
 func TestTokenHandler_Success(t *testing.T) {
@@ -362,4 +440,20 @@ func parseTokenResponse(t *testing.T, body string) map[string]interface{} {
 	err := json.Unmarshal([]byte(body), &tokenData)
 	require.NoError(t, err, "token response should be valid JSON")
 	return tokenData
+}
+
+func setTestLogger(t *testing.T) *bytes.Buffer {
+	t.Helper()
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	prev := slog.Default()
+	slog.SetDefault(logger)
+
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+	})
+
+	return &buf
 }
