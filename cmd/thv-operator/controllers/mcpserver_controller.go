@@ -441,6 +441,15 @@ func (r *MCPServerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, err
 	}
 
+	// Clean up legacy StatefulSet-era resources before reconciling the Deployment.
+	// This lets migrated MCPServers converge without manual cluster cleanup.
+	if deletedLegacy, err := r.cleanupLegacyMCPServerResources(ctx, mcpServer); err != nil {
+		ctxLogger.Error(err, "Failed to clean up legacy MCPServer resources")
+		return ctrl.Result{}, err
+	} else if deletedLegacy {
+		return ctrl.Result{Requeue: true}, nil
+	}
+
 	// Check if the deployment already exists, if not create a new one
 	deployment := &appsv1.Deployment{}
 	err = r.Get(ctx, types.NamespacedName{Name: mcpServer.Name, Namespace: mcpServer.Namespace}, deployment)
@@ -1670,6 +1679,84 @@ func (r *MCPServerReconciler) deleteIfExists(ctx context.Context, obj client.Obj
 		return fmt.Errorf("failed to check %s %s: %w", kind, name, err)
 	}
 	return nil
+}
+
+func (r *MCPServerReconciler) cleanupLegacyMCPServerResources(
+	ctx context.Context,
+	m *mcpv1alpha1.MCPServer,
+) (bool, error) {
+	deleted := false
+
+	for _, resource := range []struct {
+		obj  client.Object
+		name string
+		kind string
+	}{
+		{obj: &appsv1.StatefulSet{}, name: m.Name, kind: "StatefulSet"},
+		{obj: &corev1.Service{}, name: fmt.Sprintf("mcp-%s-headless", m.Name), kind: "Service"},
+		{obj: &corev1.Service{}, name: fmt.Sprintf("mcp-%s", m.Name), kind: "Service"},
+	} {
+		removed, err := r.deleteLegacyMCPServerResourceIfOwned(ctx, m, resource.obj, resource.name, resource.kind)
+		if err != nil {
+			return deleted, err
+		}
+		deleted = deleted || removed
+	}
+
+	return deleted, nil
+}
+
+func (r *MCPServerReconciler) deleteLegacyMCPServerResourceIfOwned(
+	ctx context.Context,
+	m *mcpv1alpha1.MCPServer,
+	obj client.Object,
+	name string,
+	kind string,
+) (bool, error) {
+	ctxLogger := log.FromContext(ctx)
+
+	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: m.Namespace}, obj)
+	if errors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to check legacy %s %s: %w", kind, name, err)
+	}
+
+	if !isLegacyMCPServerResourceFor(obj, m) {
+		ctxLogger.V(1).Info("Skipping legacy resource cleanup for object not owned by MCPServer",
+			"kind", kind, "name", name, "namespace", m.Namespace)
+		return false, nil
+	}
+
+	if err := r.Delete(ctx, obj); err != nil && !errors.IsNotFound(err) {
+		return false, fmt.Errorf("failed to delete legacy %s %s: %w", kind, name, err)
+	}
+
+	ctxLogger.Info("Deleted legacy MCPServer resource",
+		"kind", kind, "name", name, "namespace", m.Namespace)
+	return true, nil
+}
+
+func isLegacyMCPServerResourceFor(obj client.Object, m *mcpv1alpha1.MCPServer) bool {
+	if obj == nil || m == nil {
+		return false
+	}
+
+	controller := metav1.GetControllerOfNoCopy(obj)
+	if controller != nil {
+		return controller.Kind == "MCPServer" && controller.Name == m.Name
+	}
+
+	expectedLabels := labelsForMCPServer(m.Name)
+	labels := obj.GetLabels()
+	for key, expectedValue := range expectedLabels {
+		if labels[key] != expectedValue {
+			return false
+		}
+	}
+
+	return true
 }
 
 // finalizeMCPServer performs the finalizer logic for the MCPServer

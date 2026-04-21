@@ -202,14 +202,23 @@ func TestVirtualMCPServerPodTemplateSpecNeedsUpdate(t *testing.T) {
 	tests := []struct {
 		name               string
 		deployAnnotations  map[string]string
+		deployNodeSelector map[string]string
 		newPodTemplateSpec *runtime.RawExtension
 		expectUpdate       bool
 	}{
 		{
 			name:               "matching hash - no update needed",
 			deployAnnotations:  map[string]string{podTemplateSpecHashAnnotation: hashOf(t, ssdRaw.Raw)},
+			deployNodeSelector: map[string]string{"disktype": "ssd"},
 			newPodTemplateSpec: ssdRaw,
 			expectUpdate:       false,
+		},
+		{
+			name:               "matching hash but missing scheduling on deployment - update needed",
+			deployAnnotations:  map[string]string{podTemplateSpecHashAnnotation: hashOf(t, ssdRaw.Raw)},
+			deployNodeSelector: map[string]string{"disktype": "hdd"},
+			newPodTemplateSpec: ssdRaw,
+			expectUpdate:       true,
 		},
 		{
 			name:               "node selector changed - update needed",
@@ -250,6 +259,7 @@ func TestVirtualMCPServerPodTemplateSpecNeedsUpdate(t *testing.T) {
 		{
 			name:               "K8s defaults on deployment do not cause spurious update",
 			deployAnnotations:  map[string]string{podTemplateSpecHashAnnotation: hashOf(t, ssdRaw.Raw)},
+			deployNodeSelector: map[string]string{"disktype": "ssd"},
 			newPodTemplateSpec: ssdRaw,
 			expectUpdate:       false,
 		},
@@ -264,6 +274,13 @@ func TestVirtualMCPServerPodTemplateSpecNeedsUpdate(t *testing.T) {
 					Name:        testPodTemplateVmcpName,
 					Namespace:   testPodTemplateNamespace,
 					Annotations: tt.deployAnnotations,
+				},
+				Spec: appsv1.DeploymentSpec{
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							NodeSelector: tt.deployNodeSelector,
+						},
+					},
 				},
 			}
 

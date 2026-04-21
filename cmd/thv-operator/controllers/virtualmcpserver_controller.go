@@ -1415,7 +1415,30 @@ func (*VirtualMCPServerReconciler) podTemplateSpecNeedsUpdate(
 		log.FromContext(ctx).Error(err, "Failed to hash PodTemplateSpec, assuming update needed")
 		return true
 	}
-	return deployment.Annotations[podTemplateSpecHashAnnotation] != expectedHash
+	if deployment.Annotations[podTemplateSpecHashAnnotation] != expectedHash {
+		return true
+	}
+
+	builder, err := ctrlutil.NewPodTemplateSpecBuilder(vmcp.Spec.PodTemplateSpec, "vmcp")
+	if err != nil {
+		log.FromContext(ctx).Error(err, "Failed to parse PodTemplateSpec for drift detection, assuming update needed")
+		return true
+	}
+
+	expectedNodeSelector, expectedTolerations, expectedAffinity := builder.SchedulingSpec()
+	podSpec := deployment.Spec.Template.Spec
+
+	if len(expectedNodeSelector) > 0 && !equality.Semantic.DeepEqual(podSpec.NodeSelector, expectedNodeSelector) {
+		return true
+	}
+	if len(expectedTolerations) > 0 && !equality.Semantic.DeepEqual(podSpec.Tolerations, expectedTolerations) {
+		return true
+	}
+	if expectedAffinity != nil && !equality.Semantic.DeepEqual(podSpec.Affinity, expectedAffinity) {
+		return true
+	}
+
+	return false
 }
 
 // serviceNeedsUpdate checks if the service needs to be updated
