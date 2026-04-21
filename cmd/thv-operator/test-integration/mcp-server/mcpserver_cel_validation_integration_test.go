@@ -393,4 +393,29 @@ var _ = Describe("CEL Validation for OIDCConfigRef and AuthzConfigRef", Label("k
 			Expect(err).NotTo(HaveOccurred())
 		})
 	})
+
+	Context("SecretRef schema validation", func() {
+		It("should accept multiple keys from the same Kubernetes Secret", func() {
+			server := newMinimalMCPServer("secret-ref-multi-key", nil, nil)
+			server.Spec.Secrets = []mcpv1alpha1.SecretRef{
+				{Name: "shared-credentials", Key: "username", TargetEnvName: "API_USERNAME"},
+				{Name: "shared-credentials", Key: "password", TargetEnvName: "API_PASSWORD"},
+			}
+
+			err := k8sClient.Create(ctx, server)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("should still reject an exact duplicate secret reference", func() {
+			server := newMinimalMCPServer("secret-ref-duplicate-key", nil, nil)
+			server.Spec.Secrets = []mcpv1alpha1.SecretRef{
+				{Name: "shared-credentials", Key: "token", TargetEnvName: "API_TOKEN"},
+				{Name: "shared-credentials", Key: "token", TargetEnvName: "SECOND_API_TOKEN"},
+			}
+
+			err := k8sClient.Create(ctx, server)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("Duplicate value"))
+		})
+	})
 })

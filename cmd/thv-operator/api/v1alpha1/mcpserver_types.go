@@ -248,9 +248,12 @@ type MCPServerSpec struct {
 	// +optional
 	Resources ResourceRequirements `json:"resources,omitempty"`
 
-	// Secrets are references to secrets to mount in the MCP server container
+	// Secrets are references to secrets to mount in the MCP server container.
+	// The same Kubernetes Secret may be referenced multiple times as long as each
+	// entry points at a different key within that Secret.
 	// +listType=map
 	// +listMapKey=name
+	// +listMapKey=key
 	// +optional
 	Secrets []SecretRef `json:"secrets,omitempty"`
 
