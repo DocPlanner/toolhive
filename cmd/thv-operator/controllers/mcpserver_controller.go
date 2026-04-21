@@ -104,7 +104,7 @@ var defaultRBACRules = []rbacv1.PolicyRule{
 	{
 		APIGroups: []string{""},
 		Resources: []string{"pods"},
-		Verbs:     []string{"get", "list", "watch"},
+		Verbs:     []string{"get", "list", "watch", "delete"},
 	},
 	{
 		APIGroups: []string{""},

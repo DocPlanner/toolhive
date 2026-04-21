@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -49,6 +50,8 @@ const (
 	defaultNamespace = "default"
 	// serviceFieldManager is the field manager name for server-side apply operations
 	serviceFieldManager = "toolhive-container-manager"
+	// maxStatefulSetRolloutRecoveryAttempts bounds stale-pod recovery retries.
+	maxStatefulSetRolloutRecoveryAttempts = 3
 )
 
 // RuntimeName is the name identifier for the Kubernetes runtime
@@ -427,7 +430,14 @@ func (c *Client) DeployWorkload(ctx context.Context,
 	if c.waitForStatefulSetReadyFunc != nil {
 		waitFunc = c.waitForStatefulSetReadyFunc
 	}
-	err = waitFunc(ctx, c.client, namespace, createdStatefulSet.Name, createdStatefulSet.Generation)
+	err = waitForStatefulSetReadyWithRecovery(
+		ctx,
+		c.client,
+		namespace,
+		createdStatefulSet.Name,
+		createdStatefulSet.Generation,
+		waitFunc,
+	)
 	if err != nil {
 		return 0, fmt.Errorf("statefulset applied but failed to become ready: %w", err)
 	}
@@ -756,6 +766,182 @@ func waitForStatefulSetReady(
 	}
 
 	return nil
+}
+
+func waitForStatefulSetReadyWithRecovery(
+	ctx context.Context,
+	clientset kubernetes.Interface,
+	namespace, name string,
+	desiredGeneration int64,
+	waitFunc func(context.Context, kubernetes.Interface, string, string, int64) error,
+) error {
+	lastErr := error(nil)
+
+	for attempt := 0; attempt <= maxStatefulSetRolloutRecoveryAttempts; attempt++ {
+		lastErr = waitFunc(ctx, clientset, namespace, name, desiredGeneration)
+		if lastErr == nil {
+			return nil
+		}
+
+		if attempt == maxStatefulSetRolloutRecoveryAttempts {
+			break
+		}
+
+		recovered, recoveryErr := recoverStalledStatefulSetRollout(
+			ctx, clientset, namespace, name, desiredGeneration,
+		)
+		if recoveryErr != nil {
+			return fmt.Errorf("rollout recovery failed after readiness wait error: %w", recoveryErr)
+		}
+		if !recovered {
+			break
+		}
+
+		slog.Warn("deleted stale old-revision pod to unblock statefulset rollout; retrying readiness wait",
+			"name", name,
+			"recovery_attempt", attempt+1)
+	}
+
+	return lastErr
+}
+
+func recoverStalledStatefulSetRollout(
+	ctx context.Context,
+	clientset kubernetes.Interface,
+	namespace, name string,
+	desiredGeneration int64,
+) (bool, error) {
+	sts, err := clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return false, fmt.Errorf("failed to fetch statefulset for rollout recovery: %w", err)
+	}
+
+	if !statefulSetNeedsRolloutRecovery(desiredGeneration, sts) {
+		return false, nil
+	}
+
+	pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("app=%s,toolhive=true", name),
+	})
+	if err != nil {
+		return false, fmt.Errorf("failed to list statefulset pods for rollout recovery: %w", err)
+	}
+
+	podToDelete, ok := selectRecoverableStatefulSetPod(sts, pods.Items)
+	if !ok {
+		return false, nil
+	}
+
+	if err := clientset.CoreV1().Pods(namespace).Delete(ctx, podToDelete.Name, metav1.DeleteOptions{}); err != nil &&
+		!errors.IsNotFound(err) {
+		return false, fmt.Errorf("failed to delete stale pod %s: %w", podToDelete.Name, err)
+	}
+
+	slog.Warn("deleted stale old-revision pod for statefulset rollout recovery",
+		"statefulset", name,
+		"pod", podToDelete.Name,
+		"current_revision", sts.Status.CurrentRevision,
+		"update_revision", sts.Status.UpdateRevision)
+	return true, nil
+}
+
+func statefulSetNeedsRolloutRecovery(desiredGeneration int64, sts *appsv1.StatefulSet) bool {
+	if sts == nil || sts.Spec.Replicas == nil || *sts.Spec.Replicas == 0 {
+		return false
+	}
+
+	if sts.Spec.UpdateStrategy.Type != "" &&
+		sts.Spec.UpdateStrategy.Type != appsv1.RollingUpdateStatefulSetStrategyType {
+		return false
+	}
+
+	if sts.Status.ObservedGeneration < desiredGeneration {
+		return false
+	}
+
+	if sts.Status.CurrentRevision == "" || sts.Status.UpdateRevision == "" {
+		return false
+	}
+
+	if sts.Status.CurrentRevision == sts.Status.UpdateRevision {
+		return false
+	}
+
+	return sts.Status.UpdatedReplicas < *sts.Spec.Replicas
+}
+
+func selectRecoverableStatefulSetPod(sts *appsv1.StatefulSet, pods []corev1.Pod) (*corev1.Pod, bool) {
+	candidates := make([]corev1.Pod, 0, len(pods))
+	for _, pod := range pods {
+		if !isOwnedByStatefulSet(&pod, sts.Name) || pod.DeletionTimestamp != nil {
+			continue
+		}
+
+		revision := pod.Labels["controller-revision-hash"]
+		if revision == "" || revision == sts.Status.UpdateRevision {
+			continue
+		}
+
+		if isPodReady(&pod) {
+			continue
+		}
+
+		candidates = append(candidates, pod)
+	}
+
+	if len(candidates) == 0 {
+		return nil, false
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return statefulSetPodOrdinal(candidates[i].Name, sts.Name) >
+			statefulSetPodOrdinal(candidates[j].Name, sts.Name)
+	})
+
+	return &candidates[0], true
+}
+
+func isOwnedByStatefulSet(pod *corev1.Pod, statefulSetName string) bool {
+	if pod == nil {
+		return false
+	}
+
+	for _, ownerRef := range pod.OwnerReferences {
+		if ownerRef.Controller != nil && *ownerRef.Controller &&
+			ownerRef.Kind == "StatefulSet" && ownerRef.Name == statefulSetName {
+			return true
+		}
+	}
+
+	return false
+}
+
+func isPodReady(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+
+	return false
+}
+
+func statefulSetPodOrdinal(podName, statefulSetName string) int {
+	prefix := statefulSetName + "-"
+	if !strings.HasPrefix(podName, prefix) {
+		return -1
+	}
+
+	ordinal, err := strconv.Atoi(strings.TrimPrefix(podName, prefix))
+	if err != nil {
+		return -1
+	}
+
+	return ordinal
 }
 
 // parsePortString parses a port string in the format "port/protocol" and returns the port number

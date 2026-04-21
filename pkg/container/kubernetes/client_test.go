@@ -6,6 +6,7 @@ package kubernetes
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -1275,6 +1276,124 @@ func Test_isStatefulSetReady(t *testing.T) {
 			assert.False(t, result)
 		})
 	}
+}
+
+func TestWaitForStatefulSetReadyWithRecoveryRetriesAfterDeletingStalePod(t *testing.T) {
+	t.Parallel()
+
+	stsName := "aws-mcp"
+	replicas := int32(1)
+	controller := true
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      stsName,
+			Namespace: defaultNamespace,
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+		},
+		Status: appsv1.StatefulSetStatus{
+			ObservedGeneration: 2,
+			UpdatedReplicas:    0,
+			ReadyReplicas:      0,
+			CurrentRevision:    "aws-mcp-old",
+			UpdateRevision:     "aws-mcp-new",
+		},
+	}
+	stalePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "aws-mcp-0",
+			Namespace: defaultNamespace,
+			Labels: map[string]string{
+				"app":                      stsName,
+				"toolhive":                 "true",
+				"controller-revision-hash": "aws-mcp-old",
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: appsv1.SchemeGroupVersion.String(),
+				Kind:       "StatefulSet",
+				Name:       stsName,
+				Controller: &controller,
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodPending},
+	}
+
+	clientset := fake.NewClientset(sts, stalePod)
+
+	waitCalls := 0
+	waitFunc := func(_ context.Context, _ kubernetes.Interface, _, _ string, _ int64) error {
+		waitCalls++
+		if waitCalls == 1 {
+			return errors.New("timed out waiting for rollout")
+		}
+		return nil
+	}
+
+	err := waitForStatefulSetReadyWithRecovery(
+		context.Background(),
+		clientset,
+		defaultNamespace,
+		stsName,
+		2,
+		waitFunc,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 2, waitCalls)
+
+	_, err = clientset.CoreV1().Pods(defaultNamespace).Get(context.Background(), stalePod.Name, metav1.GetOptions{})
+	assert.Error(t, err)
+}
+
+func TestRecoverStalledStatefulSetRolloutSkipsNewRevisionPods(t *testing.T) {
+	t.Parallel()
+
+	stsName := "aws-mcp"
+	replicas := int32(1)
+	controller := true
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      stsName,
+			Namespace: defaultNamespace,
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+		},
+		Status: appsv1.StatefulSetStatus{
+			ObservedGeneration: 2,
+			UpdatedReplicas:    0,
+			ReadyReplicas:      0,
+			CurrentRevision:    "aws-mcp-old",
+			UpdateRevision:     "aws-mcp-new",
+		},
+	}
+	newRevisionPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "aws-mcp-0",
+			Namespace: defaultNamespace,
+			Labels: map[string]string{
+				"app":                      stsName,
+				"toolhive":                 "true",
+				"controller-revision-hash": "aws-mcp-new",
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: appsv1.SchemeGroupVersion.String(),
+				Kind:       "StatefulSet",
+				Name:       stsName,
+				Controller: &controller,
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodPending},
+	}
+
+	clientset := fake.NewClientset(sts, newRevisionPod)
+
+	recovered, err := recoverStalledStatefulSetRollout(context.Background(), clientset, defaultNamespace, stsName, 2)
+	require.NoError(t, err)
+	assert.False(t, recovered)
+
+	_, err = clientset.CoreV1().Pods(defaultNamespace).Get(context.Background(), newRevisionPod.Name, metav1.GetOptions{})
+	require.NoError(t, err)
 }
 
 func TestDeployWorkloadBackendReplicas(t *testing.T) {
