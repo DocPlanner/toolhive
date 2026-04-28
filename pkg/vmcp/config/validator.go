@@ -408,7 +408,8 @@ func (*DefaultValidator) validateFailureHandling(fh *FailureHandlingConfig) erro
 		}
 	}
 
-	validModes := []string{"fail", "bestEffort"}
+	// The CRD emits best_effort; bestEffort is retained for legacy file-based configs.
+	validModes := []string{"fail", "best_effort", "bestEffort"}
 	if !slices.Contains(validModes, fh.PartialFailureMode) {
 		return fmt.Errorf("partialFailureMode must be one of: %s", strings.Join(validModes, ", "))
 	}
