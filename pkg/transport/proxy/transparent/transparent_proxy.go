@@ -282,7 +282,7 @@ func WithSessionStorage(storage session.Storage) Option {
 			_ = p.sessionManager.Stop()
 		}
 		p.sessionManager = session.NewManagerWithStorage(
-			session.DefaultSessionTTL,
+			session.ResolveSessionTTLFromEnv(),
 			func(id string) session.Session { return session.NewProxySession(id) },
 			storage,
 		)
@@ -414,7 +414,7 @@ func NewTransparentProxyWithOptions(
 		prometheusHandler:           prometheusHandler,
 		authInfoHandler:             authInfoHandler,
 		prefixHandlers:              prefixHandlers,
-		sessionManager:              session.NewManager(session.DefaultSessionTTL, session.NewProxySession),
+		sessionManager:              session.NewManager(session.ResolveSessionTTLFromEnv(), session.NewProxySession),
 		isRemote:                    isRemote,
 		transportType:               transportType,
 		onHealthCheckFailed:         onHealthCheckFailed,

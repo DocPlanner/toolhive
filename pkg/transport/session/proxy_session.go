@@ -4,6 +4,8 @@
 package session
 
 import (
+	"log/slog"
+	"os"
 	"sync"
 	"time"
 )
@@ -25,7 +27,30 @@ const (
 const (
 	// DefaultSessionTTL is the default time-to-live for sessions (2 hours)
 	DefaultSessionTTL = 2 * time.Hour
+
+	// ProxySessionTTLEnvVar overrides the proxy session TTL for MCPServer transports.
+	ProxySessionTTLEnvVar = "TOOLHIVE_PROXY_SESSION_TTL"
 )
+
+// ResolveSessionTTLFromEnv returns the configured proxy session TTL.
+func ResolveSessionTTLFromEnv() time.Duration {
+	raw := os.Getenv(ProxySessionTTLEnvVar)
+	if raw == "" {
+		return DefaultSessionTTL
+	}
+
+	ttl, err := time.ParseDuration(raw)
+	if err != nil || ttl <= 0 {
+		slog.Warn("invalid proxy session TTL, using default",
+			"env_var", ProxySessionTTLEnvVar,
+			"value", raw,
+			"default", DefaultSessionTTL,
+			"error", err)
+		return DefaultSessionTTL
+	}
+
+	return ttl
+}
 
 // ProxySession implements the Session interface for proxy sessions.
 // It now includes support for session types, metadata, and custom data.

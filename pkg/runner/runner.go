@@ -131,7 +131,7 @@ func newTransportSessionStorage(
 		KeyPrefix: scalingConfig.SessionRedis.KeyPrefix,
 	}
 
-	storage, err := transportsession.NewRedisStorage(ctx, redisCfg, transportsession.DefaultSessionTTL)
+	storage, err := transportsession.NewRedisStorage(ctx, redisCfg, transportsession.ResolveSessionTTLFromEnv())
 	if err != nil {
 		return nil, fmt.Errorf("creating redis session storage: %w", err)
 	}

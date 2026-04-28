@@ -125,7 +125,7 @@ func WithSessionStorage(storage session.Storage) Option {
 			_ = p.sessionManager.Stop()
 		}
 		sseFactory := func(id string) session.Session { return session.NewSSESession(id) }
-		p.sessionManager = session.NewManagerWithStorage(session.DefaultSessionTTL, sseFactory, storage)
+		p.sessionManager = session.NewManagerWithStorage(session.ResolveSessionTTLFromEnv(), sseFactory, storage)
 	}
 }
 
@@ -150,7 +150,7 @@ func NewHTTPSSEProxy(
 		trustProxyHeaders: trustProxyHeaders,
 		shutdownCh:        make(chan struct{}),
 		messageCh:         make(chan jsonrpc2.Message, 100),
-		sessionManager:    session.NewManager(session.DefaultSessionTTL, sseFactory),
+		sessionManager:    session.NewManager(session.ResolveSessionTTLFromEnv(), sseFactory),
 		pendingMessages:   []*ssecommon.PendingSSEMessage{},
 		prometheusHandler: prometheusHandler,
 	}

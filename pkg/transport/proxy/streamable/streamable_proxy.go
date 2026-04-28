@@ -82,7 +82,7 @@ func WithSessionStorage(storage session.Storage) Option {
 			_ = p.sessionManager.Stop()
 		}
 		sFactory := func(id string) session.Session { return session.NewStreamableSession(id) }
-		p.sessionManager = session.NewManagerWithStorage(session.DefaultSessionTTL, sFactory, storage)
+		p.sessionManager = session.NewManagerWithStorage(session.ResolveSessionTTLFromEnv(), sFactory, storage)
 	}
 }
 
@@ -106,7 +106,7 @@ func NewHTTPProxy(
 		middlewares:       middlewares,
 		messageCh:         make(chan jsonrpc2.Message, 100),
 		responseCh:        make(chan jsonrpc2.Message, 100),
-		sessionManager:    session.NewManager(session.DefaultSessionTTL, sFactory),
+		sessionManager:    session.NewManager(session.ResolveSessionTTLFromEnv(), sFactory),
 	}
 
 	for _, opt := range opts {
