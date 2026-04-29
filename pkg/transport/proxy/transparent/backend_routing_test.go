@@ -433,6 +433,100 @@ func TestRoundTripReinitializesOnBackend404(t *testing.T) {
 	assert.Equal(t, freshSessionID, backendSID, "backend_sid must be the raw value the backend issued, not normalized")
 }
 
+// TestRoundTripReinitializesOnBackend400InvalidSession verifies AWS-style
+// streamable HTTP session loss. Some backends return 400 with "No valid session
+// ID provided" instead of 404 when a pod restart clears in-memory session state.
+func TestRoundTripReinitializesOnBackend400InvalidSession(t *testing.T) {
+	t.Parallel()
+
+	var staleHit atomic.Int32
+	staleBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		staleHit.Add(1)
+		http.Error(w, "No valid session ID provided", http.StatusBadRequest)
+	}))
+	defer staleBackend.Close()
+
+	freshSessionID := uuid.New().String()
+	var freshHit atomic.Int32
+	freshBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		freshHit.Add(1)
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), `"initialize"`) {
+			w.Header().Set("Mcp-Session-Id", freshSessionID)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer freshBackend.Close()
+
+	proxy, addr := startProxy(t, freshBackend.URL)
+
+	clientSessionID := uuid.New().String()
+	sess := session.NewProxySession(clientSessionID)
+	sess.SetMetadata(sessionMetadataBackendURL, staleBackend.URL)
+	sess.SetMetadata(sessionMetadataInitBody, `{"jsonrpc":"2.0","id":1,"method":"initialize"}`)
+	require.NoError(t, proxy.sessionManager.AddSession(sess))
+
+	ctx := context.Background()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://"+addr+"/mcp",
+		strings.NewReader(`{"method":"tools/list"}`))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Mcp-Session-Id", clientSessionID)
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode, "client should see 200 after transparent re-init")
+	assert.GreaterOrEqual(t, staleHit.Load(), int32(1), "stale backend should have been hit")
+	assert.GreaterOrEqual(t, freshHit.Load(), int32(2), "fresh backend should receive initialize + replay")
+
+	updated, ok := proxy.sessionManager.Get(normalizeSessionID(clientSessionID))
+	require.True(t, ok, "session should still exist after re-init")
+	backendSID, exists := updated.GetMetadataValue(sessionMetadataBackendSID)
+	require.True(t, exists, "backend_sid should be set after re-init")
+	assert.Equal(t, freshSessionID, backendSID)
+}
+
+func TestRoundTripDoesNotReinitializeOnGenericBackend400(t *testing.T) {
+	t.Parallel()
+
+	const responseBody = "invalid json-rpc payload"
+	var staleHit atomic.Int32
+	staleBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		staleHit.Add(1)
+		http.Error(w, responseBody, http.StatusBadRequest)
+	}))
+	defer staleBackend.Close()
+
+	proxy, addr := startProxy(t, staleBackend.URL)
+
+	clientSessionID := uuid.New().String()
+	sess := session.NewProxySession(clientSessionID)
+	sess.SetMetadata(sessionMetadataBackendURL, staleBackend.URL)
+	sess.SetMetadata(sessionMetadataInitBody, `{"jsonrpc":"2.0","id":1,"method":"initialize"}`)
+	require.NoError(t, proxy.sessionManager.AddSession(sess))
+
+	ctx := context.Background()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://"+addr+"/mcp",
+		strings.NewReader(`{"method":"tools/list"}`))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Mcp-Session-Id", clientSessionID)
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Contains(t, string(body), responseBody)
+	assert.Equal(t, int32(1), staleHit.Load(), "generic 400 must not trigger re-initialize")
+}
+
 // TestRoundTripReinitializesPreservesNonUUIDBackendSessionID verifies that when the
 // backend issues a non-UUID Mcp-Session-Id on re-initialization, the proxy stores
 // and forwards the raw value — not a UUID v5 hash of it — on all subsequent requests.

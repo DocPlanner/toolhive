@@ -623,19 +623,18 @@ func (t *tracingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		}
 	}
 
-	// Backend returned 404 for a non-initialize, non-DELETE request whose session IS
-	// known to the proxy. This means the backend pod lost its in-memory session state
-	// (e.g. it was restarted but got the same IP). Attempt transparent re-initialization
-	// so the client sees no error. DELETE is excluded because the session has already
-	// been cleaned up above and the 404 is the expected terminal response.
-	if resp.StatusCode == http.StatusNotFound && !sawInitialize && req.Method != http.MethodDelete {
-		if clientSID != "" {
-			req.Header.Set("Mcp-Session-Id", clientSID)
-			if reInitResp, reInitErr := t.recovery.reinitializeAndReplay(req, reqBody); reInitResp != nil || reInitErr != nil {
-				_, _ = io.Copy(io.Discard, resp.Body)
-				_ = resp.Body.Close()
-				return reInitResp, reInitErr
-			}
+	// Backend reported a lost session for a non-initialize, non-DELETE request whose
+	// session IS known to the proxy. This means the backend pod lost its in-memory
+	// session state (e.g. it was restarted but got the same IP). Attempt transparent
+	// re-initialization so the client sees no error. DELETE is excluded because the
+	// session has already been cleaned up above and the 404 is the expected terminal
+	// response.
+	if clientSID != "" && !sawInitialize && req.Method != http.MethodDelete && isBackendSessionLostResponse(resp) {
+		req.Header.Set("Mcp-Session-Id", clientSID)
+		if reInitResp, reInitErr := t.recovery.reinitializeAndReplay(req, reqBody); reInitResp != nil || reInitErr != nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			return reInitResp, reInitErr
 		}
 	}
 
@@ -674,6 +673,26 @@ func (t *tracingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	}
 
 	return resp, nil
+}
+
+func isBackendSessionLostResponse(resp *http.Response) bool {
+	if resp.StatusCode == http.StatusNotFound {
+		return true
+	}
+	if resp.StatusCode != http.StatusBadRequest || resp.Body == nil {
+		return false
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		slog.Debug("failed to inspect bad request response body for backend session loss", "error", err)
+		resp.Body = io.NopCloser(bytes.NewReader(nil))
+		return false
+	}
+	_ = resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+
+	return strings.Contains(strings.ToLower(string(body)), "no valid session id")
 }
 
 func readRequestBody(req *http.Request) []byte {
