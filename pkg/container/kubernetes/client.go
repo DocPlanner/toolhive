@@ -353,8 +353,13 @@ func (c *Client) DeployWorkload(ctx context.Context,
 
 	// Convert environment variables to Kubernetes format
 	var envVarList []*corev1apply.EnvVarApplyConfiguration
-	for k, v := range envVars {
-		envVarList = append(envVarList, corev1apply.EnvVar().WithName(k).WithValue(v))
+	envVarNames := make([]string, 0, len(envVars))
+	for k := range envVars {
+		envVarNames = append(envVarNames, k)
+	}
+	sort.Strings(envVarNames)
+	for _, k := range envVarNames {
+		envVarList = append(envVarList, corev1apply.EnvVar().WithName(k).WithValue(envVars[k]))
 	}
 
 	// Create a pod template spec

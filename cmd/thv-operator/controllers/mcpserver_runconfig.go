@@ -32,21 +32,28 @@ const defaultProxyHost = "0.0.0.0"
 // defaultAPITimeout is the default timeout for Kubernetes API calls made during reconciliation
 const defaultAPITimeout = 15 * time.Second
 
-// ensureRunConfigConfigMap ensures the RunConfig ConfigMap exists and is up to date
-func (r *MCPServerReconciler) ensureRunConfigConfigMap(ctx context.Context, m *mcpv1alpha1.MCPServer) error {
+// ensureRunConfigConfigMap ensures the RunConfig ConfigMap exists and is up to date.
+// It returns the checksum of the desired ConfigMap content. The caller must use
+// this value directly for pod-template rollout annotations instead of reading
+// the ConfigMap back through the client cache, which may still hold stale data
+// immediately after an update.
+func (r *MCPServerReconciler) ensureRunConfigConfigMap(
+	ctx context.Context,
+	m *mcpv1alpha1.MCPServer,
+) (string, error) {
 	runConfig, err := r.createRunConfigFromMCPServer(m)
 	if err != nil {
-		return fmt.Errorf("failed to create RunConfig from MCPServer: %w", err)
+		return "", fmt.Errorf("failed to create RunConfig from MCPServer: %w", err)
 	}
 
 	// Validate the RunConfig before creating the ConfigMap
 	if err := r.validateRunConfig(ctx, runConfig); err != nil {
-		return fmt.Errorf("invalid RunConfig: %w", err)
+		return "", fmt.Errorf("invalid RunConfig: %w", err)
 	}
 
 	runConfigJSON, err := json.MarshalIndent(runConfig, "", "  ")
 	if err != nil {
-		return fmt.Errorf("failed to marshal run config: %w", err)
+		return "", fmt.Errorf("failed to marshal run config: %w", err)
 	}
 
 	configMapName := fmt.Sprintf("%s-runconfig", m.Name)
@@ -71,10 +78,10 @@ func (r *MCPServerReconciler) ensureRunConfigConfigMap(ctx context.Context, m *m
 	// Use the kubernetes configmaps client for upsert operations
 	configMapsClient := configmaps.NewClient(r.Client, r.Scheme)
 	if _, err := configMapsClient.UpsertWithOwnerReference(ctx, cm, m); err != nil {
-		return fmt.Errorf("failed to upsert RunConfig ConfigMap: %w", err)
+		return "", fmt.Errorf("failed to upsert RunConfig ConfigMap: %w", err)
 	}
 
-	return nil
+	return cs, nil
 }
 
 // createRunConfigFromMCPServer converts MCPServer spec to RunConfig using the builder pattern

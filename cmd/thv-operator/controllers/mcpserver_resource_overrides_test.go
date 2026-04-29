@@ -20,10 +20,13 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	mcpv1alpha1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1"
@@ -814,4 +817,100 @@ func TestMCPServerStatusURLTracksProxyPort(t *testing.T) {
 		"http://mcp-aws-mcp-proxy.toolhive-operator.svc.cluster.local:8000/mcp",
 		mcpServerStatusURL(mcpServer, "mcp-aws-mcp-proxy"),
 	)
+}
+
+func TestReconcileUpdatesProxyServiceBeforeDeployment(t *testing.T) {
+	t.Parallel()
+
+	const (
+		name      = "aws-mcp"
+		namespace = "toolhive-operator"
+	)
+
+	mcpServer := &mcpv1alpha1.MCPServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: mcpv1alpha1.MCPServerSpec{
+			Image:     "public.ecr.aws/awslabs-mcp/awslabs/aws-api-mcp-server:1.3.31",
+			Transport: "streamable-http",
+			ProxyPort: 8000,
+			MCPPort:   8000,
+		},
+	}
+
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels:    labelsForMCPServer(name),
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: int32Ptr(2),
+			Selector: &metav1.LabelSelector{MatchLabels: labelsForMCPServer(name)},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: labelsForMCPServer(name),
+				},
+				Spec: corev1.PodSpec{
+					ServiceAccountName: ctrlutil.ProxyRunnerServiceAccountName(name),
+					Containers: []corev1.Container{
+						{
+							Name:  "toolhive",
+							Image: "old-proxyrunner:latest",
+							Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: 8000}},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ctrlutil.CreateProxyServiceName(name),
+			Namespace: namespace,
+			Labels:    labelsForMCPServer(name),
+		},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{
+				{Name: "http", Port: 8080, TargetPort: intstr.FromInt(8080)},
+			},
+			SessionAffinity: corev1.ServiceAffinityClientIP,
+		},
+	}
+
+	testScheme := createTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(testScheme).
+		WithObjects(mcpServer, deployment, service).
+		WithStatusSubresource(&mcpv1alpha1.MCPServer{}).
+		Build()
+	reconciler := newTestMCPServerReconciler(fakeClient, testScheme, kubernetes.PlatformKubernetes)
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: name, Namespace: namespace},
+	})
+	require.NoError(t, err)
+	//nolint:staticcheck // Requeue is what the controller currently returns after spec updates.
+	assert.True(t, result.Requeue)
+
+	updatedService := &corev1.Service{}
+	require.NoError(t, fakeClient.Get(
+		context.Background(),
+		types.NamespacedName{Name: ctrlutil.CreateProxyServiceName(name), Namespace: namespace},
+		updatedService,
+	))
+	require.Len(t, updatedService.Spec.Ports, 1)
+	assert.Equal(t, int32(8000), updatedService.Spec.Ports[0].Port)
+	assert.Equal(t, intstr.FromInt(8000), updatedService.Spec.Ports[0].TargetPort)
+
+	updatedDeployment := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(
+		context.Background(),
+		types.NamespacedName{Name: name, Namespace: namespace},
+		updatedDeployment,
+	))
+	assert.Equal(t, "old-proxyrunner:latest", updatedDeployment.Spec.Template.Spec.Containers[0].Image)
 }

@@ -409,34 +409,17 @@ func (r *MCPServerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, err
 	}
 
-	// Ensure RunConfig ConfigMap exists and is up to date
-	if err := r.ensureRunConfigConfigMap(ctx, mcpServer); err != nil {
+	// Ensure RunConfig ConfigMap exists and is up to date. Use the desired
+	// checksum returned by the writer instead of reading the ConfigMap back
+	// through the cache immediately after an update.
+	runConfigChecksum, err := r.ensureRunConfigConfigMap(ctx, mcpServer)
+	if err != nil {
 		ctxLogger.Error(err, "Failed to ensure RunConfig ConfigMap")
 		mcpServer.Status.Phase = mcpv1alpha1.MCPServerPhaseFailed
 		mcpServer.Status.Message = fmt.Sprintf("Failed to build configuration: %s", err.Error())
 		setReadyCondition(mcpServer, metav1.ConditionFalse, mcpv1alpha1.ConditionReasonNotReady, mcpServer.Status.Message)
 		if statusErr := r.Status().Update(ctx, mcpServer); statusErr != nil {
 			ctxLogger.Error(statusErr, "Failed to update MCPServer status after RunConfig error")
-		}
-		return ctrl.Result{}, err
-	}
-
-	// Fetch RunConfig ConfigMap checksum to include in pod template annotations
-	runConfigChecksum, err := r.getRunConfigChecksum(ctx, mcpServer)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			// ConfigMap doesn't exist yet - requeue with a short delay to allow
-			// API server propagation.
-			ctxLogger.Info("RunConfig ConfigMap not found yet, will retry",
-				"server", mcpServer.Name, "namespace", mcpServer.Namespace)
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-		ctxLogger.Error(err, "Failed to get RunConfig checksum")
-		mcpServer.Status.Phase = mcpv1alpha1.MCPServerPhaseFailed
-		mcpServer.Status.Message = fmt.Sprintf("Failed to build configuration: %s", err.Error())
-		setReadyCondition(mcpServer, metav1.ConditionFalse, mcpv1alpha1.ConditionReasonNotReady, mcpServer.Status.Message)
-		if statusErr := r.Status().Update(ctx, mcpServer); statusErr != nil {
-			ctxLogger.Error(statusErr, "Failed to update MCPServer status after RunConfig checksum error")
 		}
 		return ctrl.Result{}, err
 	}
@@ -539,6 +522,26 @@ func (r *MCPServerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 	}
 
+	// Check if the service spec changed before deployment updates. Deployment
+	// drift can be persistent while pods roll or when pod-template metadata is
+	// externally touched; putting service reconciliation after it can starve
+	// proxy Service port correction indefinitely.
+	if serviceNeedsUpdate(service, mcpServer) {
+		// Update the service
+		newService := r.serviceForMCPServer(ctx, mcpServer)
+		service.Spec.Ports = newService.Spec.Ports
+		service.Spec.SessionAffinity = newService.Spec.SessionAffinity
+		service.Labels = newService.Labels
+		service.Annotations = newService.Annotations
+		err = r.Update(ctx, service)
+		if err != nil {
+			ctxLogger.Error(err, "Failed to update Service", "Service.Namespace", service.Namespace, "Service.Name", service.Name)
+			return ctrl.Result{}, err
+		}
+		// Spec updated - return and requeue
+		return ctrl.Result{Requeue: true}, nil
+	}
+
 	// Check if the deployment spec changed
 	if r.deploymentNeedsUpdate(ctx, deployment, mcpServer, runConfigChecksum) {
 		// Update template and metadata. Also sync Spec.Replicas when spec.replicas is
@@ -558,23 +561,6 @@ func (r *MCPServerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			ctxLogger.Error(err, "Failed to update Deployment",
 				"Deployment.Namespace", deployment.Namespace,
 				"Deployment.Name", deployment.Name)
-			return ctrl.Result{}, err
-		}
-		// Spec updated - return and requeue
-		return ctrl.Result{Requeue: true}, nil
-	}
-
-	// Check if the service spec changed
-	if serviceNeedsUpdate(service, mcpServer) {
-		// Update the service
-		newService := r.serviceForMCPServer(ctx, mcpServer)
-		service.Spec.Ports = newService.Spec.Ports
-		service.Spec.SessionAffinity = newService.Spec.SessionAffinity
-		service.Labels = newService.Labels
-		service.Annotations = newService.Annotations
-		err = r.Update(ctx, service)
-		if err != nil {
-			ctxLogger.Error(err, "Failed to update Service", "Service.Namespace", service.Namespace, "Service.Name", service.Name)
 			return ctrl.Result{}, err
 		}
 		// Spec updated - return and requeue

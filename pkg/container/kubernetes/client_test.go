@@ -1486,3 +1486,71 @@ func TestDeployWorkloadBackendReplicas(t *testing.T) {
 		assert.Equal(t, int32(0), *sts.Spec.Replicas)
 	})
 }
+
+func TestDeployWorkloadUpdatesStatefulSetEnvVars(t *testing.T) {
+	t.Parallel()
+
+	mockStatefulSet := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "aws-mcp",
+			Namespace: defaultNamespace,
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: ptr.To(int32(2)),
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name: "mcp",
+							Env: []corev1.EnvVar{
+								{Name: "AWS_API_MCP_HOST", Value: "0.0.0.0"},
+							},
+						},
+					},
+				},
+			},
+		},
+		Status: appsv1.StatefulSetStatus{ReadyReplicas: 2},
+	}
+	clientset := fake.NewClientset(mockStatefulSet)
+	client := NewClientWithConfigAndPlatformDetector(
+		clientset,
+		&rest.Config{Host: "https://fake-k8s-api.example.com"},
+		&mockPlatformDetector{platform: PlatformKubernetes},
+	)
+	client.waitForStatefulSetReadyFunc = mockWaitForStatefulSetReady
+	client.namespaceFunc = func() string { return defaultNamespace }
+
+	options := runtime.NewDeployWorkloadOptions()
+	options.ScalingConfig = &runtime.ScalingConfig{BackendReplicas: ptr.To(int32(2))}
+
+	_, err := client.DeployWorkload(
+		context.Background(),
+		"public.ecr.aws/awslabs-mcp/awslabs/aws-api-mcp-server:1.3.31",
+		"aws-mcp",
+		nil,
+		map[string]string{
+			"AWS_API_MCP_HOST":          "0.0.0.0",
+			"AWS_API_MCP_ALLOWED_HOSTS": "mcp-aws-mcp",
+		},
+		map[string]string{},
+		nil,
+		"streamable-http",
+		options,
+		false,
+	)
+	require.NoError(t, err)
+
+	sts, err := clientset.AppsV1().StatefulSets(defaultNamespace).Get(
+		context.Background(), "aws-mcp", metav1.GetOptions{},
+	)
+	require.NoError(t, err)
+	require.Len(t, sts.Spec.Template.Spec.Containers, 1)
+
+	envByName := map[string]string{}
+	for _, env := range sts.Spec.Template.Spec.Containers[0].Env {
+		envByName[env.Name] = env.Value
+	}
+	assert.Equal(t, "mcp-aws-mcp", envByName["AWS_API_MCP_ALLOWED_HOSTS"])
+	assert.Equal(t, "0.0.0.0", envByName["AWS_API_MCP_HOST"])
+}

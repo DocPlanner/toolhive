@@ -981,7 +981,7 @@ func TestEnsureRunConfigConfigMap(t *testing.T) {
 			reconciler := newTestMCPServerReconciler(fakeClient, testScheme, kubernetes.PlatformKubernetes)
 
 			// Execute the method under test
-			err := reconciler.ensureRunConfigConfigMap(context.TODO(), tt.mcpServer)
+			runConfigChecksum, err := reconciler.ensureRunConfigConfigMap(context.TODO(), tt.mcpServer)
 			if tt.expectError {
 				assert.Error(t, err)
 				return
@@ -1002,6 +1002,7 @@ func TestEnsureRunConfigConfigMap(t *testing.T) {
 			assert.Equal(t, tt.mcpServer.Namespace, configMap.Namespace)
 			assert.Equal(t, labelsForRunConfig(tt.mcpServer.Name), configMap.Labels)
 			assert.Contains(t, configMap.Data, "runconfig.json")
+			assert.Equal(t, configMap.Annotations[checksum.ContentChecksumAnnotation], runConfigChecksum)
 
 			// Verify the RunConfig content is correct
 			var runConfig runner.RunConfig
@@ -1068,7 +1069,7 @@ func TestEnsureRunConfigConfigMap(t *testing.T) {
 
 		reconciler := newTestMCPServerReconciler(fakeClient, testScheme, kubernetes.PlatformKubernetes)
 
-		err := reconciler.ensureRunConfigConfigMap(context.TODO(), mcpServer)
+		_, err := reconciler.ensureRunConfigConfigMap(context.TODO(), mcpServer)
 		require.NoError(t, err)
 
 		// Fetch the generated runconfig ConfigMap
@@ -1328,7 +1329,7 @@ func TestEnsureRunConfigConfigMapCompleteFlow(t *testing.T) {
 		{Name: "ENV1", Value: "value1"},
 	})
 
-	err := reconciler.ensureRunConfigConfigMap(context.TODO(), mcpServer)
+	_, err := reconciler.ensureRunConfigConfigMap(context.TODO(), mcpServer)
 	require.NoError(t, err)
 
 	// Verify initial ConfigMap
@@ -1360,7 +1361,7 @@ func TestEnsureRunConfigConfigMapCompleteFlow(t *testing.T) {
 		{Name: "ENV2", Value: "value2"},
 	}
 
-	err = reconciler.ensureRunConfigConfigMap(context.TODO(), mcpServer)
+	_, err = reconciler.ensureRunConfigConfigMap(context.TODO(), mcpServer)
 	require.NoError(t, err)
 
 	// Verify ConfigMap was updated
@@ -1385,7 +1386,7 @@ func TestEnsureRunConfigConfigMapCompleteFlow(t *testing.T) {
 	assert.Equal(t, "value2", updatedRunConfig.EnvVars["ENV2"])
 
 	// Step 3: No-op update (same content)
-	err = reconciler.ensureRunConfigConfigMap(context.TODO(), mcpServer)
+	_, err = reconciler.ensureRunConfigConfigMap(context.TODO(), mcpServer)
 	require.NoError(t, err)
 
 	// Verify ConfigMap timestamp didn't change
@@ -1505,7 +1506,7 @@ func TestMCPServerModificationScenarios(t *testing.T) {
 
 			// Create initial MCPServer and ConfigMap
 			mcpServer := tt.initialServer()
-			err := reconciler.ensureRunConfigConfigMap(context.TODO(), mcpServer)
+			_, err := reconciler.ensureRunConfigConfigMap(context.TODO(), mcpServer)
 			require.NoError(t, err)
 
 			// Get initial ConfigMap
@@ -1522,7 +1523,7 @@ func TestMCPServerModificationScenarios(t *testing.T) {
 			tt.modifyServer(mcpServer)
 
 			// Ensure ConfigMap is updated
-			err = reconciler.ensureRunConfigConfigMap(context.TODO(), mcpServer)
+			_, err = reconciler.ensureRunConfigConfigMap(context.TODO(), mcpServer)
 			require.NoError(t, err)
 
 			// Verify ConfigMap was updated
@@ -1652,7 +1653,7 @@ func TestEnsureRunConfigConfigMap_WithVaultInjection(t *testing.T) {
 			reconciler := newTestMCPServerReconciler(fakeClient, testScheme, kubernetes.PlatformKubernetes)
 
 			// Execute the method under test
-			err := reconciler.ensureRunConfigConfigMap(context.TODO(), tc.mcpServer)
+			_, err := reconciler.ensureRunConfigConfigMap(context.TODO(), tc.mcpServer)
 			require.NoError(t, err)
 
 			// Verify the ConfigMap exists
