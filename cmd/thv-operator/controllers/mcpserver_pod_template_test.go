@@ -18,6 +18,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 
 	mcpv1alpha1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1"
+	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/runconfig/configmap/checksum"
 	"github.com/stacklok/toolhive/pkg/container/kubernetes"
 )
 
@@ -175,6 +176,44 @@ func TestDeploymentForMCPServerWithPodTemplateSpec(t *testing.T) {
 		}
 	}
 	assert.True(t, podTemplatePatchFound, "Pod template patch should be included in the args")
+}
+
+func TestDeploymentForMCPServerPreservesRunConfigChecksumWithPodTemplateAnnotations(t *testing.T) {
+	t.Parallel()
+
+	mcpServer := &mcpv1alpha1.MCPServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-mcp-server",
+			Namespace: "default",
+		},
+		Spec: mcpv1alpha1.MCPServerSpec{
+			Image:     "test-image:latest",
+			Transport: "streamable-http",
+			ProxyPort: 8080,
+			ResourceOverrides: &mcpv1alpha1.ResourceOverrides{
+				ProxyDeployment: &mcpv1alpha1.ProxyDeploymentOverrides{
+					PodTemplateMetadataOverrides: &mcpv1alpha1.ResourceMetadataOverrides{
+						Annotations: map[string]string{
+							"toolhive.stacklok.dev/forced-reconcile-at": "2026-04-21T18:45:00Z",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	s := runtime.NewScheme()
+	_ = scheme.AddToScheme(s)
+	s.AddKnownTypes(mcpv1alpha1.GroupVersion, &mcpv1alpha1.MCPServer{})
+	s.AddKnownTypes(mcpv1alpha1.GroupVersion, &mcpv1alpha1.MCPServerList{})
+
+	r := newTestMCPServerReconciler(nil, s, kubernetes.PlatformKubernetes)
+	deployment := r.deploymentForMCPServer(context.Background(), mcpServer, "test-checksum")
+	require.NotNil(t, deployment)
+
+	annotations := deployment.Spec.Template.Annotations
+	assert.Equal(t, "test-checksum", annotations[checksum.RunConfigChecksumAnnotation])
+	assert.Equal(t, "2026-04-21T18:45:00Z", annotations["toolhive.stacklok.dev/forced-reconcile-at"])
 }
 
 func TestDeploymentForMCPServerSecretsProviderEnv(t *testing.T) {

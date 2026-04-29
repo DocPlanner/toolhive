@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,6 +44,13 @@ func startProxy(t *testing.T, targetURL string) (proxy *TransparentProxy, addr s
 	return proxy, addr
 }
 
+func mustParseHost(t *testing.T, rawURL string) string {
+	t.Helper()
+	parsed, err := url.Parse(rawURL)
+	require.NoError(t, err)
+	return parsed.Host
+}
+
 // TestRewriteRoutesViaBackendURL verifies that a request with a session whose
 // metadata contains "backend_url" is forwarded to that URL, not the static targetURI.
 func TestRewriteRoutesViaBackendURL(t *testing.T) {
@@ -50,9 +58,11 @@ func TestRewriteRoutesViaBackendURL(t *testing.T) {
 
 	var specificHit atomic.Bool
 	var specificPath atomic.Value
+	var specificHost atomic.Value
 	specificBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		specificHit.Store(true)
 		specificPath.Store(r.URL.Path)
+		specificHost.Store(r.Host)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer specificBackend.Close()
@@ -87,6 +97,8 @@ func TestRewriteRoutesViaBackendURL(t *testing.T) {
 	require.True(t, specificHit.Load(), "request should have been forwarded to specificBackend")
 	assert.False(t, defaultHit.Load(), "request should NOT have been forwarded to defaultBackend")
 	assert.Equal(t, "/mcp", specificPath.Load(), "original request path should be preserved after backend_url rewrite")
+	assert.Equal(t, mustParseHost(t, defaultBackend.URL), specificHost.Load(),
+		"Host header should remain the logical target host, not the backend_url routing host")
 }
 
 // TestRewriteFallsBackToStaticTargetWhenNoBackendURL verifies that a request
@@ -225,6 +237,41 @@ func TestRoundTripAllowsInitializeWithUnknownSession(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, http.StatusBadRequest, resp.StatusCode)
 	_ = resp.Body.Close()
+}
+
+// TestRoundTripPreservesExplicitHost verifies that routing via URL.Host does not
+// overwrite an explicit logical Host header set by the reverse proxy.
+func TestRoundTripPreservesExplicitHost(t *testing.T) {
+	t.Parallel()
+
+	const logicalHost = "mcp-aws-mcp"
+	var receivedHost atomic.Value
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHost.Store(r.Host)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	proxy := NewTransparentProxyWithOptions(
+		"localhost", 0, backend.URL,
+		nil, nil, nil,
+		false, false, "sse",
+		nil, nil, "", false,
+		nil,
+	)
+	tt := newTracingTransport(http.DefaultTransport, proxy)
+
+	req, err := http.NewRequest(http.MethodPost, backend.URL+"/mcp",
+		strings.NewReader(`{"method":"initialize"}`))
+	require.NoError(t, err)
+	req.Host = logicalHost
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := tt.RoundTrip(req)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	assert.Equal(t, logicalHost, receivedHost.Load())
 }
 
 // TestRoundTripAllowsBatchInitializeWithUnknownSession verifies that a JSON-RPC

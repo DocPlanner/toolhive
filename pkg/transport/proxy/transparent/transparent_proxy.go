@@ -501,12 +501,11 @@ func (p *TransparentProxy) serverInitialized() bool {
 
 // nolint:gocyclo // This function handles multiple request types and is complex by design
 func (t *tracingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	// Always rewrite Host header to match the target URL to avoid "Invalid Host" errors
-	// from backends with strict host validation (e.g., Django ALLOWED_HOSTS, FastAPI TrustedHostMiddleware).
-	// Without this, the backend receives the proxy's Host header (e.g., Kubernetes service DNS name)
-	// instead of its own hostname, causing validation failures.
-	// See: https://github.com/stacklok/stacklok-epics/issues/231
-	if req.URL.Host != req.Host {
+	// Keep any Host value set by ReverseProxy.SetURL. The request URL host can
+	// be changed later to a routing-only backend_url (for example a Kubernetes
+	// ClusterIP/pod IP); strict backend host validation must still see the
+	// logical target host, not that routing address.
+	if req.Host == "" {
 		req.Host = req.URL.Host
 	}
 
@@ -940,19 +939,18 @@ func (r *backendRecovery) reinitializeAndReplay(req *http.Request, origBody []by
 		slog.Debug("failed to update session after re-initialize", "error", upsertErr)
 	}
 
-	// Replay the original client request to the new pod with the new backend SID.
-	// Use the captured pod address directly so we bypass the Rewrite closure
-	// (which still holds the old backend_url until the next session load).
-	// For HTTPS targets, keep the original hostname: IP-literal HTTPS requests
-	// fail TLS verification because server certs are issued for hostnames, not pod IPs.
-	replayHost := capturedPodAddr
-	if replayHost == "" || parsedTarget.Scheme == "https" {
-		replayHost = parsedTarget.Host
+	// Replay the original client request to the new backend with the new backend
+	// SID. Use the captured address for routing when possible, but preserve the
+	// logical Host header from the configured target so strict host validation
+	// does not see a ClusterIP/pod IP.
+	replayURLHost := capturedPodAddr
+	if replayURLHost == "" || parsedTarget.Scheme == "https" {
+		replayURLHost = parsedTarget.Host
 	}
 	replayReq := req.Clone(req.Context())
 	replayReq.URL.Scheme = parsedTarget.Scheme
-	replayReq.URL.Host = replayHost
-	replayReq.Host = replayHost // keep Host header consistent with URL to avoid backend validation errors
+	replayReq.URL.Host = replayURLHost
+	replayReq.Host = parsedTarget.Host
 	replayReq.Header.Set("Mcp-Session-Id", newBackendSID)
 	replayReq.Body = io.NopCloser(bytes.NewReader(origBody))
 	replayReq.ContentLength = int64(len(origBody))
@@ -1016,6 +1014,10 @@ func (p *TransparentProxy) Start(ctx context.Context) error {
 					}
 				}
 			}
+			// backend_url is a routing target only. Preserve the logical target
+			// Host set by SetURL so strict MCP servers do not see ClusterIP/pod IP
+			// addresses introduced for session stickiness.
+			pr.Out.Host = targetURL.Host
 
 			// Stash the original inbound request in the outbound request's
 			// context so that ModifyResponse (SSE response processor) can
