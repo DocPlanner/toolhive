@@ -23,6 +23,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	mcpv1alpha1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1"
@@ -692,7 +693,8 @@ func TestMCPServerServiceNeedsUpdate(t *testing.T) {
 		Spec: corev1.ServiceSpec{
 			SessionAffinity: corev1.ServiceAffinityClientIP,
 			Ports: []corev1.ServicePort{{
-				Port: 8080,
+				Port:       8080,
+				TargetPort: intstr.FromInt(8080),
 			}},
 		},
 	}
@@ -708,6 +710,45 @@ func TestMCPServerServiceNeedsUpdate(t *testing.T) {
 			service:     baseService.DeepCopy(),
 			mcpServer:   baseMCPServer.DeepCopy(),
 			needsUpdate: false,
+		},
+		{
+			name: "service port changed",
+			service: func() *corev1.Service {
+				s := baseService.DeepCopy()
+				s.Spec.Ports[0].Port = 8080
+				return s
+			}(),
+			mcpServer: func() *mcpv1alpha1.MCPServer {
+				m := baseMCPServer.DeepCopy()
+				m.Spec.ProxyPort = 8000
+				return m
+			}(),
+			needsUpdate: true,
+		},
+		{
+			name: "service target port changed",
+			service: func() *corev1.Service {
+				s := baseService.DeepCopy()
+				s.Spec.Ports[0].Port = 8000
+				s.Spec.Ports[0].TargetPort = intstr.FromInt(8080)
+				return s
+			}(),
+			mcpServer: func() *mcpv1alpha1.MCPServer {
+				m := baseMCPServer.DeepCopy()
+				m.Spec.ProxyPort = 8000
+				return m
+			}(),
+			needsUpdate: true,
+		},
+		{
+			name: "service port missing",
+			service: func() *corev1.Service {
+				s := baseService.DeepCopy()
+				s.Spec.Ports = nil
+				return s
+			}(),
+			mcpServer:   baseMCPServer.DeepCopy(),
+			needsUpdate: true,
 		},
 		{
 			name: "session affinity drifted to empty",
@@ -752,4 +793,25 @@ func TestMCPServerServiceNeedsUpdate(t *testing.T) {
 			assert.Equal(t, tt.needsUpdate, result)
 		})
 	}
+}
+
+func TestMCPServerStatusURLTracksProxyPort(t *testing.T) {
+	t.Parallel()
+
+	mcpServer := &mcpv1alpha1.MCPServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "aws-mcp",
+			Namespace: "toolhive-operator",
+		},
+		Spec: mcpv1alpha1.MCPServerSpec{
+			Transport: "streamable-http",
+			ProxyPort: 8000,
+		},
+	}
+
+	assert.Equal(
+		t,
+		"http://mcp-aws-mcp-proxy.toolhive-operator.svc.cluster.local:8000/mcp",
+		mcpServerStatusURL(mcpServer, "mcp-aws-mcp-proxy"),
+	)
 }

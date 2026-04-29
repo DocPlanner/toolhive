@@ -527,17 +527,11 @@ func (r *MCPServerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, err
 	}
 
-	// Update the MCPServer status with the service URL including transport-specific path
-	if mcpServer.Status.URL == "" {
-		host := fmt.Sprintf("%s.%s.svc.cluster.local", serviceName, mcpServer.Namespace)
-		mcpServer.Status.URL = transport.GenerateMCPServerURL(
-			mcpServer.Spec.Transport,
-			mcpServer.Spec.ProxyMode,
-			host,
-			int(mcpServer.GetProxyPort()),
-			mcpServer.Name,
-			"", // empty remoteURL for MCPServer (not remote proxy)
-		)
+	// Keep the MCPServer status URL in sync with proxy port changes. VMCP discovery consumes
+	// this URL directly, so stale status can keep routing clients to an obsolete service port.
+	expectedStatusURL := mcpServerStatusURL(mcpServer, serviceName)
+	if mcpServer.Status.URL != expectedStatusURL {
+		mcpServer.Status.URL = expectedStatusURL
 		err = r.Status().Update(ctx, mcpServer)
 		if err != nil {
 			ctxLogger.Error(err, "Failed to update MCPServer status")
@@ -1508,6 +1502,18 @@ func (r *MCPServerReconciler) serviceForMCPServer(ctx context.Context, m *mcpv1a
 	return svc
 }
 
+func mcpServerStatusURL(mcpServer *mcpv1alpha1.MCPServer, serviceName string) string {
+	host := fmt.Sprintf("%s.%s.svc.cluster.local", serviceName, mcpServer.Namespace)
+	return transport.GenerateMCPServerURL(
+		mcpServer.Spec.Transport,
+		mcpServer.Spec.ProxyMode,
+		host,
+		int(mcpServer.GetProxyPort()),
+		mcpServer.Name,
+		"", // empty remoteURL for MCPServer (not remote proxy)
+	)
+}
+
 // checkContainerError checks if a container is in an error state and returns the error reason.
 func checkContainerError(containerStatus corev1.ContainerStatus) (bool, string) {
 	if containerStatus.State.Waiting != nil {
@@ -2027,8 +2033,16 @@ func (r *MCPServerReconciler) deploymentNeedsUpdate(
 
 // serviceNeedsUpdate checks if the service needs to be updated
 func serviceNeedsUpdate(service *corev1.Service, mcpServer *mcpv1alpha1.MCPServer) bool {
+	if len(service.Spec.Ports) == 0 {
+		return true
+	}
+
 	// Check if the service port has changed
-	if len(service.Spec.Ports) > 0 && service.Spec.Ports[0].Port != mcpServer.GetProxyPort() {
+	if service.Spec.Ports[0].Port != mcpServer.GetProxyPort() {
+		return true
+	}
+
+	if service.Spec.Ports[0].TargetPort != intstr.FromInt(int(mcpServer.GetProxyPort())) {
 		return true
 	}
 
