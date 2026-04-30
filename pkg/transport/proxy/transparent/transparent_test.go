@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1646,6 +1647,47 @@ func TestPrefixHandlers_MountingAndRouting(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTransparentProxy_HealthEndpointDoesNotPingBackend(t *testing.T) {
+	t.Parallel()
+
+	var backendHits atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		backendHits.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer backend.Close()
+
+	proxy := NewTransparentProxy(
+		"127.0.0.1",
+		0,
+		backend.URL,
+		nil,
+		nil,
+		nil,
+		true,
+		false,
+		"streamable-http",
+		nil,
+		nil,
+		"",
+		false,
+	)
+
+	ctx := context.Background()
+	err := proxy.Start(ctx)
+	require.NoError(t, err)
+	defer func() { _ = proxy.Stop(ctx) }()
+
+	actualPort := proxy.listener.Addr().(*net.TCPAddr).Port
+
+	resp, err := http.Get(fmt.Sprintf("http://%s:%d/health", proxy.host, actualPort))
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, int32(0), backendHits.Load(), "/health must not proxy or ping backend root")
 }
 
 // TestPrefixHandlers_NilMapDoesNotPanic tests that a nil PrefixHandlers map doesn't cause panic

@@ -456,7 +456,7 @@ func (m *Monitor) performHealthCheck(ctx context.Context, backend *vmcp.Backend)
 		BaseURL:       backend.BaseURL,
 		TransportType: backend.TransportType,
 		AuthConfig:    backend.AuthConfig,
-		HealthStatus:  vmcp.BackendUnknown, // Status is determined by the health check
+		HealthStatus:  backend.HealthStatus,
 		Metadata:      backend.Metadata,
 	}
 
@@ -921,7 +921,14 @@ func buildConditions(summary Summary, phase vmcp.Phase, configuredBackendCount i
 
 // backendChanged returns true if the backend's health-check-relevant properties have changed.
 // This is used by UpdateBackends to detect when an existing backend needs its monitoring
-// goroutine restarted (e.g., URL updated after operator reconcile).
+// goroutine restarted (e.g., URL updated after operator reconcile, or a managed workload
+// status changed in its CRD).
 func backendChanged(old, updated vmcp.Backend) bool {
-	return old.BaseURL != updated.BaseURL || old.TransportType != updated.TransportType
+	oldWorkloadType := old.Metadata[metadataKeyWorkloadType]
+	updatedWorkloadType := updated.Metadata[metadataKeyWorkloadType]
+
+	return old.BaseURL != updated.BaseURL ||
+		old.TransportType != updated.TransportType ||
+		oldWorkloadType != updatedWorkloadType ||
+		(updatedWorkloadType == workloadTypeMCPServer && old.HealthStatus != updated.HealthStatus)
 }

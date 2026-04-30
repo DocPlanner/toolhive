@@ -302,8 +302,12 @@ func (w *BackendWatcher) addBackendWatchController() error {
 		Discoverer: discoverer,
 	}
 
-	// Register reconciler with manager
-	// This sets up watches on MCPServer, MCPRemoteProxy, and ExternalAuthConfig
+	if err := reconciler.SetupIndexes(context.Background(), w.ctrlManager); err != nil {
+		return fmt.Errorf("failed to setup backend reconciler indexes: %w", err)
+	}
+
+	// Register reconciler with manager.
+	// This sets up watches on MCPServer, MCPRemoteProxy, MCPServerEntry, ExternalAuthConfig, and ConfigMap.
 	if err := reconciler.SetupWithManager(w.ctrlManager); err != nil {
 		return fmt.Errorf("failed to setup backend reconciler: %w", err)
 	}

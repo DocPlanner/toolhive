@@ -80,6 +80,108 @@ func TestHealthChecker_CheckHealth_Success(t *testing.T) {
 	assert.Equal(t, vmcp.BackendHealthy, status)
 }
 
+func TestHealthChecker_CheckHealth_ManagedWorkloadUsesStatus(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockClient := mocks.NewMockBackendClient(ctrl)
+	checker := NewHealthChecker(mockClient, 5*time.Second, 0)
+	target := &vmcp.BackendTarget{
+		WorkloadID:   "backend-1",
+		WorkloadName: "test-backend",
+		BaseURL:      "http://localhost:8080",
+		HealthStatus: vmcp.BackendHealthy,
+		Metadata: map[string]string{
+			"workload_type": "mcp_server",
+		},
+	}
+
+	status, err := checker.CheckHealth(context.Background(), target)
+	assert.NoError(t, err)
+	assert.Equal(t, vmcp.BackendHealthy, status)
+}
+
+func TestHealthChecker_CheckHealth_ManagedWorkloadUnhealthyStatus(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockClient := mocks.NewMockBackendClient(ctrl)
+	checker := NewHealthChecker(mockClient, 5*time.Second, 0)
+	target := &vmcp.BackendTarget{
+		WorkloadID:   "backend-1",
+		WorkloadName: "test-backend",
+		BaseURL:      "http://localhost:8080",
+		HealthStatus: vmcp.BackendUnhealthy,
+		Metadata: map[string]string{
+			"workload_type": "mcp_server",
+		},
+	}
+
+	status, err := checker.CheckHealth(context.Background(), target)
+	assert.Error(t, err)
+	assert.Equal(t, vmcp.BackendUnhealthy, status)
+}
+
+func TestHealthChecker_CheckHealth_ServerEntryFallsBackToCapabilities(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockClient := mocks.NewMockBackendClient(ctrl)
+	mockClient.EXPECT().
+		ListCapabilities(gomock.Any(), gomock.Any()).
+		Return(&vmcp.CapabilityList{}, nil).
+		Times(1)
+
+	checker := NewHealthChecker(mockClient, 5*time.Second, 0)
+	target := &vmcp.BackendTarget{
+		WorkloadID:   "entry-1",
+		WorkloadName: "test-entry",
+		BaseURL:      "https://mcp.example.com/mcp",
+		HealthStatus: vmcp.BackendHealthy,
+		Metadata: map[string]string{
+			"workload_type": "server_entry",
+		},
+	}
+
+	status, err := checker.CheckHealth(context.Background(), target)
+	assert.NoError(t, err)
+	assert.Equal(t, vmcp.BackendHealthy, status)
+}
+
+func TestHealthChecker_CheckHealth_RemoteProxyFallsBackToCapabilities(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockClient := mocks.NewMockBackendClient(ctrl)
+	mockClient.EXPECT().
+		ListCapabilities(gomock.Any(), gomock.Any()).
+		Return(&vmcp.CapabilityList{}, nil).
+		Times(1)
+
+	checker := NewHealthChecker(mockClient, 5*time.Second, 0)
+	target := &vmcp.BackendTarget{
+		WorkloadID:   "proxy-1",
+		WorkloadName: "test-proxy",
+		BaseURL:      "https://remote.example.com/mcp",
+		HealthStatus: vmcp.BackendHealthy,
+		Metadata: map[string]string{
+			"workload_type": "remote_proxy",
+		},
+	}
+
+	status, err := checker.CheckHealth(context.Background(), target)
+	assert.NoError(t, err)
+	assert.Equal(t, vmcp.BackendHealthy, status)
+}
+
 func TestHealthChecker_CheckHealth_ContextCancellation(t *testing.T) {
 	t.Parallel()
 

@@ -1104,10 +1104,12 @@ func (p *TransparentProxy) Start(ctx context.Context) error {
 		slog.Debug("mounted prefix handler", "prefix", prefix)
 	}
 
-	// 2. Mount health check endpoint if enabled, otherwise return 404
-	// (prevents /health from being proxied to the backend)
+	// 2. Mount a shallow health check endpoint if enabled, otherwise return 404.
+	// Kubernetes probes only need to know that the proxyrunner itself can serve.
+	// Backend liveness is monitored separately; probing it from /health creates
+	// noisy backend GET / logs and does not change the probe status.
 	if p.healthChecker != nil {
-		mux.Handle("/health", p.healthChecker)
+		mux.Handle("/health", healthcheck.NewHealthChecker(p.transportType, nil))
 	} else {
 		mux.HandleFunc("/health", http.NotFound)
 	}

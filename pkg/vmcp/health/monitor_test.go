@@ -914,6 +914,50 @@ func TestBackendChanged(t *testing.T) {
 			new:      vmcp.Backend{BaseURL: "http://new-svc:9090", TransportType: "streamable-http"},
 			expected: true,
 		},
+		{
+			name:     "different health status without managed MCPServer",
+			old:      vmcp.Backend{BaseURL: "http://svc:8080", TransportType: "sse", HealthStatus: vmcp.BackendHealthy},
+			new:      vmcp.Backend{BaseURL: "http://svc:8080", TransportType: "sse", HealthStatus: vmcp.BackendUnhealthy},
+			expected: false,
+		},
+		{
+			name: "different managed MCPServer health status",
+			old: vmcp.Backend{
+				BaseURL:       "http://svc:8080",
+				TransportType: "sse",
+				HealthStatus:  vmcp.BackendHealthy,
+				Metadata: map[string]string{
+					"workload_type": "mcp_server",
+				},
+			},
+			new: vmcp.Backend{
+				BaseURL:       "http://svc:8080",
+				TransportType: "sse",
+				HealthStatus:  vmcp.BackendUnhealthy,
+				Metadata: map[string]string{
+					"workload_type": "mcp_server",
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "different workload type",
+			old: vmcp.Backend{
+				BaseURL:       "http://svc:8080",
+				TransportType: "sse",
+				Metadata: map[string]string{
+					"workload_type": "mcp_server",
+				},
+			},
+			new: vmcp.Backend{
+				BaseURL:       "http://svc:8080",
+				TransportType: "sse",
+				Metadata: map[string]string{
+					"workload_type": "server_entry",
+				},
+			},
+			expected: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -984,6 +1028,68 @@ func TestMonitor_UpdateBackends_PropertyChange(t *testing.T) {
 	summary := monitor.GetHealthSummary()
 	assert.Equal(t, 1, summary.Total, "should still have exactly 1 backend")
 	assert.Equal(t, 1, summary.Healthy, "backend should be healthy")
+}
+
+func TestMonitor_UpdateBackends_ManagedWorkloadStatusChange(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockClient := mocks.NewMockBackendClient(ctrl)
+
+	initialBackends := []vmcp.Backend{
+		{
+			ID:            "backend-1",
+			Name:          "Backend 1",
+			BaseURL:       "http://svc:8080",
+			TransportType: "streamable-http",
+			HealthStatus:  vmcp.BackendHealthy,
+			Metadata: map[string]string{
+				"workload_type": "mcp_server",
+			},
+		},
+	}
+
+	config := MonitorConfig{
+		CheckInterval:      50 * time.Millisecond,
+		UnhealthyThreshold: 1,
+		Timeout:            10 * time.Millisecond,
+	}
+
+	monitor, err := NewMonitor(mockClient, initialBackends, config)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	err = monitor.Start(ctx)
+	require.NoError(t, err)
+	defer func() {
+		_ = monitor.Stop()
+	}()
+
+	require.Eventually(t, func() bool {
+		return monitor.IsBackendHealthy("backend-1")
+	}, 500*time.Millisecond, 10*time.Millisecond, "backend-1 should start healthy")
+
+	updatedBackends := []vmcp.Backend{
+		{
+			ID:            "backend-1",
+			Name:          "Backend 1",
+			BaseURL:       "http://svc:8080",
+			TransportType: "streamable-http",
+			HealthStatus:  vmcp.BackendUnhealthy,
+			Metadata: map[string]string{
+				"workload_type": "mcp_server",
+			},
+		},
+	}
+
+	monitor.UpdateBackends(updatedBackends)
+
+	require.Eventually(t, func() bool {
+		status, err := monitor.GetBackendStatus("backend-1")
+		return err == nil && status == vmcp.BackendUnhealthy
+	}, 500*time.Millisecond, 10*time.Millisecond, "backend-1 should follow managed workload status updates")
 }
 
 func TestMonitor_CircuitBreakerDisabled(t *testing.T) {
