@@ -337,6 +337,7 @@ func discoverBackends(
 func createSessionFactory(
 	outgoingRegistry vmcpauth.OutgoingAuthRegistry,
 	agg aggregator.Aggregator,
+	backendInitTimeout time.Duration,
 ) (vmcpsession.MultiSessionFactory, error) {
 	const (
 		envKey                  = "VMCP_SESSION_HMAC_SECRET"
@@ -347,6 +348,9 @@ func createSessionFactory(
 	opts := []vmcpsession.MultiSessionFactoryOption{}
 	if agg != nil {
 		opts = append(opts, vmcpsession.WithAggregator(agg))
+	}
+	if backendInitTimeout > 0 {
+		opts = append(opts, vmcpsession.WithBackendInitTimeout(backendInitTimeout))
 	}
 
 	hmacSecret := os.Getenv(envKey)
@@ -377,6 +381,22 @@ func createSessionFactory(
 	// Development mode: use default insecure secret with warning
 	slog.Warn("VMCP_SESSION_HMAC_SECRET not set - using default insecure secret (NOT recommended for production)")
 	return vmcpsession.NewSessionFactory(outgoingRegistry, opts...), nil
+}
+
+func backendInitTimeoutFromConfig(cfg *config.Config) time.Duration {
+	if cfg == nil || cfg.Operational == nil {
+		return 0
+	}
+
+	if cfg.Operational.FailureHandling != nil && cfg.Operational.FailureHandling.HealthCheckTimeout > 0 {
+		return time.Duration(cfg.Operational.FailureHandling.HealthCheckTimeout)
+	}
+
+	if cfg.Operational.Timeouts != nil && cfg.Operational.Timeouts.Default > 0 {
+		return time.Duration(cfg.Operational.Timeouts.Default)
+	}
+
+	return 0
 }
 
 // runServe implements the serve command logic
@@ -586,7 +606,7 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("failed to validate optimizer config: %w", err)
 	}
 
-	sessionFactory, err := createSessionFactory(outgoingRegistry, agg)
+	sessionFactory, err := createSessionFactory(outgoingRegistry, agg, backendInitTimeoutFromConfig(cfg))
 	if err != nil {
 		return err
 	}
@@ -647,7 +667,7 @@ func runServe(cmd *cobra.Command, _ []string) error {
 			os.Getenv(envPodIP),
 			port,
 		),
-		SessionFactory:          sessionFactory,
+		SessionFactory: sessionFactory,
 	}
 
 	// Convert composite tool configurations to workflow definitions
