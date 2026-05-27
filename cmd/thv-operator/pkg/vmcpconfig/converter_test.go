@@ -183,6 +183,60 @@ func TestConverter_OIDCResolution(t *testing.T) {
 	}
 }
 
+func TestConverter_MCPOIDCConfigRefMapsAllowedClientIDs(t *testing.T) {
+	t.Parallel()
+
+	sharedConfig := &mcpv1alpha1.MCPOIDCConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "shared-oidc",
+			Namespace: "default",
+		},
+		Spec: mcpv1alpha1.MCPOIDCConfigSpec{
+			Type: mcpv1alpha1.MCPOIDCConfigTypeInline,
+			Inline: &mcpv1alpha1.InlineOIDCSharedConfig{
+				Issuer:           "https://cognito-idp.eu-north-1.amazonaws.com/eu-north-1_Mr6I2Vf9J",
+				AllowedClientIDs: []string{"sre-audit-agent", "litellm"},
+			},
+		},
+	}
+
+	ctrl := gomock.NewController(t)
+	mockResolver := oidcmocks.NewMockResolver(ctrl)
+	mockResolver.EXPECT().
+		ResolveFromConfigRef(gomock.Any(), gomock.Any(), gomock.Any(), "hub-agents", "default", int32(4483)).
+		Return(&oidc.OIDCConfig{
+			Issuer:           sharedConfig.Spec.Inline.Issuer,
+			AllowedClientIDs: []string{"sre-audit-agent", "litellm"},
+			ResourceURL:      "http://hub-agents.default.svc.cluster.local:4483",
+			Scopes:           []string{"toolhive-mcp/automation"},
+		}, nil)
+
+	converter, err := NewConverter(mockResolver, newTestK8sClient(t, sharedConfig))
+	require.NoError(t, err)
+
+	vmcp := &mcpv1alpha1.VirtualMCPServer{
+		ObjectMeta: metav1.ObjectMeta{Name: "hub-agents", Namespace: "default"},
+		Spec: mcpv1alpha1.VirtualMCPServerSpec{
+			Config: vmcpconfig.Config{Group: "test-group"},
+			IncomingAuth: &mcpv1alpha1.IncomingAuthConfig{
+				Type: "oidc",
+				OIDCConfigRef: &mcpv1alpha1.MCPOIDCConfigReference{
+					Name:   "shared-oidc",
+					Scopes: []string{"toolhive-mcp/automation"},
+				},
+			},
+		},
+	}
+
+	config, _, err := converter.Convert(log.IntoContext(context.Background(), logr.Discard()), vmcp)
+	require.NoError(t, err)
+	require.NotNil(t, config)
+	require.NotNil(t, config.IncomingAuth)
+	require.NotNil(t, config.IncomingAuth.OIDC)
+	assert.Empty(t, config.IncomingAuth.OIDC.Audience)
+	assert.Equal(t, []string{"sre-audit-agent", "litellm"}, config.IncomingAuth.OIDC.AllowedClientIDs)
+}
+
 // TestConverter_CompositeToolsPassThrough verifies that CompositeTools from spec.config.CompositeTools
 // are correctly passed through during conversion and not dropped.
 // It also verifies that Duration fields serialize to human-readable formats (e.g., "30s").
