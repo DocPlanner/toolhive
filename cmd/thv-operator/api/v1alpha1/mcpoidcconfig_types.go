@@ -114,6 +114,11 @@ type InlineOIDCSharedConfig struct {
 	// +optional
 	ClientID string `json:"clientId,omitempty"`
 
+	// AllowedClientIDs is the set of OAuth client IDs accepted when validating
+	// tokens by their client_id claim instead of an audience claim.
+	// +optional
+	AllowedClientIDs []string `json:"allowedClientIds,omitempty"`
+
 	// ClientSecretRef is a reference to a Kubernetes Secret containing the client secret
 	// +optional
 	ClientSecretRef *SecretKeyRef `json:"clientSecretRef,omitempty"`
@@ -227,10 +232,12 @@ type MCPOIDCConfigReference struct {
 	Name string `json:"name"`
 
 	// Audience is the expected audience for token validation.
-	// This MUST be unique per server to prevent token replay attacks.
-	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:MinLength=1
-	Audience string `json:"audience"`
+	// This should be unique per server to prevent token replay attacks. It may
+	// be omitted only when the referenced provider validates tokens by
+	// allowedClientIds because the issuer does not emit an aud claim (for
+	// example Cognito client_credentials access tokens).
+	// +optional
+	Audience string `json:"audience,omitempty"`
 
 	// Scopes is the list of OAuth scopes to advertise in the well-known endpoint (RFC 9728).
 	// If empty, defaults to ["openid"].

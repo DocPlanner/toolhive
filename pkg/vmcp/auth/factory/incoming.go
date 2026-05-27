@@ -169,6 +169,7 @@ func newOIDCAuthMiddleware(
 	oidcConfig := &auth.TokenValidatorConfig{
 		Issuer:            oidcCfg.Issuer,
 		ClientID:          oidcCfg.ClientID,
+		AllowedClientIDs:  oidcCfg.AllowedClientIDs,
 		Audience:          oidcCfg.Audience,
 		ResourceURL:       oidcCfg.Resource,
 		JWKSURL:           oidcCfg.JWKSURL,
@@ -196,7 +197,8 @@ func newOIDCAuthMiddleware(
 	}
 
 	slog.Info("oIDC authentication configured",
-		"issuer", oidcCfg.Issuer, "client_id", oidcCfg.ClientID, "resource", oidcCfg.Resource)
+		"issuer", oidcCfg.Issuer, "client_id", oidcCfg.ClientID,
+		"allowed_client_ids", len(oidcCfg.AllowedClientIDs), "resource", oidcCfg.Resource)
 
 	return authMw, authInfo, nil
 }

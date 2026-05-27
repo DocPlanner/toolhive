@@ -156,8 +156,8 @@ func (v *DefaultValidator) validateIncomingAuth(auth *IncomingAuthConfig) error 
 			return fmt.Errorf("incomingAuth.oidc.issuer is required")
 		}
 
-		if auth.OIDC.Audience == "" {
-			return fmt.Errorf("incomingAuth.oidc.audience is required")
+		if auth.OIDC.Audience == "" && len(auth.OIDC.AllowedClientIDs) == 0 {
+			return fmt.Errorf("incomingAuth.oidc.audience or allowedClientIds is required")
 		}
 
 		// ClientID is optional - only required for specific flows:

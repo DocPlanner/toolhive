@@ -360,6 +360,7 @@ type TokenValidator struct {
 	audience          string
 	jwksURL           string
 	clientID          string
+	allowedClientIDs  []string
 	clientSecret      string // Optional client secret for introspection
 	jwksClient        *jwk.Cache
 	introspectURL     string       // Optional introspection endpoint
@@ -407,6 +408,10 @@ type TokenValidatorConfig struct {
 
 	// ClientID is the OIDC client ID
 	ClientID string
+
+	// AllowedClientIDs is the set of OAuth client IDs accepted when validating
+	// tokens by their client_id claim instead of an audience claim.
+	AllowedClientIDs []string
 
 	// ClientSecret is the optional OIDC client secret for introspection
 	ClientSecret string // #nosec G117 -- not a hardcoded credential, populated at runtime from config
@@ -687,6 +692,7 @@ func NewTokenValidator(ctx context.Context, config TokenValidatorConfig, opts ..
 		jwksURL:             jwksURL,
 		introspectURL:       config.IntrospectionURL,
 		clientID:            config.ClientID,
+		allowedClientIDs:    config.AllowedClientIDs,
 		clientSecret:        clientSecret,
 		jwksClient:          cache,
 		client:              config.httpClient,
@@ -943,34 +949,41 @@ func (v *TokenValidator) validateClaims(claims jwt.MapClaims) error {
 			return ErrInvalidIssuer
 		}
 	}
+
+	clientIDValidationConfigured := len(v.allowedClientIDs) > 0 || (v.audience != "" && v.clientID != "")
+
 	// Validate the audience if provided
 	if v.audience != "" {
+		_, hasAudience := claims["aud"]
 		audiences, err := claims.GetAudience()
-		// Some providers (e.g., Cognito access tokens) may omit `aud` and
-		// expose `client_id` instead. If `aud` is missing, accept the token
-		// when configured client_id matches token client_id.
-		if err != nil || len(audiences) == 0 {
-			if v.clientID == "" {
-				return ErrInvalidAudience
+		if err != nil {
+			if !hasAudience && clientIDValidationConfigured && v.validateClientIDClaim(claims) == nil {
+				goto expiration
 			}
-			clientID, ok := claims["client_id"].(string)
-			if !ok || strings.TrimSpace(clientID) != strings.TrimSpace(v.clientID) {
-				return ErrInvalidAudience
+			return ErrInvalidAudience
+		}
+
+		found := false
+		for _, aud := range audiences {
+			if aud == v.audience {
+				found = true
+				break
 			}
-		} else {
-			found := false
-			for _, aud := range audiences {
-				if aud == v.audience {
-					found = true
-					break
-				}
+		}
+
+		if !found {
+			if !hasAudience && clientIDValidationConfigured && v.validateClientIDClaim(claims) == nil {
+				goto expiration
 			}
-			if !found {
-				return ErrInvalidAudience
-			}
+			return ErrInvalidAudience
+		}
+	} else if clientIDValidationConfigured {
+		if err := v.validateClientIDClaim(claims); err != nil {
+			return err
 		}
 	}
 
+expiration:
 	// Validate the expiration time
 	expirationTime, err := claims.GetExpirationTime()
 	if err != nil || expirationTime == nil || expirationTime.Before(time.Now()) {
@@ -978,6 +991,25 @@ func (v *TokenValidator) validateClaims(claims jwt.MapClaims) error {
 	}
 
 	return nil
+}
+
+func (v *TokenValidator) validateClientIDClaim(claims jwt.MapClaims) error {
+	claim, ok := claims["client_id"].(string)
+	if !ok || strings.TrimSpace(claim) == "" {
+		return ErrInvalidAudience
+	}
+
+	if v.clientID != "" && claim == v.clientID {
+		return nil
+	}
+
+	for _, allowedClientID := range v.allowedClientIDs {
+		if claim == allowedClientID {
+			return nil
+		}
+	}
+
+	return ErrInvalidAudience
 }
 
 func parseIntrospectionClaims(r io.Reader) (jwt.MapClaims, error) {

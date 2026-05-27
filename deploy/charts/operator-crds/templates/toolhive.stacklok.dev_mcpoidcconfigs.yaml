@@ -71,6 +71,13 @@ spec:
                   Inline contains direct OIDC configuration.
                   Only used when Type is "inline".
                 properties:
+                  allowedClientIds:
+                    description: |-
+                      AllowedClientIDs is the set of OAuth client IDs accepted when validating
+                      tokens by their client_id claim instead of an audience claim.
+                    items:
+                      type: string
+                    type: array
                   caBundleRef:
                     description: |-
                       CABundleRef references a ConfigMap containing the CA certificate bundle.

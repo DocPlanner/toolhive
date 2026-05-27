@@ -196,6 +196,98 @@ func TestTokenValidator(t *testing.T) {
 	}
 }
 
+func TestTokenValidatorValidateClaimsByClientID(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		validator *TokenValidator
+		claims    jwt.MapClaims
+		wantErr   error
+	}{
+		{
+			name: "allowed client id without aud",
+			validator: &TokenValidator{
+				issuer:           "test-issuer",
+				allowedClientIDs: []string{"n8n-client", "litellm-client"},
+			},
+			claims: jwt.MapClaims{
+				"iss":       "test-issuer",
+				"client_id": "litellm-client",
+				"exp":       float64(time.Now().Add(time.Hour).Unix()),
+			},
+		},
+		{
+			name: "single client id fallback when aud is missing",
+			validator: &TokenValidator{
+				issuer:   "test-issuer",
+				audience: "n8n-client",
+				clientID: "n8n-client",
+			},
+			claims: jwt.MapClaims{
+				"iss":       "test-issuer",
+				"client_id": "n8n-client",
+				"exp":       float64(time.Now().Add(time.Hour).Unix()),
+			},
+		},
+		{
+			name: "wrong client id",
+			validator: &TokenValidator{
+				issuer:           "test-issuer",
+				allowedClientIDs: []string{"n8n-client", "litellm-client"},
+			},
+			claims: jwt.MapClaims{
+				"iss":       "test-issuer",
+				"client_id": "other-client",
+				"exp":       float64(time.Now().Add(time.Hour).Unix()),
+			},
+			wantErr: ErrInvalidAudience,
+		},
+		{
+			name: "wrong aud with matching client id is rejected",
+			validator: &TokenValidator{
+				issuer:   "test-issuer",
+				audience: "expected-audience",
+				clientID: "n8n-client",
+			},
+			claims: jwt.MapClaims{
+				"iss":       "test-issuer",
+				"aud":       "wrong-audience",
+				"client_id": "n8n-client",
+				"exp":       float64(time.Now().Add(time.Hour).Unix()),
+			},
+			wantErr: ErrInvalidAudience,
+		},
+		{
+			name: "aud still works",
+			validator: &TokenValidator{
+				issuer:           "test-issuer",
+				audience:         "toolhive-agents",
+				allowedClientIDs: []string{"n8n-client"},
+			},
+			claims: jwt.MapClaims{
+				"iss":       "test-issuer",
+				"aud":       "toolhive-agents",
+				"client_id": "other-client",
+				"exp":       float64(time.Now().Add(time.Hour).Unix()),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tt.validator.validateClaims(tt.claims)
+			if tt.wantErr != nil {
+				require.ErrorIs(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
 //nolint:gocyclo // This test function is complex but manageable
 func TestTokenValidatorMiddleware(t *testing.T) {
 	t.Parallel()

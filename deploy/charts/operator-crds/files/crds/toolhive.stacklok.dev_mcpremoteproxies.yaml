@@ -460,8 +460,10 @@ spec:
                   audience:
                     description: |-
                       Audience is the expected audience for token validation.
-                      This MUST be unique per server to prevent token replay attacks.
-                    minLength: 1
+                      This should be unique per server to prevent token replay attacks. It may
+                      be omitted only when the referenced provider validates tokens by
+                      allowedClientIds because the issuer does not emit an aud claim (for
+                      example Cognito client_credentials access tokens).
                     type: string
                   name:
                     description: Name is the name of the MCPOIDCConfig resource
@@ -476,7 +478,6 @@ spec:
                     type: array
                     x-kubernetes-list-type: atomic
                 required:
-                - audience
                 - name
                 type: object
               podTemplateSpec:

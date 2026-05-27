@@ -273,6 +273,7 @@ func mapResolvedOIDCToVmcpConfig(
 	config := &vmcpconfig.OIDCConfig{
 		Issuer:                          resolved.Issuer,
 		ClientID:                        resolved.ClientID,
+		AllowedClientIDs:                resolved.AllowedClientIDs,
 		Audience:                        resolved.Audience,
 		Resource:                        resolved.ResourceURL,
 		JWKSURL:                         resolved.JWKSURL,

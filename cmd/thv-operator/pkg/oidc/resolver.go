@@ -29,18 +29,20 @@ const (
 
 // OIDCConfig represents the resolved OIDC configuration values
 type OIDCConfig struct { //nolint:revive // Keeping OIDCConfig name for backward compatibility
-	Issuer             string
-	Audience           string
-	JWKSURL            string
-	IntrospectionURL   string
-	ClientID           string
-	ClientSecret       string // #nosec G117 -- not a hardcoded credential, populated at runtime from config
-	ThvCABundlePath    string
-	JWKSAuthTokenPath  string
-	ResourceURL        string
-	JWKSAllowPrivateIP bool
-	InsecureAllowHTTP  bool
-	Scopes             []string
+	Issuer                          string
+	Audience                        string
+	JWKSURL                         string
+	IntrospectionURL                string
+	ClientID                        string
+	AllowedClientIDs                []string
+	ClientSecret                    string // #nosec G117 -- not a hardcoded credential, populated at runtime from config
+	ThvCABundlePath                 string
+	JWKSAuthTokenPath               string
+	ResourceURL                     string
+	JWKSAllowPrivateIP              bool
+	ProtectedResourceAllowPrivateIP bool
+	InsecureAllowHTTP               bool
+	Scopes                          []string
 }
 
 // OIDCConfigurable is an interface for resources that have OIDC configuration
@@ -198,17 +200,19 @@ func (*resolver) resolveFromInlineSharedConfig(
 	}
 
 	return &OIDCConfig{
-		Issuer:             config.Issuer,
-		Audience:           ref.Audience,
-		JWKSURL:            config.JWKSURL,
-		IntrospectionURL:   config.IntrospectionURL,
-		ClientID:           config.ClientID,
-		ThvCABundlePath:    computeCABundlePath(config.CABundleRef),
-		JWKSAuthTokenPath:  config.JWKSAuthTokenPath,
-		ResourceURL:        resourceURL,
-		JWKSAllowPrivateIP: config.JWKSAllowPrivateIP,
-		InsecureAllowHTTP:  config.InsecureAllowHTTP,
-		Scopes:             ref.Scopes,
+		Issuer:                          config.Issuer,
+		Audience:                        ref.Audience,
+		JWKSURL:                         config.JWKSURL,
+		IntrospectionURL:                config.IntrospectionURL,
+		ClientID:                        config.ClientID,
+		AllowedClientIDs:                config.AllowedClientIDs,
+		ThvCABundlePath:                 computeCABundlePath(config.CABundleRef),
+		JWKSAuthTokenPath:               config.JWKSAuthTokenPath,
+		ResourceURL:                     resourceURL,
+		JWKSAllowPrivateIP:              config.JWKSAllowPrivateIP,
+		ProtectedResourceAllowPrivateIP: config.ProtectedResourceAllowPrivateIP,
+		InsecureAllowHTTP:               config.InsecureAllowHTTP,
+		Scopes:                          ref.Scopes,
 	}, nil
 }
 

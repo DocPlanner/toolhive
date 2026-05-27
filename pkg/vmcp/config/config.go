@@ -215,6 +215,10 @@ type OIDCConfig struct {
 	// ClientID is the OAuth client ID.
 	ClientID string `json:"clientId" yaml:"clientId"`
 
+	// AllowedClientIDs is the set of OAuth client IDs accepted when validating
+	// tokens by their client_id claim instead of an audience claim.
+	AllowedClientIDs []string `json:"allowedClientIds,omitempty" yaml:"allowedClientIds,omitempty"`
+
 	// ClientSecretEnv is the name of the environment variable containing the client secret.
 	// This is the secure way to reference secrets - the actual secret value is never stored
 	// in configuration files, only the environment variable name.
