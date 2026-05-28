@@ -467,6 +467,11 @@ spec:
                     description: Name is the name of the MCPOIDCConfig resource
                     minLength: 1
                     type: string
+                  resourceUrl:
+                    description: |-
+                      ResourceURL is the explicit resource URL for OAuth discovery endpoint (RFC 9728).
+                      If not specified, defaults to the in-cluster Kubernetes service URL.
+                    type: string
                   scopes:
                     description: |-
                       Scopes is the list of OAuth scopes to advertise in the well-known endpoint (RFC 9728).

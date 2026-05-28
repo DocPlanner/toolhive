@@ -239,6 +239,11 @@ type MCPOIDCConfigReference struct {
 	// +optional
 	Audience string `json:"audience,omitempty"`
 
+	// ResourceURL is the explicit resource URL for OAuth discovery endpoint (RFC 9728).
+	// If not specified, defaults to the in-cluster Kubernetes service URL.
+	// +optional
+	ResourceURL string `json:"resourceUrl,omitempty"`
+
 	// Scopes is the list of OAuth scopes to advertise in the well-known endpoint (RFC 9728).
 	// If empty, defaults to ["openid"].
 	// +listType=atomic
