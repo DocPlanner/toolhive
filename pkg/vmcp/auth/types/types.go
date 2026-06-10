@@ -18,6 +18,10 @@ import "errors"
 // is not present in the identity's UpstreamTokens map.
 var ErrUpstreamTokenNotFound = errors.New("upstream token not found")
 
+// UpstreamInjectProviderCaller is a reserved upstreamInject providerName that
+// forwards the already-validated caller bearer token to the backend.
+const UpstreamInjectProviderCaller = "caller"
+
 // Strategy type identifiers used to identify authentication strategies.
 const (
 	// StrategyTypeUnauthenticated identifies the unauthenticated strategy.
@@ -121,8 +125,9 @@ type TokenExchangeConfig struct {
 }
 
 // UpstreamInjectConfig configures the upstream inject auth strategy.
-// This strategy uses the embedded authorization server to obtain and inject
-// upstream IDP tokens into backend requests.
+// This strategy usually uses the embedded authorization server to obtain and
+// inject upstream IDP tokens into backend requests. Set ProviderName to
+// UpstreamInjectProviderCaller to forward the already-validated caller token.
 // +kubebuilder:object:generate=true
 // +gendoc
 type UpstreamInjectConfig struct {

@@ -918,6 +918,24 @@ func TestValidateAuthServerIntegration(t *testing.T) {
 			errMsg:  "upstream_inject requires an embedded auth server",
 		},
 		{
+			name: "upstream_inject_caller_without_auth_server_passes",
+			cfg: &Config{
+				OutgoingAuth: &OutgoingAuthConfig{
+					Source: "inline",
+					Backends: map[string]*authtypes.BackendAuthStrategy{
+						"memory-tools": {
+							Type: authtypes.StrategyTypeUpstreamInject,
+							UpstreamInject: &authtypes.UpstreamInjectConfig{
+								ProviderName: authtypes.UpstreamInjectProviderCaller,
+							},
+						},
+					},
+				},
+			},
+			rc:      nil,
+			wantErr: false,
+		},
+		{
 			name: "v02_provider_not_in_upstreams",
 			cfg: &Config{
 				IncomingAuth: &IncomingAuthConfig{
@@ -1154,6 +1172,43 @@ func TestValidateAuthServerIntegration(t *testing.T) {
 							Type: authtypes.StrategyTypeUpstreamInject,
 							UpstreamInject: &authtypes.UpstreamInjectConfig{
 								ProviderName: "github",
+							},
+						},
+					},
+				},
+			},
+			rc: &authserver.RunConfig{
+				Issuer: "http://localhost:9090",
+				Upstreams: []authserver.UpstreamRunConfig{
+					{Name: "github", Type: authserver.UpstreamProviderTypeOIDC},
+				},
+				AllowedAudiences: []string{"https://my-vmcp"},
+			},
+			wantErr: false,
+		},
+		{
+			name: "upstream_inject_caller_skips_provider_registry_validation",
+			cfg: &Config{
+				IncomingAuth: &IncomingAuthConfig{
+					Type: IncomingAuthTypeOIDC,
+					OIDC: &OIDCConfig{
+						Issuer:   "http://localhost:9090",
+						Audience: "https://my-vmcp",
+					},
+				},
+				OutgoingAuth: &OutgoingAuthConfig{
+					Source: "inline",
+					Backends: map[string]*authtypes.BackendAuthStrategy{
+						"github-tools": {
+							Type: authtypes.StrategyTypeUpstreamInject,
+							UpstreamInject: &authtypes.UpstreamInjectConfig{
+								ProviderName: "github",
+							},
+						},
+						"memory-tools": {
+							Type: authtypes.StrategyTypeUpstreamInject,
+							UpstreamInject: &authtypes.UpstreamInjectConfig{
+								ProviderName: authtypes.UpstreamInjectProviderCaller,
 							},
 						},
 					},
