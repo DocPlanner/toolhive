@@ -456,15 +456,15 @@ func (*DefaultValidator) validateCompositeToolRefs(refs []CompositeToolRef) erro
 // auth server RunConfig that is not part of the serializable Config.
 func ValidateAuthServerIntegration(cfg *Config, rc *authserver.RunConfig) error {
 	strategies := collectAllBackendStrategies(cfg)
-	hasUpstreamInject := hasStrategyType(strategies, authtypes.StrategyTypeUpstreamInject)
+	hasProviderUpstreamInject := hasUpstreamInjectRequiringAuthServer(strategies)
 
 	// Guard clause: nothing to validate if no auth server and no upstream_inject backends.
-	if rc == nil && !hasUpstreamInject {
+	if rc == nil && !hasProviderUpstreamInject {
 		return nil
 	}
 
 	// upstream_inject requires an auth server to obtain upstream tokens.
-	if hasUpstreamInject && rc == nil {
+	if hasProviderUpstreamInject && rc == nil {
 		return fmt.Errorf("upstream_inject requires an embedded auth server (authServer must be configured)")
 	}
 
@@ -517,6 +517,9 @@ func validateUpstreamInjectProviders(
 	}
 	for name, strategy := range strategies {
 		if strategy.Type != authtypes.StrategyTypeUpstreamInject || strategy.UpstreamInject == nil {
+			continue
+		}
+		if strategy.UpstreamInject.ProviderName == authtypes.UpstreamInjectProviderCaller {
 			continue
 		}
 		if !upstreamExists(rc, strategy.UpstreamInject.ProviderName) {
@@ -609,10 +612,12 @@ func collectAllBackendStrategies(cfg *Config) map[string]*authtypes.BackendAuthS
 	return result
 }
 
-// hasStrategyType checks if any strategy in the map uses the given type.
-func hasStrategyType(strategies map[string]*authtypes.BackendAuthStrategy, strategyType string) bool {
+func hasUpstreamInjectRequiringAuthServer(strategies map[string]*authtypes.BackendAuthStrategy) bool {
 	for _, s := range strategies {
-		if s.Type == strategyType {
+		if s.Type != authtypes.StrategyTypeUpstreamInject || s.UpstreamInject == nil {
+			continue
+		}
+		if s.UpstreamInject.ProviderName != authtypes.UpstreamInjectProviderCaller {
 			return true
 		}
 	}

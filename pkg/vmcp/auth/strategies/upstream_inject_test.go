@@ -56,6 +56,37 @@ func TestUpstreamInjectStrategy_Authenticate(t *testing.T) {
 			},
 		},
 		{
+			name: "caller provider injects validated caller token",
+			setupCtx: func() context.Context {
+				return createContextWithUpstreamTokens("user1", "incoming-token", nil)
+			},
+			strategy: &authtypes.BackendAuthStrategy{
+				Type: authtypes.StrategyTypeUpstreamInject,
+				UpstreamInject: &authtypes.UpstreamInjectConfig{
+					ProviderName: authtypes.UpstreamInjectProviderCaller,
+				},
+			},
+			expectError: false,
+			checkHeader: func(t *testing.T, req *http.Request) {
+				t.Helper()
+				assert.Equal(t, "Bearer incoming-token", req.Header.Get("Authorization"))
+			},
+		},
+		{
+			name: "caller provider requires validated caller token",
+			setupCtx: func() context.Context {
+				return createContextWithUpstreamTokens("user1", "", nil)
+			},
+			strategy: &authtypes.BackendAuthStrategy{
+				Type: authtypes.StrategyTypeUpstreamInject,
+				UpstreamInject: &authtypes.UpstreamInjectConfig{
+					ProviderName: authtypes.UpstreamInjectProviderCaller,
+				},
+			},
+			expectError:   true,
+			errorContains: "caller token is empty",
+		},
+		{
 			name:     "missing identity in context",
 			setupCtx: func() context.Context { return context.Background() },
 			strategy: &authtypes.BackendAuthStrategy{

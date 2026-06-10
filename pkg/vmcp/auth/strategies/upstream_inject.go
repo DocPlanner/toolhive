@@ -76,6 +76,13 @@ func (*UpstreamInjectStrategy) Authenticate(
 	}
 
 	providerName := strategy.UpstreamInject.ProviderName
+	if providerName == authtypes.UpstreamInjectProviderCaller {
+		if identity.Token == "" {
+			return fmt.Errorf("caller token is empty")
+		}
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", identity.Token))
+		return nil
+	}
 
 	token := identity.UpstreamTokens[providerName]
 	if token == "" {
