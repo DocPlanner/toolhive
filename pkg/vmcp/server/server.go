@@ -1746,6 +1746,9 @@ func shouldForwardToSessionOwner(r *http.Request) (bool, error) {
 		if isSessionScopedClientResponse(envelope) {
 			return true, nil
 		}
+		if isSessionScopedClientRequest(envelope.Method) {
+			return true, nil
+		}
 		return envelope.Method == mcp.MethodSetLogLevel || envelope.Method == mcp.MethodNotificationElicitationComplete, nil
 	default:
 		return false, nil
@@ -1796,6 +1799,21 @@ func isSessionScopedClientResponse(envelope forwardableEnvelope) bool {
 	return envelope.Method == "" &&
 		len(envelope.ID) > 0 &&
 		(len(envelope.Result) > 0 || len(envelope.Error) > 0)
+}
+
+func isSessionScopedClientRequest(method mcp.MCPMethod) bool {
+	switch method {
+	case mcp.MethodToolsList,
+		mcp.MethodToolsCall,
+		mcp.MethodResourcesList,
+		mcp.MethodResourcesRead,
+		mcp.MethodResourcesTemplatesList,
+		mcp.MethodPromptsList,
+		mcp.MethodPromptsGet:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) loadSessionOwnerURL(ctx context.Context, sessionID string) (string, error) {

@@ -233,12 +233,12 @@ func TestOwnerForwardingMiddleware_SkipsRequestsOwnedLocally(t *testing.T) {
 	assert.Equal(t, http.StatusCreated, recorder.Code)
 }
 
-func TestOwnerForwardingMiddleware_DoesNotForwardRegularToolRequests(t *testing.T) {
+func TestOwnerForwardingMiddleware_DoesNotForwardNonSessionScopedPOSTRequests(t *testing.T) {
 	t.Parallel()
 
 	storage := &forwardingTestStorage{
 		metadata: map[string]map[string]string{
-			"session-tools": {
+			"session-ping": {
 				sessiontypes.MetadataKeyOwnerURL: "http://10.1.2.6:4483/mcp",
 			},
 		},
@@ -265,9 +265,9 @@ func TestOwnerForwardingMiddleware_DoesNotForwardRegularToolRequests(t *testing.
 	req := httptest.NewRequest(
 		http.MethodPost,
 		"/mcp",
-		strings.NewReader(`{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}`),
+		strings.NewReader(`{"jsonrpc":"2.0","id":3,"method":"ping","params":{}}`),
 	)
-	req.Header.Set(mcpserver.HeaderKeySessionID, "session-tools")
+	req.Header.Set(mcpserver.HeaderKeySessionID, "session-ping")
 	recorder := httptest.NewRecorder()
 
 	handler.ServeHTTP(recorder, req)
@@ -275,4 +275,92 @@ func TestOwnerForwardingMiddleware_DoesNotForwardRegularToolRequests(t *testing.
 	assert.True(t, nextCalled)
 	assert.False(t, forwarded)
 	assert.Equal(t, http.StatusOK, recorder.Code)
+}
+
+func TestOwnerForwardingMiddleware_ForwardsSessionScopedPOSTRequests(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{
+			name: "tools list",
+			body: `{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}`,
+		},
+		{
+			name: "tools call",
+			body: `{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"echo","arguments":{}}}`,
+		},
+		{
+			name: "resources list",
+			body: `{"jsonrpc":"2.0","id":5,"method":"resources/list","params":{}}`,
+		},
+		{
+			name: "resources read",
+			body: `{"jsonrpc":"2.0","id":6,"method":"resources/read","params":{"uri":"memory://one"}}`,
+		},
+		{
+			name: "resource templates list",
+			body: `{"jsonrpc":"2.0","id":7,"method":"resources/templates/list","params":{}}`,
+		},
+		{
+			name: "prompts list",
+			body: `{"jsonrpc":"2.0","id":8,"method":"prompts/list","params":{}}`,
+		},
+		{
+			name: "prompts get",
+			body: `{"jsonrpc":"2.0","id":9,"method":"prompts/get","params":{"name":"triage","arguments":{}}}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			storage := &forwardingTestStorage{
+				metadata: map[string]map[string]string{
+					"session-tools": {
+						sessiontypes.MetadataKeyOwnerURL: "http://10.1.2.6:4483/mcp",
+					},
+				},
+			}
+
+			var forwardedBody string
+			srv := &Server{
+				sessionDataStorage: storage,
+				sessionOwnerURL:    "http://10.9.9.9:4483/mcp",
+				ownerForwardClient: &http.Client{
+					Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+						body, err := io.ReadAll(req.Body)
+						require.NoError(t, err)
+						forwardedBody = string(body)
+						return &http.Response{
+							StatusCode: http.StatusAccepted,
+							Header:     make(http.Header),
+							Body:       io.NopCloser(strings.NewReader("")),
+						}, nil
+					}),
+				},
+			}
+
+			nextCalled := false
+			handler := srv.ownerForwardingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				nextCalled = true
+				w.WriteHeader(http.StatusOK)
+			}))
+
+			req := httptest.NewRequest(
+				http.MethodPost,
+				"/mcp",
+				strings.NewReader(tc.body),
+			)
+			req.Header.Set(mcpserver.HeaderKeySessionID, "session-tools")
+			recorder := httptest.NewRecorder()
+
+			handler.ServeHTTP(recorder, req)
+
+			assert.False(t, nextCalled)
+			assert.Equal(t, http.StatusAccepted, recorder.Code)
+			assert.JSONEq(t, tc.body, forwardedBody)
+		})
+	}
 }
