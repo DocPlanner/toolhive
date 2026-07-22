@@ -50,6 +50,7 @@ import (
 const (
 	envVMCPSessionOwnerURL = "THV_VMCP_SESSION_OWNER_URL"
 	envPodIP               = "POD_IP"
+	backendResponseMargin  = 5 * time.Second
 )
 
 var rootCmd = &cobra.Command{
@@ -338,6 +339,8 @@ func createSessionFactory(
 	outgoingRegistry vmcpauth.OutgoingAuthRegistry,
 	agg aggregator.Aggregator,
 	backendInitTimeout time.Duration,
+	backendRequestTimeout time.Duration,
+	perWorkloadRequestTimeouts map[string]time.Duration,
 ) (vmcpsession.MultiSessionFactory, error) {
 	const (
 		envKey                  = "VMCP_SESSION_HMAC_SECRET"
@@ -351,6 +354,12 @@ func createSessionFactory(
 	}
 	if backendInitTimeout > 0 {
 		opts = append(opts, vmcpsession.WithBackendInitTimeout(backendInitTimeout))
+	}
+	if backendRequestTimeout > 0 || len(perWorkloadRequestTimeouts) > 0 {
+		opts = append(opts, vmcpsession.WithBackendRequestTimeouts(
+			backendRequestTimeout,
+			perWorkloadRequestTimeouts,
+		))
 	}
 
 	hmacSecret := os.Getenv(envKey)
@@ -397,6 +406,34 @@ func backendInitTimeoutFromConfig(cfg *config.Config) time.Duration {
 	}
 
 	return 0
+}
+
+func backendRequestTimeoutsFromConfig(cfg *config.Config) (time.Duration, map[string]time.Duration) {
+	if cfg == nil || cfg.Operational == nil || cfg.Operational.Timeouts == nil {
+		return 0, nil
+	}
+
+	timeouts := cfg.Operational.Timeouts
+	perWorkload := make(map[string]time.Duration, len(timeouts.PerWorkload))
+	for workloadID, timeout := range timeouts.PerWorkload {
+		perWorkload[workloadID] = time.Duration(timeout)
+	}
+
+	return time.Duration(timeouts.Default), perWorkload
+}
+
+func serverWriteTimeoutFromConfig(cfg *config.Config) time.Duration {
+	defaultTimeout, perWorkload := backendRequestTimeoutsFromConfig(cfg)
+	maxTimeout := defaultTimeout
+	for _, timeout := range perWorkload {
+		if timeout > maxTimeout {
+			maxTimeout = timeout
+		}
+	}
+	if maxTimeout <= 0 {
+		return 0
+	}
+	return maxTimeout + backendResponseMargin
 }
 
 // runServe implements the serve command logic
@@ -606,7 +643,14 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("failed to validate optimizer config: %w", err)
 	}
 
-	sessionFactory, err := createSessionFactory(outgoingRegistry, agg, backendInitTimeoutFromConfig(cfg))
+	backendRequestTimeout, perWorkloadRequestTimeouts := backendRequestTimeoutsFromConfig(cfg)
+	sessionFactory, err := createSessionFactory(
+		outgoingRegistry,
+		agg,
+		backendInitTimeoutFromConfig(cfg),
+		backendRequestTimeout,
+		perWorkloadRequestTimeouts,
+	)
 	if err != nil {
 		return err
 	}
@@ -662,6 +706,7 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		OptimizerConfig:         optCfg,
 		SessionStorage:          cfg.SessionStorage,
 		SessionTTL:              time.Duration(cfg.SessionTTL),
+		WriteTimeout:            serverWriteTimeoutFromConfig(cfg),
 		SessionOwnerAdvertiseURL: resolveSessionOwnerAdvertiseURL(
 			os.Getenv(envVMCPSessionOwnerURL),
 			os.Getenv(envPodIP),

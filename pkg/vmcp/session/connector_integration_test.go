@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	mcpmcp "github.com/mark3labs/mcp-go/mcp"
@@ -88,6 +89,33 @@ func startInProcessMCPServer(t *testing.T) string {
 	return ts.URL + "/mcp"
 }
 
+func startSlowInProcessMCPServer(t *testing.T, delay time.Duration) string {
+	t.Helper()
+
+	mcpSrv := mcpserver.NewMCPServer("slow-integration-test-backend", "1.0.0")
+	mcpSrv.AddTool(
+		mcpmcp.NewTool("slow_echo"),
+		func(ctx context.Context, _ mcpmcp.CallToolRequest) (*mcpmcp.CallToolResult, error) {
+			select {
+			case <-time.After(delay):
+				return &mcpmcp.CallToolResult{
+					Content: []mcpmcp.Content{mcpmcp.NewTextContent("done")},
+				}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	)
+
+	streamableSrv := mcpserver.NewStreamableHTTPServer(mcpSrv)
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", streamableSrv)
+
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	return ts.URL + "/mcp"
+}
+
 // newUnauthenticatedRegistry returns a minimal OutgoingAuthRegistry that
 // uses the unauthenticated (no-op) strategy — suitable for tests where the
 // backend MCP server does not require auth.
@@ -152,6 +180,39 @@ func TestSessionFactory_Integration_CallTool(t *testing.T) {
 	require.NotNil(t, result)
 	require.Len(t, result.Content, 1)
 	assert.Equal(t, "hello world", result.Content[0].Text)
+}
+
+func TestSessionFactory_Integration_PerWorkloadRequestTimeout(t *testing.T) {
+	t.Parallel()
+
+	baseURL := startSlowInProcessMCPServer(t, 100*time.Millisecond)
+	backend := &vmcp.Backend{
+		ID:            "slow-backend",
+		Name:          "slow-backend",
+		BaseURL:       baseURL,
+		TransportType: "streamable-http",
+	}
+
+	factory := NewSessionFactory(
+		newUnauthenticatedRegistry(t),
+		WithBackendRequestTimeouts(25*time.Millisecond, map[string]time.Duration{
+			"slow-backend": 250 * time.Millisecond,
+		}),
+	)
+	sess, err := factory.MakeSessionWithID(
+		context.Background(),
+		uuid.New().String(),
+		nil,
+		true,
+		[]*vmcp.Backend{backend},
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sess.Close()) })
+
+	result, err := sess.CallTool(context.Background(), nil, "slow_echo", nil, nil)
+	require.NoError(t, err)
+	require.Len(t, result.Content, 1)
+	assert.Equal(t, "done", result.Content[0].Text)
 }
 
 func TestSessionFactory_Integration_ReadResource(t *testing.T) {

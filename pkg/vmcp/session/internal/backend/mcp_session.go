@@ -195,9 +195,15 @@ func (c *mcpSession) GetPrompt(
 // onCapabilityChange is an optional callback invoked (in a separate goroutine)
 // when the backend sends a tools/list_changed or resources/list_changed
 // notification. Pass nil to ignore capability change notifications.
+//
+// defaultRequestTimeout applies to streamable-HTTP backends. Entries in
+// perWorkloadRequestTimeouts override it by BackendTarget.WorkloadID. Invalid
+// or absent values retain the built-in timeout.
 func NewHTTPConnector(
 	registry vmcpauth.OutgoingAuthRegistry,
 	onCapabilityChange func(backendID string),
+	defaultRequestTimeout time.Duration,
+	perWorkloadRequestTimeouts map[string]time.Duration,
 ) func(
 	ctx context.Context,
 	target *vmcp.BackendTarget,
@@ -208,7 +214,12 @@ func NewHTTPConnector(
 		target *vmcp.BackendTarget,
 		identity *auth.Identity,
 	) (Session, *vmcp.CapabilityList, error) {
-		c, err := createMCPClient(target, identity, registry)
+		requestTimeout := requestTimeoutForWorkload(
+			target.WorkloadID,
+			defaultRequestTimeout,
+			perWorkloadRequestTimeouts,
+		)
+		c, err := createMCPClient(target, identity, registry, requestTimeout)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to create MCP client for backend %s: %w", target.WorkloadID, err)
 		}
@@ -252,6 +263,7 @@ func createMCPClient(
 	target *vmcp.BackendTarget,
 	identity *auth.Identity,
 	registry vmcpauth.OutgoingAuthRegistry,
+	requestTimeout time.Duration,
 ) (*mcpclient.Client, error) {
 	// Resolve and validate the auth strategy once at client creation time.
 	strategyName := authtypes.StrategyTypeUnauthenticated
@@ -290,7 +302,7 @@ func createMCPClient(
 		// WithHTTPTimeout additionally wraps each SDK request in a
 		// context.WithTimeout so the mark3labs transport surfaces a descriptive
 		// error before the stdlib deadline fires. Both are set to
-		// defaultBackendRequestTimeout: defense-in-depth.
+		// requestTimeout: defense-in-depth.
 		sizeLimited := httpRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
 			resp, err := base.RoundTrip(req)
 			if err != nil {
@@ -307,11 +319,11 @@ func createMCPClient(
 		})
 		httpClient := &http.Client{
 			Transport: sizeLimited,
-			Timeout:   defaultBackendRequestTimeout,
+			Timeout:   requestTimeout,
 		}
 		c, err = mcpclient.NewStreamableHttpClient(
 			target.BaseURL,
-			mcptransport.WithHTTPTimeout(defaultBackendRequestTimeout),
+			mcptransport.WithHTTPTimeout(requestTimeout),
 			mcptransport.WithHTTPBasicClient(httpClient),
 		)
 	case "sse":
@@ -348,6 +360,20 @@ func createMCPClient(
 	}
 
 	return c, nil
+}
+
+func requestTimeoutForWorkload(
+	workloadID string,
+	defaultTimeout time.Duration,
+	perWorkloadTimeouts map[string]time.Duration,
+) time.Duration {
+	if timeout := perWorkloadTimeouts[workloadID]; timeout > 0 {
+		return timeout
+	}
+	if defaultTimeout > 0 {
+		return defaultTimeout
+	}
+	return defaultBackendRequestTimeout
 }
 
 // initAndQueryCapabilities runs the MCP Initialize handshake then discovers

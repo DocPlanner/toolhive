@@ -5,6 +5,7 @@ package backend
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -40,10 +41,34 @@ func TestCreateMCPClient_UnsupportedTransport(t *testing.T) {
 				TransportType: transport,
 			}
 
-			_, err := createMCPClient(target, nil, newTestRegistry(t))
+			_, err := createMCPClient(target, nil, newTestRegistry(t), time.Second)
 			require.Error(t, err)
 			assert.ErrorIs(t, err, vmcp.ErrUnsupportedTransport,
 				"transport %q should return ErrUnsupportedTransport", transport)
 		})
 	}
+}
+
+func TestRequestTimeoutForWorkload(t *testing.T) {
+	t.Parallel()
+
+	perWorkload := map[string]time.Duration{
+		"slow-backend": 125 * time.Second,
+	}
+
+	assert.Equal(
+		t,
+		125*time.Second,
+		requestTimeoutForWorkload("slow-backend", 60*time.Second, perWorkload),
+	)
+	assert.Equal(
+		t,
+		60*time.Second,
+		requestTimeoutForWorkload("other-backend", 60*time.Second, perWorkload),
+	)
+	assert.Equal(
+		t,
+		defaultBackendRequestTimeout,
+		requestTimeoutForWorkload("other-backend", 0, nil),
+	)
 }
