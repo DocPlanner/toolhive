@@ -60,8 +60,8 @@ const (
 	// It protects all routes (health, metrics, well-known, etc.) from slow-write clients.
 	// For qualifying SSE (GET) connections, transportmiddleware.WriteTimeout clears this
 	// per-request via http.ResponseController.SetWriteDeadline(time.Time{}) (golang/go#16100).
-	// Must exceed the backend client HTTP timeout (90s) plus overhead so the handler
-	// can write its response before the server kills the connection.
+	// Configured values may raise this deadline so it exceeds the backend client
+	// timeout plus response-writing overhead.
 	defaultWriteTimeout = 120 * time.Second
 
 	// defaultIdleTimeout is the maximum amount of time to wait for the next request when keep-alive's are enabled.
@@ -157,6 +157,11 @@ type Config struct {
 	// SessionTTL is the session time-to-live duration (default: 30 minutes)
 	// Sessions inactive for this duration will be automatically cleaned up
 	SessionTTL time.Duration
+
+	// WriteTimeout is the server-level write deadline. Values below the secure
+	// default are raised to the default; larger values allow configured backend
+	// requests to finish and leave time to write the MCP response.
+	WriteTimeout time.Duration
 
 	// AuthMiddleware is the optional authentication middleware to apply to MCP routes.
 	// If nil, no authentication is required.
@@ -776,7 +781,7 @@ func (s *Server) Handler(_ context.Context) (http.Handler, error) {
 	// Accept: text/event-stream + MCP endpoint path) so the server-level
 	// WriteTimeout does not kill long-lived SSE streams (see golang/go#16100).
 	// Non-qualifying requests are left untouched; http.Server.WriteTimeout
-	// (defaultWriteTimeout) remains in effect for them.
+	// remains in effect for them.
 	mcpHandler = transportmiddleware.WriteTimeout(s.config.EndpointPath)(mcpHandler)
 
 	// Apply recovery middleware as outermost (catches panics from all inner middleware)
@@ -805,7 +810,7 @@ func (s *Server) Start(ctx context.Context) error {
 		Handler:           handler,
 		ReadHeaderTimeout: defaultReadHeaderTimeout,
 		ReadTimeout:       defaultReadTimeout,
-		WriteTimeout:      defaultWriteTimeout,
+		WriteTimeout:      effectiveWriteTimeout(s.config.WriteTimeout),
 		IdleTimeout:       defaultIdleTimeout,
 		MaxHeaderBytes:    defaultMaxHeaderBytes,
 	}
@@ -903,6 +908,13 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 		return err
 	}
+}
+
+func effectiveWriteTimeout(configured time.Duration) time.Duration {
+	if configured > defaultWriteTimeout {
+		return configured
+	}
+	return defaultWriteTimeout
 }
 
 // Stop gracefully stops the Virtual MCP Server.

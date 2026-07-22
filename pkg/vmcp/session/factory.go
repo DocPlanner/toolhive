@@ -130,12 +130,14 @@ type CapabilityChangeRegistrar interface {
 
 // defaultMultiSessionFactory is the production MultiSessionFactory implementation.
 type defaultMultiSessionFactory struct {
-	connector          backendConnector
-	maxConcurrency     int
-	backendInitTimeout time.Duration
-	hmacSecret         []byte                // Server-managed secret for HMAC-SHA256 token hashing
-	aggregator         aggregator.Aggregator // Optional: applies tool transforms (overrides, conflict resolution, filter)
-	onCapabilityChange func(backendID string) // Late-bound callback for capability-change notifications
+	connector                  backendConnector
+	maxConcurrency             int
+	backendInitTimeout         time.Duration
+	backendRequestTimeout      time.Duration
+	perWorkloadRequestTimeouts map[string]time.Duration
+	hmacSecret                 []byte                 // Server-managed secret for HMAC-SHA256 token hashing
+	aggregator                 aggregator.Aggregator  // Optional: applies tool transforms (overrides, conflict resolution, filter)
+	onCapabilityChange         func(backendID string) // Late-bound callback for capability-change notifications
 }
 
 // MultiSessionFactoryOption configures a defaultMultiSessionFactory.
@@ -157,6 +159,30 @@ func WithBackendInitTimeout(d time.Duration) MultiSessionFactoryOption {
 	return func(f *defaultMultiSessionFactory) {
 		if d > 0 {
 			f.backendInitTimeout = d
+		}
+	}
+}
+
+// WithBackendRequestTimeouts configures the wall-clock timeout for individual
+// streamable-HTTP backend requests. Per-workload values override the default.
+// Non-positive values are ignored and fall back to the built-in 30 s timeout.
+func WithBackendRequestTimeouts(
+	defaultTimeout time.Duration,
+	perWorkload map[string]time.Duration,
+) MultiSessionFactoryOption {
+	return func(f *defaultMultiSessionFactory) {
+		if defaultTimeout > 0 {
+			f.backendRequestTimeout = defaultTimeout
+		}
+		if len(perWorkload) == 0 {
+			return
+		}
+
+		f.perWorkloadRequestTimeouts = make(map[string]time.Duration, len(perWorkload))
+		for workloadID, timeout := range perWorkload {
+			if timeout > 0 {
+				f.perWorkloadRequestTimeouts[workloadID] = timeout
+			}
 		}
 	}
 }
@@ -216,11 +242,16 @@ func NewSessionFactory(registry vmcpauth.OutgoingAuthRegistry, opts ...MultiSess
 	}
 	// The closure captures f so that SetOnCapabilityChange works after
 	// factory creation (late-binding for the server callback).
-	f.connector = backend.NewHTTPConnector(registry, func(backendID string) {
-		if f.onCapabilityChange != nil {
-			f.onCapabilityChange(backendID)
-		}
-	})
+	f.connector = backend.NewHTTPConnector(
+		registry,
+		func(backendID string) {
+			if f.onCapabilityChange != nil {
+				f.onCapabilityChange(backendID)
+			}
+		},
+		f.backendRequestTimeout,
+		f.perWorkloadRequestTimeouts,
+	)
 	return f
 }
 

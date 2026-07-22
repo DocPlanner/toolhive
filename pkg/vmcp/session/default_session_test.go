@@ -1098,6 +1098,26 @@ func TestWithBackendInitTimeout_IgnoresNonPositive(t *testing.T) {
 	assert.Equal(t, defaultBackendInitTimeout, f.backendInitTimeout)
 }
 
+func TestWithBackendRequestTimeouts(t *testing.T) {
+	t.Parallel()
+
+	perWorkload := map[string]time.Duration{
+		"cilium-flows-mcp": 125 * time.Second,
+		"invalid":          0,
+	}
+	f := &defaultMultiSessionFactory{}
+	WithBackendRequestTimeouts(60*time.Second, perWorkload)(f)
+
+	assert.Equal(t, 60*time.Second, f.backendRequestTimeout)
+	assert.Equal(t, map[string]time.Duration{
+		"cilium-flows-mcp": 125 * time.Second,
+	}, f.perWorkloadRequestTimeouts)
+
+	perWorkload["cilium-flows-mcp"] = time.Second
+	assert.Equal(t, 125*time.Second, f.perWorkloadRequestTimeouts["cilium-flows-mcp"],
+		"the option must keep a defensive copy of caller-owned configuration")
+}
+
 func TestValidateSessionID(t *testing.T) {
 	t.Parallel()
 
