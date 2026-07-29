@@ -121,6 +121,13 @@ const docTemplate = `{
                         "description": "AllowPrivateIP allows JWKS/OIDC endpoints on private IP addresses",
                         "type": "boolean"
                     },
+                    "allowedClientIDs": {
+                        "description": "AllowedClientIDs is the set of OAuth client IDs accepted when validating\ntokens by their client_id claim instead of an audience claim.",
+                        "items": {
+                            "type": "string"
+                        },
+                        "type": "array"
+                    },
                     "audience": {
                         "description": "Audience is the expected audience for the token",
                         "type": "string"
@@ -845,7 +852,7 @@ const docTemplate = `{
                 "type": "object"
             },
             "github_com_stacklok_toolhive_pkg_authserver_storage.SentinelRunConfig": {
-                "description": "SentinelConfig contains Sentinel-specific configuration.\nMutually exclusive with Addr.",
+                "description": "SentinelConfig contains Sentinel-specific configuration for HA deployments.\nMutually exclusive with Addr.",
                 "properties": {
                     "db": {
                         "description": "DB is the Redis database number (default: 0).",
@@ -1562,7 +1569,7 @@ const docTemplate = `{
                 "type": "object"
             },
             "github_com_stacklok_toolhive_pkg_runner.SessionRedisConfig": {
-                "description": "SessionRedis holds non-sensitive Redis connection parameters for distributed session storage.\nPopulated only when MCPServer.spec.sessionStorage.provider == \"redis\".\nRedis credentials are not included — they are injected as env vars THV_SESSION_REDIS_USERNAME and THV_SESSION_REDIS_PASSWORD when configured.\n+optional",
+                "description": "SessionRedis holds non-sensitive Redis connection parameters for distributed session storage.\nPopulated only when MCPServer.spec.sessionStorage.provider == \"redis\".\nRedis credentials are not included — they are injected as env vars\nTHV_SESSION_REDIS_USERNAME / THV_SESSION_REDIS_PASSWORD.\n+optional",
                 "properties": {
                     "address": {
                         "description": "Address is the Redis server address (host:port).",

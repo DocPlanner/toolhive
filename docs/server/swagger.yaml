@@ -129,6 +129,13 @@ components:
         allowPrivateIP:
           description: AllowPrivateIP allows JWKS/OIDC endpoints on private IP addresses
           type: boolean
+        allowedClientIDs:
+          description: |-
+            AllowedClientIDs is the set of OAuth client IDs accepted when validating
+            tokens by their client_id claim instead of an audience claim.
+          items:
+            type: string
+          type: array
         audience:
           description: Audience is the expected audience for the token
           type: string
@@ -920,7 +927,7 @@ components:
       type: object
     github_com_stacklok_toolhive_pkg_authserver_storage.SentinelRunConfig:
       description: |-
-        SentinelConfig contains Sentinel-specific configuration.
+        SentinelConfig contains Sentinel-specific configuration for HA deployments.
         Mutually exclusive with Addr.
       properties:
         db:
@@ -1615,7 +1622,7 @@ components:
         SessionRedis holds non-sensitive Redis connection parameters for distributed session storage.
         Populated only when MCPServer.spec.sessionStorage.provider == "redis".
         Redis credentials are not included — they are injected as env vars
-        THV_SESSION_REDIS_USERNAME and THV_SESSION_REDIS_PASSWORD when configured.
+        THV_SESSION_REDIS_USERNAME / THV_SESSION_REDIS_PASSWORD.
         +optional
       properties:
         address:
