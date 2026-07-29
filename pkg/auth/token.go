@@ -24,11 +24,10 @@ import (
 	"github.com/lestrrat-go/jwx/v3/jwk"
 
 	"github.com/stacklok/toolhive-core/env"
-	"github.com/stacklok/toolhive/pkg/auth/oauth"
 	"github.com/stacklok/toolhive/pkg/auth/upstreamtoken"
 	"github.com/stacklok/toolhive/pkg/authserver/server/keys"
 	"github.com/stacklok/toolhive/pkg/networking"
-	oauthproto "github.com/stacklok/toolhive/pkg/oauth"
+	"github.com/stacklok/toolhive/pkg/oauthproto"
 )
 
 // TokenIntrospector defines the interface for token introspection providers
@@ -124,7 +123,7 @@ func (g *GoogleProvider) IntrospectToken(ctx context.Context, token string) (jwt
 	}
 
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", oauth.UserAgent)
+	req.Header.Set("User-Agent", oauthproto.UserAgent)
 
 	// Make the request
 	resp, err := g.client.Do(req) // #nosec G704 -- URL is the configured OIDC introspection endpoint
@@ -301,7 +300,7 @@ func (r *RFC7662Provider) IntrospectToken(ctx context.Context, token string) (jw
 
 	// Set headers
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", oauth.UserAgent)
+	req.Header.Set("User-Agent", oauthproto.UserAgent)
 	req.Header.Set("Accept", "application/json")
 
 	// Add client authentication if configured
@@ -465,7 +464,7 @@ func discoverOIDCConfiguration(
 	}
 
 	// Set User-Agent header
-	req.Header.Set("User-Agent", oauth.UserAgent)
+	req.Header.Set("User-Agent", oauthproto.UserAgent)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := client.Do(req) // #nosec G704 -- URL is the configured OIDC issuer discovery endpoint
@@ -495,22 +494,6 @@ func discoverOIDCConfiguration(
 	}
 
 	return &doc, nil
-}
-
-// NewTokenValidatorConfig creates a new TokenValidatorConfig with the provided parameters
-func NewTokenValidatorConfig(issuer, audience, jwksURL, clientID string, clientSecret string) *TokenValidatorConfig {
-	// Only create a config if at least one parameter is provided
-	if issuer == "" && audience == "" && jwksURL == "" && clientID == "" && clientSecret == "" {
-		return nil
-	}
-
-	return &TokenValidatorConfig{
-		Issuer:       issuer,
-		Audience:     audience,
-		JWKSURL:      jwksURL,
-		ClientID:     clientID,
-		ClientSecret: clientSecret,
-	}
 }
 
 // registerIntrospectionProviders creates and configures the provider registry
@@ -576,7 +559,8 @@ func WithEnvReader(reader env.Reader) TokenValidatorOption {
 // WithUpstreamTokenReader configures the token validator to enrich Identity
 // with upstream provider tokens. When set, the Middleware extracts the token
 // session ID (tsid) from JWT claims and loads all upstream tokens into
-// Identity.UpstreamTokens before placing the Identity in the request context.
+// Identity.UpstreamTokens (access tokens) and Identity.UpstreamIDTokens
+// (ID tokens) before placing the Identity in the request context.
 func WithUpstreamTokenReader(reader upstreamtoken.TokenReader) TokenValidatorOption {
 	return func(o *tokenValidatorOptions) {
 		o.upstreamTokenReader = reader
@@ -646,7 +630,13 @@ func NewTokenValidator(ctx context.Context, config TokenValidatorConfig, opts ..
 			"issuer", config.Issuer,
 		)
 	} else if jwksURL == "" && config.Issuer != "" {
-		slog.Debug("OIDC discovery deferred - will discover on first validation request", "issuer", config.Issuer)
+		if o.keyProvider != nil {
+			slog.Debug("OIDC discovery deferred - failure non-fatal with local key provider",
+				"issuer", config.Issuer)
+		} else {
+			slog.Debug("OIDC discovery deferred - will discover on first validation request",
+				"issuer", config.Issuer)
+		}
 	}
 
 	// Ensure we have either an explicit JWKS URL, an issuer to discover from,
@@ -898,9 +888,15 @@ func (v *TokenValidator) getKeyFromJWKS(ctx context.Context, token *jwt.Token) (
 	}
 
 	// Fall through to HTTP-based JWKS lookup.
-	// Defensive check: JWKS URL must be set before calling this function.
-	// This invariant is normally guaranteed by ValidateToken calling ensureOIDCDiscovered first.
+	// When a local key provider is present, OIDC discovery may have been
+	// skipped entirely, so jwksURL can legitimately be empty.
 	if v.jwksURL == "" {
+		if v.keyProvider != nil {
+			return nil, fmt.Errorf(
+				"local key provider could not resolve key and no JWKS URL is available: %w",
+				ErrMissingJWKSURL,
+			)
+		}
 		return nil, ErrMissingJWKSURL
 	}
 
@@ -1081,10 +1077,20 @@ func (v *TokenValidator) introspectOpaqueToken(ctx context.Context, tokenStr str
 
 // ValidateToken validates a token.
 func (v *TokenValidator) ValidateToken(ctx context.Context, tokenString string) (jwt.MapClaims, error) {
-	// Ensure OIDC discovery is complete (lazy discovery with retry)
-	// This is a no-op if discovery was already performed or if JWKS URL was provided directly
+	// Ensure OIDC discovery is complete (lazy discovery with retry).
+	// When a local key provider is configured (embedded auth server),
+	// discovery failure is non-fatal — signing keys can be resolved
+	// in-process and the issuer URL may not be reachable from within
+	// the cluster. Mark discovery as done to avoid per-request retries.
 	if err := v.ensureOIDCDiscovered(ctx); err != nil {
-		return nil, fmt.Errorf("OIDC discovery failed: %w", err)
+		if v.keyProvider == nil {
+			return nil, fmt.Errorf("OIDC discovery failed: %w", err)
+		}
+		slog.Warn("OIDC discovery failed, proceeding with local key provider",
+			"issuer", v.issuer, "error", err)
+		v.oidcDiscoveryMu.Lock()
+		v.oidcDiscovered = true
+		v.oidcDiscoveryMu.Unlock()
 	}
 
 	// Parse the token
@@ -1186,7 +1192,7 @@ type RFC6750Error struct {
 }
 
 // writeOAuthError writes an RFC 6750 compliant JSON error response.
-func writeOAuthError(w http.ResponseWriter, errorCode, description string, status int) {
+func writeOAuthError(w http.ResponseWriter, errorCode, description string) {
 	body, err := json.Marshal(RFC6750Error{
 		Error:            errorCode,
 		ErrorDescription: description,
@@ -1196,51 +1202,34 @@ func writeOAuthError(w http.ResponseWriter, errorCode, description string, statu
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
+	w.WriteHeader(http.StatusUnauthorized)
 	_, _ = w.Write(body)
 }
 
-type upstreamTokenLoadResult struct {
-	tokens   map[string]string
-	statuses map[string]upstreamtoken.UpstreamCredentialStatus
-}
-
 // loadUpstreamTokens extracts the token session ID from claims and loads
-// all upstream provider tokens for that session. Returns (nil, nil) if no
-// tsid claim exists. Returns a non-nil error when a tsid claim is present
-// but token loading fails (infrastructure error).
-func (v *TokenValidator) loadUpstreamTokens(ctx context.Context, claims jwt.MapClaims) (*upstreamTokenLoadResult, error) {
+// all upstream provider credentials (access + ID tokens) for that session.
+// Returns (nil, nil, nil) if no tsid claim exists. Returns a non-nil error
+// when a tsid claim is present but token loading fails due to an infrastructure
+// error (storage unavailable). A non-empty failed slice means one or more
+// providers' tokens could not be refreshed; those providers remain in the creds
+// map with a non-valid Status so the caller can surface a precise
+// re-authentication signal to the authorization layer.
+func (v *TokenValidator) loadUpstreamTokens(
+	ctx context.Context, claims jwt.MapClaims,
+) (map[string]upstreamtoken.UpstreamCredential, []string, error) {
 	tsid, ok := claims[upstreamtoken.TokenSessionIDClaimKey].(string)
 	if !ok || tsid == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 
-	credentials, err := v.upstreamTokenReader.GetAllValidTokens(ctx, tsid)
+	creds, failed, err := v.upstreamTokenReader.GetAllUpstreamCredentials(ctx, tsid)
 	if err != nil {
-		return nil, fmt.Errorf("load upstream tokens for session %s: %w", tsid, err)
+		// Log tsid at DEBUG only — it is credential-adjacent and must not
+		// leak into WARN-level logs or returned error strings.
+		slog.DebugContext(ctx, "load upstream credentials failed", "tsid", tsid, "error", err)
+		return nil, nil, fmt.Errorf("load upstream credentials: %w", err)
 	}
-
-	result := &upstreamTokenLoadResult{}
-	for providerName, credential := range credentials {
-		if credential.Status == "" {
-			credential.Status = upstreamtoken.StatusValid
-		}
-
-		if credential.AccessToken != "" {
-			if result.tokens == nil {
-				result.tokens = make(map[string]string)
-			}
-			result.tokens[providerName] = credential.AccessToken
-		}
-		if credential.Status != upstreamtoken.StatusValid {
-			if result.statuses == nil {
-				result.statuses = make(map[string]upstreamtoken.UpstreamCredentialStatus)
-			}
-			result.statuses[providerName] = credential.Status
-		}
-	}
-
-	return result, nil
+	return creds, failed, nil
 }
 
 // Middleware creates an HTTP middleware that validates JWT tokens and creates Identity.
@@ -1250,7 +1239,7 @@ func (v *TokenValidator) Middleware(next http.Handler) http.Handler {
 		tokenString, err := ExtractBearerToken(r)
 		if err != nil {
 			w.Header().Set("WWW-Authenticate", v.buildWWWAuthenticate(OAuthErrInvalidRequest, err.Error()))
-			writeOAuthError(w, OAuthErrInvalidRequest, err.Error(), http.StatusUnauthorized)
+			writeOAuthError(w, OAuthErrInvalidRequest, err.Error())
 			return
 		}
 
@@ -1258,7 +1247,7 @@ func (v *TokenValidator) Middleware(next http.Handler) http.Handler {
 		claims, err := v.ValidateToken(r.Context(), tokenString)
 		if err != nil {
 			w.Header().Set("WWW-Authenticate", v.buildWWWAuthenticate(OAuthErrInvalidToken, err.Error()))
-			writeOAuthError(w, OAuthErrInvalidToken, fmt.Sprintf("Invalid token: %v", err), http.StatusUnauthorized)
+			writeOAuthError(w, OAuthErrInvalidToken, fmt.Sprintf("Invalid token: %v", err))
 			return
 		}
 
@@ -1267,28 +1256,79 @@ func (v *TokenValidator) Middleware(next http.Handler) http.Handler {
 		if err != nil {
 			slog.Error("failed to convert claims to identity", "error", err)
 			w.Header().Set("WWW-Authenticate", v.buildWWWAuthenticate(OAuthErrInvalidToken, err.Error()))
-			writeOAuthError(w, OAuthErrInvalidToken, "Invalid authentication claims", http.StatusUnauthorized)
+			writeOAuthError(w, OAuthErrInvalidToken, "Invalid authentication claims")
 			return
 		}
 
-		// Enrich Identity with upstream provider tokens when an embedded
-		// auth server is active (reader configured via WithUpstreamTokenReader).
+		// Enrich Identity with upstream provider tokens when an embedded auth
+		// server is active (reader configured via WithUpstreamTokenReader). The
+		// load runs against a temporary load-scoped context carrying the Identity,
+		// so storage layers invoked during the load can resolve the canonical user
+		// from context (via CanonicalUserFromContext, which falls back to the
+		// Identity's PlatformUserID on this request-serving path). The in-place
+		// UpstreamTokens mutation completes here, before the publicly-reachable
+		// context is built below — so the Identity placed in the served context is
+		// never mutated afterwards (see the UpstreamTokens doc comment in identity.go).
 		if v.upstreamTokenReader != nil {
-			loaded, loadErr := v.loadUpstreamTokens(r.Context(), claims)
+			loadCtx := WithIdentity(r.Context(), identity)
+			creds, failed, loadErr := v.loadUpstreamTokens(loadCtx, claims)
 			if loadErr != nil {
-				slog.WarnContext(r.Context(), "upstream token storage unavailable",
+				slog.WarnContext(loadCtx, "upstream token storage unavailable",
 					"error", loadErr,
 				)
 				http.Error(w, "authentication service temporarily unavailable", http.StatusServiceUnavailable)
 				return
 			}
-			if loaded != nil {
-				identity.UpstreamTokens = loaded.tokens
-				identity.UpstreamTokenStatuses = loaded.statuses
+			// A provider refresh failure does NOT reject the request here.
+			// Instead the per-provider statuses are surfaced on the Identity
+			// (UpstreamTokenStatuses) so the authorization layer can return a
+			// precise re-authentication error only when the failing provider is
+			// actually required (e.g. Cedar's primary upstream provider), rather
+			// than blanket-rejecting every request in multi-provider sessions.
+			if len(failed) > 0 {
+				slog.WarnContext(loadCtx, "upstream token refresh failed; deferring to authorization layer",
+					"providers", failed)
+			}
+			// Project the per-provider credential bundle onto the
+			// consumer-facing Identity fields.
+			//
+			// Non-nil empty maps are preserved when a tsid claim was present
+			// so consumers can distinguish "enrichment attempted, nothing
+			// stored" from "enrichment never ran" (nil).
+			if creds != nil {
+				accessTokens := make(map[string]string, len(creds))
+				idTokens := make(map[string]string, len(creds))
+				var statuses map[string]upstreamtoken.UpstreamCredentialStatus
+				for provider, cred := range creds {
+					// Omit providers with no usable access token (mirrors the ID-token
+					// filter below); a provider may carry an ID token but no access token.
+					if cred.AccessToken != "" {
+						accessTokens[provider] = cred.AccessToken
+					}
+					// Omit providers whose upstream login did not yield an
+					// ID token so consumers see the same map shape as before
+					// (keyed only on providers with a usable ID token).
+					if cred.IDToken != "" {
+						idTokens[provider] = cred.IDToken
+					}
+					// Surface non-valid credential states so authorization can
+					// distinguish a normal deny from re-authentication-required.
+					// An empty Status is treated as valid for readers that do
+					// not populate the field.
+					if cred.Status != "" && cred.Status != upstreamtoken.StatusValid {
+						if statuses == nil {
+							statuses = make(map[string]upstreamtoken.UpstreamCredentialStatus)
+						}
+						statuses[provider] = cred.Status
+					}
+				}
+				identity.UpstreamTokens = accessTokens
+				identity.UpstreamIDTokens = idTokens
+				identity.UpstreamTokenStatuses = statuses
 			}
 		}
 
-		// Add the Identity to the request context
+		// Add the fully-populated Identity to the request context and serve.
 		ctx := WithIdentity(r.Context(), identity)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})

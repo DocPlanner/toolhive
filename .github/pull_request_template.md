@@ -42,6 +42,25 @@ describe exactly what you tested below the checkbox.
 - [ ] Linting (`task lint-fix`)
 - [ ] Manual testing (describe below)
 
+## API Compatibility
+
+<!--
+The CRD Schema Compatibility check guards the v1beta1 operator API.
+If the check flags this PR as Incompatible and the break is intentional,
+apply the `api-break-allowed` label and describe below:
+
+1. Which fields, types, or CRDs are changing.
+2. Why the break is unavoidable.
+3. The user-facing migration path (what cluster admins need to do).
+
+See CONTRIBUTING.md → "API Stability" for the full rubric. Coordinate
+with maintainers before applying the label.
+
+Remove this section entirely if the PR does not touch operator API surface.
+-->
+
+- [ ] This PR does not break the `v1beta1` API, OR the `api-break-allowed` label is applied and the migration guidance is described above.
+
 ## Changes
 
 <!--
@@ -60,6 +79,22 @@ If yes, describe the change from the user's perspective. This helps with release
 If no, write "No".
 Remove this section entirely if not applicable.
 -->
+
+## Implementation plan
+
+<!--
+Optional — include when this PR was planned with an AI assistant (Claude Code, etc.).
+Paste the approved plan inside the <details> block so reviewers can see the intended
+design without cluttering the main PR description. Remove this section entirely
+for PRs that were not AI-planned.
+-->
+
+<details>
+<summary>Approved implementation plan</summary>
+
+<!-- Paste the plan here -->
+
+</details>
 
 ## Special notes for reviewers
 

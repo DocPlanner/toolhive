@@ -1,4 +1,4 @@
-# DEPRECATED: Inline oidcConfig in incomingAuth will be removed in v1beta1.
+# DEPRECATED: Inline oidcConfig in incomingAuth will be removed in a future API version.
 # Prefer using a shared MCPOIDCConfig with oidcConfigRef instead.
 # See vmcp_with_oidcconfig_ref.yaml for the recommended pattern.
 #
@@ -40,7 +40,7 @@ stringData:
 
 ---
 # Create MCPGroup
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPGroup
 metadata:
   name: my-services
@@ -50,13 +50,14 @@ spec:
 
 ---
 # Create backend MCPServer: yardstick with SSE transport
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: yardstick-sse
   namespace: default
 spec:
-  groupRef: my-services
+  groupRef:
+    name: my-services
   image: ghcr.io/stackloklabs/yardstick/yardstick-server:1.1.1
   transport: sse
   env:
@@ -74,13 +75,14 @@ spec:
 
 ---
 # Create backend MCPServer: fetch with streamable-http transport
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: fetch
   namespace: default
 spec:
-  groupRef: my-services
+  groupRef:
+    name: my-services
   image: ghcr.io/stackloklabs/gofetch/server
   transport: streamable-http
   proxyPort: 8080
@@ -95,13 +97,14 @@ spec:
 
 ---
 # Create backend MCPServer: yardstick with streamable-http transport
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: yardstick-streamable
   namespace: default
 spec:
-  groupRef: my-services
+  groupRef:
+    name: my-services
   image: ghcr.io/stackloklabs/yardstick/yardstick-server:1.1.1
   transport: streamable-http
   env:
@@ -118,14 +121,15 @@ spec:
       memory: "64Mi"
 
 ---
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: VirtualMCPServer
 metadata:
   name: inline-auth-vmcp
   namespace: default
 spec:
+  groupRef:
+    name: my-services
   config:
-    groupRef: my-services
     # Aggregation configuration
     aggregation:
       conflictResolution: prefix
@@ -137,19 +141,12 @@ spec:
         unhealthyThreshold: 3
         partialFailureMode: best_effort
 
-  # Incoming authentication - inline OIDC configuration
+  # Incoming authentication via shared MCPOIDCConfig
   incomingAuth:
     type: oidc
-    oidcConfig:
-      type: inline
-      resourceUrl: http://inline-auth-vmcp.default.svc.cluster.local:4483
-      inline:
-        issuer: https://auth.example.com
-        clientId: vmcp-client
-        audience: vmcp-api
-        clientSecretRef:
-          name: vmcp-oidc-client-secret
-          key: clientSecret
+    oidcConfigRef:
+      name: inline-auth-oidc-config
+      audience: vmcp-api
     authzConfig:
       type: inline
       inline:

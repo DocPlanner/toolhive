@@ -348,6 +348,25 @@ thv mcp list prompts --server filesystem
 thv mcp list tools --server filesystem --format json
 ```
 
+### Invoke a Tool
+
+```bash
+# Inline JSON args
+thv mcp call fetch --server fetch --args '{"url":"https://example.com"}'
+
+# Args from a file
+thv mcp call read_file --server filesystem --args-file ./args.json
+
+# Args from stdin
+echo '{"url":"https://example.com"}' | thv mcp call fetch --server fetch --args-file -
+
+# JSON output (full CallToolResult, includes content + structuredContent + isError)
+thv mcp call fetch --server fetch --args '{"url":"https://example.com"}' --format json
+
+# Tool-reported errors normally exit non-zero; flip with --ignore-tool-error
+thv mcp call fetch --server fetch --args '{"url":"not-a-url"}' --ignore-tool-error
+```
+
 ### Launch Inspector UI
 
 ```bash
@@ -471,7 +490,7 @@ Global patterns at `~/.config/toolhive/thvignore` apply to all mounts. Disable w
 thv skill install code-review
 
 # Install targeting a specific client
-thv skill install code-review --client claude-code
+thv skill install code-review --clients claude-code
 
 # Install into a project (requires --project-root)
 thv skill install code-review --scope project --project-root /home/user/myproject
@@ -550,7 +569,7 @@ thv skill build ./my-skill --tag ghcr.io/myorg/my-skill:v1.0
 thv skill push ghcr.io/myorg/my-skill:v1.0
 
 # 4. Install from registry to verify
-thv skill install ghcr.io/myorg/my-skill:v1.0 --client claude-code
+thv skill install ghcr.io/myorg/my-skill:v1.0 --clients claude-code
 
 # 5. Confirm installation
 thv skill info my-skill

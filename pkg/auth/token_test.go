@@ -29,7 +29,7 @@ import (
 	"github.com/stacklok/toolhive/pkg/authserver/server/keys"
 	keysmocks "github.com/stacklok/toolhive/pkg/authserver/server/keys/mocks"
 	"github.com/stacklok/toolhive/pkg/networking"
-	oauthproto "github.com/stacklok/toolhive/pkg/oauth"
+	"github.com/stacklok/toolhive/pkg/oauthproto"
 )
 
 const (
@@ -2343,25 +2343,27 @@ func TestMiddleware_RFC6750JSONErrorResponse(t *testing.T) {
 func TestLoadUpstreamTokens(t *testing.T) {
 	t.Parallel()
 
-	t.Run("loads tokens when tsid present", func(t *testing.T) {
+	t.Run("loads credentials when tsid present", func(t *testing.T) {
 		t.Parallel()
 		ctrl := gomock.NewController(t)
 		reader := upstreamtokenmocks.NewMockTokenReader(ctrl)
-		reader.EXPECT().GetAllValidTokens(gomock.Any(), "session-abc").
+		reader.EXPECT().GetAllUpstreamCredentials(gomock.Any(), "session-abc").
 			Return(map[string]upstreamtoken.UpstreamCredential{
-				"github":    {AccessToken: "gh-token", Status: upstreamtoken.StatusValid},
+				"github":    {AccessToken: "gh-token", IDToken: "gh-id-token", Status: upstreamtoken.StatusValid},
 				"atlassian": {AccessToken: "atl-token", Status: upstreamtoken.StatusValid},
-			}, nil)
+			}, []string(nil), nil)
 
 		v := &TokenValidator{upstreamTokenReader: reader}
-		result, err := v.loadUpstreamTokens(context.Background(), jwt.MapClaims{
+		creds, failed, err := v.loadUpstreamTokens(context.Background(), jwt.MapClaims{
 			"sub":                                "user123",
 			upstreamtoken.TokenSessionIDClaimKey: "session-abc",
 		})
 		require.NoError(t, err)
-		require.NotNil(t, result)
-		require.Equal(t, map[string]string{"github": "gh-token", "atlassian": "atl-token"}, result.tokens)
-		require.Nil(t, result.statuses)
+		require.Nil(t, failed)
+		require.Equal(t, map[string]upstreamtoken.UpstreamCredential{
+			"github":    {AccessToken: "gh-token", IDToken: "gh-id-token", Status: upstreamtoken.StatusValid},
+			"atlassian": {AccessToken: "atl-token", Status: upstreamtoken.StatusValid},
+		}, creds)
 	})
 
 	t.Run("returns nil when no tsid claim", func(t *testing.T) {
@@ -2371,9 +2373,10 @@ func TestLoadUpstreamTokens(t *testing.T) {
 		// No EXPECT — reader should not be called
 
 		v := &TokenValidator{upstreamTokenReader: reader}
-		result, err := v.loadUpstreamTokens(context.Background(), jwt.MapClaims{"sub": "user123"})
+		creds, failed, err := v.loadUpstreamTokens(context.Background(), jwt.MapClaims{"sub": "user123"})
 		require.NoError(t, err)
-		require.Nil(t, result)
+		require.Nil(t, creds)
+		require.Nil(t, failed)
 	})
 
 	t.Run("returns nil when tsid is empty string", func(t *testing.T) {
@@ -2382,12 +2385,13 @@ func TestLoadUpstreamTokens(t *testing.T) {
 		reader := upstreamtokenmocks.NewMockTokenReader(ctrl)
 
 		v := &TokenValidator{upstreamTokenReader: reader}
-		result, err := v.loadUpstreamTokens(context.Background(), jwt.MapClaims{
+		creds, failed, err := v.loadUpstreamTokens(context.Background(), jwt.MapClaims{
 			"sub":                                "user123",
 			upstreamtoken.TokenSessionIDClaimKey: "",
 		})
 		require.NoError(t, err)
-		require.Nil(t, result)
+		require.Nil(t, creds)
+		require.Nil(t, failed)
 	})
 
 	t.Run("returns nil when tsid is non-string type", func(t *testing.T) {
@@ -2396,68 +2400,85 @@ func TestLoadUpstreamTokens(t *testing.T) {
 		reader := upstreamtokenmocks.NewMockTokenReader(ctrl)
 
 		v := &TokenValidator{upstreamTokenReader: reader}
-		result, err := v.loadUpstreamTokens(context.Background(), jwt.MapClaims{
+		creds, failed, err := v.loadUpstreamTokens(context.Background(), jwt.MapClaims{
 			"sub":                                "user123",
 			upstreamtoken.TokenSessionIDClaimKey: 12345,
 		})
 		require.NoError(t, err)
-		require.Nil(t, result)
+		require.Nil(t, creds)
+		require.Nil(t, failed)
 	})
 
 	t.Run("returns error when reader fails", func(t *testing.T) {
 		t.Parallel()
 		ctrl := gomock.NewController(t)
 		reader := upstreamtokenmocks.NewMockTokenReader(ctrl)
-		reader.EXPECT().GetAllValidTokens(gomock.Any(), "session-abc").
-			Return(nil, errors.New("storage unavailable"))
+		reader.EXPECT().GetAllUpstreamCredentials(gomock.Any(), "session-abc").
+			Return(nil, nil, errors.New("storage unavailable"))
 
 		v := &TokenValidator{upstreamTokenReader: reader}
-		result, err := v.loadUpstreamTokens(context.Background(), jwt.MapClaims{
+		creds, failed, err := v.loadUpstreamTokens(context.Background(), jwt.MapClaims{
 			"sub":                                "user123",
 			upstreamtoken.TokenSessionIDClaimKey: "session-abc",
 		})
 		require.Error(t, err)
-		require.Nil(t, result)
+		require.Nil(t, creds)
+		require.Nil(t, failed)
+	})
+
+	t.Run("returns failed providers from reader", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+		reader := upstreamtokenmocks.NewMockTokenReader(ctrl)
+		reader.EXPECT().GetAllUpstreamCredentials(gomock.Any(), "session-abc").
+			Return(map[string]upstreamtoken.UpstreamCredential{}, []string{"github"}, nil)
+
+		v := &TokenValidator{upstreamTokenReader: reader}
+		creds, failed, err := v.loadUpstreamTokens(context.Background(), jwt.MapClaims{
+			"sub":                                "user123",
+			upstreamtoken.TokenSessionIDClaimKey: "session-abc",
+		})
+		require.NoError(t, err)
+		require.Equal(t, map[string]upstreamtoken.UpstreamCredential{}, creds)
+		require.Equal(t, []string{"github"}, failed)
 	})
 
 	t.Run("returns empty map from reader", func(t *testing.T) {
 		t.Parallel()
 		ctrl := gomock.NewController(t)
 		reader := upstreamtokenmocks.NewMockTokenReader(ctrl)
-		reader.EXPECT().GetAllValidTokens(gomock.Any(), "session-abc").
-			Return(map[string]upstreamtoken.UpstreamCredential{}, nil)
+		reader.EXPECT().GetAllUpstreamCredentials(gomock.Any(), "session-abc").
+			Return(map[string]upstreamtoken.UpstreamCredential{}, []string(nil), nil)
 
 		v := &TokenValidator{upstreamTokenReader: reader}
-		result, err := v.loadUpstreamTokens(context.Background(), jwt.MapClaims{
+		creds, failed, err := v.loadUpstreamTokens(context.Background(), jwt.MapClaims{
 			"sub":                                "user123",
 			upstreamtoken.TokenSessionIDClaimKey: "session-abc",
 		})
 		require.NoError(t, err)
-		require.NotNil(t, result)
-		require.Nil(t, result.tokens)
-		require.Nil(t, result.statuses)
+		require.Equal(t, map[string]upstreamtoken.UpstreamCredential{}, creds)
+		require.Nil(t, failed)
 	})
 
 	t.Run("preserves unusable upstream token status", func(t *testing.T) {
 		t.Parallel()
 		ctrl := gomock.NewController(t)
 		reader := upstreamtokenmocks.NewMockTokenReader(ctrl)
-		reader.EXPECT().GetAllValidTokens(gomock.Any(), "session-abc").
+		reader.EXPECT().GetAllUpstreamCredentials(gomock.Any(), "session-abc").
 			Return(map[string]upstreamtoken.UpstreamCredential{
 				"cognito": {Status: upstreamtoken.StatusRefreshFailed},
-			}, nil)
+			}, []string{"cognito"}, nil)
 
 		v := &TokenValidator{upstreamTokenReader: reader}
-		result, err := v.loadUpstreamTokens(context.Background(), jwt.MapClaims{
+		creds, failed, err := v.loadUpstreamTokens(context.Background(), jwt.MapClaims{
 			"sub":                                "user123",
 			upstreamtoken.TokenSessionIDClaimKey: "session-abc",
 		})
 		require.NoError(t, err)
-		require.NotNil(t, result)
-		require.Nil(t, result.tokens)
-		require.Equal(t, map[string]upstreamtoken.UpstreamCredentialStatus{
-			"cognito": upstreamtoken.StatusRefreshFailed,
-		}, result.statuses)
+		require.Equal(t, map[string]upstreamtoken.UpstreamCredential{
+			"cognito": {Status: upstreamtoken.StatusRefreshFailed},
+		}, creds)
+		require.Equal(t, []string{"cognito"}, failed)
 	})
 }
 
@@ -2526,10 +2547,10 @@ func TestMiddleware_UpstreamTokenEnrichment(t *testing.T) {
 		t.Parallel()
 		ctrl := gomock.NewController(t)
 		reader := upstreamtokenmocks.NewMockTokenReader(ctrl)
-		reader.EXPECT().GetAllValidTokens(gomock.Any(), "session-xyz").
+		reader.EXPECT().GetAllUpstreamCredentials(gomock.Any(), "session-xyz").
 			Return(map[string]upstreamtoken.UpstreamCredential{
-				"github": {AccessToken: "gh-tok", Status: upstreamtoken.StatusValid},
-			}, nil)
+				"github": {AccessToken: "gh-tok", IDToken: "gh-id-tok", Status: upstreamtoken.StatusValid},
+			}, []string(nil), nil)
 		v := makeValidator(t, WithUpstreamTokenReader(reader))
 
 		var captured *Identity
@@ -2544,15 +2565,131 @@ func TestMiddleware_UpstreamTokenEnrichment(t *testing.T) {
 
 		require.Equal(t, http.StatusOK, rr.Code)
 		require.Equal(t, map[string]string{"github": "gh-tok"}, captured.UpstreamTokens)
+		require.Equal(t, map[string]string{"github": "gh-id-tok"}, captured.UpstreamIDTokens)
 		require.Nil(t, captured.UpstreamTokenStatuses)
+	})
+
+	t.Run("all access tokens with no ID tokens yields non-nil empty UpstreamIDTokens", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+		reader := upstreamtokenmocks.NewMockTokenReader(ctrl)
+		// Reader returns providers that have valid access tokens but no ID tokens.
+		// The service layer preserves the empty IDToken field (see
+		// TestInProcessService_GetAllUpstreamCredentials); the projection that
+		// drops providers whose IDToken is empty happens in Middleware.
+		reader.EXPECT().GetAllUpstreamCredentials(gomock.Any(), "session-xyz").
+			Return(map[string]upstreamtoken.UpstreamCredential{
+				"github":    {AccessToken: "gh-tok", IDToken: ""},
+				"atlassian": {AccessToken: "atl-tok", IDToken: ""},
+			}, []string(nil), nil)
+		v := makeValidator(t, WithUpstreamTokenReader(reader))
+
+		var captured *Identity
+		handler := v.Middleware(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			captured, _ = IdentityFromContext(r.Context())
+		}))
+
+		req := httptest.NewRequest("GET", "/", nil)
+		req.Header.Set("Authorization", "Bearer "+signToken(claimsWithTsid))
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		// Access tokens map contains every provider.
+		require.Equal(t, map[string]string{
+			"github":    "gh-tok",
+			"atlassian": "atl-tok",
+		}, captured.UpstreamTokens)
+		// UpstreamIDTokens must be non-nil (tsid was present, enrichment ran)
+		// but empty (no provider had a usable ID token). Consumers rely on
+		// nil vs. empty-map to distinguish "enrichment never ran" from
+		// "enrichment ran, no ID tokens stored".
+		require.NotNil(t, captured.UpstreamIDTokens,
+			"UpstreamIDTokens must be non-nil when tsid was present and enrichment ran")
+		require.Empty(t, captured.UpstreamIDTokens,
+			"UpstreamIDTokens must be empty when no provider has an ID token")
+	})
+
+	t.Run("mixed providers: only those with ID tokens appear in UpstreamIDTokens", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+		reader := upstreamtokenmocks.NewMockTokenReader(ctrl)
+		// github has an ID token; atlassian has only an access token. The
+		// projection in Middleware must key UpstreamTokens on both providers
+		// but UpstreamIDTokens only on github.
+		reader.EXPECT().GetAllUpstreamCredentials(gomock.Any(), "session-xyz").
+			Return(map[string]upstreamtoken.UpstreamCredential{
+				"github":    {AccessToken: "gh-tok", IDToken: "gh-id-tok"},
+				"atlassian": {AccessToken: "atl-tok", IDToken: ""},
+			}, []string(nil), nil)
+		v := makeValidator(t, WithUpstreamTokenReader(reader))
+
+		var captured *Identity
+		handler := v.Middleware(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			captured, _ = IdentityFromContext(r.Context())
+		}))
+
+		req := httptest.NewRequest("GET", "/", nil)
+		req.Header.Set("Authorization", "Bearer "+signToken(claimsWithTsid))
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		require.Equal(t, map[string]string{
+			"github":    "gh-tok",
+			"atlassian": "atl-tok",
+		}, captured.UpstreamTokens)
+		require.Equal(t, map[string]string{
+			"github": "gh-id-tok",
+		}, captured.UpstreamIDTokens,
+			"only providers with a non-empty ID token must appear in UpstreamIDTokens")
+	})
+
+	t.Run("places identity in context before loading upstream tokens", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+		reader := upstreamtokenmocks.NewMockTokenReader(ctrl)
+
+		// loadUpstreamTokens forwards its context straight to the reader, so the
+		// context the reader receives IS the one loadUpstreamTokens ran with.
+		// Capture it to assert the middleware enriched the context with the identity
+		// BEFORE performing the load.
+		var loadCtxIdentity *Identity
+		var loadCtxHadIdentity bool
+		var loadCtxCanonicalUser string
+		var loadCtxHadCanonicalUser bool
+		reader.EXPECT().GetAllUpstreamCredentials(gomock.Any(), "session-xyz").
+			DoAndReturn(func(ctx context.Context, _ string) (map[string]upstreamtoken.UpstreamCredential, []string, error) {
+				loadCtxIdentity, loadCtxHadIdentity = IdentityFromContext(ctx)
+				loadCtxCanonicalUser, loadCtxHadCanonicalUser = CanonicalUserFromContext(ctx)
+				return map[string]upstreamtoken.UpstreamCredential{"github": {AccessToken: "gh-tok"}}, nil, nil
+			})
+		v := makeValidator(t, WithUpstreamTokenReader(reader))
+		handler := v.Middleware(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
+
+		req := httptest.NewRequest("GET", "/", nil)
+		req.Header.Set("Authorization", "Bearer "+signToken(claimsWithTsid))
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		require.True(t, loadCtxHadIdentity,
+			"middleware must place the identity into the context before loading upstream tokens")
+		require.Equal(t, "test-user", loadCtxIdentity.PlatformUserID)
+		// Storage resolves the canonical user via CanonicalUserFromContext. On this
+		// request-serving path no dedicated platform-user key is set, so it must fall
+		// back to the Identity's PlatformUserID — verify that fallback resolves.
+		require.True(t, loadCtxHadCanonicalUser,
+			"CanonicalUserFromContext must resolve the user during the upstream-token load")
+		require.Equal(t, "test-user", loadCtxCanonicalUser)
 	})
 
 	t.Run("returns 503 when storage fails", func(t *testing.T) {
 		t.Parallel()
 		ctrl := gomock.NewController(t)
 		reader := upstreamtokenmocks.NewMockTokenReader(ctrl)
-		reader.EXPECT().GetAllValidTokens(gomock.Any(), "session-xyz").
-			Return(nil, errors.New("redis down"))
+		reader.EXPECT().GetAllUpstreamCredentials(gomock.Any(), "session-xyz").
+			Return(nil, nil, errors.New("redis down"))
 		v := makeValidator(t, WithUpstreamTokenReader(reader))
 
 		nextCalled := false
@@ -2567,6 +2704,72 @@ func TestMiddleware_UpstreamTokenEnrichment(t *testing.T) {
 
 		require.Equal(t, http.StatusServiceUnavailable, rr.Code)
 		require.False(t, nextCalled)
+	})
+
+	t.Run("provider refresh failure does not reject the request; status is surfaced", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+		reader := upstreamtokenmocks.NewMockTokenReader(ctrl)
+		reader.EXPECT().GetAllUpstreamCredentials(gomock.Any(), "session-xyz").
+			Return(map[string]upstreamtoken.UpstreamCredential{
+				"github": {Status: upstreamtoken.StatusRefreshFailed},
+			}, []string{"github"}, nil)
+		v := makeValidator(t, WithUpstreamTokenReader(reader))
+
+		var captured *Identity
+		nextCalled := false
+		handler := v.Middleware(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			nextCalled = true
+			captured, _ = IdentityFromContext(r.Context())
+		}))
+
+		req := httptest.NewRequest("GET", "/", nil)
+		req.Header.Set("Authorization", "Bearer "+signToken(claimsWithTsid))
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+
+		// The middleware defers the re-authentication decision to the
+		// authorization layer via Identity.UpstreamTokenStatuses instead of
+		// short-circuiting with 401.
+		require.Equal(t, http.StatusOK, rr.Code)
+		require.True(t, nextCalled)
+		require.Empty(t, captured.UpstreamTokens)
+		require.Equal(t, map[string]upstreamtoken.UpstreamCredentialStatus{
+			"github": upstreamtoken.StatusRefreshFailed,
+		}, captured.UpstreamTokenStatuses)
+	})
+
+	t.Run("one failing provider does not block other providers' tokens", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+		reader := upstreamtokenmocks.NewMockTokenReader(ctrl)
+		// atlassian succeeded, github failed — the request proceeds with
+		// atlassian's token and github's failure surfaced as a status.
+		reader.EXPECT().GetAllUpstreamCredentials(gomock.Any(), "session-xyz").
+			Return(map[string]upstreamtoken.UpstreamCredential{
+				"atlassian": {AccessToken: "atl-tok", Status: upstreamtoken.StatusValid},
+				"github":    {Status: upstreamtoken.StatusNoRefreshToken},
+			}, []string{"github"}, nil)
+		v := makeValidator(t, WithUpstreamTokenReader(reader))
+
+		var captured *Identity
+		nextCalled := false
+		handler := v.Middleware(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			nextCalled = true
+			captured, _ = IdentityFromContext(r.Context())
+		}))
+
+		req := httptest.NewRequest("GET", "/", nil)
+		req.Header.Set("Authorization", "Bearer "+signToken(claimsWithTsid))
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		require.True(t, nextCalled, "next must be called; re-auth is decided by the authorization layer")
+		require.Equal(t, map[string]string{"atlassian": "atl-tok"}, captured.UpstreamTokens)
+		require.Equal(t, map[string]upstreamtoken.UpstreamCredentialStatus{
+			"github": upstreamtoken.StatusNoRefreshToken,
+		}, captured.UpstreamTokenStatuses)
 	})
 
 	t.Run("no enrichment without tsid", func(t *testing.T) {
@@ -2592,6 +2795,8 @@ func TestMiddleware_UpstreamTokenEnrichment(t *testing.T) {
 
 		require.Equal(t, http.StatusOK, rr.Code)
 		require.Nil(t, captured.UpstreamTokens)
+		require.Nil(t, captured.UpstreamIDTokens,
+			"UpstreamIDTokens must stay nil when enrichment never ran (no tsid)")
 		require.Nil(t, captured.UpstreamTokenStatuses)
 	})
 
@@ -2611,6 +2816,8 @@ func TestMiddleware_UpstreamTokenEnrichment(t *testing.T) {
 
 		require.Equal(t, http.StatusOK, rr.Code)
 		require.Nil(t, captured.UpstreamTokens)
+		require.Nil(t, captured.UpstreamIDTokens,
+			"UpstreamIDTokens must stay nil when no reader is configured")
 		require.Nil(t, captured.UpstreamTokenStatuses)
 	})
 
@@ -2618,10 +2825,10 @@ func TestMiddleware_UpstreamTokenEnrichment(t *testing.T) {
 		t.Parallel()
 		ctrl := gomock.NewController(t)
 		reader := upstreamtokenmocks.NewMockTokenReader(ctrl)
-		reader.EXPECT().GetAllValidTokens(gomock.Any(), "session-xyz").
+		reader.EXPECT().GetAllUpstreamCredentials(gomock.Any(), "session-xyz").
 			Return(map[string]upstreamtoken.UpstreamCredential{
 				"cognito": {Status: upstreamtoken.StatusRefreshFailed},
-			}, nil)
+			}, []string{"cognito"}, nil)
 		v := makeValidator(t, WithUpstreamTokenReader(reader))
 
 		var captured *Identity
@@ -2635,7 +2842,7 @@ func TestMiddleware_UpstreamTokenEnrichment(t *testing.T) {
 		handler.ServeHTTP(rr, req)
 
 		require.Equal(t, http.StatusOK, rr.Code)
-		require.Nil(t, captured.UpstreamTokens)
+		require.Empty(t, captured.UpstreamTokens)
 		require.Equal(t, map[string]upstreamtoken.UpstreamCredentialStatus{
 			"cognito": upstreamtoken.StatusRefreshFailed,
 		}, captured.UpstreamTokenStatuses)
@@ -2770,5 +2977,218 @@ func TestGetKeyFromLocalProvider(t *testing.T) {
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "token header missing kid")
 		require.Nil(t, key)
+	})
+}
+
+func TestValidateToken_DiscoveryFailsWithKeyProvider(t *testing.T) {
+	t.Parallel()
+
+	// closedTLSServer returns a closed TLS server URL and its CA cert path.
+	// Connection refused is instant because DNS resolves but the socket is closed.
+	closedTLSServer := func(t *testing.T) (string, string) {
+		t.Helper()
+		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		certPath := writeTestServerCert(t, server)
+		server.Close()
+		return server.URL, certPath
+	}
+
+	// setupClosedServerTest generates an RSA key pair, creates a validator pointed
+	// at a closed TLS server, and returns a signed JWT for that issuer. The
+	// keyProviderKID controls whether a mock key provider is configured:
+	//   - non-empty: configures a mock returning a key with that kid
+	//   - empty: no key provider is attached
+	type closedServerFixture struct {
+		validator   *TokenValidator
+		tokenString string
+	}
+	setupClosedServerTest := func(t *testing.T, keyProviderKID string) closedServerFixture {
+		t.Helper()
+
+		ctrl := gomock.NewController(t)
+		mockEnv := envmocks.NewMockReader(ctrl)
+		mockEnv.EXPECT().Getenv(gomock.Any()).Return("").AnyTimes()
+
+		privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		require.NoError(t, err)
+
+		opts := []TokenValidatorOption{WithEnvReader(mockEnv)}
+		if keyProviderKID != "" {
+			mockProvider := keysmocks.NewMockPublicKeyProvider(ctrl)
+			mockProvider.EXPECT().PublicKeys(gomock.Any()).Return([]*keys.PublicKeyData{
+				{KeyID: keyProviderKID, Algorithm: "RS256", PublicKey: &privateKey.PublicKey},
+			}, nil).AnyTimes()
+			opts = append(opts, WithKeyProvider(mockProvider))
+		}
+
+		closedURL, certPath := closedTLSServer(t)
+
+		ctx := context.Background()
+		validator, err := NewTokenValidator(ctx, TokenValidatorConfig{
+			Issuer:         closedURL,
+			Audience:       "test-audience",
+			ClientID:       "test-client",
+			CACertPath:     certPath,
+			AllowPrivateIP: true,
+		}, opts...)
+		require.NoError(t, err)
+
+		token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
+			"iss": closedURL,
+			"aud": "test-audience",
+			"exp": time.Now().Add(time.Hour).Unix(),
+			"sub": "test-user",
+		})
+		token.Header["kid"] = testKeyID
+		tokenString, err := token.SignedString(privateKey)
+		require.NoError(t, err)
+
+		return closedServerFixture{validator: validator, tokenString: tokenString}
+	}
+
+	tests := []struct {
+		name            string
+		keyProviderKID  string // empty means no key provider
+		wantErr         error  // nil means success
+		wantSub         string // checked only when wantErr is nil
+		checkDiscovered bool   // whether to assert oidcDiscovered state after tolerated failure
+	}{
+		{
+			name:            "discovery fails but keyProvider resolves key",
+			keyProviderKID:  testKeyID,
+			wantErr:         nil,
+			wantSub:         "test-user",
+			checkDiscovered: true,
+		},
+		{
+			name:           "discovery fails and keyProvider kid miss returns error",
+			keyProviderKID: "other-kid",
+			wantErr:        ErrMissingJWKSURL,
+		},
+		{
+			name:    "discovery fails without keyProvider returns discovery error",
+			wantErr: ErrFailedToDiscoverOIDC,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fix := setupClosedServerTest(t, tt.keyProviderKID)
+			ctx := context.Background()
+
+			claims, err := fix.validator.ValidateToken(ctx, fix.tokenString)
+			if tt.wantErr != nil {
+				require.Error(t, err)
+				require.ErrorIs(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tt.wantSub, claims["sub"])
+			}
+			if tt.checkDiscovered {
+				// Discovery was attempted, failed, and tolerated — marked as done
+				// to avoid per-request retry penalty.
+				require.True(t, fix.validator.oidcDiscovered)
+			}
+		})
+	}
+
+	t.Run("keyProvider miss falls through to explicit JWKS URL", func(t *testing.T) {
+		t.Parallel()
+
+		ctrl := gomock.NewController(t)
+		mockEnv := envmocks.NewMockReader(ctrl)
+		mockEnv.EXPECT().Getenv(gomock.Any()).Return("").AnyTimes()
+
+		privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		require.NoError(t, err)
+
+		// Mock key provider returns a key with a DIFFERENT kid than the token,
+		// so getKeyFromLocalProvider returns (nil, nil) on kid mismatch.
+		mockProvider := keysmocks.NewMockPublicKeyProvider(ctrl)
+		mockProvider.EXPECT().PublicKeys(gomock.Any()).Return([]*keys.PublicKeyData{
+			{KeyID: "other-kid", Algorithm: "RS256", PublicKey: &privateKey.PublicKey},
+		}, nil).AnyTimes()
+
+		// Build JWK key set for the JWKS server with the CORRECT kid
+		jwkKey, err := jwk.Import(&privateKey.PublicKey)
+		require.NoError(t, err)
+		require.NoError(t, jwkKey.Set(jwk.KeyIDKey, testKeyID))
+		require.NoError(t, jwkKey.Set(jwk.AlgorithmKey, "RS256"))
+		require.NoError(t, jwkKey.Set(jwk.KeyUsageKey, "sig"))
+		keySet := jwk.NewSet()
+		require.NoError(t, keySet.AddKey(jwkKey))
+
+		jwksServer, certPath := createTestJWKSServer(t, keySet)
+		t.Cleanup(jwksServer.Close)
+
+		ctx := context.Background()
+		validator, err := NewTokenValidator(ctx, TokenValidatorConfig{
+			JWKSURL:        jwksServer.URL,
+			Audience:       "test-audience",
+			ClientID:       "test-client",
+			CACertPath:     certPath,
+			AllowPrivateIP: true,
+		}, WithEnvReader(mockEnv), WithKeyProvider(mockProvider))
+		require.NoError(t, err)
+
+		token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
+			"aud": "test-audience",
+			"exp": time.Now().Add(time.Hour).Unix(),
+			"sub": "test-user",
+		})
+		token.Header["kid"] = testKeyID
+		tokenString, err := token.SignedString(privateKey)
+		require.NoError(t, err)
+
+		claims, err := validator.ValidateToken(ctx, tokenString)
+		require.NoError(t, err)
+		require.Equal(t, "test-user", claims["sub"])
+	})
+
+	t.Run("keyProvider PublicKeys error falls through to JWKS miss", func(t *testing.T) {
+		t.Parallel()
+
+		ctrl := gomock.NewController(t)
+		mockEnv := envmocks.NewMockReader(ctrl)
+		mockEnv.EXPECT().Getenv(gomock.Any()).Return("").AnyTimes()
+
+		privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		require.NoError(t, err)
+
+		mockProvider := keysmocks.NewMockPublicKeyProvider(ctrl)
+		mockProvider.EXPECT().PublicKeys(gomock.Any()).Return(nil, errors.New("key store unavailable")).AnyTimes()
+
+		closedURL, certPath := closedTLSServer(t)
+
+		ctx := context.Background()
+		validator, err := NewTokenValidator(ctx, TokenValidatorConfig{
+			Issuer:         closedURL,
+			Audience:       "test-audience",
+			ClientID:       "test-client",
+			CACertPath:     certPath,
+			AllowPrivateIP: true,
+		}, WithEnvReader(mockEnv), WithKeyProvider(mockProvider))
+		require.NoError(t, err)
+
+		token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
+			"iss": closedURL,
+			"aud": "test-audience",
+			"exp": time.Now().Add(time.Hour).Unix(),
+			"sub": "test-user",
+		})
+		token.Header["kid"] = testKeyID
+		tokenString, err := token.SignedString(privateKey)
+		require.NoError(t, err)
+
+		// Provider error is swallowed (falls back to HTTP JWKS), but
+		// discovery was also skipped so no JWKS URL is available.
+		_, err = validator.ValidateToken(ctx, tokenString)
+		require.Error(t, err)
+		require.ErrorIs(t, err, ErrMissingJWKSURL)
+		require.Contains(t, err.Error(), "local key provider could not resolve key")
 	})
 }

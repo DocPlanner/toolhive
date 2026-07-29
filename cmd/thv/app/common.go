@@ -11,6 +11,7 @@ import (
 
 	groupval "github.com/stacklok/toolhive-core/validation/group"
 	"github.com/stacklok/toolhive/pkg/config"
+	"github.com/stacklok/toolhive/pkg/container/runtime"
 	"github.com/stacklok/toolhive/pkg/secrets"
 	"github.com/stacklok/toolhive/pkg/workloads"
 )
@@ -78,9 +79,10 @@ func SetSecretsProvider(ctx context.Context, provider secrets.ProviderType) erro
 	}
 
 	// Update the secrets provider type and mark setup as completed
-	err := config.UpdateConfig(func(c *config.Config) {
+	err := config.UpdateConfig(func(c *config.Config) error {
 		c.Secrets.ProviderType = string(provider)
 		c.Secrets.SetupCompleted = true
+		return nil
 	})
 	if err != nil {
 		return fmt.Errorf("failed to update configuration: %w", err)
@@ -152,6 +154,25 @@ func completeLogsArgs(cmd *cobra.Command, args []string, _ string) ([]string, co
 	}
 
 	return completions, cobra.ShellCompDirectiveNoFileComp
+}
+
+// workloadStatusIndicator returns the status string with a visual indicator prepended
+// for statuses that warrant user attention (unauthenticated, auth_retrying, policy_stopped).
+// All other statuses are returned as plain strings.
+func workloadStatusIndicator(status runtime.WorkloadStatus) string {
+	switch status {
+	case runtime.WorkloadStatusUnauthenticated:
+		return "⚠️  " + string(status)
+	case runtime.WorkloadStatusAuthRetrying:
+		return "🔄 " + string(status)
+	case runtime.WorkloadStatusPolicyStopped:
+		return "🚫 " + string(status)
+	case runtime.WorkloadStatusRunning, runtime.WorkloadStatusStopped, runtime.WorkloadStatusError,
+		runtime.WorkloadStatusStarting, runtime.WorkloadStatusStopping, runtime.WorkloadStatusUnhealthy,
+		runtime.WorkloadStatusRemoving, runtime.WorkloadStatusUnknown:
+		return string(status)
+	}
+	return string(status)
 }
 
 // AddGroupFlag adds a --group flag to the provided command for filtering by group.

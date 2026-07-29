@@ -30,7 +30,7 @@
 
 ---
 # Step 1: Create MCPGroup
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPGroup
 metadata:
   name: optimizer-services
@@ -40,13 +40,14 @@ spec:
 
 ---
 # Step 2: Create MCPServer backend - yardstick
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: yardstick
   namespace: default
 spec:
-  groupRef: optimizer-services
+  groupRef:
+    name: optimizer-services
   image: ghcr.io/stackloklabs/yardstick/yardstick-server:1.1.1
   transport: stdio
   proxyPort: 8080
@@ -60,13 +61,14 @@ spec:
 
 ---
 # Step 3: Create MCPServer backend - fetch (URL content fetching)
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: fetch
   namespace: default
 spec:
-  groupRef: optimizer-services
+  groupRef:
+    name: optimizer-services
   image: ghcr.io/stackloklabs/gofetch/server
   transport: streamable-http
   proxyPort: 8080
@@ -85,7 +87,7 @@ spec:
 # IMPORTANT: Images must come from HuggingFace Text Embeddings Inference (TEI):
 #   https://github.com/huggingface/text-embeddings-inference
 # Available tags include :cpu-latest, :latest (GPU), and version-pinned variants.
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: EmbeddingServer
 metadata:
   name: optimizer-embedding
@@ -138,15 +140,15 @@ spec:
 # This example sets every optimizer field explicitly rather than relying on
 # auto-configuration. The embeddingServerRef still resolves the URL from the
 # EmbeddingServer status, but the optimizer tuning parameters are user-controlled.
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: VirtualMCPServer
 metadata:
   name: optimizer-vmcp
   namespace: default
 spec:
+  groupRef:
+    name: optimizer-services
   config:
-    groupRef: optimizer-services
-
     # Aggregation: prefix strategy prevents tool name conflicts
     aggregation:
       conflictResolution: prefix

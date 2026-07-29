@@ -23,7 +23,6 @@ import (
 	"github.com/stacklok/toolhive/pkg/vmcp/auth/strategies"
 	authtypes "github.com/stacklok/toolhive/pkg/vmcp/auth/types"
 	vmcpconfig "github.com/stacklok/toolhive/pkg/vmcp/config"
-	discoveryMocks "github.com/stacklok/toolhive/pkg/vmcp/discovery/mocks"
 	"github.com/stacklok/toolhive/pkg/vmcp/mocks"
 	"github.com/stacklok/toolhive/pkg/vmcp/router"
 	"github.com/stacklok/toolhive/pkg/vmcp/server"
@@ -44,7 +43,6 @@ func newOwnerAwareTestServer(
 	t.Cleanup(ctrl.Finish)
 
 	mockBackendClient := mocks.NewMockBackendClient(ctrl)
-	mockDiscoveryMgr := discoveryMocks.NewMockManager(ctrl)
 	mockBackendRegistry := mocks.NewMockBackendRegistry(ctrl)
 
 	backend := vmcp.Backend{
@@ -55,10 +53,27 @@ func newOwnerAwareTestServer(
 	}
 
 	mockBackendRegistry.EXPECT().List(gomock.Any()).Return([]vmcp.Backend{backend}).AnyTimes()
-	mockDiscoveryMgr.EXPECT().Discover(gomock.Any(), gomock.Any()).
-		Return(&aggregator.AggregatedCapabilities{}, nil).AnyTimes()
-	mockDiscoveryMgr.EXPECT().Stop().AnyTimes()
-
+	mockBackendRegistry.EXPECT().Get(gomock.Any(), gomock.Any()).Return(&backend).AnyTimes()
+	mockBackendClient.EXPECT().CallTool(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(func(
+			_ context.Context, _ *vmcp.BackendTarget, _ string, args map[string]any, _ map[string]any,
+		) (*vmcp.ToolCallResult, error) {
+			input, _ := args["input"].(string)
+			return &vmcp.ToolCallResult{Content: []vmcp.Content{{Type: "text", Text: input}}}, nil
+		}).AnyTimes()
+	// The core is the single aggregator on the New/Serve path, so the advertised
+	// set comes from the backend client rather than a discovery manager.
+	mockBackendClient.EXPECT().ListCapabilities(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, target *vmcp.BackendTarget) (*vmcp.CapabilityList, error) {
+			return &vmcp.CapabilityList{
+				Tools: []vmcp.Tool{{
+					Name:        "echo",
+					Description: "echo tool",
+					BackendID:   target.WorkloadID,
+					InputSchema: map[string]any{"type": "object"},
+				}},
+			}, nil
+		}).AnyTimes()
 	authReg := vmcpauth.NewDefaultOutgoingAuthRegistry()
 	require.NoError(t, authReg.RegisterStrategy(
 		authtypes.StrategyTypeUnauthenticated,
@@ -72,7 +87,7 @@ func newOwnerAwareTestServer(
 	ts.Start()
 	t.Cleanup(ts.Close)
 
-	rt := router.NewDefaultRouter()
+	rt := router.NewSessionRouter(&vmcp.RoutingTable{})
 	srv, err := server.New(
 		context.Background(),
 		&server.Config{
@@ -81,6 +96,8 @@ func newOwnerAwareTestServer(
 			SessionTTL:               5 * time.Minute,
 			SessionFactory:           factory,
 			SessionOwnerAdvertiseURL: ts.URL,
+			Aggregator: aggregator.NewDefaultAggregator(
+				mockBackendClient, nil, nil, nil),
 			SessionStorage: &vmcpconfig.SessionStorageConfig{
 				Provider: "redis",
 				Address:  redisAddr,
@@ -88,7 +105,6 @@ func newOwnerAwareTestServer(
 		},
 		rt,
 		mockBackendClient,
-		mockDiscoveryMgr,
 		mockBackendRegistry,
 		nil,
 	)

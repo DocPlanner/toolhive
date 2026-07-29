@@ -50,7 +50,7 @@ The `--format k8s` option automatically converts to MCPServer CRD format.
 Review the exported YAML and make any necessary adjustments:
 
 ```yaml
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: my-server
@@ -163,7 +163,7 @@ Create an MCPGroup to organize the backends:
 
 ```yaml
 # mcp-group.yaml
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPGroup
 metadata:
   name: my-services
@@ -178,13 +178,14 @@ Add `groupRef` to each exported MCPServer:
 
 ```yaml
 # github.yaml
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: github
   namespace: default
 spec:
-  groupRef: my-services  # Add this line
+  groupRef:
+    name: my-services  # Add this field
   image: ghcr.io/example/github-mcp
   transport: streamable-http
   proxyPort: 8080
@@ -199,14 +200,15 @@ Create a VirtualMCPServer to aggregate the backends:
 
 ```yaml
 # virtual-mcp-server.yaml
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: VirtualMCPServer
 metadata:
   name: my-vmcp
   namespace: default
 spec:
-  config:
-    groupRef: my-services
+  groupRef:
+    name: my-services
+  config: {}
 
   # Configure authentication (adjust from CLI if using OIDC)
   # For OIDC, use oidcConfigRef with a shared MCPOIDCConfig resource:
@@ -339,8 +341,8 @@ The preferred approach is to create a shared `MCPOIDCConfig` resource and refere
 See example configurations:
 
 - [mcpserver_with_oidcconfig_ref.yaml](../../examples/operator/mcp-servers/mcpserver_with_oidcconfig_ref.yaml) — Shared MCPOIDCConfig (preferred)
-- [mcpserver_with_inline_oidc.yaml](../../examples/operator/mcp-servers/mcpserver_with_inline_oidc.yaml) — Inline OIDC (deprecated)
-- [mcpserver_with_kubernetes_oidc.yaml](../../examples/operator/mcp-servers/mcpserver_with_kubernetes_oidc.yaml) — Kubernetes SA OIDC (deprecated inline variant)
+
+Inline OIDC and Kubernetes SA OIDC variants were deprecated and removed; use `MCPOIDCConfig` references instead.
 
 #### Scenario 3: Grouped Servers (CLI) → VirtualMCPServer (K8s)
 
@@ -360,21 +362,21 @@ thv export backend2 ./backend2.yaml --format k8s
 
 # Create manifests (add groupRef to each backend YAML)
 cat > resources.yaml <<EOF
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPGroup
 metadata:
   name: services
 ---
-# Include backend1.yaml content with groupRef: services
-# Include backend2.yaml content with groupRef: services
+# Include backend1.yaml content with groupRef: {name: services}
+# Include backend2.yaml content with groupRef: {name: services}
 ---
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: VirtualMCPServer
 metadata:
   name: services-vmcp
 spec:
-  config:
-    groupRef: services
+  groupRef:
+    name: services
   incomingAuth:
     type: anonymous
   outgoingAuth:
@@ -407,7 +409,7 @@ kubectl apply -f resources.yaml
 #### Issue: Backend servers not discovered by VirtualMCPServer
 
 **Solution**:
-- Verify all MCPServers have `groupRef` set
+- Verify all MCPServers have `groupRef.name` set
 - Ensure all resources are in the same namespace
 - Check MCPServer status: `kubectl get mcpserver`
 - Review VirtualMCPServer conditions: `kubectl describe virtualmcpserver <name>`
@@ -436,27 +438,29 @@ For remote MCP servers that don't need a dedicated proxy, use `MCPServerEntry` i
 
 **Before (MCPRemoteProxy — deploys a proxy pod):**
 ```yaml
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPRemoteProxy
 metadata:
   name: context7
 spec:
-  remoteURL: https://mcp.context7.com/mcp
+  remoteUrl: https://mcp.context7.com/mcp
   transport: streamable-http
-  groupRef: engineering-team
+  groupRef:
+    name: engineering-team
   # Requires OIDC config, deploys proxy pod
 ```
 
 **After (MCPServerEntry — zero infrastructure):**
 ```yaml
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServerEntry
 metadata:
   name: context7
 spec:
-  remoteURL: https://mcp.context7.com/mcp
+  remoteUrl: https://mcp.context7.com/mcp
   transport: streamable-http
-  groupRef: engineering-team
+  groupRef:
+    name: engineering-team
   # No pods deployed, VirtualMCPServer connects directly
 ```
 
@@ -491,19 +495,20 @@ kubectl get virtualmcpserver my-vmcp -o yaml | grep -A 5 conditions
 kubectl get mcpgroup <group-name>
 ```
 
-Create if missing or fix `spec.config.groupRef` in VirtualMCPServer spec.
+Create if missing or fix `spec.groupRef.name` in VirtualMCPServer spec.
 
 **2. No Backend MCPServers in Group**
 
 ```bash
-kubectl get mcpserver -o custom-columns=NAME:.metadata.name,GROUP:.spec.groupRef
+kubectl get mcpserver -o custom-columns=NAME:.metadata.name,GROUP:.spec.groupRef.name
 ```
 
 **Solution**: Create MCPServers and link them to the group:
 
 ```yaml
 spec:
-  groupRef: <group-name>
+  groupRef:
+    name: <group-name>
 ```
 
 **3. Backend MCPServers Not Ready**
@@ -620,6 +625,71 @@ Then gradually add restrictions. Common Cedar policy issues:
 - Verify attribute names match token claims
 - Test policies with different user roles
 
+**Multiple upstream IDPs**: when `spec.authServerConfig` declares more than
+one `upstreamProviders` entry, Cedar evaluates claims from the first one by
+default. Pin a specific provider explicitly via
+`spec.authServerConfig.primaryUpstreamProvider`:
+
+```yaml
+spec:
+  authServerConfig:
+    issuer: https://vmcp.example.com
+    primaryUpstreamProvider: okta   # must match one of the configured upstreams
+    upstreamProviders:
+      - name: okta
+        type: oidc
+        # ...
+      - name: github
+        type: oauth2
+        # ...
+  incomingAuth:
+    authzConfig:
+      type: inline
+      inline:
+        policies:
+          - 'permit(principal, action, resource);'
+```
+
+> **Migration: `primaryUpstreamProvider` location**
+>
+> The field used to live under
+> `spec.incomingAuth.authzConfig.inline.primaryUpstreamProvider`. It has
+> moved to `spec.authServerConfig.primaryUpstreamProvider` to sit next to
+> the `upstreamProviders` list it selects from. The old location is read
+> for one release for backward compatibility; the controller emits a
+> Warning event with reason `AuthzPrimaryUpstreamProviderDeprecated`
+> whenever it consumes the deprecated location. Move the value to the new
+> location to clear the warning. The deprecated field is planned for
+> removal one release after the deprecation cycle.
+
+**Authorization policy errors**: misconfigured authz surfaces on the
+`AuthConfigured` condition with one of:
+
+* `AuthzConfigMapNotFound`: the ConfigMap referenced by
+  `spec.incomingAuth.authzConfig.configMap` does not exist in the
+  namespace. Create it before reconciling, or fix the name.
+* `AuthzConfigMapInvalid`: the ConfigMap exists but the payload is
+  missing the configured key, empty, malformed YAML/JSON, fails Cedar
+  validation, or is a registered non-Cedar authorizer (vMCP supports
+  Cedar only). Check the payload shape (see the Cedar v1 schema in the
+  example above).
+
+**Enterprise Cedar policies that deny every request**: when a policy
+walks a transitive hierarchy like `Client → ClaimGroup → PlatformRole`,
+both Cedar JWT-claim mapping settings and the static entity store must
+agree on the entity type. The configuration fields live on
+`spec.incomingAuth.authzConfig`:
+
+* `groupClaimName` / `roleClaimName`: JWT claim keys to extract.
+* `groupEntityType`: Cedar entity type used for principal parent UIDs.
+  Must match the entity type used in `entitiesJson` (e.g. `ClaimGroup`
+  rather than the default `THVGroup`).
+
+For configMap-sourced authz, the same fields can be set in the
+ConfigMap payload (`cedar.group_claim_name`, `cedar.role_claim_name`,
+`cedar.group_entity_type`); spec-level values on `authzConfig` override
+the ConfigMap when set.
+
 ### Backend Discovery Issues
 
 #### Backends Not Discovered
@@ -636,13 +706,13 @@ kubectl get virtualmcpserver my-vmcp -o jsonpath='{.status.discoveredBackends}' 
 **1. Backend Not in MCPGroup**
 
 ```bash
-kubectl get mcpserver <backend-name> -o yaml | grep groupRef
+kubectl get mcpserver <backend-name> -o yaml | grep -A1 groupRef
 ```
 
 **Solution**: Verify backend has correct `groupRef`:
 
 ```bash
-kubectl patch mcpserver <backend-name> -p '{"spec":{"groupRef":"<group-name>"}}'
+kubectl patch mcpserver <backend-name> --type merge -p '{"spec":{"groupRef":{"name":"<group-name>"}}}'
 ```
 
 **2. Namespace Mismatch**

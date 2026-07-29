@@ -73,7 +73,7 @@
 
 ---
 # Step 1: Create MCPGroup
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPGroup
 metadata:
   name: optimizer-services
@@ -83,13 +83,14 @@ spec:
 
 ---
 # Step 2a: MCPServer backend - yardstick (unit conversion)
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: yardstick
   namespace: default
 spec:
-  groupRef: optimizer-services
+  groupRef:
+    name: optimizer-services
   image: ghcr.io/stackloklabs/yardstick/yardstick-server:1.1.1
   transport: streamable-http
   proxyPort: 8080
@@ -106,13 +107,14 @@ spec:
 
 ---
 # Step 2b: MCPServer backend - fetch (URL content fetching)
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: fetch
   namespace: default
 spec:
-  groupRef: optimizer-services
+  groupRef:
+    name: optimizer-services
   image: ghcr.io/stackloklabs/gofetch/server
   transport: streamable-http
   proxyPort: 8080
@@ -130,13 +132,14 @@ spec:
 # Requires a Kubernetes Secret named "github-token" with key "token"
 # containing a GitHub Personal Access Token:
 #   kubectl create secret generic github-token --from-literal=token=ghp_YOUR_TOKEN
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: github
   namespace: default
 spec:
-  groupRef: optimizer-services
+  groupRef:
+    name: optimizer-services
   image: ghcr.io/github/github-mcp-server
   transport: stdio
   proxyPort: 8080
@@ -154,13 +157,14 @@ spec:
 
 ---
 # Step 2d: MCPServer backend - memory (knowledge graph-based persistent memory)
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: memory
   namespace: default
 spec:
-  groupRef: optimizer-services
+  groupRef:
+    name: optimizer-services
   image: docker.io/mcp/memory
   transport: stdio
   proxyPort: 8080
@@ -174,13 +178,14 @@ spec:
 
 ---
 # Step 2e: MCPServer backend - puppeteer (browser automation and web scraping)
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: puppeteer
   namespace: default
 spec:
-  groupRef: optimizer-services
+  groupRef:
+    name: optimizer-services
   image: docker.io/mcp/puppeteer
   transport: stdio
   proxyPort: 8080
@@ -194,13 +199,14 @@ spec:
 
 ---
 # Step 2f: MCPServer backend - osv (OSV vulnerability database)
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: osv
   namespace: default
 spec:
-  groupRef: optimizer-services
+  groupRef:
+    name: optimizer-services
   image: ghcr.io/stackloklabs/osv-mcp/server:0.0.7
   transport: streamable-http
   proxyPort: 8080
@@ -214,13 +220,14 @@ spec:
 
 ---
 # Step 2g: MCPServer backend - terraform (Terraform registry and workspace management)
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: terraform
   namespace: default
 spec:
-  groupRef: optimizer-services
+  groupRef:
+    name: optimizer-services
   image: docker.io/hashicorp/terraform-mcp-server:0.4.0
   transport: streamable-http
   proxyPort: 8080
@@ -239,13 +246,14 @@ spec:
 
 ---
 # Step 2h: MCPServer backend - playwright (browser automation and testing)
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: playwright
   namespace: default
 spec:
-  groupRef: optimizer-services
+  groupRef:
+    name: optimizer-services
   image: mcr.microsoft.com/playwright/mcp:v0.0.68
   transport: stdio
   proxyPort: 8080
@@ -259,13 +267,14 @@ spec:
 
 ---
 # Step 2i: MCPServer backend - everything (MCP reference/test server)
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: everything
   namespace: default
 spec:
-  groupRef: optimizer-services
+  groupRef:
+    name: optimizer-services
   image: docker.io/mcp/everything:latest
   transport: stdio
   proxyPort: 8080
@@ -279,13 +288,14 @@ spec:
 
 ---
 # Step 2j: MCPServer backend - ida-pro-mcp (IDA Pro reverse engineering)
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: ida-pro-mcp
   namespace: default
 spec:
-  groupRef: optimizer-services
+  groupRef:
+    name: optimizer-services
   image: ghcr.io/stacklok/dockyard/uvx/ida-pro-mcp:1.4.0
   transport: stdio
   proxyPort: 8080
@@ -302,13 +312,14 @@ spec:
 # Requires a Kubernetes Secret named "pagerduty-token" with key "token"
 # containing a PagerDuty User API Key:
 #   kubectl create secret generic pagerduty-token --from-literal=token=YOUR_KEY
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: pagerduty
   namespace: default
 spec:
-  groupRef: optimizer-services
+  groupRef:
+    name: optimizer-services
   image: ghcr.io/stacklok/dockyard/uvx/pagerduty-mcp:0.12.0
   transport: stdio
   proxyPort: 8080
@@ -332,7 +343,7 @@ spec:
 #   port: 8080
 #   imagePullPolicy: IfNotPresent
 #   replicas: 1
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: EmbeddingServer
 metadata:
   name: optimizer-embedding
@@ -344,15 +355,15 @@ spec: {}
 # Note: No explicit "optimizer" config is needed. The operator detects that
 # embeddingServerRef is set, auto-populates the optimizer with default values,
 # resolves the EmbeddingServer URL, and emits an "OptimizerAutoConfigured" event.
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: VirtualMCPServer
 metadata:
   name: optimizer-vmcp
   namespace: default
 spec:
+  groupRef:
+    name: optimizer-services
   config:
-    groupRef: optimizer-services
-
     # Aggregation: prefix strategy prevents tool name conflicts
     aggregation:
       conflictResolution: prefix

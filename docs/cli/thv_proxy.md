@@ -97,6 +97,7 @@ thv proxy [flags] SERVER_NAME
 ### Options
 
 ```
+      --allowed-origins stringArray                 Exact-match allowlist for the HTTP Origin header (repeatable). Recommended when binding publicly; loopback binds derive a default allowlist automatically, non-loopback binds log a warning when no value is supplied. Example: https://my-mcp.example.com
   -h, --help                                        help for proxy
       --host string                                 Host for the HTTP proxy to listen on (IP or hostname) (default "127.0.0.1")
       --oidc-audience string                        Expected audience for the token
@@ -117,6 +118,7 @@ thv proxy [flags] SERVER_NAME
       --remote-auth-client-secret-file string       Path to file containing OAuth client secret (alternative to --remote-auth-client-secret) (optional if the authorization server supports dynamic client registration (RFC 7591) or if using PKCE)
       --remote-auth-issuer string                   OAuth/OIDC issuer URL for remote server authentication (e.g., https://accounts.google.com)
       --remote-auth-resource string                 OAuth 2.0 resource indicator (RFC 8707)
+      --remote-auth-scope-param-name string         Override the query parameter name for scopes in the authorization URL (e.g., 'user_scope' for Slack OAuth)
       --remote-auth-scopes strings                  OAuth scopes to request for remote server authentication (defaults: OIDC uses 'openid,profile,email')
       --remote-auth-skip-browser                    Skip opening browser for remote server OAuth flow (default false)
       --remote-auth-timeout duration                Timeout for OAuth authentication flow (e.g., 30s, 1m, 2m30s) (default 30s)

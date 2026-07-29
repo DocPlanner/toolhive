@@ -15,7 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	mcpv1alpha1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1"
+	mcpv1beta1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1beta1"
 )
 
 // ServiceName returns the expected Service name for an MCPRemoteProxy,
@@ -68,14 +68,14 @@ func NewMCPRemoteProxyTestHelper(
 
 // RemoteProxyBuilder provides a fluent interface for building MCPRemoteProxy objects
 type RemoteProxyBuilder struct {
-	proxy *mcpv1alpha1.MCPRemoteProxy
+	proxy *mcpv1beta1.MCPRemoteProxy
 }
 
 // NewRemoteProxyBuilder creates a new MCPRemoteProxy builder with sensible defaults
 // for required fields (RemoteURL, OIDCConfig) so tests only need to override what they're testing
 func (h *MCPRemoteProxyTestHelper) NewRemoteProxyBuilder(name string) *RemoteProxyBuilder {
 	return &RemoteProxyBuilder{
-		proxy: &mcpv1alpha1.MCPRemoteProxy{
+		proxy: &mcpv1beta1.MCPRemoteProxy{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      name,
 				Namespace: h.Namespace,
@@ -83,19 +83,10 @@ func (h *MCPRemoteProxyTestHelper) NewRemoteProxyBuilder(name string) *RemotePro
 					"test.toolhive.io/suite": "operator-e2e",
 				},
 			},
-			Spec: mcpv1alpha1.MCPRemoteProxySpec{
+			Spec: mcpv1beta1.MCPRemoteProxySpec{
 				RemoteURL: "https://remote.example.com/mcp",
 				ProxyPort: 8080,
 				Transport: "streamable-http",
-				// Default OIDC config for tests - override with WithInlineOIDCConfig if testing OIDC
-				OIDCConfig: &mcpv1alpha1.OIDCConfigRef{
-					Type: "inline",
-					Inline: &mcpv1alpha1.InlineOIDCConfig{
-						Issuer:   "https://auth.example.com",
-						Audience: "test-audience",
-						ClientID: "test-client",
-					},
-				},
 			},
 		},
 	}
@@ -109,15 +100,36 @@ func (rb *RemoteProxyBuilder) WithProxyPort(port int32) *RemoteProxyBuilder {
 
 // WithExternalAuthConfigRef sets the ExternalAuthConfigRef for the proxy
 func (rb *RemoteProxyBuilder) WithExternalAuthConfigRef(name string) *RemoteProxyBuilder {
-	rb.proxy.Spec.ExternalAuthConfigRef = &mcpv1alpha1.ExternalAuthConfigRef{
+	rb.proxy.Spec.ExternalAuthConfigRef = &mcpv1beta1.ExternalAuthConfigRef{
 		Name: name,
+	}
+	return rb
+}
+
+// WithAuthServerRef sets the AuthServerRef for the proxy
+func (rb *RemoteProxyBuilder) WithAuthServerRef(name string) *RemoteProxyBuilder {
+	rb.proxy.Spec.AuthServerRef = &mcpv1beta1.AuthServerRef{
+		Kind: "MCPExternalAuthConfig",
+		Name: name,
+	}
+	return rb
+}
+
+// WithOIDCConfigRef sets the OIDCConfigRef for the proxy.
+// resourceURL sets both Audience and ResourceURL to the same value, which is
+// required when an embedded auth server is active (#4860).
+func (rb *RemoteProxyBuilder) WithOIDCConfigRef(name, resourceURL string) *RemoteProxyBuilder {
+	rb.proxy.Spec.OIDCConfigRef = &mcpv1beta1.MCPOIDCConfigReference{
+		Name:        name,
+		Audience:    resourceURL,
+		ResourceURL: resourceURL,
 	}
 	return rb
 }
 
 // WithToolConfigRef sets the ToolConfigRef for the proxy
 func (rb *RemoteProxyBuilder) WithToolConfigRef(name string) *RemoteProxyBuilder {
-	rb.proxy.Spec.ToolConfigRef = &mcpv1alpha1.ToolConfigRef{
+	rb.proxy.Spec.ToolConfigRef = &mcpv1beta1.ToolConfigRef{
 		Name: name,
 	}
 	return rb
@@ -125,20 +137,7 @@ func (rb *RemoteProxyBuilder) WithToolConfigRef(name string) *RemoteProxyBuilder
 
 // WithGroupRef sets the GroupRef for the proxy
 func (rb *RemoteProxyBuilder) WithGroupRef(name string) *RemoteProxyBuilder {
-	rb.proxy.Spec.GroupRef = name
-	return rb
-}
-
-// WithInlineOIDCConfig sets an inline OIDC config for the proxy
-func (rb *RemoteProxyBuilder) WithInlineOIDCConfig(issuer, audience string, insecureAllowHTTP bool) *RemoteProxyBuilder {
-	rb.proxy.Spec.OIDCConfig = &mcpv1alpha1.OIDCConfigRef{
-		Type: "inline",
-		Inline: &mcpv1alpha1.InlineOIDCConfig{
-			Issuer:            issuer,
-			Audience:          audience,
-			InsecureAllowHTTP: insecureAllowHTTP,
-		},
-	}
+	rb.proxy.Spec.GroupRef = &mcpv1beta1.MCPGroupRef{Name: name}
 	return rb
 }
 
@@ -148,26 +147,11 @@ func (rb *RemoteProxyBuilder) WithRemoteURL(url string) *RemoteProxyBuilder {
 	return rb
 }
 
-// WithInlineOIDCConfigAndJWKS sets an inline OIDC config with a custom JWKS URL
-func (rb *RemoteProxyBuilder) WithInlineOIDCConfigAndJWKS(
-	issuer, audience, jwksURL string,
-) *RemoteProxyBuilder {
-	rb.proxy.Spec.OIDCConfig = &mcpv1alpha1.OIDCConfigRef{
-		Type: mcpv1alpha1.OIDCConfigTypeInline,
-		Inline: &mcpv1alpha1.InlineOIDCConfig{
-			Issuer:   issuer,
-			Audience: audience,
-			JWKSURL:  jwksURL,
-		},
-	}
-	return rb
-}
-
 // WithInlineAuthzConfig sets an inline authz config with Cedar policies
 func (rb *RemoteProxyBuilder) WithInlineAuthzConfig(policies []string) *RemoteProxyBuilder {
-	rb.proxy.Spec.AuthzConfig = &mcpv1alpha1.AuthzConfigRef{
-		Type: mcpv1alpha1.AuthzConfigTypeInline,
-		Inline: &mcpv1alpha1.InlineAuthzConfig{
+	rb.proxy.Spec.AuthzConfig = &mcpv1beta1.AuthzConfigRef{
+		Type: mcpv1beta1.AuthzConfigTypeInline,
+		Inline: &mcpv1beta1.InlineAuthzConfig{
 			Policies: policies,
 		},
 	}
@@ -176,9 +160,9 @@ func (rb *RemoteProxyBuilder) WithInlineAuthzConfig(policies []string) *RemotePr
 
 // WithAuthzConfigMapRef sets an authz config referencing a ConfigMap
 func (rb *RemoteProxyBuilder) WithAuthzConfigMapRef(name, key string) *RemoteProxyBuilder {
-	rb.proxy.Spec.AuthzConfig = &mcpv1alpha1.AuthzConfigRef{
-		Type: mcpv1alpha1.AuthzConfigTypeConfigMap,
-		ConfigMap: &mcpv1alpha1.ConfigMapAuthzRef{
+	rb.proxy.Spec.AuthzConfig = &mcpv1beta1.AuthzConfigRef{
+		Type: mcpv1beta1.AuthzConfigTypeConfigMap,
+		ConfigMap: &mcpv1beta1.ConfigMapAuthzRef{
 			Name: name,
 			Key:  key,
 		},
@@ -190,11 +174,11 @@ func (rb *RemoteProxyBuilder) WithAuthzConfigMapRef(name, key string) *RemotePro
 func (rb *RemoteProxyBuilder) WithHeaderFromSecret(
 	headerName, secretName, secretKey string,
 ) *RemoteProxyBuilder {
-	rb.proxy.Spec.HeaderForward = &mcpv1alpha1.HeaderForwardConfig{
-		AddHeadersFromSecret: []mcpv1alpha1.HeaderFromSecret{
+	rb.proxy.Spec.HeaderForward = &mcpv1beta1.HeaderForwardConfig{
+		AddHeadersFromSecret: []mcpv1beta1.HeaderFromSecret{
 			{
 				HeaderName: headerName,
-				ValueSecretRef: &mcpv1alpha1.SecretKeyRef{
+				ValueSecretRef: &mcpv1beta1.SecretKeyRef{
 					Name: secretName,
 					Key:  secretKey,
 				},
@@ -206,12 +190,12 @@ func (rb *RemoteProxyBuilder) WithHeaderFromSecret(
 
 // Build returns a deep copy of the MCPRemoteProxy without creating it in the cluster.
 // Use this when testing CRD-level validation that rejects the resource at creation time.
-func (rb *RemoteProxyBuilder) Build() *mcpv1alpha1.MCPRemoteProxy {
+func (rb *RemoteProxyBuilder) Build() *mcpv1beta1.MCPRemoteProxy {
 	return rb.proxy.DeepCopy()
 }
 
 // Create builds and creates the MCPRemoteProxy in the cluster
-func (rb *RemoteProxyBuilder) Create(h *MCPRemoteProxyTestHelper) *mcpv1alpha1.MCPRemoteProxy {
+func (rb *RemoteProxyBuilder) Create(h *MCPRemoteProxyTestHelper) *mcpv1beta1.MCPRemoteProxy {
 	proxy := rb.proxy.DeepCopy()
 	err := h.Client.Create(h.Context, proxy)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to create MCPRemoteProxy")
@@ -219,8 +203,8 @@ func (rb *RemoteProxyBuilder) Create(h *MCPRemoteProxyTestHelper) *mcpv1alpha1.M
 }
 
 // GetRemoteProxy retrieves an MCPRemoteProxy by name
-func (h *MCPRemoteProxyTestHelper) GetRemoteProxy(name string) (*mcpv1alpha1.MCPRemoteProxy, error) {
-	proxy := &mcpv1alpha1.MCPRemoteProxy{}
+func (h *MCPRemoteProxyTestHelper) GetRemoteProxy(name string) (*mcpv1beta1.MCPRemoteProxy, error) {
+	proxy := &mcpv1beta1.MCPRemoteProxy{}
 	err := h.Client.Get(h.Context, types.NamespacedName{
 		Namespace: h.Namespace,
 		Name:      name,
@@ -231,7 +215,7 @@ func (h *MCPRemoteProxyTestHelper) GetRemoteProxy(name string) (*mcpv1alpha1.MCP
 // GetRemoteProxyStatus returns the current status of an MCPRemoteProxy
 func (h *MCPRemoteProxyTestHelper) GetRemoteProxyStatus(
 	name string,
-) (*mcpv1alpha1.MCPRemoteProxyStatus, error) {
+) (*mcpv1beta1.MCPRemoteProxyStatus, error) {
 	proxy, err := h.GetRemoteProxy(name)
 	if err != nil {
 		return nil, err
@@ -242,7 +226,7 @@ func (h *MCPRemoteProxyTestHelper) GetRemoteProxyStatus(
 // GetRemoteProxyPhase returns the current phase of an MCPRemoteProxy
 func (h *MCPRemoteProxyTestHelper) GetRemoteProxyPhase(
 	name string,
-) (mcpv1alpha1.MCPRemoteProxyPhase, error) {
+) (mcpv1beta1.MCPRemoteProxyPhase, error) {
 	status, err := h.GetRemoteProxyStatus(name)
 	if err != nil {
 		return "", err
@@ -269,7 +253,7 @@ func (h *MCPRemoteProxyTestHelper) GetRemoteProxyCondition(
 
 // CleanupRemoteProxies deletes all MCPRemoteProxies in the namespace
 func (h *MCPRemoteProxyTestHelper) CleanupRemoteProxies() error {
-	proxyList := &mcpv1alpha1.MCPRemoteProxyList{}
+	proxyList := &mcpv1beta1.MCPRemoteProxyList{}
 	err := h.Client.List(h.Context, proxyList, client.InNamespace(h.Namespace))
 	if err != nil {
 		return err

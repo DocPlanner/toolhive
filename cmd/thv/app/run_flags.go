@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -30,6 +31,7 @@ import (
 	"github.com/stacklok/toolhive/pkg/telemetry"
 	"github.com/stacklok/toolhive/pkg/transport"
 	"github.com/stacklok/toolhive/pkg/transport/types"
+	"github.com/stacklok/toolhive/pkg/webhook"
 )
 
 const (
@@ -57,6 +59,9 @@ type RunFlags struct {
 
 	// Remote MCP server support
 	RemoteURL string
+
+	// Stateless indicates the server is stateless (POST-only, no SSE)
+	Stateless bool
 
 	// Security and audit
 	AuthzConfig string
@@ -100,6 +105,9 @@ type RunFlags struct {
 	// Endpoint prefix for SSE endpoint URLs
 	EndpointPrefix string
 
+	// SessionTTL is the session inactivity timeout. Zero uses the transport default.
+	SessionTTL time.Duration
+
 	// Network mode
 	Network string
 
@@ -133,9 +141,19 @@ type RunFlags struct {
 	RemoteForwardHeaders       []string
 	RemoteForwardHeadersSecret []string
 
+	// AllowedOrigins is the HTTP Origin-header allowlist for DNS-rebinding protection
+	// (MCP 2025-11-25 §"Security Warning"). Empty with a loopback host auto-derives
+	// loopback-only defaults; empty with a non-loopback host disables the check
+	// (operator must supply explicit origins for public bind).
+	AllowedOrigins []string
+
 	// Runtime configuration
 	RuntimeImage       string
 	RuntimeAddPackages []string
+
+	// WebhookConfigs is a list of paths to webhook configuration files.
+	// Each file may define validating and/or mutating webhooks.
+	WebhookConfigs []string
 }
 
 // AddRunFlags adds all the run flags to a command
@@ -148,6 +166,10 @@ func AddRunFlags(cmd *cobra.Command, config *RunFlags) {
 	cmd.Flags().StringVar(&config.Name, "name", "", "Name of the MCP server (default to auto-generated from image)")
 	cmd.Flags().StringVar(&config.Group, "group", "default", "Name of the group this workload should belong to")
 	cmd.Flags().StringVar(&config.Host, "host", transport.LocalhostIPv4, "Host for the HTTP proxy to listen on (IP or hostname)")
+	cmd.Flags().StringArrayVar(&config.AllowedOrigins, "allowed-origins", nil,
+		"Exact-match allowlist for the HTTP Origin header (repeatable). Recommended when binding publicly; "+
+			"loopback binds derive a default allowlist automatically, non-loopback binds log a warning when "+
+			"no value is supplied. Example: https://my-mcp.example.com")
 	cmd.Flags().IntVar(&config.ProxyPort, "proxy-port", 0, "Port for the HTTP proxy to listen on (host port)")
 	cmd.Flags().IntVar(&config.TargetPort, "target-port", 0,
 		"Port for the container to expose (only applicable to SSE or Streamable HTTP transport)")
@@ -245,14 +267,21 @@ func AddRunFlags(cmd *cobra.Command, config *RunFlags) {
 	cmd.Flags().BoolVar(&config.OtelUseLegacyAttributes, "otel-use-legacy-attributes", true,
 		"Emit legacy attribute names alongside new OTEL semantic convention names (default true)")
 
-	cmd.Flags().BoolVar(&config.IsolateNetwork, "isolate-network", false,
-		"Isolate the container network from the host (default false)")
+	cmd.Flags().BoolVar(&config.IsolateNetwork, "isolate-network", true,
+		"Isolate the container network from the host. Use --isolate-network=false to opt out.")
 	cmd.Flags().BoolVar(&config.AllowDockerGateway, "allow-docker-gateway", false,
 		"Allow outbound connections to Docker gateway addresses (host.docker.internal, gateway.docker.internal, 172.17.0.1). "+
-			"Only applies when --isolate-network is set. These are blocked by default even when insecure_allow_all is enabled.")
+			"Only applies when --isolate-network is set. These are blocked by default even when insecure_allow_all is enabled. "+
+			"Gateway access is port-independent: it ignores the permission profile's allowed ports, so once enabled the "+
+			"gateway is reachable on any port.")
 	cmd.Flags().BoolVar(&config.TrustProxyHeaders, "trust-proxy-headers", false,
 		"Trust X-Forwarded-* headers from reverse proxies (X-Forwarded-Proto, X-Forwarded-Host, X-Forwarded-Port, X-Forwarded-Prefix) "+
 			"(default false)")
+	cmd.Flags().BoolVar(&config.Stateless, "stateless", false,
+		"Declare the server as stateless (POST-only, no SSE). "+
+			"Use for MCP servers implementing streamable-HTTP stateless mode.")
+	cmd.Flags().DurationVar(&config.SessionTTL, "session-ttl", 0,
+		"Session inactivity timeout (e.g., 30m, 2h); zero uses the default (2h)")
 	cmd.Flags().StringVar(&config.EndpointPrefix, "endpoint-prefix", "",
 		"Path prefix to prepend to SSE endpoint URLs (e.g., /playwright)")
 	cmd.Flags().StringVar(&config.Network, "network", "",
@@ -277,6 +306,10 @@ func AddRunFlags(cmd *cobra.Command, config *RunFlags) {
 	// Environment file processing flags
 	cmd.Flags().StringVar(&config.EnvFile, "env-file", "", "Load environment variables from a single file")
 	cmd.Flags().StringVar(&config.EnvFileDir, "env-file-dir", "", "Load environment variables from all files in a directory")
+
+	// Webhook configuration flags
+	cmd.Flags().StringArrayVar(&config.WebhookConfigs, "webhook-config", nil,
+		"Path to webhook configuration file (can be specified multiple times to merge configs)")
 
 	// Ignore functionality flags
 	cmd.Flags().BoolVar(&config.IgnoreGlobally, "ignore-globally", true,
@@ -313,13 +346,17 @@ func BuildRunnerConfig(
 	}
 
 	// Load application config once for the entire build.
-	appConfig := cfg.NewDefaultProvider().GetConfig()
+	configProvider := cfg.NewProvider()
+	appConfig, err := configProvider.LoadOrCreateConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load application config: %w", err)
+	}
 
 	// Setup telemetry configuration
 	telemetryConfig := setupTelemetryConfiguration(cmd, runFlags, appConfig)
 
 	// Setup runtime and validation
-	rt, envVarValidator, err := setupRuntimeAndValidation(ctx)
+	rt, envVarValidator, err := setupRuntimeAndValidation(ctx, configProvider)
 	if err != nil {
 		return nil, err
 	}
@@ -327,7 +364,7 @@ func BuildRunnerConfig(
 	if runFlags.RemoteURL != "" {
 		slog.Debug(fmt.Sprintf("Attempting to run remote MCP server: %s", runFlags.RemoteURL))
 		return buildRunnerConfig(ctx, runFlags, cmdArgs, debugMode, validatedHost, rt, runFlags.RemoteURL, nil,
-			nil, envVarValidator, oidcConfig, telemetryConfig)
+			nil, envVarValidator, oidcConfig, telemetryConfig, appConfig)
 	}
 
 	// Resolve image from registry without pulling (fast registry lookup only).
@@ -353,7 +390,7 @@ func BuildRunnerConfig(
 
 	// Build the runner config
 	runConfig, err := buildRunnerConfig(ctx, runFlags, cmdArgs, debugMode, validatedHost, rt, imageURL, serverMetadata,
-		envVars, envVarValidator, oidcConfig, telemetryConfig,
+		envVars, envVarValidator, oidcConfig, telemetryConfig, appConfig,
 		runner.WithRegistrySourceURLs(regAPIURL, regURL),
 		runner.WithRegistryServerName(regServerName))
 	if err != nil {
@@ -406,8 +443,11 @@ func setupTelemetryConfiguration(cmd *cobra.Command, runFlags *RunFlags, appConf
 		finalTelemetry.OtelUseLegacyAttributes)
 }
 
-// setupRuntimeAndValidation creates container runtime and selects environment variable validator
-func setupRuntimeAndValidation(ctx context.Context) (runtime.Deployer, runner.EnvVarValidator, error) {
+// setupRuntimeAndValidation creates container runtime and selects environment variable validator.
+// The provided configProvider is reused so the factory-registered provider is not bypassed.
+func setupRuntimeAndValidation(
+	ctx context.Context, configProvider cfg.Provider,
+) (runtime.Deployer, runner.EnvVarValidator, error) {
 	rt, err := container.NewFactory().Create(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create container runtime: %w", err)
@@ -417,8 +457,7 @@ func setupRuntimeAndValidation(ctx context.Context) (runtime.Deployer, runner.En
 	if process.IsDetached() || runtime.IsKubernetesRuntime() {
 		envVarValidator = &runner.DetachedEnvVarValidator{}
 	} else {
-		cfgProvider := cfg.NewDefaultProvider()
-		envVarValidator = runner.NewCLIEnvVarValidator(cfgProvider)
+		envVarValidator = runner.NewCLIEnvVarValidator(configProvider)
 	}
 
 	return rt, envVarValidator, nil
@@ -524,6 +563,25 @@ func loadToolsOverrideConfig(toolsOverridePath string) (map[string]runner.ToolOv
 	return *loadedToolsOverride, nil
 }
 
+// loadAndMergeWebhookConfigs loads, merges, and validates webhook configuration files.
+// Each file may define validating and/or mutating webhooks. Later files override earlier
+// ones for webhooks with the same name.
+func loadAndMergeWebhookConfigs(paths []string) (*webhook.FileConfig, error) {
+	configs := make([]*webhook.FileConfig, 0, len(paths))
+	for _, path := range paths {
+		config, err := webhook.LoadConfig(path)
+		if err != nil {
+			return nil, err
+		}
+		configs = append(configs, config)
+	}
+	merged := webhook.MergeConfigs(configs...)
+	if err := webhook.ValidateConfig(merged); err != nil {
+		return nil, fmt.Errorf("invalid webhook configuration: %w", err)
+	}
+	return merged, nil
+}
+
 // configureRemoteHeaderOptions configures header forwarding options for remote servers
 func configureRemoteHeaderOptions(runFlags *RunFlags) ([]runner.RunConfigBuilderOption, error) {
 	var opts []runner.RunConfigBuilderOption
@@ -585,6 +643,7 @@ func buildRunnerConfig(
 	envVarValidator runner.EnvVarValidator,
 	oidcConfig *auth.TokenValidatorConfig,
 	telemetryConfig *telemetry.Config,
+	appConfig *cfg.Config,
 	extraOpts ...runner.RunConfigBuilderOption,
 ) (*runner.RunConfig, error) {
 	transportType := resolveTransportType(runFlags, serverMetadata)
@@ -623,6 +682,8 @@ func buildRunnerConfig(
 		runner.WithNetworkIsolation(runFlags.IsolateNetwork),
 		runner.WithAllowDockerGateway(runFlags.AllowDockerGateway),
 		runner.WithTrustProxyHeaders(runFlags.TrustProxyHeaders),
+		runner.WithStateless(runFlags.Stateless),
+		runner.WithSessionTTL(runFlags.SessionTTL),
 		runner.WithEndpointPrefix(runFlags.EndpointPrefix),
 		runner.WithNetworkMode(runFlags.Network),
 		runner.WithK8sPodPatch(runFlags.K8sPodPatch),
@@ -636,6 +697,7 @@ func buildRunnerConfig(
 			PrintOverlays: runFlags.PrintOverlays,
 		}),
 		runner.WithPublish(runFlags.Publish),
+		runner.WithAllowedOrigins(runFlags.AllowedOrigins),
 	}
 	opts = append(opts, extraOpts...)
 
@@ -664,9 +726,21 @@ func buildRunnerConfig(
 	}
 	opts = append(opts, runtimeOpts...)
 
+	// Load and merge webhook configurations
+	if len(runFlags.WebhookConfigs) > 0 {
+		whCfg, err := loadAndMergeWebhookConfigs(runFlags.WebhookConfigs)
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts,
+			runner.WithValidatingWebhooks(whCfg.Validating),
+			runner.WithMutatingWebhooks(whCfg.Mutating),
+		)
+	}
+
 	// Configure middleware and additional options
 	additionalOpts, err := configureMiddlewareAndOptions(runFlags, serverMetadata, toolsOverride, oidcConfig,
-		telemetryConfig, serverName, transportType)
+		telemetryConfig, serverName, transportType, appConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -684,12 +758,9 @@ func configureMiddlewareAndOptions(
 	telemetryConfig *telemetry.Config,
 	serverName string,
 	transportType string,
+	appConfig *cfg.Config,
 ) ([]runner.RunConfigBuilderOption, error) {
 	var opts []runner.RunConfigBuilderOption
-
-	// Load application config for global settings
-	configProvider := cfg.NewDefaultProvider()
-	appConfig := configProvider.GetConfig()
 
 	// Resolve the OTel service name from the workload name when not explicitly set
 	telemetry.ResolveServiceName(telemetryConfig, serverName)
@@ -897,12 +968,11 @@ func getRemoteAuthFromRemoteServerMetadata(
 	authCfg.AuthorizeURL = firstNonEmpty(f.RemoteAuthAuthorizeURL, oc.AuthorizeURL)
 	authCfg.TokenURL = firstNonEmpty(f.RemoteAuthTokenURL, oc.TokenURL)
 
-	resourceIndicator := firstNonEmpty(f.RemoteAuthResource, oc.Resource)
-	if resourceIndicator != "" {
-		authCfg.Resource = resourceIndicator
-	} else {
-		authCfg.Resource = remote.DefaultResourceIndicator(remoteServerMetadata.URL)
-	}
+	// Resource is only set from explicit user flag or registry metadata.
+	// Unlike the direct-URL path (getRemoteAuthFromRunFlags), --resource-url
+	// derivation is intentionally not applied here: registry metadata is the
+	// authoritative source for the resource indicator in this path.
+	authCfg.Resource = firstNonEmpty(f.RemoteAuthResource, oc.Resource)
 
 	// OAuthParams: REPLACE metadata when CLI provides any key/value.
 	if len(runFlags.OAuthParams) > 0 {
@@ -910,6 +980,9 @@ func getRemoteAuthFromRemoteServerMetadata(
 	} else {
 		authCfg.OAuthParams = oc.OAuthParams
 	}
+
+	// ScopeParamName: from CLI flag only (not yet supported in registry metadata)
+	authCfg.ScopeParamName = f.RemoteAuthScopeParamName
 
 	// Resolve bearer token from multiple sources (flag, file, environment variable)
 	resolvedBearerToken, err := resolveSecret(
@@ -972,6 +1045,7 @@ func getRemoteAuthFromRunFlags(runFlags *RunFlags) (*remote.Config, error) {
 		ClientID:        runFlags.RemoteAuthFlags.RemoteAuthClientID,
 		ClientSecret:    clientSecret,
 		Scopes:          runFlags.RemoteAuthFlags.RemoteAuthScopes,
+		ScopeParamName:  runFlags.RemoteAuthFlags.RemoteAuthScopeParamName,
 		SkipBrowser:     runFlags.RemoteAuthFlags.RemoteAuthSkipBrowser,
 		Timeout:         runFlags.RemoteAuthFlags.RemoteAuthTimeout,
 		CallbackPort:    runFlags.RemoteAuthFlags.RemoteAuthCallbackPort,
@@ -1092,65 +1166,30 @@ func createOIDCConfig(oidcIssuer, oidcAudience, oidcJwksURL, oidcIntrospectionUR
 	return nil
 }
 
-// createTelemetryConfig creates a telemetry configuration if any telemetry parameters are provided
+// createTelemetryConfig creates a telemetry configuration if any telemetry parameters are provided.
+//
+// The bool inputs have already been resolved by getTelemetryFromFlags
+// (which layers global config defaults under any flag the user did not set),
+// so we forward them as non-nil *bool to the shared builder. This keeps the
+// CLI and the API's POST /api/v1/workloads path on the same build path; see
+// issue #5253.
 func createTelemetryConfig(otelEndpoint string, otelEnablePrometheusMetricsPath bool,
 	otelServiceName string, otelTracingEnabled bool, otelMetricsEnabled bool, otelSamplingRate float64, otelHeaders []string,
 	otelInsecure bool, otelEnvironmentVariables []string, otelCustomAttributes string,
 	otelUseLegacyAttributes bool) *telemetry.Config {
-	if otelEndpoint == "" && !otelEnablePrometheusMetricsPath {
-		return nil
-	}
-
-	// If both tracing and metrics are disabled, skip telemetry entirely.
-	// This allows users to disable telemetry via global config while keeping
-	// the endpoint configured for later re-enablement.
-	if !otelTracingEnabled && !otelMetricsEnabled && !otelEnablePrometheusMetricsPath {
-		return nil
-	}
-
-	// Parse headers from key=value format
-	headers := make(map[string]string)
-	for _, header := range otelHeaders {
-		parts := strings.SplitN(header, "=", 2)
-		if len(parts) == 2 {
-			headers[parts[0]] = parts[1]
-		}
-	}
-
-	// Process environment variables - split comma-separated values
-	var processedEnvVars []string
-	for _, envVarEntry := range otelEnvironmentVariables {
-		// Split by comma and trim whitespace
-		envVars := strings.Split(envVarEntry, ",")
-		for _, envVar := range envVars {
-			trimmed := strings.TrimSpace(envVar)
-			if trimmed != "" {
-				processedEnvVars = append(processedEnvVars, trimmed)
-			}
-		}
-	}
-
-	// Parse custom attributes
-	customAttrs, err := telemetry.ParseCustomAttributes(otelCustomAttributes)
-	if err != nil {
-		// Log the error but don't fail - telemetry is optional
-		slog.Warn(fmt.Sprintf("Failed to parse custom attributes: %v", err))
-		customAttrs = nil
-	}
-
-	telemetryCfg := &telemetry.Config{
-		Endpoint:                    otelEndpoint,
-		ServiceName:                 otelServiceName,
-		ServiceVersion:              "", // resolved at runtime in NewProvider()
-		TracingEnabled:              otelTracingEnabled,
-		MetricsEnabled:              otelMetricsEnabled,
-		Headers:                     headers,
-		Insecure:                    otelInsecure,
-		EnablePrometheusMetricsPath: otelEnablePrometheusMetricsPath,
-		EnvironmentVariables:        processedEnvVars,
-		CustomAttributes:            customAttrs,
-		UseLegacyAttributes:         otelUseLegacyAttributes,
-	}
-	telemetryCfg.SetSamplingRateFromFloat(otelSamplingRate)
-	return telemetryCfg
+	return runner.BuildTelemetryConfigFromAppConfig(
+		cfg.OpenTelemetryConfig{
+			Endpoint:                    otelEndpoint,
+			SamplingRate:                otelSamplingRate,
+			EnvVars:                     otelEnvironmentVariables,
+			MetricsEnabled:              &otelMetricsEnabled,
+			TracingEnabled:              &otelTracingEnabled,
+			Insecure:                    otelInsecure,
+			EnablePrometheusMetricsPath: otelEnablePrometheusMetricsPath,
+			UseLegacyAttributes:         &otelUseLegacyAttributes,
+		},
+		otelServiceName,
+		otelHeaders,
+		otelCustomAttributes,
+	)
 }

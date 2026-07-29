@@ -38,6 +38,10 @@ type LoginOptions struct {
 	Audience string
 	// Scopes overrides the default OAuth scopes (defaults to ["openid", "offline_access"]).
 	Scopes []string
+	// AllowPrivateIP permits RegistryURL to resolve to a private IP address.
+	// Mirrors the `--allow-private-ip` flag on `thv config set-registry`; only
+	// honored when RegistryURL is supplied (no-op when reusing stored config).
+	AllowPrivateIP bool
 }
 
 // Login performs an interactive OAuth login against the configured registry.
@@ -93,6 +97,14 @@ func Login(
 }
 
 // Logout clears cached OAuth credentials for the configured registry.
+//
+// Every secret under the registry scope is deleted, not just the refresh-token
+// key the current config points at. This is intentional: the token source also
+// stores a cached access token under "<key>_AT" (see pkg/auth/tokensource),
+// and a registry/issuer change can leave stale entries under derived keys the
+// current config no longer points at. A targeted delete would miss both and
+// allow the next login to short-circuit through tier 2/3 of the token source
+// instead of triggering a fresh browser flow.
 func Logout(ctx context.Context, configProvider config.Provider, secretsProvider secrets.Provider) error {
 	cfg, err := configProvider.LoadOrCreateConfig()
 	if err != nil {
@@ -102,39 +114,46 @@ func Logout(ctx context.Context, configProvider config.Provider, secretsProvider
 		return err
 	}
 
-	registryURL := registryURLFromConfig(cfg)
-
-	if ref := cfg.RegistryAuth.OAuth.CachedRefreshTokenRef; ref != "" {
-		if err := secretsProvider.DeleteSecret(ctx, ref); err != nil && !secrets.IsNotFoundError(err) {
-			return fmt.Errorf("deleting cached token: %w", err)
-		}
-	}
-
-	// Also attempt cleanup using the derived key as a fallback. If
-	// updateConfigTokenRef failed previously (it only logs a warning),
-	// the secret may exist under this key even when CachedRefreshTokenRef
-	// is empty or points to a different reference.
-	if cfg.RegistryAuth.OAuth.Issuer != "" {
-		derivedKey := DeriveSecretKey(registryURL, cfg.RegistryAuth.OAuth.Issuer)
-		if derivedKey != cfg.RegistryAuth.OAuth.CachedRefreshTokenRef {
-			if err := secretsProvider.DeleteSecret(ctx, derivedKey); err != nil && !secrets.IsNotFoundError(err) {
-				slog.Debug("failed to delete derived secret key", "error", err)
-			}
-		}
+	if err := deleteAllScopedSecrets(ctx, secretsProvider); err != nil {
+		return fmt.Errorf("deleting cached tokens: %w", err)
 	}
 
 	// Clear the persistent registry cache so authenticated data doesn't
 	// remain on disk after logout.
-	if err := clearRegistryCache(registryURL); err != nil {
+	if err := clearRegistryCache(registryURLFromConfig(cfg)); err != nil {
 		slog.Debug("failed to clear registry cache", "error", err)
 	}
 
-	return configProvider.UpdateConfig(func(c *config.Config) {
+	return configProvider.UpdateConfig(func(c *config.Config) error {
 		if c.RegistryAuth.OAuth != nil {
 			c.RegistryAuth.OAuth.CachedRefreshTokenRef = ""
 			c.RegistryAuth.OAuth.CachedTokenExpiry = time.Time{}
 		}
+		return nil
 	})
+}
+
+// deleteAllScopedSecrets removes every secret visible to the given (already
+// scope-restricted) provider. Mirrors pkg/llm.DeleteCachedTokens — providers
+// that cannot list or delete (e.g. the environment provider) cannot hold cached
+// tokens, so the operation is a no-op there.
+func deleteAllScopedSecrets(ctx context.Context, provider secrets.Provider) error {
+	caps := provider.Capabilities()
+	if !caps.CanList || !caps.CanDelete {
+		return nil
+	}
+	descs, err := provider.ListSecrets(ctx)
+	if err != nil {
+		return fmt.Errorf("listing cached tokens: %w", err)
+	}
+	if len(descs) == 0 {
+		return nil
+	}
+	names := make([]string, len(descs))
+	for i, d := range descs {
+		names[i] = d.Key
+	}
+	return provider.DeleteSecrets(ctx, names)
 }
 
 // validateOAuthConfig checks that registry OAuth authentication is configured.
@@ -195,23 +214,24 @@ func ensureRegistryURL(configProvider config.Provider, opts LoginOptions) error 
 		return nil
 	}
 
-	registryType, cleanPath := config.DetectRegistryType(opts.RegistryURL, false)
+	registryType, cleanPath := config.DetectRegistryType(opts.RegistryURL, opts.AllowPrivateIP)
 
 	// Always clear auth when a registry URL is explicitly provided, so that
 	// tokens are never sent to the wrong server.
-	if err := configProvider.UpdateConfig(func(c *config.Config) {
+	if err := configProvider.UpdateConfig(func(c *config.Config) error {
 		c.RegistryAuth = config.RegistryAuth{}
+		return nil
 	}); err != nil {
 		return fmt.Errorf("clearing stale auth config: %w", err)
 	}
 
 	switch registryType {
 	case config.RegistryTypeAPI:
-		if err := configProvider.SetRegistryAPI(cleanPath, false); err != nil {
+		if err := configProvider.SetRegistryAPI(cleanPath, opts.AllowPrivateIP); err != nil {
 			return fmt.Errorf("saving registry API URL: %w", err)
 		}
 	case config.RegistryTypeURL:
-		if err := configProvider.SetRegistryURL(cleanPath, false); err != nil {
+		if err := configProvider.SetRegistryURL(cleanPath, opts.AllowPrivateIP); err != nil {
 			return fmt.Errorf("saving registry URL: %w", err)
 		}
 	case config.RegistryTypeFile:
@@ -262,7 +282,7 @@ func registryURLFromConfig(cfg *config.Config) string {
 // implementation used by both Login and AuthManager.SetOAuthAuth.
 func ConfigureOAuth(
 	ctx context.Context, issuer, clientID, audience string, scopes []string,
-) (func(*config.Config), error) {
+) (func(*config.Config) error, error) {
 	if err := validateIssuerURL(issuer); err != nil {
 		return nil, err
 	}
@@ -281,7 +301,8 @@ func ConfigureOAuth(
 		return DefaultOAuthScopes()
 	}()
 
-	return func(c *config.Config) {
+	//nolint:unparam // error return is part of the UpdateConfig callback contract; this closure always succeeds
+	return func(c *config.Config) error {
 		c.RegistryAuth = config.RegistryAuth{
 			Type: config.RegistryAuthTypeOAuth,
 			OAuth: &config.RegistryOAuthConfig{
@@ -292,6 +313,7 @@ func ConfigureOAuth(
 				CallbackPort: remote.DefaultCallbackPort,
 			},
 		}
+		return nil
 	}, nil
 }
 

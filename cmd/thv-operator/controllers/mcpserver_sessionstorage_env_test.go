@@ -12,7 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	mcpv1alpha1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1"
+	mcpv1beta1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1beta1"
 	ctrlutil "github.com/stacklok/toolhive/cmd/thv-operator/pkg/controllerutil"
 	vmcpconfig "github.com/stacklok/toolhive/pkg/vmcp/config"
 )
@@ -20,20 +20,20 @@ import (
 func TestDeploymentForMCPServer_WithRedisCredentials(t *testing.T) {
 	t.Parallel()
 
-	usernameRef := &mcpv1alpha1.SecretKeyRef{Name: "redis-session-user", Key: "username"}
-	passwordRef := &mcpv1alpha1.SecretKeyRef{Name: "redis-secret", Key: "password"}
+	usernameRef := &mcpv1beta1.SecretKeyRef{Name: "redis-session-user", Key: "username"}
+	passwordRef := &mcpv1beta1.SecretKeyRef{Name: "redis-secret", Key: "password"}
 
-	mcpServer := &mcpv1alpha1.MCPServer{
+	mcpServer := &mcpv1beta1.MCPServer{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-mcp-redis",
 			Namespace: "default",
 		},
-		Spec: mcpv1alpha1.MCPServerSpec{
+		Spec: mcpv1beta1.MCPServerSpec{
 			Image:     "test-image:latest",
 			Transport: "sse",
 			ProxyPort: 8080,
-			SessionStorage: &mcpv1alpha1.SessionStorageConfig{
-				Provider:    mcpv1alpha1.SessionStorageProviderRedis,
+			SessionStorage: &mcpv1beta1.SessionStorageConfig{
+				Provider:    mcpv1beta1.SessionStorageProviderRedis,
 				Address:     "redis:6379",
 				UsernameRef: usernameRef,
 				PasswordRef: passwordRef,
@@ -42,12 +42,12 @@ func TestDeploymentForMCPServer_WithRedisCredentials(t *testing.T) {
 	}
 
 	scheme := runtime.NewScheme()
-	require.NoError(t, mcpv1alpha1.AddToScheme(scheme))
+	require.NoError(t, mcpv1beta1.AddToScheme(scheme))
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(mcpServer).
-		WithStatusSubresource(&mcpv1alpha1.MCPServer{}).
+		WithStatusSubresource(&mcpv1beta1.MCPServer{}).
 		Build()
 
 	r := &MCPServerReconciler{
@@ -56,7 +56,8 @@ func TestDeploymentForMCPServer_WithRedisCredentials(t *testing.T) {
 		PlatformDetector: ctrlutil.NewSharedPlatformDetector(),
 	}
 
-	deployment := r.deploymentForMCPServer(t.Context(), mcpServer, "test-checksum")
+	deployment, err := r.deploymentForMCPServer(t.Context(), mcpServer, "test-checksum")
+	require.NoError(t, err)
 	require.NotNil(t, deployment)
 	require.Len(t, deployment.Spec.Template.Spec.Containers, 1)
 
@@ -89,12 +90,12 @@ func TestBuildSessionRedisCredentialEnvVars(t *testing.T) {
 	t.Parallel()
 
 	r := &MCPServerReconciler{}
-	usernameRef := &mcpv1alpha1.SecretKeyRef{Name: "redis-session-user", Key: "username"}
-	passwordRef := &mcpv1alpha1.SecretKeyRef{Name: "redis-secret", Key: "password"}
+	usernameRef := &mcpv1beta1.SecretKeyRef{Name: "redis-session-user", Key: "username"}
+	passwordRef := &mcpv1beta1.SecretKeyRef{Name: "redis-secret", Key: "password"}
 
 	tests := []struct {
 		name            string
-		storage         *mcpv1alpha1.SessionStorageConfig
+		storage         *mcpv1beta1.SessionStorageConfig
 		expectEnvVarNum int
 	}{
 		{
@@ -104,23 +105,23 @@ func TestBuildSessionRedisCredentialEnvVars(t *testing.T) {
 		},
 		{
 			name:            "memory provider produces no env var",
-			storage:         &mcpv1alpha1.SessionStorageConfig{Provider: "memory"},
+			storage:         &mcpv1beta1.SessionStorageConfig{Provider: "memory"},
 			expectEnvVarNum: 0,
 		},
 		{
 			name:            "redis without credentials produces no env var",
-			storage:         &mcpv1alpha1.SessionStorageConfig{Provider: mcpv1alpha1.SessionStorageProviderRedis, Address: "redis:6379"},
+			storage:         &mcpv1beta1.SessionStorageConfig{Provider: mcpv1beta1.SessionStorageProviderRedis, Address: "redis:6379"},
 			expectEnvVarNum: 0,
 		},
 		{
 			name:            "redis with passwordRef produces redis password env var",
-			storage:         &mcpv1alpha1.SessionStorageConfig{Provider: mcpv1alpha1.SessionStorageProviderRedis, Address: "redis:6379", PasswordRef: passwordRef},
+			storage:         &mcpv1beta1.SessionStorageConfig{Provider: mcpv1beta1.SessionStorageProviderRedis, Address: "redis:6379", PasswordRef: passwordRef},
 			expectEnvVarNum: 1,
 		},
 		{
 			name: "redis with usernameRef and passwordRef produces both redis credential env vars",
-			storage: &mcpv1alpha1.SessionStorageConfig{
-				Provider:    mcpv1alpha1.SessionStorageProviderRedis,
+			storage: &mcpv1beta1.SessionStorageConfig{
+				Provider:    mcpv1beta1.SessionStorageProviderRedis,
 				Address:     "redis:6379",
 				UsernameRef: usernameRef,
 				PasswordRef: passwordRef,
@@ -133,9 +134,9 @@ func TestBuildSessionRedisCredentialEnvVars(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			mcpServer := &mcpv1alpha1.MCPServer{
+			mcpServer := &mcpv1beta1.MCPServer{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-mcp", Namespace: "default"},
-				Spec:       mcpv1alpha1.MCPServerSpec{SessionStorage: tc.storage},
+				Spec:       mcpv1beta1.MCPServerSpec{SessionStorage: tc.storage},
 			}
 
 			env := r.buildSessionRedisCredentialEnvVars(mcpServer)

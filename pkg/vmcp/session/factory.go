@@ -17,8 +17,8 @@ import (
 	"github.com/stacklok/toolhive/pkg/auth"
 	transportsession "github.com/stacklok/toolhive/pkg/transport/session"
 	"github.com/stacklok/toolhive/pkg/vmcp"
-	"github.com/stacklok/toolhive/pkg/vmcp/aggregator"
 	vmcpauth "github.com/stacklok/toolhive/pkg/vmcp/auth"
+	"github.com/stacklok/toolhive/pkg/vmcp/session/binding"
 	"github.com/stacklok/toolhive/pkg/vmcp/session/internal/backend"
 	"github.com/stacklok/toolhive/pkg/vmcp/session/internal/security"
 	sessiontypes "github.com/stacklok/toolhive/pkg/vmcp/session/types"
@@ -27,11 +27,6 @@ import (
 const (
 	defaultMaxBackendInitConcurrency = 10
 	defaultBackendInitTimeout        = 30 * time.Second
-
-	// MetadataKeyIdentitySubject is the transport-session metadata key that
-	// holds the subject claim of the authenticated caller (identity.Subject).
-	// Set at session creation; empty for anonymous callers.
-	MetadataKeyIdentitySubject = "vmcp.identity.subject"
 
 	// MetadataKeyBackendIDs is the transport-session metadata key that holds
 	// a comma-separated, sorted list of successfully-connected backend IDs.
@@ -46,18 +41,6 @@ const (
 	MetadataKeyBackendSessionPrefix = "vmcp.backend.session."
 )
 
-var (
-	// defaultHMACSecret is the fallback HMAC secret used when WithHMACSecret is not provided.
-	// WARNING: This is INSECURE and should ONLY be used for testing/development.
-	// Production deployments MUST provide a secure secret via WithHMACSecret option.
-	//
-	// NOTE: In multi-replica deployments, all replicas must use the same HMAC secret,
-	// injected via the VMCP_SESSION_HMAC_SECRET environment variable. If replicas use
-	// different secrets, cross-pod token validation will silently reject legitimate
-	// callers. The default insecure secret must NOT be used in production.
-	defaultHMACSecret = []byte("insecure-default-for-testing-only-change-in-production")
-)
-
 // MultiSessionFactory creates new MultiSessions for connecting clients.
 type MultiSessionFactory interface {
 	// MakeSessionWithID creates a new MultiSession with a specific session ID.
@@ -67,9 +50,8 @@ type MultiSessionFactory interface {
 	// The id parameter must be non-empty and should be a valid MCP session ID
 	// (visible ASCII characters, 0x21 to 0x7E per the MCP specification).
 	//
-	// The allowAnonymous parameter controls whether the session allows nil caller
-	// identity. If false, all session method calls must provide a valid caller
-	// that matches the session creator's identity.
+	// Whether the session allows anonymous (nil) caller identity is derived
+	// internally from identity via ShouldAllowAnonymous.
 	//
 	// All other behaviour (partial initialisation, bounded concurrency, etc.)
 	// is identical to MakeSession.
@@ -77,18 +59,19 @@ type MultiSessionFactory interface {
 		ctx context.Context,
 		id string,
 		identity *auth.Identity,
-		allowAnonymous bool,
 		backends []*vmcp.Backend,
 	) (MultiSession, error)
 
 	// RestoreSession reconstructs a live MultiSession from persisted metadata.
 	// It reconnects to the backends whose IDs are listed in storedMetadata under
 	// MetadataKeyBackendIDs, rebuilds the routing table, and reapplies the
-	// hijack-prevention decorator using the stored token hash and salt.
+	// session-binding decorator from the stored identity binding.
 	//
 	// Use this when the node-local session cache misses — for example after a
 	// pod restart or when a request is routed to a different pod. It is more
 	// expensive than a cache hit because it opens new backend connections.
+	// Because MCP clients cannot be serialised, sticky sessions (session affinity
+	// at the load balancer) minimise how often this path is taken.
 	//
 	// allBackends is the current backend list from the registry; RestoreSession
 	// filters it to the subset originally included in this session.
@@ -108,6 +91,11 @@ type MultiSessionFactory interface {
 //  2. Running the MCP Initialize handshake.
 //  3. Querying backend capabilities (tools, resources, prompts).
 //
+// sessionHint is the backend-assigned session ID from a prior connection (stored
+// in Redis metadata). When non-empty the connector should send it as the
+// Mcp-Session-Id hint during Initialize so the backend can resume rather than
+// re-initialize. Pass an empty string for brand-new sessions.
+//
 // The returned backend.Session owns the underlying transport connection and
 // must be closed when the session ends. The returned CapabilityList is used
 // to populate the session's routing table and capability lists.
@@ -118,6 +106,7 @@ type backendConnector func(
 	ctx context.Context,
 	target *vmcp.BackendTarget,
 	identity *auth.Identity,
+	sessionHint string,
 ) (backend.Session, *vmcp.CapabilityList, error)
 
 // CapabilityChangeRegistrar is an optional interface implemented by session
@@ -135,8 +124,6 @@ type defaultMultiSessionFactory struct {
 	backendInitTimeout         time.Duration
 	backendRequestTimeout      time.Duration
 	perWorkloadRequestTimeouts map[string]time.Duration
-	hmacSecret                 []byte                 // Server-managed secret for HMAC-SHA256 token hashing
-	aggregator                 aggregator.Aggregator  // Optional: applies tool transforms (overrides, conflict resolution, filter)
 	onCapabilityChange         func(backendID string) // Late-bound callback for capability-change notifications
 }
 
@@ -187,36 +174,6 @@ func WithBackendRequestTimeouts(
 	}
 }
 
-// WithHMACSecret sets the server-managed secret used for HMAC-SHA256 token hashing.
-// The secret should be 32+ bytes and loaded from secure configuration (e.g., environment
-// variable, secret management system).
-//
-// The secret is defensively copied to prevent external modification after assignment.
-// Empty or nil secrets are rejected (function is a no-op) to prevent accidental security downgrades.
-//
-// If not set, a default insecure secret is used (NOT RECOMMENDED for production).
-func WithHMACSecret(secret []byte) MultiSessionFactoryOption {
-	return func(f *defaultMultiSessionFactory) {
-		// Reject empty/nil secrets to prevent silent security downgrade
-		if len(secret) == 0 {
-			slog.Warn("WithHMACSecret: empty or nil secret rejected, falling back to default insecure secret",
-				"recommendation", "provide a secure secret via VMCP_SESSION_HMAC_SECRET environment variable")
-			return
-		}
-		// Make a defensive copy to prevent external modification
-		f.hmacSecret = append([]byte(nil), secret...)
-	}
-}
-
-// WithAggregator configures the factory to apply per-backend tool overrides,
-// conflict resolution, and advertising filters when building sessions.
-// If not set, raw backend tool names are used unchanged.
-func WithAggregator(agg aggregator.Aggregator) MultiSessionFactoryOption {
-	return func(f *defaultMultiSessionFactory) {
-		f.aggregator = agg
-	}
-}
-
 // SetOnCapabilityChange registers a callback that fires when any backend
 // session created by this factory receives a tools/list_changed or
 // resources/list_changed notification from its backend. The callback is
@@ -235,7 +192,6 @@ func NewSessionFactory(registry vmcpauth.OutgoingAuthRegistry, opts ...MultiSess
 	f := &defaultMultiSessionFactory{
 		maxConcurrency:     defaultMaxBackendInitConcurrency,
 		backendInitTimeout: defaultBackendInitTimeout,
-		hmacSecret:         defaultHMACSecret,
 	}
 	for _, opt := range opts {
 		opt(f)
@@ -263,7 +219,6 @@ func newSessionFactoryWithConnector(connector backendConnector, opts ...MultiSes
 		connector:          connector,
 		maxConcurrency:     defaultMaxBackendInitConcurrency,
 		backendInitTimeout: defaultBackendInitTimeout,
-		hmacSecret:         defaultHMACSecret, // Initialize with default (insecure) secret
 	}
 	for _, opt := range opts {
 		opt(f)
@@ -287,12 +242,13 @@ func (f *defaultMultiSessionFactory) initOneBackend(
 	ctx context.Context,
 	b *vmcp.Backend,
 	identity *auth.Identity,
+	sessionHint string,
 ) *initResult {
 	bCtx, cancel := context.WithTimeout(ctx, f.backendInitTimeout)
 	defer cancel()
 
 	target := vmcp.BackendToTarget(b)
-	conn, caps, err := f.connector(bCtx, target, identity)
+	conn, caps, err := f.connector(bCtx, target, identity, sessionHint)
 	if err != nil {
 		if conn != nil {
 			_ = conn.Close()
@@ -353,85 +309,16 @@ func buildRoutingTable(results []initResult) (*vmcp.RoutingTable, []vmcp.Tool, [
 	return rt, tools, resources, prompts
 }
 
-// buildRoutingTableWithAggregator applies the aggregator's full transformation
-// pipeline (overrides, conflict resolution, advertising filter) to the raw
-// backend capabilities in results, producing resolved tool names identical to
-// the standard aggregation path. Resources and prompts pass through unchanged.
-//
-// Returns the routing table, advertised tools (for MCP clients), all resolved
-// tools (for schema lookup), resources, prompts, and any error.
-func buildRoutingTableWithAggregator(
-	ctx context.Context,
-	agg aggregator.Aggregator,
-	results []initResult,
-) (*vmcp.RoutingTable, []vmcp.Tool, []vmcp.Tool, []vmcp.Resource, []vmcp.Prompt, error) {
-	toolsByBackend := make(map[string][]vmcp.Tool, len(results))
-	targets := make(map[string]*vmcp.BackendTarget, len(results))
-	for i := range results {
-		r := &results[i]
-		toolsByBackend[r.target.WorkloadID] = r.caps.Tools
-		targets[r.target.WorkloadID] = r.target
-	}
-
-	advertisedTools, allResolvedTools, toolsRouting, err := agg.ProcessPreQueriedCapabilities(ctx, toolsByBackend, targets)
-	if err != nil {
-		return nil, nil, nil, nil, nil, err
-	}
-
-	rt := &vmcp.RoutingTable{
-		Tools:     toolsRouting,
-		Resources: make(map[string]*vmcp.BackendTarget),
-		Prompts:   make(map[string]*vmcp.BackendTarget),
-	}
-
-	var allResources []vmcp.Resource
-	var allPrompts []vmcp.Prompt
-	for _, r := range results {
-		for _, res := range r.caps.Resources {
-			if _, ok := rt.Resources[res.URI]; !ok {
-				allResources = append(allResources, res)
-				rt.Resources[res.URI] = r.target
-			}
-		}
-		for _, prompt := range r.caps.Prompts {
-			if _, ok := rt.Prompts[prompt.Name]; !ok {
-				allPrompts = append(allPrompts, prompt)
-				rt.Prompts[prompt.Name] = r.target
-			}
-		}
-	}
-
-	return rt, advertisedTools, allResolvedTools, allResources, allPrompts, nil
-}
-
 // MakeSessionWithID implements MultiSessionFactory.
 func (f *defaultMultiSessionFactory) MakeSessionWithID(
 	ctx context.Context,
 	id string,
 	identity *auth.Identity,
-	allowAnonymous bool,
 	backends []*vmcp.Backend,
 ) (MultiSession, error) {
 	if err := validateSessionID(id); err != nil {
 		return nil, err
 	}
-
-	// Validate allowAnonymous is consistent with identity to prevent security footguns.
-	// If identity has a token, allowAnonymous must be false (caller wants a bound session).
-	// If identity is nil or has no token, allowAnonymous should be true (anonymous session).
-	if identity != nil && identity.Token != "" && allowAnonymous {
-		return nil, fmt.Errorf(
-			"invalid session configuration: cannot create anonymous session " +
-				"(allowAnonymous=true) with bearer token (identity.Token is non-empty)",
-		)
-	}
-	if (identity == nil || identity.Token == "") && !allowAnonymous {
-		return nil, fmt.Errorf(
-			"invalid session configuration: cannot create bound session " +
-				"(allowAnonymous=false) without bearer token (identity is nil or has empty token)",
-		)
-	}
-
 	return f.makeSession(ctx, id, identity, backends)
 }
 
@@ -466,23 +353,22 @@ func populateBackendMetadata(transportSess transportsession.Session, results []i
 			transportSess.SetMetadata(MetadataKeyBackendSessionPrefix+r.target.WorkloadID, sessID)
 		}
 	}
-	// Always write MetadataKeyBackendIDs, even for zero-backend sessions ("").
-	// This distinguishes an explicit zero-backend state from absent/corrupted metadata
-	// in RestoreSession, preventing filterBackendsByStoredIDs from silently
-	// falling back to all backends when the key is missing.
+	// Always write MetadataKeyBackendIDs — key presence distinguishes explicit
+	// zero-backend from absent/corrupted metadata (see const doc).
 	transportSess.SetMetadata(MetadataKeyBackendIDs, strings.Join(ids, ","))
 }
 
 // makeBaseSession initialises backends and assembles a defaultMultiSession
-// WITHOUT applying the hijack-prevention security wrapper.
+// WITHOUT applying the session-binding security wrapper.
 // Callers are responsible for wrapping the result with the appropriate decorator
-// (PreventSessionHijacking for new sessions, RestoreHijackPrevention for restored ones).
+// (BindSession for new sessions, RestoreSessionBinding for restored ones).
 func (f *defaultMultiSessionFactory) makeBaseSession(
 	ctx context.Context,
 	sessID string,
 	identity *auth.Identity,
 	backends []*vmcp.Backend,
-) (*defaultMultiSession, error) {
+	sessionHints map[string]string,
+) *defaultMultiSession {
 	filtered := make([]*vmcp.Backend, 0, len(backends))
 	for _, b := range backends {
 		if b == nil {
@@ -502,7 +388,7 @@ func (f *defaultMultiSessionFactory) makeBaseSession(
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			rawResults[i] = f.initOneBackend(ctx, b, identity)
+			rawResults[i] = f.initOneBackend(ctx, b, identity, sessionHints[b.ID])
 		}(i, b)
 	}
 	wg.Wait()
@@ -527,29 +413,13 @@ func (f *defaultMultiSessionFactory) makeBaseSession(
 			"backendCount", len(backends))
 	}
 
-	var (
-		routingTable     *vmcp.RoutingTable
-		advertisedTools  []vmcp.Tool
-		allResolvedTools []vmcp.Tool
-		allResources     []vmcp.Resource
-		allPrompts       []vmcp.Prompt
-	)
-	if f.aggregator != nil {
-		var aggErr error
-		routingTable, advertisedTools, allResolvedTools, allResources, allPrompts, aggErr =
-			buildRoutingTableWithAggregator(ctx, f.aggregator, results)
-		if aggErr != nil {
-			return nil, fmt.Errorf("failed to process backend capabilities: %w", aggErr)
-		}
-	} else {
-		routingTable, advertisedTools, allResources, allPrompts = buildRoutingTable(results)
-		allResolvedTools = advertisedTools // no filter when no aggregator
-	}
+	// The core is the single source of capability aggregation/advertising (the factory never
+	// aggregates), so the routing table is built from the raw backend capabilities with no
+	// overrides/conflict-resolution/filter; advertised and resolved tools are identical.
+	routingTable, advertisedTools, allResources, allPrompts := buildRoutingTable(results)
+	allResolvedTools := advertisedTools
 
 	transportSess := transportsession.NewStreamableSession(sessID)
-	if identity != nil && identity.Subject != "" {
-		transportSess.SetMetadata(MetadataKeyIdentitySubject, identity.Subject)
-	}
 	populateBackendMetadata(transportSess, results)
 
 	return &defaultMultiSession{
@@ -563,11 +433,11 @@ func (f *defaultMultiSessionFactory) makeBaseSession(
 		backendSessions: backendSessions,
 		creatorIdentity: cloneIdentity(identity),
 		queue:           newAdmissionQueue(),
-	}, nil
+	}
 }
 
 // makeSession is the shared implementation for MakeSession and MakeSessionWithID.
-// It builds the base session via makeBaseSession, then applies the hijack-prevention
+// It builds the base session via makeBaseSession, then applies the session-binding
 // security wrapper using the caller's identity.
 func (f *defaultMultiSessionFactory) makeSession(
 	ctx context.Context,
@@ -575,14 +445,12 @@ func (f *defaultMultiSessionFactory) makeSession(
 	identity *auth.Identity,
 	backends []*vmcp.Backend,
 ) (MultiSession, error) {
-	baseSession, err := f.makeBaseSession(ctx, sessID, identity, backends)
-	if err != nil {
-		return nil, err
-	}
+	baseSession := f.makeBaseSession(ctx, sessID, identity, backends, nil)
 
-	// Apply hijack prevention: computes token binding, stores metadata, and wraps
-	// the session with validation logic.
-	decorated, err := security.PreventSessionHijacking(baseSession, f.hmacSecret, identity)
+	// Apply session binding: extracts the (iss, sub) identity tuple, stores it in
+	// session metadata under MetadataKeyIdentityBinding, and wraps the session with
+	// validation logic that checks every subsequent caller against that binding.
+	decorated, err := security.BindSession(baseSession, identity)
 	if err != nil {
 		_ = baseSession.Close()
 		return nil, err
@@ -592,8 +460,10 @@ func (f *defaultMultiSessionFactory) makeSession(
 
 // RestoreSession implements MultiSessionFactory.
 // It reconnects to the backends whose IDs are listed in storedMetadata, rebuilds
-// the routing table, and reapplies the hijack-prevention decorator from the stored
-// token hash and salt — without recomputing them from a (unavailable) token.
+// the routing table, and reapplies the session-binding decorator from the stored
+// identity binding. Because the original bearer token is not persisted, backend
+// connectors receive nil identity; live requests carry a fully-populated identity
+// on req.Context() from TokenValidator.Middleware.
 func (f *defaultMultiSessionFactory) RestoreSession(
 	ctx context.Context,
 	id string,
@@ -617,56 +487,68 @@ func (f *defaultMultiSessionFactory) RestoreSession(
 	// Filter allBackends to the subset originally connected in this session.
 	filteredBackends := filterBackendsByStoredIDs(allBackends, storedBackendIDs)
 
-	// Reconstruct a minimal identity from stored metadata. The original bearer
-	// token is never persisted (only its HMAC-SHA256 hash is), so Token is empty.
-	// The security decorator is restored from the stored hash/salt below.
-	var identity *auth.Identity
-	if subject := storedMetadata[MetadataKeyIdentitySubject]; subject != "" {
-		identity = &auth.Identity{}
-		identity.Subject = subject
+	// Validate and read the stored identity binding. This key is written by
+	// BindSession at session-creation time and identifies whether the session
+	// was bound to an authenticated identity or was anonymous.
+	storedBinding, hasBinding := storedMetadata[sessiontypes.MetadataKeyIdentityBinding]
+	if !hasBinding {
+		// Legacy token-hash key present confirms not corrupted — safe to invalidate.
+		if _, hasLegacy := storedMetadata[sessiontypes.MetadataKeyTokenHash]; hasLegacy {
+			slog.Warn("RestoreSession: legacy session missing identity binding; invalidating",
+				"reason", "legacy_session_missing_identity_binding",
+			)
+			return nil, transportsession.ErrSessionNotFound
+		}
+		return nil, fmt.Errorf("RestoreSession: %q metadata key absent (corrupted session metadata)",
+			sessiontypes.MetadataKeyIdentityBinding)
 	}
 
-	// Build the base session (backend connections + routing table) without the
-	// security wrapper. The wrapper is applied separately using stored hash/salt.
-	baseSession, err := f.makeBaseSession(ctx, id, identity, filteredBackends)
-	if err != nil {
-		return nil, fmt.Errorf("RestoreSession: failed to rebuild backend connections: %w", err)
-	}
-
-	// Restore only the security keys (token hash and salt) from stored metadata.
-	// MetadataKeyIdentitySubject is already set by makeBaseSession via the
-	// reconstructed identity. MetadataKeyBackendIDs and the per-backend session
-	// keys (MetadataKeyBackendSessionPrefix.*) are freshly computed by
-	// makeBaseSession from the actual reconnected backends; overwriting them with
-	// stored values would make metadata inconsistent if any backend failed to
-	// reconnect during restore.
-	for _, key := range []string{
-		sessiontypes.MetadataKeyOwnerURL,
-		sessiontypes.MetadataKeyTokenHash,
-		sessiontypes.MetadataKeyTokenSalt,
-	} {
-		if v, ok := storedMetadata[key]; ok {
-			baseSession.SetMetadata(key, v)
+	// Validate that the stored binding is parsable (or the unauthenticated
+	// sentinel) before proceeding. A malformed value indicates corrupted metadata.
+	// We do NOT construct a partial *auth.Identity here: the original bearer
+	// token is not persisted, so UpstreamTokens cannot be recovered. Fabricating
+	// a struct with empty Token and UpstreamTokens would violate the contract that
+	// a non-nil *auth.Identity is always fully populated (see pkg/auth/identity.go).
+	// Backend connectors receive nil identity; live tool calls already carry a
+	// complete identity on req.Context() from TokenValidator.Middleware. See #5336.
+	if !binding.IsUnauthenticated(storedBinding) {
+		if _, _, ok := binding.Parse(storedBinding); !ok {
+			return nil, fmt.Errorf("RestoreSession: stored identity binding is malformed: %q", storedBinding)
 		}
 	}
 
-	// Recreate the hijack-prevention decorator using the stored hash and salt,
-	// not by recomputing from identity.Token (which is unavailable at restore time).
-	//
-	// Fail closed if the token-hash key is entirely absent from stored metadata:
-	// PreventSessionHijacking always writes the key (empty string for anonymous,
-	// non-empty for authenticated), so an absent key indicates corrupted or
-	// truncated metadata — not a legitimately anonymous session.
-	storedHash, hashKeyPresent := storedMetadata[sessiontypes.MetadataKeyTokenHash]
-	if !hashKeyPresent {
-		_ = baseSession.Close()
-		return nil, fmt.Errorf("RestoreSession: token hash metadata key absent (corrupted session metadata)")
+	// Extract stored per-backend session IDs as hints so each backend can
+	// resume its session (via Mcp-Session-Id) rather than starting a new one.
+	sessionHints := make(map[string]string, len(filteredBackends))
+	for _, b := range filteredBackends {
+		if hint := storedMetadata[MetadataKeyBackendSessionPrefix+b.ID]; hint != "" {
+			sessionHints[b.ID] = hint
+		}
 	}
-	storedSalt := storedMetadata[sessiontypes.MetadataKeyTokenSalt]
-	restored, err := security.RestoreHijackPrevention(baseSession, storedHash, storedSalt, f.hmacSecret)
+
+	// Build the base session (backend connections + routing table) without the
+	// security wrapper. Pass nil identity — see comment above.
+	baseSession := f.makeBaseSession(ctx, id, nil, filteredBackends, sessionHints)
+
+	// Restore only the identity-binding key from stored metadata. The other
+	// keys (MetadataKeyBackendIDs, MetadataKeyBackendSessionPrefix.*) are
+	// freshly computed by makeBaseSession from the actual reconnected backends;
+	// overwriting them with stored values would make metadata inconsistent if
+	// any backend failed to reconnect during restore.
+	baseSession.SetMetadata(sessiontypes.MetadataKeyIdentityBinding, storedBinding)
+
+	// Preserve the session-owner URL so a replica restoring this session still
+	// knows which pod currently owns the live SDK session state. Owner-forwarding
+	// logic in the server consults this key to route live-session traffic (SSE
+	// listen/delete and methodless client replies) back to the owning pod.
+	if ownerURL, ok := storedMetadata[sessiontypes.MetadataKeyOwnerURL]; ok && ownerURL != "" {
+		baseSession.SetMetadata(sessiontypes.MetadataKeyOwnerURL, ownerURL)
+	}
+
+	restored, err := security.RestoreSessionBinding(baseSession, storedBinding)
 	if err != nil {
 		_ = baseSession.Close()
-		return nil, fmt.Errorf("RestoreSession: failed to restore hijack prevention: %w", err)
+		return nil, fmt.Errorf("RestoreSession: failed to restore session binding: %w", err)
 	}
 	return restored, nil
 }

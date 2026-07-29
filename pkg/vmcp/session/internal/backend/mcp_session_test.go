@@ -4,12 +4,14 @@
 package backend
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/stacklok/toolhive/pkg/secrets"
 	"github.com/stacklok/toolhive/pkg/vmcp"
 	vmcpauth "github.com/stacklok/toolhive/pkg/vmcp/auth"
 	"github.com/stacklok/toolhive/pkg/vmcp/auth/strategies"
@@ -26,6 +28,10 @@ func newTestRegistry(t *testing.T) vmcpauth.OutgoingAuthRegistry {
 	return reg
 }
 
+// mergeForwardedHeaders is now a one-line delegation to
+// headerforward.MergeForwardedHeaders; full coverage lives in
+// pkg/vmcp/headerforward/transport_test.go (TestMergeForwardedHeaders).
+
 func TestCreateMCPClient_UnsupportedTransport(t *testing.T) {
 	t.Parallel()
 
@@ -41,7 +47,9 @@ func TestCreateMCPClient_UnsupportedTransport(t *testing.T) {
 				TransportType: transport,
 			}
 
-			_, err := createMCPClient(target, nil, newTestRegistry(t), time.Second)
+			_, err := createMCPClient(
+				context.Background(), target, nil, newTestRegistry(t), "", secrets.NewEnvironmentProvider(), time.Second,
+			)
 			require.Error(t, err)
 			assert.ErrorIs(t, err, vmcp.ErrUnsupportedTransport,
 				"transport %q should return ErrUnsupportedTransport", transport)

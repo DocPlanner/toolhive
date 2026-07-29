@@ -17,9 +17,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	mcpv1alpha1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1"
+	mcpv1beta1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1beta1"
+	"github.com/stacklok/toolhive/cmd/thv-operator/api/v1beta1/v1beta1test"
+	"github.com/stacklok/toolhive/cmd/thv-operator/internal/testutil"
 	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/runconfig/configmap/checksum"
-	vmcpconfig "github.com/stacklok/toolhive/pkg/vmcp/config"
 	"github.com/stacklok/toolhive/pkg/vmcp/workloads"
 )
 
@@ -33,22 +34,19 @@ const (
 // twice with the same PodTemplateSpec produces identical results (no spurious updates)
 func TestVirtualMCPServerPodTemplateSpecDeterministic(t *testing.T) {
 	t.Parallel()
-	scheme := runtime.NewScheme()
-	_ = mcpv1alpha1.AddToScheme(scheme)
-	_ = corev1.AddToScheme(scheme)
-	_ = appsv1.AddToScheme(scheme)
+	scheme := testutil.NewScheme(t)
 
 	namespace := testPodTemplateNamespace
 	vmcpName := testPodTemplateVmcpName
 	groupName := testPodTemplateGroupName
 
-	mcpGroup := &mcpv1alpha1.MCPGroup{
+	mcpGroup := &mcpv1beta1.MCPGroup{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      groupName,
 			Namespace: namespace,
 		},
-		Status: mcpv1alpha1.MCPGroupStatus{
-			Phase: mcpv1alpha1.MCPGroupPhaseReady,
+		Status: mcpv1beta1.MCPGroupStatus{
+			Phase: mcpv1beta1.MCPGroupPhaseReady,
 		},
 	}
 
@@ -58,16 +56,10 @@ func TestVirtualMCPServerPodTemplateSpecDeterministic(t *testing.T) {
 		},
 	}
 
-	vmcp := &mcpv1alpha1.VirtualMCPServer{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      vmcpName,
-			Namespace: namespace,
-		},
-		Spec: mcpv1alpha1.VirtualMCPServerSpec{
-			Config:          vmcpconfig.Config{Group: groupName},
-			PodTemplateSpec: podTemplateSpecToRawExtension(t, podTemplate),
-		},
-	}
+	vmcp := v1beta1test.NewVirtualMCPServer(vmcpName, namespace,
+		v1beta1test.WithVMCPGroupRef(groupName),
+		v1beta1test.WithVMCPPodTemplateSpec(podTemplateSpecToRawExtension(t, podTemplate)),
+	)
 
 	configMap := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -87,8 +79,8 @@ func TestVirtualMCPServerPodTemplateSpecDeterministic(t *testing.T) {
 	}
 
 	// Generate deployment twice with same input
-	dep1 := reconciler.deploymentForVirtualMCPServer(context.Background(), vmcp, "test-checksum", []workloads.TypedWorkload{})
-	dep2 := reconciler.deploymentForVirtualMCPServer(context.Background(), vmcp, "test-checksum", []workloads.TypedWorkload{})
+	dep1 := reconciler.deploymentForVirtualMCPServer(context.Background(), vmcp, "test-checksum", nil, []workloads.TypedWorkload{})
+	dep2 := reconciler.deploymentForVirtualMCPServer(context.Background(), vmcp, "test-checksum", nil, []workloads.TypedWorkload{})
 
 	// Both should be non-nil
 	assert.NotNil(t, dep1, "First deployment should not be nil")
@@ -111,39 +103,30 @@ func TestVirtualMCPServerPodTemplateSpecDeterministic(t *testing.T) {
 // This is a regression test for the nil-slice-becomes-empty-array bug.
 func TestVirtualMCPServerPodTemplateSpecPreservesContainer(t *testing.T) {
 	t.Parallel()
-	scheme := runtime.NewScheme()
-	_ = mcpv1alpha1.AddToScheme(scheme)
-	_ = corev1.AddToScheme(scheme)
-	_ = appsv1.AddToScheme(scheme)
+	scheme := testutil.NewScheme(t)
 
 	namespace := testPodTemplateNamespace
 	vmcpName := testPodTemplateVmcpName
 	groupName := testPodTemplateGroupName
 
-	mcpGroup := &mcpv1alpha1.MCPGroup{
+	mcpGroup := &mcpv1beta1.MCPGroup{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      groupName,
 			Namespace: namespace,
 		},
-		Status: mcpv1alpha1.MCPGroupStatus{
-			Phase: mcpv1alpha1.MCPGroupPhaseReady,
+		Status: mcpv1beta1.MCPGroupStatus{
+			Phase: mcpv1beta1.MCPGroupPhaseReady,
 		},
 	}
 
 	// Use raw JSON directly (simulating real user input) - only nodeSelector, no containers
 	// This is the exact scenario that triggered the original bug
-	vmcp := &mcpv1alpha1.VirtualMCPServer{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      vmcpName,
-			Namespace: namespace,
-		},
-		Spec: mcpv1alpha1.VirtualMCPServerSpec{
-			Config: vmcpconfig.Config{Group: groupName},
-			PodTemplateSpec: &runtime.RawExtension{
-				Raw: []byte(`{"spec":{"nodeSelector":{"disktype":"ssd"}}}`),
-			},
-		},
-	}
+	vmcp := v1beta1test.NewVirtualMCPServer(vmcpName, namespace,
+		v1beta1test.WithVMCPGroupRef(groupName),
+		v1beta1test.WithVMCPPodTemplateSpec(&runtime.RawExtension{
+			Raw: []byte(`{"spec":{"nodeSelector":{"disktype":"ssd"}}}`),
+		}),
+	)
 
 	configMap := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -162,7 +145,7 @@ func TestVirtualMCPServerPodTemplateSpecPreservesContainer(t *testing.T) {
 		Scheme: scheme,
 	}
 
-	dep := reconciler.deploymentForVirtualMCPServer(context.Background(), vmcp, "test-checksum", []workloads.TypedWorkload{})
+	dep := reconciler.deploymentForVirtualMCPServer(context.Background(), vmcp, "test-checksum", nil, []workloads.TypedWorkload{})
 
 	// Verify deployment was created
 	assert.NotNil(t, dep, "Deployment should not be nil")
@@ -284,16 +267,10 @@ func TestVirtualMCPServerPodTemplateSpecNeedsUpdate(t *testing.T) {
 				},
 			}
 
-			vmcp := &mcpv1alpha1.VirtualMCPServer{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      testPodTemplateVmcpName,
-					Namespace: testPodTemplateNamespace,
-				},
-				Spec: mcpv1alpha1.VirtualMCPServerSpec{
-					Config:          vmcpconfig.Config{Group: testPodTemplateGroupName},
-					PodTemplateSpec: tt.newPodTemplateSpec,
-				},
-			}
+			vmcp := v1beta1test.NewVirtualMCPServer(testPodTemplateVmcpName, testPodTemplateNamespace,
+				v1beta1test.WithVMCPGroupRef(testPodTemplateGroupName),
+				v1beta1test.WithVMCPPodTemplateSpec(tt.newPodTemplateSpec),
+			)
 
 			reconciler := &VirtualMCPServerReconciler{}
 			needsUpdate := reconciler.podTemplateSpecNeedsUpdate(
@@ -303,42 +280,141 @@ func TestVirtualMCPServerPodTemplateSpecNeedsUpdate(t *testing.T) {
 	}
 }
 
+// TestVirtualMCPServerPodTemplateSpecPreservesUndetectedFields is a regression test for
+// https://github.com/stacklok/toolhive/issues/5110. PodTemplateSpecBuilder.isEmpty()
+// only enumerated a subset of PodSpec fields, so applyPodTemplateSpecToDeployment
+// skipped the strategic merge patch when a user set only fields outside that list
+// (runtimeClassName, topologySpreadConstraints, hostNetwork, dnsConfig, readinessGates).
+func TestVirtualMCPServerPodTemplateSpecPreservesUndetectedFields(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		userJSON string
+		assert   func(t *testing.T, podSpec corev1.PodSpec)
+	}{
+		{
+			name:     "runtimeClassName is preserved",
+			userJSON: `{"spec":{"runtimeClassName":"kata"}}`,
+			assert: func(t *testing.T, podSpec corev1.PodSpec) {
+				t.Helper()
+				require.NotNil(t, podSpec.RuntimeClassName)
+				assert.Equal(t, "kata", *podSpec.RuntimeClassName)
+			},
+		},
+		{
+			name:     "topologySpreadConstraints are preserved",
+			userJSON: `{"spec":{"topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"vmcp"}}}]}}`,
+			assert: func(t *testing.T, podSpec corev1.PodSpec) {
+				t.Helper()
+				require.Len(t, podSpec.TopologySpreadConstraints, 1)
+				assert.Equal(t, int32(1), podSpec.TopologySpreadConstraints[0].MaxSkew)
+				assert.Equal(t, "topology.kubernetes.io/zone", podSpec.TopologySpreadConstraints[0].TopologyKey)
+			},
+		},
+		{
+			name:     "hostNetwork is preserved",
+			userJSON: `{"spec":{"hostNetwork":true}}`,
+			assert: func(t *testing.T, podSpec corev1.PodSpec) {
+				t.Helper()
+				assert.True(t, podSpec.HostNetwork)
+			},
+		},
+		{
+			name:     "dnsConfig is preserved",
+			userJSON: `{"spec":{"dnsConfig":{"searches":["svc.cluster.local"]}}}`,
+			assert: func(t *testing.T, podSpec corev1.PodSpec) {
+				t.Helper()
+				require.NotNil(t, podSpec.DNSConfig)
+				assert.Equal(t, []string{"svc.cluster.local"}, podSpec.DNSConfig.Searches)
+			},
+		},
+		{
+			name:     "readinessGates are preserved",
+			userJSON: `{"spec":{"readinessGates":[{"conditionType":"cloud.google.com/load-balancer-healthy"}]}}`,
+			assert: func(t *testing.T, podSpec corev1.PodSpec) {
+				t.Helper()
+				require.Len(t, podSpec.ReadinessGates, 1)
+				assert.Equal(t, corev1.PodConditionType("cloud.google.com/load-balancer-healthy"), podSpec.ReadinessGates[0].ConditionType)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			scheme := testutil.NewScheme(t)
+
+			mcpGroup := &mcpv1beta1.MCPGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      testPodTemplateGroupName,
+					Namespace: testPodTemplateNamespace,
+				},
+				Status: mcpv1beta1.MCPGroupStatus{
+					Phase: mcpv1beta1.MCPGroupPhaseReady,
+				},
+			}
+
+			vmcp := v1beta1test.NewVirtualMCPServer(testPodTemplateVmcpName, testPodTemplateNamespace,
+				v1beta1test.WithVMCPGroupRef(testPodTemplateGroupName),
+				v1beta1test.WithVMCPPodTemplateSpec(&runtime.RawExtension{Raw: []byte(tt.userJSON)}),
+			)
+
+			configMap := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      vmcpConfigMapName(testPodTemplateVmcpName),
+					Namespace: testPodTemplateNamespace,
+				},
+			}
+
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(mcpGroup, vmcp, configMap).
+				Build()
+
+			reconciler := &VirtualMCPServerReconciler{
+				Client: fakeClient,
+				Scheme: scheme,
+			}
+
+			dep := reconciler.deploymentForVirtualMCPServer(
+				context.Background(), vmcp, "test-checksum", nil, []workloads.TypedWorkload{})
+
+			require.NotNil(t, dep, "Deployment should not be nil")
+			assert.Len(t, dep.Spec.Template.Spec.Containers, 1, "vmcp container should be preserved")
+			assert.Equal(t, "vmcp", dep.Spec.Template.Spec.Containers[0].Name)
+			tt.assert(t, dep.Spec.Template.Spec)
+		})
+	}
+}
+
 // TestVirtualMCPServerPodTemplateSpecResourceOverride verifies that a user can override
 // the default resource requirements via PodTemplateSpec using strategic merge patch.
 func TestVirtualMCPServerPodTemplateSpecResourceOverride(t *testing.T) {
 	t.Parallel()
-	scheme := runtime.NewScheme()
-	_ = mcpv1alpha1.AddToScheme(scheme)
-	_ = corev1.AddToScheme(scheme)
-	_ = appsv1.AddToScheme(scheme)
+	scheme := testutil.NewScheme(t)
 
 	namespace := testPodTemplateNamespace
 	vmcpName := testPodTemplateVmcpName
 	groupName := testPodTemplateGroupName
 
-	mcpGroup := &mcpv1alpha1.MCPGroup{
+	mcpGroup := &mcpv1beta1.MCPGroup{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      groupName,
 			Namespace: namespace,
 		},
-		Status: mcpv1alpha1.MCPGroupStatus{
-			Phase: mcpv1alpha1.MCPGroupPhaseReady,
+		Status: mcpv1beta1.MCPGroupStatus{
+			Phase: mcpv1beta1.MCPGroupPhaseReady,
 		},
 	}
 
 	// Provide custom resources for the vmcp container via PodTemplateSpec
-	vmcp := &mcpv1alpha1.VirtualMCPServer{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      vmcpName,
-			Namespace: namespace,
-		},
-		Spec: mcpv1alpha1.VirtualMCPServerSpec{
-			Config: vmcpconfig.Config{Group: groupName},
-			PodTemplateSpec: &runtime.RawExtension{
-				Raw: []byte(`{"spec":{"containers":[{"name":"vmcp","resources":{"requests":{"cpu":"200m","memory":"256Mi"},"limits":{"cpu":"1","memory":"1Gi"}}}]}}`),
-			},
-		},
-	}
+	vmcp := v1beta1test.NewVirtualMCPServer(vmcpName, namespace,
+		v1beta1test.WithVMCPGroupRef(groupName),
+		v1beta1test.WithVMCPPodTemplateSpec(&runtime.RawExtension{
+			Raw: []byte(`{"spec":{"containers":[{"name":"vmcp","resources":{"requests":{"cpu":"200m","memory":"256Mi"},"limits":{"cpu":"1","memory":"1Gi"}}}]}}`),
+		}),
+	)
 
 	configMap := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -357,7 +433,7 @@ func TestVirtualMCPServerPodTemplateSpecResourceOverride(t *testing.T) {
 		Scheme: scheme,
 	}
 
-	dep := reconciler.deploymentForVirtualMCPServer(context.Background(), vmcp, "test-checksum", []workloads.TypedWorkload{})
+	dep := reconciler.deploymentForVirtualMCPServer(context.Background(), vmcp, "test-checksum", nil, []workloads.TypedWorkload{})
 
 	require.NotNil(t, dep, "Deployment should not be nil")
 	require.Len(t, dep.Spec.Template.Spec.Containers, 1, "Should have exactly one container")

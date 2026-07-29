@@ -25,8 +25,7 @@ Represents an MCP server registry in Kubernetes. When you create an `MCPRegistry
 
 1. Synchronizes registry data from various sources (ConfigMap, Git)
 2. Deploys a Registry API service for server discovery
-3. Provides image validation
-4. Manages automatic and manual synchronization policies
+3. Manages automatic and manual synchronization policies
 
 For detailed MCPRegistry documentation, see [REGISTRY.md](REGISTRY.md).
 
@@ -130,6 +129,10 @@ helm upgrade -i toolhive-operator-crds oci://ghcr.io/stacklok/toolhive/toolhive-
 helm upgrade -i <release_name> oci://ghcr.io/stacklok/toolhive/toolhive-operator --version=<version> -n toolhive-system --create-namespace
 ```
 
+For the full list of configurable values, see the
+[operator chart](../../deploy/charts/operator/README.md) and
+[operator CRDs chart](../../deploy/charts/operator-crds/README.md) documentation.
+
 ## Usage
 
 ### Creating an MCP Server
@@ -137,7 +140,7 @@ helm upgrade -i <release_name> oci://ghcr.io/stacklok/toolhive/toolhive-operator
 To create an MCP server, define an `MCPServer` resource and apply it to your cluster:
 
 ```yaml
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: fetch
@@ -166,7 +169,7 @@ kubectl apply -f your-mcpserver.yaml
 For MCP servers that require authentication tokens or other secrets:
 
 ```yaml
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: github
@@ -273,7 +276,7 @@ kubectl create configmap my-registry-data --from-file registry.json=/path/to/you
 Then create the MCPRegistry resource with `configYAML` and mount the ConfigMap:
 
 ```yaml
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPRegistry
 metadata:
   name: my-registry
@@ -283,7 +286,6 @@ spec:
   configYAML: |
     sources:
       - name: my-source
-        format: toolhive
         file:
           path: /config/registry/my-source/registry.json
         syncPolicy:
@@ -351,7 +353,7 @@ This operator is scaffolded using Kubebuilder. If you want to make changes to th
 Generate CRD manifests:
 
 ```bash
-kubebuilder create api --group toolhive --version v1alpha1 --kind MCPServer
+kubebuilder create api --group toolhive --version v1beta1 --kind MCPServer
 ```
 
 Update CRD manifests after changing API types:
@@ -370,7 +372,7 @@ task operator-run
 
 The Kubebuilder project structure is as follows:
 
-- `api/v1alpha1/`: Contains the API definitions for the CRDs
+- `api/v1beta1/`: Contains the API definitions for the CRDs
 - `controllers/`: Contains the reconciliation logic for the controllers
 - `config/`: Contains the Kubernetes manifests for deploying the operator
 - `PROJECT`: Kubebuilder project configuration file

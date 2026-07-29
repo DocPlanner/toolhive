@@ -12,6 +12,7 @@ vMCP solves the problem of **MCP server sprawl**. As organizations deploy more s
 - **Composite workflows** - Create new tools that orchestrate multiple backends
 - **Centralized security** - Single authentication and authorization point
 - **Token management** - Exchange and cache tokens for backend access
+- **Shared telemetry** - Reference an MCPTelemetryConfig via `telemetryConfigRef` for fleet-wide OpenTelemetry settings
 
 ## Architecture
 
@@ -236,12 +237,16 @@ Middleware is applied by wrapping handlers, so execution order is outer-to-inner
 | Order | Middleware | Required | Purpose |
 |-------|------------|----------|---------|
 | 1 | Recovery | Always | Catches panics, returns HTTP 500 |
-| 2 | Authentication | Optional | Validates incoming JWT tokens (OIDC/Anonymous) |
-| 3 | Authorization | Optional | Evaluates Cedar policies (composed with auth) |
-| 4 | Audit | Optional | Logs request events for compliance |
-| 5 | Discovery | Always | Aggregates backend capabilities per session |
-| 6 | Backend Enrichment | Optional | Adds backend name to audit context |
-| 7 | Telemetry | Optional | OpenTelemetry instrumentation |
+| 2 | WriteTimeout | Always | Clears the server `WriteTimeout` for qualifying SSE connections |
+| 3 | Header Validation | Always | Rejects GETs without `Accept: text/event-stream` before they reach the MCP handler |
+| 4 | Authentication (+ MCP parsing) | Optional | Validates incoming credentials (OIDC/local/anonymous); MCP parsing is composed inside so downstream layers see `ParsedMCPRequest` |
+| 5 | Audit | Optional | Logs request events for compliance |
+| 6 | Discovery | Always | Aggregates backend capabilities per session |
+| 7 | Annotation Enrichment | Optional | Injects tool annotations into context for annotation-aware authz (only when Authorization is configured) |
+| 8 | Authorization | Optional | Evaluates Cedar policies after discovery and annotation enrichment |
+| 9 | Backend Enrichment | Optional | Adds backend name to audit context (only when Audit is configured) |
+| 10 | MCP Parsing | Always | Second application is a no-op when auth already parsed; ensures telemetry can label metrics with `mcp_method` when auth is nil |
+| 11 | Telemetry | Optional | OpenTelemetry instrumentation |
 
 ### Discovery Middleware
 
@@ -271,13 +276,16 @@ This enriches audit events with the backend name for better observability.
 
 ### Authentication Composition
 
-When Authorization is configured, Authentication middleware is composed with MCP Parsing and Authorization:
+`pkg/vmcp/auth/factory/incoming.NewIncomingAuthMiddleware()` returns two separate middlewares:
+
+- `authMw`: Authentication composed with MCP Parsing (parsing runs immediately after auth so downstream layers see `ParsedMCPRequest`).
+- `authzMw`: Authorization, returned independently so the server can place it after discovery and annotation enrichment in the chain.
+
+The server wires them around discovery/annotation-enrichment so the effective execution order is:
 
 ```
-Authentication → MCP Parsing → Authorization → Next Handler
+Authentication → MCP Parsing → Audit → Discovery → Annotation Enrichment → Authorization → Next Handler
 ```
-
-This composition is created by `pkg/vmcp/auth/factory/incoming.NewIncomingAuthMiddleware()`.
 
 **Implementation**: `pkg/vmcp/server/server.go`, `pkg/vmcp/discovery/middleware.go`, `pkg/vmcp/auth/factory/`
 
@@ -289,14 +297,29 @@ vMCP monitors backend health with configurable intervals. Health status (healthy
 
 ## Deployment
 
-vMCP can be deployed two ways:
+vMCP can be deployed in three ways:
 
 - **Kubernetes** - Via the VirtualMCPServer CRD managed by the operator
-- **CLI** - Standalone via the `vmcp` binary for development or non-Kubernetes environments
+- **Local CLI (`thv vmcp`)** - Recommended path for local and non-Kubernetes use; built into the main `thv` binary
+- **Standalone `vmcp` binary** - Preserved for backwards compatibility and advanced CLI use
 
 **Implementation**:
 - Kubernetes: `cmd/thv-operator/controllers/virtualmcpserver_controller.go`
-- CLI: `cmd/vmcp/`
+- Local CLI: `cmd/thv/app/vmcp.go`, `pkg/vmcp/cli/`
+- Standalone binary: `cmd/vmcp/`
+
+## Local CLI Mode
+
+`thv vmcp` is the recommended way to run a vMCP server outside of Kubernetes. It provides the same aggregation, tool routing, and optimizer capabilities as the Kubernetes-managed VirtualMCPServer, but runs as a local foreground process driven by Cobra CLI flags.
+
+Key features:
+
+- **Zero-config quick mode**: `thv vmcp serve --group <name>` generates an in-memory config from a running ToolHive group — no YAML file required.
+- **Config-file workflow**: `thv vmcp init` → `thv vmcp validate` → `thv vmcp serve --config` for reproducible deployments.
+- **Optimizer tiers**: optional FTS5 keyword search (Tier 1) and managed TEI semantic search (Tier 2) reduce tool count for MCP clients.
+- **Loopback-only binding**: quick mode enforces a loopback-only host via `ServeConfig.validateQuickModeHost` — `localhost`, `127.0.0.1`, `::1`, or any other loopback IP is accepted; non-loopback addresses are rejected.
+
+See [Local vMCP CLI Mode](vmcp-local.md) for the full architecture, optimizer tier table, and TEI container lifecycle documentation.
 
 ## Status Reporting
 
@@ -310,12 +333,12 @@ Status reporting enables vMCP runtime to report operational status directly inst
 
 ### Key Concepts
 
-- `StatusReporter` interface (`pkg/vmcp/status/reporter.go`): `ReportStatus(ctx, *vmcp.Status)` and `Start(ctx)` returning shutdown func.
+- `Reporter` interface (`pkg/vmcp/status/reporter.go`); set via `Config.StatusReporter` field: `ReportStatus(ctx, *vmcp.Status)` and `Start(ctx)` returning shutdown func.
 - Status model (`pkg/vmcp/types.go`):
   - Phase: Pending, Ready, Degraded, Failed
   - Conditions: `metav1.Condition` (ready, backends discovered, auth configured) using shared constants
   - DiscoveredBackends: backend URL/auth type/health with timestamps
-- CLI reporter: Logging-only reporter (no persistence) always logs status updates.
+- CLI reporter: Logging-only reporter (no persistence) logs status updates at Debug level (visible when `--debug` is set).
 - Lifecycle hook: server starts the reporter, collects shutdown funcs, and stops them during graceful shutdown.
 
 ### Integration in vMCP Runtime
@@ -338,3 +361,7 @@ Status reporting enables vMCP runtime to report operational status directly inst
 - [Operator Architecture](09-operator-architecture.md) - CRD details
 - [Transport Architecture](03-transport-architecture.md) - Transport types used by backends
 - [Middleware Architecture](../middleware.md) - Shared middleware system (Authentication, Audit, Telemetry, etc.)
+- [Local vMCP CLI Mode](vmcp-local.md) - `thv vmcp` CLI surface, optimizer tiers, and TEI lifecycle
+- [vMCP Library Embedding](vmcp-library.md) - Embedding `pkg/vmcp/` in downstream Go projects
+- [vMCP Scalability Limits and Constraints](13-vmcp-scalability.md) - Per-pod session cap, TTL mechanics, Redis sizing, and pod restart behaviour
+- [Deployment Modes](01-deployment-modes.md) - Where vMCP fits among local and Kubernetes deployment patterns
