@@ -36,6 +36,7 @@ func SkillsRouter(skillService skills.SkillService) http.Handler {
 	r.Post("/push", apierrors.ErrorHandler(routes.pushSkill))
 	r.Get("/builds", apierrors.ErrorHandler(routes.listBuilds))
 	r.Delete("/builds/{tag}", apierrors.ErrorHandler(routes.deleteBuild))
+	r.Get("/content", apierrors.ErrorHandler(routes.getSkillContent))
 
 	return r
 }
@@ -84,8 +85,13 @@ func (s *SkillsRoutes) listSkills(w http.ResponseWriter, r *http.Request) error 
 //	@Success		201		{object}	installSkillResponse
 //	@Header			201		{string}	Location	"URI of the installed skill resource"
 //	@Failure		400		{string}	string		"Bad Request"
+//	@Failure		401		{string}	string		"Unauthorized (registry refused credentials)"
+//	@Failure		404		{string}	string		"Not Found (artifact not present in registry)"
 //	@Failure		409		{string}	string		"Conflict"
+//	@Failure		429		{string}	string		"Too Many Requests (registry rate limit)"
 //	@Failure		500		{string}	string		"Internal Server Error"
+//	@Failure		502		{string}	string		"Bad Gateway (upstream registry failure)"
+//	@Failure		504		{string}	string		"Gateway Timeout (upstream pull timed out)"
 //	@Router			/api/v1beta/skills [post]
 func (s *SkillsRoutes) installSkill(w http.ResponseWriter, r *http.Request) error {
 	var req installSkillRequest
@@ -101,7 +107,7 @@ func (s *SkillsRoutes) installSkill(w http.ResponseWriter, r *http.Request) erro
 		Version:     req.Version,
 		Scope:       req.Scope,
 		ProjectRoot: req.ProjectRoot,
-		Client:      req.Client,
+		Clients:     req.Clients,
 		Force:       req.Force,
 		Group:       req.Group,
 	})
@@ -321,4 +327,41 @@ func (s *SkillsRoutes) deleteBuild(w http.ResponseWriter, r *http.Request) error
 	}
 	w.WriteHeader(http.StatusNoContent)
 	return nil
+}
+
+// getSkillContent retrieves the SKILL.md body and file listing from an OCI artifact.
+//
+//	@Summary		Get skill content
+//	@Description	Retrieve the SKILL.md body and file listing from an artifact
+//	@Description	without installing it. Accepts OCI refs, git refs, or local tags.
+//	@Tags			skills
+//	@Produce		json
+//	@Param			ref	query		string	true	"OCI reference or local build tag"
+//	@Success		200	{object}	skills.SkillContent
+//	@Failure		400	{string}	string	"Bad Request"
+//	@Failure		401	{string}	string	"Unauthorized (registry refused credentials)"
+//	@Failure		404	{string}	string	"Not Found (artifact not present in registry)"
+//	@Failure		429	{string}	string	"Too Many Requests (registry rate limit)"
+//	@Failure		500	{string}	string	"Internal Server Error"
+//	@Failure		502	{string}	string	"Bad Gateway (upstream registry or git resolver failure)"
+//	@Failure		504	{string}	string	"Gateway Timeout (upstream pull timed out)"
+//	@Router			/api/v1beta/skills/content [get]
+func (s *SkillsRoutes) getSkillContent(w http.ResponseWriter, r *http.Request) error {
+	ref := r.URL.Query().Get("ref")
+	if ref == "" {
+		return httperr.WithCode(
+			fmt.Errorf("ref query parameter is required"),
+			http.StatusBadRequest,
+		)
+	}
+
+	content, err := s.skillService.GetContent(r.Context(), skills.ContentOptions{
+		Reference: ref,
+	})
+	if err != nil {
+		return err
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	return json.NewEncoder(w).Encode(content)
 }

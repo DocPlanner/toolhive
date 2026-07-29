@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -16,13 +17,14 @@ import (
 	"github.com/stacklok/toolhive-core/permissions"
 	regtypes "github.com/stacklok/toolhive-core/registry/types"
 	"github.com/stacklok/toolhive/pkg/auth"
-	"github.com/stacklok/toolhive/pkg/auth/tokenexchange"
 	"github.com/stacklok/toolhive/pkg/authserver"
 	"github.com/stacklok/toolhive/pkg/authserver/server/registration"
 	appconfig "github.com/stacklok/toolhive/pkg/config"
 	"github.com/stacklok/toolhive/pkg/mcp"
 	"github.com/stacklok/toolhive/pkg/networking"
+	"github.com/stacklok/toolhive/pkg/oauthproto/tokenexchange"
 	"github.com/stacklok/toolhive/pkg/transport/types"
+	"github.com/stacklok/toolhive/pkg/webhook"
 )
 
 func TestRunConfigBuilder_Build_WithPermissionProfile(t *testing.T) {
@@ -545,6 +547,40 @@ func TestRunConfigBuilder_WithToolOverride(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRunConfigBuilder_WithWebhookConfigs(t *testing.T) {
+	t.Parallel()
+
+	validating := []webhook.Config{
+		{
+			Name:          "validate-a",
+			URL:           "http://localhost/validate-a",
+			Timeout:       webhook.DefaultTimeout,
+			FailurePolicy: webhook.FailurePolicyIgnore,
+			TLSConfig:     &webhook.TLSConfig{InsecureSkipVerify: true},
+		},
+	}
+	mutating := []webhook.Config{
+		{
+			Name:          "mutate-a",
+			URL:           "http://localhost/mutate-a",
+			Timeout:       3 * time.Second,
+			FailurePolicy: webhook.FailurePolicyIgnore,
+			TLSConfig:     &webhook.TLSConfig{InsecureSkipVerify: true},
+		},
+	}
+
+	builder := &runConfigBuilder{
+		config: &RunConfig{},
+	}
+
+	require.NoError(t, WithValidatingWebhooks(validating)(builder))
+	require.NoError(t, WithMutatingWebhooks(mutating)(builder))
+	require.Len(t, builder.config.ValidatingWebhooks, 1)
+	require.Len(t, builder.config.MutatingWebhooks, 1)
+	assert.Equal(t, validating, builder.config.ValidatingWebhooks)
+	assert.Equal(t, mutating, builder.config.MutatingWebhooks)
 }
 
 func TestRunConfigBuilder_ToolOverrideMutualExclusivity(t *testing.T) {
@@ -1453,6 +1489,57 @@ func TestWithRegistryServerName(t *testing.T) {
 	}
 }
 
+func TestWithSessionTTL(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		ttl         time.Duration
+		expectErr   bool
+		expectedTTL string
+	}{
+		{
+			name:        "zero is accepted and serialized as empty (use transport default)",
+			ttl:         0,
+			expectErr:   false,
+			expectedTTL: "",
+		},
+		{
+			name:        "positive duration is stored as Go duration string",
+			ttl:         45 * time.Minute,
+			expectErr:   false,
+			expectedTTL: "45m0s",
+		},
+		{
+			name:        "large positive duration is stored as Go duration string",
+			ttl:         24 * time.Hour,
+			expectErr:   false,
+			expectedTTL: "24h0m0s",
+		},
+		{
+			name:      "negative duration returns an error",
+			ttl:       -1 * time.Second,
+			expectErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			builder := &runConfigBuilder{config: NewRunConfig()}
+			err := WithSessionTTL(tt.ttl)(builder)
+
+			if tt.expectErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.expectedTTL, builder.config.SessionTTL)
+		})
+	}
+}
+
 func TestResolveRegistryServerName(t *testing.T) {
 	t.Parallel()
 
@@ -1494,4 +1581,61 @@ func TestResolveRegistryServerName(t *testing.T) {
 			assert.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+// TestWithAdditionalMiddlewareConfigs verifies the generic injected-middleware
+// builder option: it appends pre-built configs (across multiple calls and
+// multiple arguments), preserves order, and skips nil entries. The option is
+// OBO-agnostic, so the test uses synthetic middleware types.
+func TestWithAdditionalMiddlewareConfigs(t *testing.T) {
+	t.Parallel()
+
+	mk := func(t *testing.T, mwType string) *types.MiddlewareConfig {
+		t.Helper()
+		mc, err := types.NewMiddlewareConfig(mwType, map[string]string{"marker": mwType})
+		require.NoError(t, err)
+		return mc
+	}
+
+	t.Run("appends a single config", func(t *testing.T) {
+		t.Parallel()
+		b := &runConfigBuilder{config: &RunConfig{}}
+		require.NoError(t, WithAdditionalMiddlewareConfigs(mk(t, "type-a"))(b))
+		require.Len(t, b.config.AdditionalMiddlewareConfigs, 1)
+		assert.Equal(t, "type-a", b.config.AdditionalMiddlewareConfigs[0].Type)
+	})
+
+	t.Run("multiple args in one call preserve order", func(t *testing.T) {
+		t.Parallel()
+		b := &runConfigBuilder{config: &RunConfig{}}
+		require.NoError(t, WithAdditionalMiddlewareConfigs(mk(t, "type-a"), mk(t, "type-b"))(b))
+		require.Len(t, b.config.AdditionalMiddlewareConfigs, 2)
+		assert.Equal(t, "type-a", b.config.AdditionalMiddlewareConfigs[0].Type)
+		assert.Equal(t, "type-b", b.config.AdditionalMiddlewareConfigs[1].Type)
+	})
+
+	t.Run("multiple calls are additive", func(t *testing.T) {
+		t.Parallel()
+		b := &runConfigBuilder{config: &RunConfig{}}
+		require.NoError(t, WithAdditionalMiddlewareConfigs(mk(t, "type-a"))(b))
+		require.NoError(t, WithAdditionalMiddlewareConfigs(mk(t, "type-b"))(b))
+		require.Len(t, b.config.AdditionalMiddlewareConfigs, 2)
+		assert.Equal(t, "type-a", b.config.AdditionalMiddlewareConfigs[0].Type)
+		assert.Equal(t, "type-b", b.config.AdditionalMiddlewareConfigs[1].Type)
+	})
+
+	t.Run("nil entries are skipped", func(t *testing.T) {
+		t.Parallel()
+		b := &runConfigBuilder{config: &RunConfig{}}
+		require.NoError(t, WithAdditionalMiddlewareConfigs(nil, mk(t, "type-a"), nil)(b))
+		require.Len(t, b.config.AdditionalMiddlewareConfigs, 1)
+		assert.Equal(t, "type-a", b.config.AdditionalMiddlewareConfigs[0].Type)
+	})
+
+	t.Run("no args leaves the slice nil", func(t *testing.T) {
+		t.Parallel()
+		b := &runConfigBuilder{config: &RunConfig{}}
+		require.NoError(t, WithAdditionalMiddlewareConfigs()(b))
+		assert.Nil(t, b.config.AdditionalMiddlewareConfigs)
+	})
 }

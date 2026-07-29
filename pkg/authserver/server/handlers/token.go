@@ -49,8 +49,13 @@ func (h *Handler) TokenHandler(w http.ResponseWriter, req *http.Request) {
 			server.ErrInvalidTarget.WithHint("Multiple resource parameters are not supported"))
 		return
 	}
+	// Audience defaulting below is restricted to authorization_code grants: for
+	// refresh_token grants fosite already carries the originally-granted audience
+	// forward through the session, so re-granting (or demanding a resource) here
+	// would conflict with fosite's audience matching strategy.
+	isAuthCodeGrant := accessRequest.GetGrantTypes().ExactOne("authorization_code")
 	switch {
-	case len(resources) == 1:
+	case len(resources) == 1 && resources[0] != "":
 		resource := resources[0]
 		// Validate URI format per RFC 8707
 		if err := server.ValidateAudienceURI(resource); err != nil {
@@ -76,13 +81,19 @@ func (h *Handler) TokenHandler(w http.ResponseWriter, req *http.Request) {
 			"resource", resource,
 		)
 		accessRequest.GrantAudience(resource)
-	case len(h.config.AllowedAudiences) == 1:
-		defaultAudience := h.config.AllowedAudiences[0]
-		slog.Debug("granting default audience for token request without resource", //nolint:gosec // G706: configured audience URI
-			"audience", defaultAudience,
+	case isAuthCodeGrant && len(h.config.AllowedAudiences) == 1:
+		// No resource parameter provided (or provided as empty) during an
+		// authorization_code exchange; default to the sole allowed audience. The
+		// len == 1 guard makes the intended audience unambiguous and the index
+		// access safe.
+		slog.Debug("no resource parameter, defaulting to sole allowed audience", //nolint:gosec // G706: configured audience URI
+			"audience", h.config.AllowedAudiences[0],
 		)
-		accessRequest.GrantAudience(defaultAudience)
-	case len(h.config.AllowedAudiences) > 1:
+		accessRequest.GrantAudience(h.config.AllowedAudiences[0])
+	case isAuthCodeGrant && len(h.config.AllowedAudiences) > 1:
+		// Multiple audiences are configured and the client did not say which one
+		// it wants. Minting a token with an ambiguous (or empty) aud would produce
+		// a token no resource server can safely accept, so reject instead.
 		slog.Debug("resource parameter required when multiple audiences are configured", //nolint:gosec // G706: count is an integer
 			"count", len(h.config.AllowedAudiences),
 		)
@@ -97,6 +108,20 @@ func (h *Handler) TokenHandler(w http.ResponseWriter, req *http.Request) {
 		logTokenEndpointError("response_generation", req, err)
 		h.provider.WriteAccessError(ctx, w, accessRequest, err)
 		return
+	}
+
+	// Renew the registration TTL for public (DCR) clients on a successful token
+	// exchange/refresh. This is the proven-use signal — unlike the unauthenticated
+	// /oauth/authorize client read — so an actively-used public client is not evicted
+	// mid-lifecycle and forced to re-register. Best-effort: a renewal failure must not
+	// fail the token that was just issued. Storage renews only public clients.
+	if client := accessRequest.GetClient(); client != nil {
+		if err := h.storage.RenewClientTTL(ctx, client); err != nil {
+			slog.Warn("failed to renew client registration TTL",
+				"client_id", client.GetID(),
+				"error", err,
+			)
+		}
 	}
 
 	// Write the token response

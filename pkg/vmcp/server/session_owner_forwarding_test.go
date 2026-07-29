@@ -24,8 +24,8 @@ type forwardingTestStorage struct {
 	metadata map[string]map[string]string
 }
 
-func (s *forwardingTestStorage) Upsert(context.Context, string, map[string]string) error {
-	return nil
+func (s *forwardingTestStorage) Update(context.Context, string, map[string]string) (bool, error) {
+	return true, nil
 }
 
 func (s *forwardingTestStorage) Load(_ context.Context, id string) (map[string]string, error) {

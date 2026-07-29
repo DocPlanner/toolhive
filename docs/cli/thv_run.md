@@ -111,7 +111,8 @@ thv run [flags] SERVER_OR_IMAGE_OR_PROTOCOL [-- ARGS...]
 ### Options
 
 ```
-      --allow-docker-gateway                        Allow outbound connections to Docker gateway addresses (host.docker.internal, gateway.docker.internal, 172.17.0.1). Only applies when --isolate-network is set. These are blocked by default even when insecure_allow_all is enabled.
+      --allow-docker-gateway                        Allow outbound connections to Docker gateway addresses (host.docker.internal, gateway.docker.internal, 172.17.0.1). Only applies when --isolate-network is set. These are blocked by default even when insecure_allow_all is enabled. Gateway access is port-independent: it ignores the permission profile's allowed ports, so once enabled the gateway is reachable on any port.
+      --allowed-origins stringArray                 Exact-match allowlist for the HTTP Origin header (repeatable). Recommended when binding publicly; loopback binds derive a default allowlist automatically, non-loopback binds log a warning when no value is supplied. Example: https://my-mcp.example.com
       --audit-config string                         Path to the audit configuration file
       --authz-config string                         Path to the authorization configuration file
       --ca-cert string                              Path to a custom CA certificate file to use for container builds
@@ -127,7 +128,7 @@ thv run [flags] SERVER_OR_IMAGE_OR_PROTOCOL [-- ARGS...]
       --host string                                 Host for the HTTP proxy to listen on (IP or hostname) (default "127.0.0.1")
       --ignore-globally                             Load global ignore patterns from ~/.config/toolhive/thvignore (default true)
       --image-verification string                   Set image verification mode (warn, enabled, disabled) (default "warn")
-      --isolate-network                             Isolate the container network from the host (default false)
+      --isolate-network                             Isolate the container network from the host. Use --isolate-network=false to opt out. (default true)
       --jwks-allow-private-ip                       Allow JWKS/OIDC endpoints on private IP addresses (use with caution) (default false)
       --jwks-auth-token-file string                 Path to file containing bearer token for authenticating JWKS/OIDC requests
   -l, --label stringArray                           Set labels on the container (format: key=value)
@@ -167,6 +168,7 @@ thv run [flags] SERVER_OR_IMAGE_OR_PROTOCOL [-- ARGS...]
       --remote-auth-client-secret-file string       Path to file containing OAuth client secret (alternative to --remote-auth-client-secret) (optional if the authorization server supports dynamic client registration (RFC 7591) or if using PKCE)
       --remote-auth-issuer string                   OAuth/OIDC issuer URL for remote server authentication (e.g., https://accounts.google.com)
       --remote-auth-resource string                 OAuth 2.0 resource indicator (RFC 8707)
+      --remote-auth-scope-param-name string         Override the query parameter name for scopes in the authorization URL (e.g., 'user_scope' for Slack OAuth)
       --remote-auth-scopes strings                  OAuth scopes to request for remote server authentication (defaults: OIDC uses 'openid,profile,email')
       --remote-auth-skip-browser                    Skip opening browser for remote server OAuth flow (default false)
       --remote-auth-timeout duration                Timeout for OAuth authentication flow (e.g., 30s, 1m, 2m30s) (default 30s)
@@ -177,6 +179,8 @@ thv run [flags] SERVER_OR_IMAGE_OR_PROTOCOL [-- ARGS...]
       --runtime-add-package stringArray             Add additional packages to install in the builder and runtime stages (can be repeated)
       --runtime-image string                        Override the default base image for protocol schemes (e.g., golang:1.24-alpine, node:20-alpine, python:3.11-slim)
       --secret stringArray                          Specify a secret to be fetched from the secrets manager and set as an environment variable (format: NAME,target=TARGET)
+      --session-ttl duration                        Session inactivity timeout (e.g., 30m, 2h); zero uses the default (2h)
+      --stateless                                   Declare the server as stateless (POST-only, no SSE). Use for MCP servers implementing streamable-HTTP stateless mode.
       --target-host string                          Host to forward traffic to (only applicable to SSE or Streamable HTTP transport) (default "127.0.0.1")
       --target-port int                             Port for the container to expose (only applicable to SSE or Streamable HTTP transport)
       --thv-ca-bundle string                        Path to CA certificate bundle for ToolHive HTTP operations (JWKS, OIDC discovery, etc.)
@@ -193,6 +197,7 @@ thv run [flags] SERVER_OR_IMAGE_OR_PROTOCOL [-- ARGS...]
       --transport string                            Transport mode (sse, streamable-http or stdio)
       --trust-proxy-headers                         Trust X-Forwarded-* headers from reverse proxies (X-Forwarded-Proto, X-Forwarded-Host, X-Forwarded-Port, X-Forwarded-Prefix) (default false)
   -v, --volume stringArray                          Mount a volume into the container (format: host-path:container-path[:ro])
+      --webhook-config stringArray                  Path to webhook configuration file (can be specified multiple times to merge configs)
 ```
 
 ### Options inherited from parent commands

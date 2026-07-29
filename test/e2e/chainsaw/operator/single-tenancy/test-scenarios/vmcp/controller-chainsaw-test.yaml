@@ -182,7 +182,7 @@ spec:
 
     - patch:
         resource:
-          apiVersion: toolhive.stacklok.dev/v1alpha1
+          apiVersion: toolhive.stacklok.dev/v1beta1
           kind: VirtualMCPServer
           metadata:
             name: test-vmcp-controller
@@ -245,6 +245,10 @@ spec:
     - assert:
         file: oidc-client-secret.yaml
 
+    - apply:
+        file: vmcp-oidc-config.yaml
+    - assert:
+        file: vmcp-oidc-config.yaml
     - apply:
         file: vmcp-with-oidc.yaml
     - assert:

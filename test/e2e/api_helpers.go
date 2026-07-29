@@ -7,10 +7,10 @@ package e2e
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -77,6 +77,11 @@ func NewServer(config *ServerConfig) (*Server, error) {
 		tempXdgConfigHome = GinkgoT().TempDir()
 		tempHome = GinkgoT().TempDir()
 	}
+
+	// Create a stub claude-code settings file so that at least one skill-supporting
+	// client is detected as installed. Without this, installs that omit --clients
+	// would fail because no client config paths exist in the temp home dir.
+	_ = os.WriteFile(filepath.Join(tempHome, ".claude.json"), []byte("{}"), 0600)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -190,20 +195,6 @@ func (s *Server) Get(path string) (*http.Response, error) {
 	return s.httpClient.Do(req) // #nosec G704 -- baseURL is the local test server URL
 }
 
-// GetWithHeaders performs a GET request with custom headers.
-func (s *Server) GetWithHeaders(path string, headers map[string]string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(s.ctx, http.MethodGet, s.baseURL+path, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	for key, value := range headers {
-		req.Header.Set(key, value)
-	}
-
-	return s.httpClient.Do(req) // #nosec G704 -- baseURL is the local test server URL
-}
-
 // BaseURL returns the base URL of the API server.
 func (s *Server) BaseURL() string {
 	return s.baseURL
@@ -235,15 +226,4 @@ func StartServer(config *ServerConfig) *Server {
 	})
 
 	return server
-}
-
-// ExpectStatus reads the response body and asserts the status code,
-// including the response body in the failure message for debugging.
-// The response body is consumed and closed; callers must not read it again.
-func ExpectStatus(resp *http.Response, expected int) {
-	body, _ := io.ReadAll(resp.Body)
-	//nolint:errcheck,gosec // This is just a test
-	resp.Body.Close()
-	ExpectWithOffset(1, resp.StatusCode).To(Equal(expected),
-		fmt.Sprintf("Response body: %s", string(body)))
 }

@@ -190,7 +190,7 @@ Requires `thv serve` to be running. Skills have two scopes: `user` (global, defa
 ```bash
 thv skill install my-skill                              # Install from registry
 thv skill install ghcr.io/org/skill:v1.0                # Install by OCI reference
-thv skill install my-skill --client claude-code          # Target specific client
+thv skill install my-skill --clients claude-code          # Target specific client(s)
 thv skill install my-skill --scope project --project-root .  # Project-scoped
 thv skill install my-skill --group development           # Add to group
 thv skill install my-skill --force                       # Overwrite existing
@@ -220,8 +220,11 @@ thv inspector filesystem                        # MCP Inspector UI
 thv mcp list tools --server filesystem
 thv mcp list resources --server filesystem
 thv mcp list prompts --server filesystem
+thv mcp call read_file --server filesystem --args '{"path":"/etc/hosts"}'  # Invoke a tool
 thv runtime check                               # Verify container runtime
 ```
+
+For tool invocation patterns (file args, stdin, JSON output, error handling), see [EXAMPLES.md](references/EXAMPLES.md#invoke-a-tool).
 
 ## Guardrails
 

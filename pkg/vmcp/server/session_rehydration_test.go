@@ -21,13 +21,9 @@ import (
 
 	"github.com/stacklok/toolhive/pkg/vmcp"
 	"github.com/stacklok/toolhive/pkg/vmcp/aggregator"
-	"github.com/stacklok/toolhive/pkg/vmcp/discovery"
-	discoverymocks "github.com/stacklok/toolhive/pkg/vmcp/discovery/mocks"
 	"github.com/stacklok/toolhive/pkg/vmcp/health"
 	backendmocks "github.com/stacklok/toolhive/pkg/vmcp/mocks"
 	routermocks "github.com/stacklok/toolhive/pkg/vmcp/router/mocks"
-	"github.com/stacklok/toolhive/pkg/vmcp/server/adapter"
-	adaptermocks "github.com/stacklok/toolhive/pkg/vmcp/server/adapter/mocks"
 	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
 	sessiontypes "github.com/stacklok/toolhive/pkg/vmcp/session/types"
 )
@@ -55,7 +51,7 @@ func (m *hydrationTestManager) Validate(string) (bool, error) {
 
 func (*hydrationTestManager) Terminate(string) (bool, error) { return false, nil }
 
-func (*hydrationTestManager) NotifyBackendExpired(string, string) {}
+func (*hydrationTestManager) NotifyBackendExpired(string, string, map[string]string) {}
 
 func (m *hydrationTestManager) CreateSession(context.Context, string) (vmcpsession.MultiSession, error) {
 	m.mu.Lock()
@@ -82,7 +78,7 @@ func (m *hydrationTestManager) GetAdaptedResources(string) ([]mcpserver.ServerRe
 	return m.resources, nil
 }
 
-func (m *hydrationTestManager) GetMultiSession(string) (vmcpsession.MultiSession, bool) {
+func (m *hydrationTestManager) GetMultiSession(context.Context, string) (vmcpsession.MultiSession, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.getMultiSessionCalls++
@@ -142,13 +138,10 @@ func (s *hydrationTestSession) SetSessionResources(resources map[string]mcpserve
 func TestHandleSessionRequestInitialization_RehydratesSessionTools(t *testing.T) {
 	t.Parallel()
 
-	mgr := &hydrationTestManager{
-		hasSession: true,
-		tools: []mcpserver.ServerTool{{
-			Tool: mcp.Tool{Name: "echo"},
-		}},
-	}
-	srv := &Server{vmcpSessionMgr: mgr}
+	mgr := &hydrationTestManager{hasSession: true}
+	// Rehydration re-derives the advertised set from the core, so the core (not
+	// the session manager) is the source of the tool list.
+	srv := &Server{vmcpSessionMgr: mgr, core: &fakeCore{tools: []vmcp.Tool{{Name: "echo"}}}}
 	session := &hydrationTestSession{
 		sessionID: "session-tools",
 		ch:        make(chan mcp.JSONRPCNotification, 1),
@@ -163,20 +156,16 @@ func TestHandleSessionRequestInitialization_RehydratesSessionTools(t *testing.T)
 	require.Len(t, session.GetSessionTools(), 1)
 	assert.Contains(t, session.GetSessionTools(), "echo")
 	assert.Equal(t, 2, mgr.getMultiSessionCalls)
-	assert.Equal(t, 1, mgr.getAdaptedToolsCalls)
-	assert.Zero(t, mgr.getAdaptedResourcesCalls)
 }
 
 func TestHandleSessionRequestInitialization_RehydratesSessionResources(t *testing.T) {
 	t.Parallel()
 
-	mgr := &hydrationTestManager{
-		hasSession: true,
-		resources: []mcpserver.ServerResource{{
-			Resource: mcp.Resource{URI: "file://example"},
-		}},
+	mgr := &hydrationTestManager{hasSession: true}
+	srv := &Server{
+		vmcpSessionMgr: mgr,
+		core:           &fakeCore{resources: []vmcp.Resource{{URI: "file://example", Name: "example"}}},
 	}
-	srv := &Server{vmcpSessionMgr: mgr}
 	session := &hydrationTestSession{
 		sessionID: "session-resources",
 		ch:        make(chan mcp.JSONRPCNotification, 1),
@@ -191,8 +180,6 @@ func TestHandleSessionRequestInitialization_RehydratesSessionResources(t *testin
 	require.Len(t, session.GetSessionResources(), 1)
 	assert.Contains(t, session.GetSessionResources(), "file://example")
 	assert.Equal(t, 2, mgr.getMultiSessionCalls)
-	assert.Zero(t, mgr.getAdaptedToolsCalls)
-	assert.Equal(t, 1, mgr.getAdaptedResourcesCalls)
 }
 
 func TestHandleSessionRequestInitialization_SkipsHydrationWhenSessionAlreadyPrimed(t *testing.T) {
@@ -242,13 +229,8 @@ func TestHandleSessionRequestInitialization_IgnoresInitialize(t *testing.T) {
 func TestHandleSessionRequestInitialization_WaitsForInFlightRegistration(t *testing.T) {
 	t.Parallel()
 
-	mgr := &hydrationTestManager{
-		hasSession: false,
-		tools: []mcpserver.ServerTool{{
-			Tool: mcp.Tool{Name: "echo"},
-		}},
-	}
-	srv := &Server{vmcpSessionMgr: mgr}
+	mgr := &hydrationTestManager{hasSession: false}
+	srv := &Server{vmcpSessionMgr: mgr, core: &fakeCore{tools: []vmcp.Tool{{Name: "echo"}}}}
 	session := &hydrationTestSession{
 		sessionID: "session-registration-wait",
 		ch:        make(chan mcp.JSONRPCNotification, 1),
@@ -279,29 +261,16 @@ func TestHandleSessionRequestInitialization_WaitsForInFlightRegistration(t *test
 	assert.Contains(t, session.GetSessionTools(), "echo")
 }
 
-func TestHandleSessionRegistrationImpl_HealthCheckInjectsCapabilitiesWithoutCreateSession(t *testing.T) {
+// TestHandleSessionRegistrationImpl_HealthCheckSkipsSessionCreation asserts the
+// health-probe short-circuit: a probe-marked registration must not open
+// session-scoped backend connections (no CreateSession call) and leaves the SDK
+// session without tools or resources. The hub's health checker only inspects
+// response time and errors, never the advertised capability list.
+func TestHandleSessionRegistrationImpl_HealthCheckSkipsSessionCreation(t *testing.T) {
 	t.Parallel()
 
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	handlerFactory := adaptermocks.NewMockHandlerFactory(ctrl)
-	handlerFactory.EXPECT().
-		CreateToolHandler("echo").
-		Return(func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			return mcp.NewToolResultText("ok"), nil
-		})
-	handlerFactory.EXPECT().
-		CreateResourceHandler("file://example").
-		Return(func(context.Context, mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-			return nil, nil
-		})
-
 	mgr := &hydrationTestManager{}
-	srv := &Server{
-		vmcpSessionMgr:    mgr,
-		capabilityAdapter: adapter.NewCapabilityAdapter(handlerFactory),
-	}
+	srv := &Server{vmcpSessionMgr: mgr}
 	session := &hydrationTestSession{
 		sessionID: "session-health-register",
 		ch:        make(chan mcp.JSONRPCNotification, 1),
@@ -309,48 +278,24 @@ func TestHandleSessionRegistrationImpl_HealthCheckInjectsCapabilitiesWithoutCrea
 		resources: map[string]mcpserver.ServerResource{},
 	}
 
-	ctx := discovery.WithDiscoveredCapabilities(
-		health.WithHealthCheckMarker(context.Background()),
-		&aggregator.AggregatedCapabilities{
-			Tools: []vmcp.Tool{{
-				Name:        "echo",
-				Description: "echo tool",
-				InputSchema: map[string]any{"type": "object"},
-			}},
-			Resources: []vmcp.Resource{{
-				URI:         "file://example",
-				Name:        "example",
-				Description: "example resource",
-			}},
-		},
-	)
+	ctx := health.WithHealthCheckMarker(context.Background())
 
 	err := srv.handleSessionRegistrationImpl(ctx, session)
 	require.NoError(t, err)
 
-	require.Len(t, session.GetSessionTools(), 1)
-	require.Len(t, session.GetSessionResources(), 1)
-	assert.Zero(t, mgr.createSessionCalls)
+	assert.Zero(t, mgr.createSessionCalls, "probe registration must not create session-scoped backends")
+	assert.Empty(t, session.GetSessionTools(), "probe session must stay empty")
+	assert.Empty(t, session.GetSessionResources(), "probe session must stay empty")
 }
 
-func TestHandleSessionRequestInitialization_HealthCheckInjectsCapabilitiesWithoutSessionManager(t *testing.T) {
+// TestHandleSessionRequestInitialization_HealthCheckSkipsHydration asserts that a
+// probe-marked request proceeds without hydrating session capabilities, so a slow
+// backend sweep can never inflate the probe's response time.
+func TestHandleSessionRequestInitialization_HealthCheckSkipsHydration(t *testing.T) {
 	t.Parallel()
 
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	handlerFactory := adaptermocks.NewMockHandlerFactory(ctrl)
-	handlerFactory.EXPECT().
-		CreateToolHandler("echo").
-		Return(func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			return mcp.NewToolResultText("ok"), nil
-		})
-
 	mgr := &hydrationTestManager{}
-	srv := &Server{
-		vmcpSessionMgr:    mgr,
-		capabilityAdapter: adapter.NewCapabilityAdapter(handlerFactory),
-	}
+	srv := &Server{vmcpSessionMgr: mgr}
 	session := &hydrationTestSession{
 		sessionID: "session-health-tools-list",
 		ch:        make(chan mcp.JSONRPCNotification, 1),
@@ -358,42 +303,24 @@ func TestHandleSessionRequestInitialization_HealthCheckInjectsCapabilitiesWithou
 		resources: map[string]mcpserver.ServerResource{},
 	}
 
-	ctx := discovery.WithDiscoveredCapabilities(
-		health.WithHealthCheckMarker(
-			mcpserver.NewMCPServer("test", "1.0.0").WithContext(context.Background(), session),
-		),
-		&aggregator.AggregatedCapabilities{
-			Tools: []vmcp.Tool{{
-				Name:        "echo",
-				Description: "echo tool",
-				InputSchema: map[string]any{"type": "object"},
-			}},
-		},
+	ctx := health.WithHealthCheckMarker(
+		mcpserver.NewMCPServer("test", "1.0.0").WithContext(context.Background(), session),
 	)
 
 	err := srv.handleSessionRequestInitialization(
 		ctx,
-		1,
-		json.RawMessage(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`),
+		nil,
+		json.RawMessage(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`),
 	)
 	require.NoError(t, err)
-
-	require.Len(t, session.GetSessionTools(), 1)
-	assert.Zero(t, mgr.getMultiSessionCalls)
-	assert.Zero(t, mgr.getAdaptedToolsCalls)
-	assert.Zero(t, mgr.getAdaptedResourcesCalls)
+	assert.Empty(t, session.GetSessionTools(), "probe request must not hydrate session tools")
 }
 
 func TestHandleSessionRequestInitialization_WaitsForRegistrationMarkerGraceWindow(t *testing.T) {
 	t.Parallel()
 
-	mgr := &hydrationTestManager{
-		hasSession: false,
-		tools: []mcpserver.ServerTool{{
-			Tool: mcp.Tool{Name: "echo"},
-		}},
-	}
-	srv := &Server{vmcpSessionMgr: mgr}
+	mgr := &hydrationTestManager{hasSession: false}
+	srv := &Server{vmcpSessionMgr: mgr, core: &fakeCore{tools: []vmcp.Tool{{Name: "echo"}}}}
 	session := &hydrationTestSession{
 		sessionID: "session-registration-grace",
 		ch:        make(chan mcp.JSONRPCNotification, 1),
@@ -429,12 +356,6 @@ func TestHandler_HealthProbeSessionIsSweptAfterTTL(t *testing.T) {
 
 	mockRouter := routermocks.NewMockRouter(ctrl)
 	mockBackendClient := backendmocks.NewMockBackendClient(ctrl)
-	mockDiscoveryMgr := discoverymocks.NewMockManager(ctrl)
-	mockDiscoveryMgr.EXPECT().
-		Discover(gomock.Any(), gomock.Any()).
-		Return(&aggregator.AggregatedCapabilities{}, nil).
-		AnyTimes()
-
 	srv, err := New(
 		context.Background(),
 		&Config{
@@ -443,10 +364,11 @@ func TestHandler_HealthProbeSessionIsSweptAfterTTL(t *testing.T) {
 			EndpointPath:   "/mcp",
 			SessionTTL:     50 * time.Millisecond,
 			SessionFactory: testMinimalFactory(),
+			Aggregator: aggregator.NewDefaultAggregator(
+				mockBackendClient, nil, nil, nil),
 		},
 		mockRouter,
 		mockBackendClient,
-		mockDiscoveryMgr,
 		vmcp.NewImmutableRegistry(nil),
 		nil,
 	)

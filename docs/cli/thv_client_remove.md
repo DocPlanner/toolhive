@@ -19,23 +19,22 @@ Remove a client from MCP server configuration.
 
 Valid clients:
   - amp-cli: Sourcegraph Amp CLI
-  - amp-cursor: Cursor Sourcegraph Amp extension
-  - amp-vscode: VS Code Sourcegraph Amp extension
-  - amp-vscode-insider: VS Code Insiders Sourcegraph Amp extension
-  - amp-windsurf: Windsurf Sourcegraph Amp extension
   - antigravity: Google Antigravity IDE
   - claude-code: Claude Code CLI
   - cline: VS Code Cline extension
   - codex: OpenAI Codex CLI
   - continue: Continue.dev IDE plugins
+  - copilot-cli: GitHub Copilot CLI
   - cursor: Cursor editor
+  - factory: Factory.ai Droid CLI
   - gemini-cli: Google Gemini CLI
   - goose: Goose AI agent
+  - kimi-cli: Kimi Code CLI
   - kiro: Kiro AI IDE
   - lm-studio: LM Studio application
   - mistral-vibe: Mistral Vibe IDE
   - opencode: OpenCode editor
-  - roo-code: VS Code Roo Code extension
+  - roo-code: VS Code Roo Code extension (deprecated)
   - trae: Trae IDE
   - vscode: Visual Studio Code
   - vscode-insider: Visual Studio Code Insiders

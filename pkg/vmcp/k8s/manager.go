@@ -23,7 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
-	mcpv1alpha1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1"
+	mcpv1beta1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1beta1"
 	"github.com/stacklok/toolhive/pkg/vmcp"
 	"github.com/stacklok/toolhive/pkg/vmcp/workloads"
 )
@@ -124,7 +124,7 @@ func NewBackendWatcher(
 
 	// Create runtime scheme and register ToolHive CRDs + core Kubernetes types
 	scheme := runtime.NewScheme()
-	if err := mcpv1alpha1.AddToScheme(scheme); err != nil {
+	if err := mcpv1beta1.AddToScheme(scheme); err != nil {
 		return nil, fmt.Errorf("failed to register ToolHive CRDs to scheme: %w", err)
 	}
 
@@ -190,7 +190,7 @@ func (w *BackendWatcher) Start(ctx context.Context) error {
 	slog.Info("watching backend resources", "namespace", w.namespace, "group", w.groupRef)
 
 	// Register backend watch controller to reconcile MCPServer/MCPRemoteProxy changes
-	err := w.addBackendWatchController()
+	err := w.addBackendWatchController(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to add backend watch controller: %w", err)
 	}
@@ -285,7 +285,7 @@ func (w *BackendWatcher) WaitForCacheSync(ctx context.Context) bool {
 // Returns:
 //   - nil: Reconciler registered successfully
 //   - error: Failed to create discoverer or register reconciler
-func (w *BackendWatcher) addBackendWatchController() error {
+func (w *BackendWatcher) addBackendWatchController(ctx context.Context) error {
 	// Create K8s discoverer for backend conversion
 	// This reuses the existing workloads package conversion logic
 	discoverer := workloads.NewK8SDiscovererWithClient(
@@ -302,7 +302,9 @@ func (w *BackendWatcher) addBackendWatchController() error {
 		Discoverer: discoverer,
 	}
 
-	if err := reconciler.SetupIndexes(context.Background(), w.ctrlManager); err != nil {
+	// Register field indexes required by the reconciler's watch handlers.
+	// Must be called before SetupWithManager.
+	if err := reconciler.SetupIndexes(ctx, w.ctrlManager); err != nil {
 		return fmt.Errorf("failed to setup backend reconciler indexes: %w", err)
 	}
 

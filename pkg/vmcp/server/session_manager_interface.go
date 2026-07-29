@@ -43,8 +43,12 @@ type SessionManager interface {
 
 	// GetMultiSession retrieves the fully-formed MultiSession for the given session ID.
 	// Returns (nil, false) if the session does not exist or is still a placeholder.
-	// Used to access session-scoped backend tool metadata (e.g. for conflict validation).
-	GetMultiSession(sessionID string) (vmcpsession.MultiSession, bool)
+	//
+	// ctx may carry request-scoped values (e.g. *auth.Identity) that implementations
+	// should forward to storage and backend-restore operations. Implementations must
+	// not let caller cancellation abort an in-progress restore that concurrent
+	// waiters depend on.
+	GetMultiSession(ctx context.Context, sessionID string) (vmcpsession.MultiSession, bool)
 
 	// DecorateSession retrieves the MultiSession for sessionID, applies fn to it,
 	// and stores the result back. Used to stack session decorators (composite tools,
@@ -55,11 +59,15 @@ type SessionManager interface {
 	Terminate(sessionID string) (bool, error)
 
 	// NotifyBackendExpired updates session metadata in storage to reflect that the
-	// backend identified by workloadID is no longer connected. It is a best-effort,
-	// metadata-only operation intended to be called by keepalive or health-monitoring
-	// components when they detect that a backend session has expired or been lost.
-	// Storage errors are logged but not returned.
-	NotifyBackendExpired(sessionID, workloadID string)
+	// backend identified by workloadID is no longer connected. The caller must
+	// supply the session metadata it already holds (e.g. from MultiSession.GetMetadata);
+	// passing nil is treated as "no metadata available" and is a silent no-op.
+	// The metadata map is treated as read-only; the implementation copies it before
+	// making any modifications.
+	// It is a best-effort, metadata-only operation intended to be called by keepalive
+	// or health-monitoring components when they detect that a backend session has
+	// expired or been lost. Storage errors are logged but not returned.
+	NotifyBackendExpired(sessionID, workloadID string, metadata map[string]string)
 
 	// ReplaceSession swaps the stored MultiSession for sessionID from current to
 	// replacement. Used for refresh rollback when the rebuilt session cannot be

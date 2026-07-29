@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
-	"github.com/go-jose/go-jose/v4/jwt"
+	josejwt "github.com/go-jose/go-jose/v4/jwt"
 	"github.com/ory/fosite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -255,21 +255,23 @@ func TestTokenHandler_Success(t *testing.T) {
 	assert.Contains(t, body, "expires_in")
 }
 
-func TestTokenHandler_ResourceParameter(t *testing.T) {
+// TestTokenHandler_Success_RenewsClientTTL asserts that a successful token
+// exchange renews the registration TTL of the public client — the proven-use
+// signal that keeps an active client from being evicted and forced to
+// re-register. Renewal must run on the token path, not the unauthenticated
+// authorize read.
+func TestTokenHandler_Success_RenewsClientTTL(t *testing.T) {
 	t.Parallel()
 	handler, storState, _ := handlerTestSetup(t)
 
-	// Simulate authorize flow
 	authorizeCode := simulateAuthorizeFlow(t, handler, storState)
 
-	// Exchange code with RFC 8707 resource parameter
 	form := url.Values{
 		"grant_type":    {"authorization_code"},
 		"client_id":     {testAuthClientID},
 		"redirect_uri":  {testAuthRedirectURI},
 		"code":          {authorizeCode},
 		"code_verifier": {testPKCEVerifier},
-		"resource":      {"https://api.example.com"},
 	}
 	req := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -277,13 +279,83 @@ func TestTokenHandler_ResourceParameter(t *testing.T) {
 
 	handler.TokenHandler(rec, req)
 
-	require.Equal(t, http.StatusOK, rec.Code, "expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+	require.Equal(t, http.StatusOK, rec.Code, "got %d: %s", rec.Code, rec.Body.String())
+	assert.Contains(t, storState.renewedClients, testAuthClientID,
+		"successful token exchange should renew the public client's registration TTL")
+}
 
-	// The resource parameter should be granted as audience in the JWT
-	// We can't easily verify the JWT contents here without decoding,
-	// but we verify the request succeeded
-	body := rec.Body.String()
-	assert.Contains(t, body, "access_token")
+func TestTokenHandler_AudienceClaim(t *testing.T) {
+	t.Parallel()
+
+	// ptr is a helper to take the address of a string literal.
+	ptr := func(s string) *string { return &s }
+
+	tests := []struct {
+		name     string
+		resource *string // nil = omit parameter; non-nil = include (possibly empty)
+		wantAud  string
+	}{
+		{
+			name:     "explicit resource grants matching audience",
+			resource: ptr("https://api.example.com"),
+			wantAud:  "https://api.example.com",
+		},
+		{
+			name:     "absent resource defaults to sole AllowedAudience",
+			resource: nil,
+			wantAud:  "https://api.example.com",
+		},
+		{
+			name:     "explicit empty resource defaults to sole AllowedAudience",
+			resource: ptr(""),
+			wantAud:  "https://api.example.com",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			handler, storState, _ := handlerTestSetup(t)
+			authorizeCode := simulateAuthorizeFlow(t, handler, storState)
+
+			form := url.Values{
+				"grant_type":    {"authorization_code"},
+				"client_id":     {testAuthClientID},
+				"redirect_uri":  {testAuthRedirectURI},
+				"code":          {authorizeCode},
+				"code_verifier": {testPKCEVerifier},
+			}
+			if tc.resource != nil {
+				form.Set("resource", *tc.resource)
+			}
+
+			req := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(form.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			rec := httptest.NewRecorder()
+
+			handler.TokenHandler(rec, req)
+
+			require.Equal(t, http.StatusOK, rec.Code, "got %d: %s", rec.Code, rec.Body.String())
+
+			var tokenResp map[string]any
+			require.NoError(t, json.NewDecoder(rec.Body).Decode(&tokenResp))
+
+			accessToken, ok := tokenResp["access_token"].(string)
+			require.True(t, ok, "access_token should be a string")
+			require.NotEmpty(t, accessToken)
+
+			parsedToken, err := josejwt.ParseSigned(accessToken, []jose.SignatureAlgorithm{jose.RS256})
+			require.NoError(t, err)
+
+			var claims map[string]any
+			require.NoError(t, parsedToken.UnsafeClaimsWithoutVerification(&claims))
+
+			aud, ok := claims["aud"].([]any)
+			require.True(t, ok, "aud claim should be an array, got: %T %v", claims["aud"], claims["aud"])
+			require.Len(t, aud, 1)
+			assert.Equal(t, tc.wantAud, aud[0])
+		})
+	}
 }
 
 func TestTokenHandler_DefaultsSingleAudienceWhenResourceOmitted(t *testing.T) {
@@ -312,7 +384,7 @@ func TestTokenHandler_DefaultsSingleAudienceWhenResourceOmitted(t *testing.T) {
 	require.True(t, ok, "access_token should be a string")
 	require.NotEmpty(t, accessToken, "access_token should not be empty")
 
-	parsedToken, err := jwt.ParseSigned(accessToken, []jose.SignatureAlgorithm{jose.RS256})
+	parsedToken, err := josejwt.ParseSigned(accessToken, []jose.SignatureAlgorithm{jose.RS256})
 	require.NoError(t, err, "should be able to parse JWT")
 
 	var claims map[string]interface{}

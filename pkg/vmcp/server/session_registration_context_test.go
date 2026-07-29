@@ -41,7 +41,7 @@ func (*registrationContextRecordingManager) Terminate(string) (bool, error) {
 	return false, nil
 }
 
-func (*registrationContextRecordingManager) NotifyBackendExpired(string, string) {}
+func (*registrationContextRecordingManager) NotifyBackendExpired(string, string, map[string]string) {}
 
 func (m *registrationContextRecordingManager) CreateSession(
 	ctx context.Context,
@@ -77,7 +77,7 @@ func (*registrationContextRecordingManager) GetAdaptedResources(string) ([]mcpse
 	return nil, nil
 }
 
-func (*registrationContextRecordingManager) GetMultiSession(string) (vmcpsession.MultiSession, bool) {
+func (*registrationContextRecordingManager) GetMultiSession(context.Context, string) (vmcpsession.MultiSession, bool) {
 	return nil, false
 }
 
@@ -130,7 +130,7 @@ func TestHandleSessionRegistrationImpl_DetachesFromRequestCancellation(t *testin
 	t.Parallel()
 
 	mgr := &registrationContextRecordingManager{}
-	srv := &Server{vmcpSessionMgr: mgr}
+	srv := &Server{vmcpSessionMgr: mgr, core: &stubVMCP{}}
 	session := &registrationContextTestSession{
 		sessionID: "session-123",
 		ch:        make(chan mcp.JSONRPCNotification, 1),
@@ -159,7 +159,7 @@ func TestHandleSessionRegistrationImpl_BoundsDetachedContext(t *testing.T) {
 	t.Parallel()
 
 	mgr := &registrationContextRecordingManager{}
-	srv := &Server{vmcpSessionMgr: mgr}
+	srv := &Server{vmcpSessionMgr: mgr, core: &stubVMCP{}}
 	session := &registrationContextTestSession{
 		sessionID: "session-456",
 		ch:        make(chan mcp.JSONRPCNotification, 1),

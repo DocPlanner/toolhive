@@ -14,15 +14,15 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/stacklok/toolhive-core/permissions"
 	regtypes "github.com/stacklok/toolhive-core/registry/types"
-	v1alpha1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1"
+	v1beta1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1beta1"
 	"github.com/stacklok/toolhive/pkg/audit"
 	"github.com/stacklok/toolhive/pkg/auth"
 	"github.com/stacklok/toolhive/pkg/auth/awssts"
 	"github.com/stacklok/toolhive/pkg/auth/remote"
-	"github.com/stacklok/toolhive/pkg/auth/tokenexchange"
 	"github.com/stacklok/toolhive/pkg/authserver"
 	"github.com/stacklok/toolhive/pkg/authserver/server/registration"
 	"github.com/stacklok/toolhive/pkg/authz"
@@ -32,11 +32,13 @@ import (
 	"github.com/stacklok/toolhive/pkg/ignore"
 	"github.com/stacklok/toolhive/pkg/labels"
 	"github.com/stacklok/toolhive/pkg/mcp"
+	"github.com/stacklok/toolhive/pkg/oauthproto/tokenexchange"
 	"github.com/stacklok/toolhive/pkg/recovery"
 	"github.com/stacklok/toolhive/pkg/telemetry"
 	"github.com/stacklok/toolhive/pkg/transport"
 	"github.com/stacklok/toolhive/pkg/transport/types"
 	"github.com/stacklok/toolhive/pkg/usagemetrics"
+	"github.com/stacklok/toolhive/pkg/webhook"
 )
 
 // BuildContext defines the context in which the RunConfigBuilder is being used
@@ -83,6 +85,14 @@ func WithRuntime(deployer rt.Deployer) RunConfigBuilderOption {
 func WithImage(image string) RunConfigBuilderOption {
 	return func(b *runConfigBuilder) error {
 		b.config.Image = image
+		return nil
+	}
+}
+
+// WithMCPServerGeneration sets the MCPServer generation as the monotonic version stamp.
+func WithMCPServerGeneration(gen int64) RunConfigBuilderOption {
+	return func(b *runConfigBuilder) error {
+		b.config.MCPServerGeneration = gen
 		return nil
 	}
 }
@@ -167,14 +177,6 @@ func WithRemoteAuth(config *remote.Config) RunConfigBuilderOption {
 func WithName(name string) RunConfigBuilderOption {
 	return func(b *runConfigBuilder) error {
 		b.config.Name = name
-		return nil
-	}
-}
-
-// WithMiddlewareConfig sets the middleware configuration
-func WithMiddlewareConfig(middlewareConfig []types.MiddlewareConfig) RunConfigBuilderOption {
-	return func(b *runConfigBuilder) error {
-		b.config.MiddlewareConfigs = middlewareConfig
 		return nil
 	}
 }
@@ -265,6 +267,24 @@ func WithAuthzConfig(config *authz.Config) RunConfigBuilderOption {
 	}
 }
 
+// WithValidatingWebhooks sets the validating webhook configurations.
+// These webhooks run after mutating webhooks and can accept or deny requests.
+func WithValidatingWebhooks(webhooks []webhook.Config) RunConfigBuilderOption {
+	return func(b *runConfigBuilder) error {
+		b.config.ValidatingWebhooks = webhooks
+		return nil
+	}
+}
+
+// WithMutatingWebhooks sets the mutating webhook configurations.
+// These webhooks run before validating webhooks and can transform requests.
+func WithMutatingWebhooks(webhooks []webhook.Config) RunConfigBuilderOption {
+	return func(b *runConfigBuilder) error {
+		b.config.MutatingWebhooks = webhooks
+		return nil
+	}
+}
+
 // WithAuditConfigPath sets the audit config path
 func WithAuditConfigPath(path string) RunConfigBuilderOption {
 	return func(b *runConfigBuilder) error {
@@ -311,6 +331,18 @@ func WithAllowDockerGateway(allow bool) RunConfigBuilderOption {
 	}
 }
 
+// WithAllowedOrigins sets the HTTP Origin-header allowlist used for
+// DNS-rebinding protection (MCP 2025-11-25 §"Security Warning").
+// An empty slice defers the choice to middleware wiring, which derives a
+// loopback-only default when the bind host is loopback and otherwise leaves
+// the middleware disabled.
+func WithAllowedOrigins(origins []string) RunConfigBuilderOption {
+	return func(b *runConfigBuilder) error {
+		b.config.AllowedOrigins = origins
+		return nil
+	}
+}
+
 // WithTrustProxyHeaders sets whether to trust X-Forwarded-* headers from reverse proxies
 func WithTrustProxyHeaders(trust bool) RunConfigBuilderOption {
 	return func(b *runConfigBuilder) error {
@@ -319,10 +351,39 @@ func WithTrustProxyHeaders(trust bool) RunConfigBuilderOption {
 	}
 }
 
+// WithStateless declares the server is stateless (POST-only, no SSE).
+func WithStateless(stateless bool) RunConfigBuilderOption {
+	return func(b *runConfigBuilder) error {
+		b.config.Stateless = stateless
+		return nil
+	}
+}
+
 // WithEndpointPrefix sets the path prefix for SSE endpoint URLs
 func WithEndpointPrefix(prefix string) RunConfigBuilderOption {
 	return func(b *runConfigBuilder) error {
 		b.config.EndpointPrefix = prefix
+		return nil
+	}
+}
+
+// WithSessionTTL sets the inactivity timeout for proxy sessions.
+// Zero is valid and means "use the transport default" (2h).
+// Negative values return an error.
+//
+// The value is stored as a Go duration string on RunConfig so it survives a
+// JSON/YAML round-trip in the runconfig API contract; a time.Duration field
+// would serialize as nanoseconds.
+func WithSessionTTL(ttl time.Duration) RunConfigBuilderOption {
+	return func(b *runConfigBuilder) error {
+		if ttl < 0 {
+			return fmt.Errorf("session-ttl must be non-negative, got %s", ttl)
+		}
+		if ttl == 0 {
+			b.config.SessionTTL = ""
+			return nil
+		}
+		b.config.SessionTTL = ttl.String()
 		return nil
 	}
 }
@@ -519,7 +580,7 @@ func WithTelemetryConfig(config *telemetry.Config) RunConfigBuilderOption {
 }
 
 // WithRateLimitConfig sets the rate limiting configuration.
-func WithRateLimitConfig(namespace string, config *v1alpha1.RateLimitConfig) RunConfigBuilderOption {
+func WithRateLimitConfig(namespace string, config *v1beta1.RateLimitConfig) RunConfigBuilderOption {
 	return func(b *runConfigBuilder) error {
 		b.config.RateLimitConfig = config
 		b.config.RateLimitNamespace = namespace
@@ -591,6 +652,24 @@ func WithMiddlewareFromFlags(
 
 		// NOTE: AWS STS middleware is NOT added here because it is only configured
 		// through the operator path via PopulateMiddlewareConfigs(), not via CLI flags.
+		//
+		// NOTE: addCoreMiddlewares also injects usage metrics before webhook insertion here,
+		// which differs slightly from PopulateMiddlewareConfigs where usage metrics is added
+		// after webhooks. This is currently benign because usage metrics does not depend on
+		// webhook state, and the broader ordering TODO remains to unify these paths.
+
+		// Add Mutating webhooks before Validating webhooks
+		var err error
+		middlewareConfigs, err = addMutatingWebhookMiddleware(middlewareConfigs, b.config)
+		if err != nil {
+			return err
+		}
+
+		// Add Validating webhooks
+		middlewareConfigs, err = addValidatingWebhookMiddleware(middlewareConfigs, b.config)
+		if err != nil {
+			return err
+		}
 
 		// Add optional middlewares
 		middlewareConfigs = addTelemetryMiddleware(middlewareConfigs, telemetryConfig, serverName, transportType)
@@ -606,6 +685,48 @@ func WithMiddlewareFromFlags(
 
 		// Set the populated middleware configs
 		b.config.MiddlewareConfigs = middlewareConfigs
+		return nil
+	}
+}
+
+// WithAdditionalMiddlewareConfigs appends pre-built middleware configs to the
+// RunConfig's AdditionalMiddlewareConfigs slice.
+//
+// Unlike the typed-field middleware (auth, token exchange, AWS STS, ...) that
+// PopulateMiddlewareConfigs derives from RunConfig fields, these configs are
+// supplied already-built by external-auth handlers reached via
+// *[]RunConfigBuilderOption. PopulateMiddlewareConfigs splices them into the
+// backend-egress group — after auth and before recovery — so they survive
+// population and reach the serialized RunConfig the proxyrunner reads.
+//
+// The carrier is generic: upstream moves these configs verbatim and never
+// interprets their parameters; the middleware type identity is supplied by the
+// caller via the config's Type. Multiple calls and multiple arguments are
+// additive; nil entries are skipped.
+//
+// NOTE: the injected configs are consumed only by PopulateMiddlewareConfigs (the
+// operator build path). The CLI flag path (WithMiddlewareFromFlags) builds
+// MiddlewareConfigs directly and never reads AdditionalMiddlewareConfigs, so
+// combining this option with that path would silently drop the injected config.
+//
+// SECURITY: a config's Parameters are serialized verbatim into the RunConfig the
+// operator writes to a ConfigMap — plaintext, not a Secret — readable by anyone
+// with ConfigMap read access in the workload namespace. Injected parameters must
+// therefore NEVER embed raw credentials (client secrets, refresh tokens,
+// service-account keys, …). Reference such secrets by environment-variable name
+// and resolve them at runtime instead, mirroring the typed token-exchange
+// middleware, which leaves its serialized client_secret empty and reads
+// TOOLHIVE_TOKEN_EXCHANGE_CLIENT_SECRET at startup. Because the seam carries
+// parameters opaquely it cannot enforce this — it is a contract the injecting
+// handler must uphold.
+func WithAdditionalMiddlewareConfigs(configs ...*types.MiddlewareConfig) RunConfigBuilderOption {
+	return func(b *runConfigBuilder) error {
+		for _, c := range configs {
+			if c == nil {
+				continue
+			}
+			b.config.AdditionalMiddlewareConfigs = append(b.config.AdditionalMiddlewareConfigs, *c)
+		}
 		return nil
 	}
 }

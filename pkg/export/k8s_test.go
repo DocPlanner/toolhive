@@ -13,13 +13,11 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/stacklok/toolhive-core/permissions"
-	v1alpha1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1"
+	v1beta1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1beta1"
 	"github.com/stacklok/toolhive/pkg/audit"
-	"github.com/stacklok/toolhive/pkg/auth"
 	"github.com/stacklok/toolhive/pkg/authz"
 	"github.com/stacklok/toolhive/pkg/authz/authorizers/cedar"
 	"github.com/stacklok/toolhive/pkg/runner"
-	"github.com/stacklok/toolhive/pkg/telemetry"
 	"github.com/stacklok/toolhive/pkg/transport/types"
 )
 
@@ -42,7 +40,7 @@ func TestWriteK8sManifest(t *testing.T) {
 		name       string
 		config     *runner.RunConfig
 		wantErr    bool
-		validateFn func(t *testing.T, mcpServer *v1alpha1.MCPServer)
+		validateFn func(t *testing.T, mcpServer *v1beta1.MCPServer)
 	}{
 		{
 			name: "basic stdio config",
@@ -56,9 +54,9 @@ func TestWriteK8sManifest(t *testing.T) {
 				Port:          8080,
 				CmdArgs:       []string{"--verbose"},
 			},
-			validateFn: func(t *testing.T, mcpServer *v1alpha1.MCPServer) {
+			validateFn: func(t *testing.T, mcpServer *v1beta1.MCPServer) {
 				t.Helper()
-				assert.Equal(t, "toolhive.stacklok.dev/v1alpha1", mcpServer.APIVersion)
+				assert.Equal(t, "toolhive.stacklok.dev/v1beta1", mcpServer.APIVersion)
 				assert.Equal(t, "MCPServer", mcpServer.Kind)
 				assert.Equal(t, "github", mcpServer.Name)
 				assert.Equal(t, "ghcr.io/stacklok/mcp-server-github:latest", mcpServer.Spec.Image)
@@ -78,7 +76,7 @@ func TestWriteK8sManifest(t *testing.T) {
 				Port:       8081,
 				TargetPort: 3000,
 			},
-			validateFn: func(t *testing.T, mcpServer *v1alpha1.MCPServer) {
+			validateFn: func(t *testing.T, mcpServer *v1beta1.MCPServer) {
 				t.Helper()
 				assert.Equal(t, "sse", mcpServer.Spec.Transport)
 				assert.Equal(t, int32(8081), mcpServer.GetProxyPort())
@@ -97,7 +95,7 @@ func TestWriteK8sManifest(t *testing.T) {
 					"DEBUG":        "true",
 				},
 			},
-			validateFn: func(t *testing.T, mcpServer *v1alpha1.MCPServer) {
+			validateFn: func(t *testing.T, mcpServer *v1beta1.MCPServer) {
 				t.Helper()
 				require.Len(t, mcpServer.Spec.Env, 2)
 				envMap := make(map[string]string)
@@ -120,7 +118,7 @@ func TestWriteK8sManifest(t *testing.T) {
 					"/readonly:/data:ro",
 				},
 			},
-			validateFn: func(t *testing.T, mcpServer *v1alpha1.MCPServer) {
+			validateFn: func(t *testing.T, mcpServer *v1beta1.MCPServer) {
 				t.Helper()
 				require.Len(t, mcpServer.Spec.Volumes, 2)
 				assert.Equal(t, "/host/path", mcpServer.Spec.Volumes[0].HostPath)
@@ -143,34 +141,11 @@ func TestWriteK8sManifest(t *testing.T) {
 					Write: []permissions.MountDeclaration{"/output"},
 				},
 			},
-			validateFn: func(t *testing.T, mcpServer *v1alpha1.MCPServer) {
+			validateFn: func(t *testing.T, mcpServer *v1beta1.MCPServer) {
 				t.Helper()
 				require.NotNil(t, mcpServer.Spec.PermissionProfile)
-				assert.Equal(t, v1alpha1.PermissionProfileTypeBuiltin, mcpServer.Spec.PermissionProfile.Type)
+				assert.Equal(t, v1beta1.PermissionProfileTypeBuiltin, mcpServer.Spec.PermissionProfile.Type)
 				assert.Equal(t, "none", mcpServer.Spec.PermissionProfile.Name)
-			},
-		},
-		{
-			name: "config with OIDC",
-			config: &runner.RunConfig{
-				Image:     "ghcr.io/stacklok/mcp-server:latest",
-				Name:      "test",
-				BaseName:  "test",
-				Transport: types.TransportTypeStdio,
-				OIDCConfig: &auth.TokenValidatorConfig{
-					Issuer:   "https://accounts.google.com",
-					Audience: "my-client-id",
-					JWKSURL:  "https://accounts.google.com/.well-known/jwks.json",
-				},
-			},
-			validateFn: func(t *testing.T, mcpServer *v1alpha1.MCPServer) {
-				t.Helper()
-				require.NotNil(t, mcpServer.Spec.OIDCConfig)
-				assert.Equal(t, v1alpha1.OIDCConfigTypeInline, mcpServer.Spec.OIDCConfig.Type)
-				require.NotNil(t, mcpServer.Spec.OIDCConfig.Inline)
-				assert.Equal(t, "https://accounts.google.com", mcpServer.Spec.OIDCConfig.Inline.Issuer)
-				assert.Equal(t, "my-client-id", mcpServer.Spec.OIDCConfig.Inline.Audience)
-				assert.Equal(t, "https://accounts.google.com/.well-known/jwks.json", mcpServer.Spec.OIDCConfig.Inline.JWKSURL)
 			},
 		},
 		{
@@ -187,10 +162,10 @@ func TestWriteK8sManifest(t *testing.T) {
 					EntitiesJSON: "[]",
 				}),
 			},
-			validateFn: func(t *testing.T, mcpServer *v1alpha1.MCPServer) {
+			validateFn: func(t *testing.T, mcpServer *v1beta1.MCPServer) {
 				t.Helper()
 				require.NotNil(t, mcpServer.Spec.AuthzConfig)
-				assert.Equal(t, v1alpha1.AuthzConfigTypeInline, mcpServer.Spec.AuthzConfig.Type)
+				assert.Equal(t, v1beta1.AuthzConfigTypeInline, mcpServer.Spec.AuthzConfig.Type)
 				require.NotNil(t, mcpServer.Spec.AuthzConfig.Inline)
 				require.Len(t, mcpServer.Spec.AuthzConfig.Inline.Policies, 1)
 				assert.Equal(t, "permit(principal, action, resource);", mcpServer.Spec.AuthzConfig.Inline.Policies[0])
@@ -208,51 +183,10 @@ func TestWriteK8sManifest(t *testing.T) {
 					Component: "test-component",
 				},
 			},
-			validateFn: func(t *testing.T, mcpServer *v1alpha1.MCPServer) {
+			validateFn: func(t *testing.T, mcpServer *v1beta1.MCPServer) {
 				t.Helper()
 				require.NotNil(t, mcpServer.Spec.Audit)
 				assert.True(t, mcpServer.Spec.Audit.Enabled)
-			},
-		},
-		{
-			name: "config with telemetry",
-			config: &runner.RunConfig{
-				Image:     "ghcr.io/stacklok/mcp-server:latest",
-				Name:      "test",
-				BaseName:  "test",
-				Transport: types.TransportTypeStdio,
-				TelemetryConfig: &telemetry.Config{
-					Endpoint:    "http://otel-collector:4318",
-					ServiceName: "my-service",
-					Insecure:    true,
-				},
-			},
-			validateFn: func(t *testing.T, mcpServer *v1alpha1.MCPServer) {
-				t.Helper()
-				require.NotNil(t, mcpServer.Spec.Telemetry)
-				require.NotNil(t, mcpServer.Spec.Telemetry.OpenTelemetry)
-				assert.True(t, mcpServer.Spec.Telemetry.OpenTelemetry.Enabled)
-				assert.Equal(t, "http://otel-collector:4318", mcpServer.Spec.Telemetry.OpenTelemetry.Endpoint)
-				assert.Equal(t, "my-service", mcpServer.Spec.Telemetry.OpenTelemetry.ServiceName)
-				assert.True(t, mcpServer.Spec.Telemetry.OpenTelemetry.Insecure)
-			},
-		},
-		{
-			name: "config with prometheus metrics",
-			config: &runner.RunConfig{
-				Image:     "ghcr.io/stacklok/mcp-server:latest",
-				Name:      "test",
-				BaseName:  "test",
-				Transport: types.TransportTypeStdio,
-				TelemetryConfig: &telemetry.Config{
-					EnablePrometheusMetricsPath: true,
-				},
-			},
-			validateFn: func(t *testing.T, mcpServer *v1alpha1.MCPServer) {
-				t.Helper()
-				require.NotNil(t, mcpServer.Spec.Telemetry)
-				require.NotNil(t, mcpServer.Spec.Telemetry.Prometheus)
-				assert.True(t, mcpServer.Spec.Telemetry.Prometheus.Enabled)
 			},
 		},
 		{
@@ -264,7 +198,7 @@ func TestWriteK8sManifest(t *testing.T) {
 				Transport:   types.TransportTypeStdio,
 				ToolsFilter: []string{"tool1", "tool2"},
 			},
-			validateFn: func(t *testing.T, mcpServer *v1alpha1.MCPServer) {
+			validateFn: func(t *testing.T, mcpServer *v1beta1.MCPServer) {
 				t.Helper()
 				// ToolsFilter is not exported to the CRD; use MCPToolConfig with toolConfigRef instead
 				assert.Nil(t, mcpServer.Spec.ToolConfigRef, "toolConfigRef should not be set by export")
@@ -322,7 +256,7 @@ func TestWriteK8sManifest(t *testing.T) {
 			assert.NotEmpty(t, buf.String())
 
 			// Parse the YAML to validate structure
-			var mcpServer v1alpha1.MCPServer
+			var mcpServer v1beta1.MCPServer
 			err = yaml.Unmarshal(buf.Bytes(), &mcpServer)
 			require.NoError(t, err)
 
@@ -341,14 +275,14 @@ func TestParseVolumeString(t *testing.T) {
 		name    string
 		volStr  string
 		index   int
-		wantVol v1alpha1.Volume
+		wantVol v1beta1.Volume
 		wantErr bool
 	}{
 		{
 			name:   "basic volume",
 			volStr: "/host/path:/container/path",
 			index:  0,
-			wantVol: v1alpha1.Volume{
+			wantVol: v1beta1.Volume{
 				Name:      "volume-0",
 				HostPath:  "/host/path",
 				MountPath: "/container/path",
@@ -359,7 +293,7 @@ func TestParseVolumeString(t *testing.T) {
 			name:   "read-only volume",
 			volStr: "/host/path:/container/path:ro",
 			index:  1,
-			wantVol: v1alpha1.Volume{
+			wantVol: v1beta1.Volume{
 				Name:      "volume-1",
 				HostPath:  "/host/path",
 				MountPath: "/container/path",
@@ -369,6 +303,18 @@ func TestParseVolumeString(t *testing.T) {
 		{
 			name:    "invalid format - missing colon",
 			volStr:  "/host/path",
+			index:   0,
+			wantErr: true,
+		},
+		{
+			name:    "invalid format - too many fields",
+			volStr:  "/host/path:/container/path:ro:extra",
+			index:   0,
+			wantErr: true,
+		},
+		{
+			name:    "invalid format - unknown mode",
+			volStr:  "/host/path:/container/path:rw",
 			index:   0,
 			wantErr: true,
 		},

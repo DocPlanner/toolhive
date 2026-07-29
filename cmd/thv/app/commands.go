@@ -70,9 +70,13 @@ func NewRootCmd(enableUpdates bool) *cobra.Command {
 	rootCmd.AddCommand(newSecretCommand())
 	rootCmd.AddCommand(inspectorCommand())
 	rootCmd.AddCommand(newMCPCommand())
+	rootCmd.AddCommand(newVMCPCommand())
+	rootCmd.AddCommand(newLLMCommand())
 	rootCmd.AddCommand(groupCmd)
 	rootCmd.AddCommand(skillCmd)
 	rootCmd.AddCommand(statusCmd)
+	rootCmd.AddCommand(tuiCmd)
+	rootCmd.AddCommand(upgradeCmd)
 
 	// Silence printing the usage on error
 	rootCmd.SilenceUsage = true
@@ -100,14 +104,22 @@ func IsInformationalCommand(args []string) bool {
 
 	command := args[1]
 
-	// Commands that are entirely informational and don't need container runtime
+	// Commands that don't need container runtime or startup migrations.
+	// "vmcp" is safe here: telemetry/secret-scope migrations only affect thv run state,
+	// and EnsureDefaultGroupExists is called inside pkg/vmcp/cli/Serve when dynamic
+	// backend discovery is used (i.e. when no static backends are configured).
+	// "secret" is safe here: secrets management is pure config/credential I/O and
+	// does not interact with container runtimes.
 	informationalCommands := map[string]bool{
 		"version":    true,
 		"search":     true,
 		"completion": true,
 		"registry":   true,
 		"mcp":        true,
+		"secret":     true,
 		"skill":      true,
+		"vmcp":       true,
+		"llm":        true,
 	}
 
 	return informationalCommands[command]

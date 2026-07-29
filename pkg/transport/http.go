@@ -13,12 +13,13 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/oauth2"
 
-	"github.com/stacklok/toolhive/pkg/auth/tokenexchange"
 	"github.com/stacklok/toolhive/pkg/container"
 	rt "github.com/stacklok/toolhive/pkg/container/runtime"
+	"github.com/stacklok/toolhive/pkg/oauthproto/tokenexchange"
 	transporterrors "github.com/stacklok/toolhive/pkg/transport/errors"
 	"github.com/stacklok/toolhive/pkg/transport/middleware"
 	"github.com/stacklok/toolhive/pkg/transport/proxy/transparent"
@@ -58,6 +59,9 @@ type HTTPTransport struct {
 	// Remote MCP server support
 	remoteURL string
 
+	// stateless indicates the server is POST-only (no SSE/GET support)
+	stateless bool
+
 	// tokenSource is the OAuth token source for remote authentication
 	tokenSource oauth2.TokenSource
 
@@ -77,6 +81,10 @@ type HTTPTransport struct {
 	// sessionStorage overrides the default in-memory session store when set.
 	// Used for Redis-backed session sharing across replicas.
 	sessionStorage session.Storage
+
+	// sessionTTL overrides the inactivity timeout for sessions managed by the
+	// underlying proxy. Zero uses the proxy's default.
+	sessionTTL time.Duration
 
 	// Transparent proxy
 	proxy types.Proxy
@@ -150,6 +158,11 @@ func (t *HTTPTransport) SetTokenSource(tokenSource oauth2.TokenSource) {
 // SetOnHealthCheckFailed sets the callback for health check failures
 func (t *HTTPTransport) SetOnHealthCheckFailed(callback types.HealthCheckFailedCallback) {
 	t.onHealthCheckFailed = callback
+}
+
+// SetStateless configures the transport for a stateless server.
+func (t *HTTPTransport) SetStateless(stateless bool) {
+	t.stateless = stateless
 }
 
 // SetOnUnauthorizedResponse sets the callback for 401 Unauthorized responses
@@ -321,14 +334,7 @@ func (t *HTTPTransport) Start(ctx context.Context) error {
 	enableHealthCheck := shouldEnableHealthCheck(isRemote)
 
 	// Build proxy options
-	var proxyOptions []transparent.Option
-	if remoteBasePath != "" {
-		proxyOptions = append(proxyOptions, transparent.WithRemoteBasePath(remoteBasePath))
-	}
-	proxyOptions = append(proxyOptions, transparent.WithRemoteRawQuery(remoteRawQuery))
-	if t.sessionStorage != nil {
-		proxyOptions = append(proxyOptions, transparent.WithSessionStorage(t.sessionStorage))
-	}
+	proxyOptions := t.buildProxyOptions(remoteBasePath, remoteRawQuery)
 
 	// Create the transparent proxy
 	t.proxy = transparent.NewTransparentProxyWithOptions(
@@ -419,6 +425,25 @@ func (t *HTTPTransport) Stop(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// buildProxyOptions constructs the transparent proxy options for this transport.
+func (t *HTTPTransport) buildProxyOptions(remoteBasePath, remoteRawQuery string) []transparent.Option {
+	var opts []transparent.Option
+	if remoteBasePath != "" {
+		opts = append(opts, transparent.WithRemoteBasePath(remoteBasePath))
+	}
+	opts = append(opts, transparent.WithRemoteRawQuery(remoteRawQuery))
+	if t.stateless {
+		opts = append(opts, transparent.WithStateless())
+	}
+	if t.sessionTTL > 0 {
+		opts = append(opts, transparent.WithSessionTTL(t.sessionTTL))
+	}
+	if t.sessionStorage != nil {
+		opts = append(opts, transparent.WithSessionStorage(t.sessionStorage))
+	}
+	return opts
 }
 
 // handleContainerExit handles container exit events.

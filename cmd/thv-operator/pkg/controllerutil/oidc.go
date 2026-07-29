@@ -11,47 +11,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	mcpv1alpha1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1"
-	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/oidc"
-	"github.com/stacklok/toolhive/pkg/runner"
+	mcpv1beta1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1beta1"
 )
-
-// AddOIDCConfigOptions adds OIDC configuration options to builder options
-func AddOIDCConfigOptions(
-	ctx context.Context,
-	c client.Client,
-	res oidc.OIDCConfigurable,
-	options *[]runner.RunConfigBuilderOption,
-) error {
-	// Use the OIDC resolver to get configuration
-	resolver := oidc.NewResolver(c)
-	oidcConfig, err := resolver.Resolve(ctx, res)
-	if err != nil {
-		return fmt.Errorf("failed to resolve OIDC configuration: %w", err)
-	}
-
-	if oidcConfig == nil {
-		return nil
-	}
-
-	// Add OIDC config to options
-	*options = append(*options, runner.WithOIDCConfig(
-		oidcConfig.Issuer,
-		oidcConfig.Audience,
-		oidcConfig.JWKSURL,
-		oidcConfig.IntrospectionURL,
-		oidcConfig.ClientID,
-		oidcConfig.ClientSecret,
-		oidcConfig.ThvCABundlePath,
-		oidcConfig.JWKSAuthTokenPath,
-		oidcConfig.ResourceURL,
-		oidcConfig.JWKSAllowPrivateIP,
-		oidcConfig.InsecureAllowHTTP,
-		oidcConfig.Scopes,
-	))
-
-	return nil
-}
 
 // GetOIDCConfigForServer fetches the MCPOIDCConfig referenced by an MCPServer.
 // Returns nil if the ref is nil or the resource is not found.
@@ -59,13 +20,13 @@ func GetOIDCConfigForServer(
 	ctx context.Context,
 	c client.Client,
 	namespace string,
-	ref *mcpv1alpha1.MCPOIDCConfigReference,
-) (*mcpv1alpha1.MCPOIDCConfig, error) {
+	ref *mcpv1beta1.MCPOIDCConfigReference,
+) (*mcpv1beta1.MCPOIDCConfig, error) {
 	if ref == nil {
 		return nil, nil
 	}
 
-	oidcConfig := &mcpv1alpha1.MCPOIDCConfig{}
+	oidcConfig := &mcpv1beta1.MCPOIDCConfig{}
 	if err := c.Get(ctx, types.NamespacedName{
 		Name:      ref.Name,
 		Namespace: namespace,
@@ -83,7 +44,7 @@ func GenerateOIDCClientSecretEnvVar(
 	ctx context.Context,
 	c client.Client,
 	namespace string,
-	clientSecretRef *mcpv1alpha1.SecretKeyRef,
+	clientSecretRef *mcpv1beta1.SecretKeyRef,
 ) (*corev1.EnvVar, error) {
 	if clientSecretRef == nil {
 		return nil, nil

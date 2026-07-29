@@ -30,6 +30,7 @@ import (
 	"golang.org/x/exp/jsonrpc2"
 
 	"github.com/stacklok/toolhive/pkg/auth"
+	"github.com/stacklok/toolhive/pkg/bodylimit"
 	"github.com/stacklok/toolhive/pkg/healthcheck"
 	"github.com/stacklok/toolhive/pkg/transport/proxy/socket"
 	"github.com/stacklok/toolhive/pkg/transport/session"
@@ -78,6 +79,18 @@ type TransparentProxy struct {
 	// Sessions for tracking state
 	sessionManager *session.Manager
 
+	// sessionTTL is the resolved inactivity timeout for the session manager.
+	// Defaults to session.DefaultSessionTTL; overridable via WithSessionTTL.
+	sessionTTL time.Duration
+
+	// readTimeout is the resolved http.Server.ReadTimeout for this proxy.
+	// Defaults to defaultReadTimeout; overridable via WithReadTimeout.
+	readTimeout time.Duration
+
+	// sessionStorage is the optional custom storage backend for the session manager.
+	// When nil, in-memory LocalStorage is used. Set via WithSessionStorage.
+	sessionStorage session.Storage
+
 	// If mcp server has been initialized (atomic access)
 	isServerInitialized atomic.Bool
 
@@ -89,6 +102,9 @@ type TransparentProxy struct {
 
 	// Transport type (sse, streamable-http)
 	transportType string
+
+	// stateless indicates the server is POST-only (no SSE/GET support)
+	stateless bool
 
 	// Callback when health check fails (for remote servers)
 	onHealthCheckFailed types.HealthCheckFailedCallback
@@ -149,6 +165,12 @@ const (
 	// defaultIdleTimeout is the maximum time to wait for the next request on a
 	// keep-alive connection. Matches the value used by the vMCP server.
 	defaultIdleTimeout = 120 * time.Second
+
+	// defaultReadTimeout bounds reading the entire request (headers + body) on
+	// the proxy http.Server, mitigating slow-upload connection exhaustion. It
+	// does not affect responses, so streamed backend responses are unaffected.
+	// Matches the value used by the vMCP server.
+	defaultReadTimeout = 30 * time.Second
 
 	// HealthCheckIntervalEnvVar is the environment variable name for configuring health check interval.
 	HealthCheckIntervalEnvVar = "TOOLHIVE_HEALTH_CHECK_INTERVAL"
@@ -236,6 +258,15 @@ func WithRemoteRawQuery(rawQuery string) Option {
 	}
 }
 
+// WithStateless configures the proxy for stateless streamable-HTTP servers.
+// In stateless mode, incoming GET and DELETE requests receive 405 Method Not Allowed
+// instead of being forwarded, and health checks use POST ping instead of GET.
+func WithStateless() Option {
+	return func(p *TransparentProxy) {
+		p.stateless = true
+	}
+}
+
 // withHealthCheckPingTimeout sets the health check ping timeout.
 // This is primarily useful for testing with shorter timeouts.
 // Ignores non-positive timeouts; default will be used.
@@ -278,14 +309,30 @@ func WithSessionStorage(storage session.Storage) Option {
 		if storage == nil {
 			return
 		}
-		if p.sessionManager != nil {
-			_ = p.sessionManager.Stop()
+		p.sessionStorage = storage
+	}
+}
+
+// WithSessionTTL overrides the session inactivity timeout used by this proxy.
+// Zero or negative values are ignored so the constructor's default is preserved.
+func WithSessionTTL(ttl time.Duration) Option {
+	return func(p *TransparentProxy) {
+		if ttl <= 0 {
+			return
 		}
-		p.sessionManager = session.NewManagerWithStorage(
-			session.ResolveSessionTTLFromEnv(),
-			func(id string) session.Session { return session.NewProxySession(id) },
-			storage,
-		)
+		p.sessionTTL = ttl
+	}
+}
+
+// WithReadTimeout overrides http.Server.ReadTimeout for this proxy, which bounds
+// reading the entire request (headers + body). Zero or negative values are
+// ignored so the constructor's default (defaultReadTimeout) is preserved.
+func WithReadTimeout(d time.Duration) Option {
+	return func(p *TransparentProxy) {
+		if d <= 0 {
+			return
+		}
+		p.readTimeout = d
 	}
 }
 
@@ -405,6 +452,9 @@ func NewTransparentProxyWithOptions(
 	middlewares []types.NamedMiddleware,
 	options ...Option,
 ) *TransparentProxy {
+	// sessionTTL defaults to the TOOLHIVE_PROXY_SESSION_TTL env override
+	// (DocPlanner fork behavior), falling back to session.DefaultSessionTTL.
+	// WithSessionTTL still takes precedence when a positive TTL is passed.
 	proxy := &TransparentProxy{
 		host:                        host,
 		port:                        port,
@@ -414,7 +464,8 @@ func NewTransparentProxyWithOptions(
 		prometheusHandler:           prometheusHandler,
 		authInfoHandler:             authInfoHandler,
 		prefixHandlers:              prefixHandlers,
-		sessionManager:              session.NewManager(session.ResolveSessionTTLFromEnv(), session.NewProxySession),
+		sessionTTL:                  session.ResolveSessionTTLFromEnv(),
+		readTimeout:                 defaultReadTimeout,
 		isRemote:                    isRemote,
 		transportType:               transportType,
 		onHealthCheckFailed:         onHealthCheckFailed,
@@ -433,6 +484,14 @@ func NewTransparentProxyWithOptions(
 		opt(proxy)
 	}
 
+	// Construct the session manager once, after options have resolved sessionTTL and sessionStorage.
+	proxyFactory := func(id string) session.Session { return session.NewProxySession(id) }
+	if proxy.sessionStorage != nil {
+		proxy.sessionManager = session.NewManagerWithStorage(proxy.sessionTTL, proxyFactory, proxy.sessionStorage)
+	} else {
+		proxy.sessionManager = session.NewManager(proxy.sessionTTL, proxyFactory)
+	}
+
 	// Create appropriate response processor based on transport type
 	proxy.responseProcessor = createResponseProcessor(
 		transportType,
@@ -444,11 +503,11 @@ func NewTransparentProxyWithOptions(
 	// Create health checker always for Kubernetes probes
 	var mcpPinger healthcheck.MCPPinger
 	if enableHealthCheck {
-		pingTimeout := proxy.healthCheckPingTimeout
-		if pingTimeout == 0 {
-			pingTimeout = DefaultPingerTimeout
+		if proxy.stateless {
+			mcpPinger = NewStatelessMCPPingerWithTimeout(targetURI, proxy.healthCheckPingTimeout)
+		} else {
+			mcpPinger = NewMCPPingerWithTimeout(targetURI, proxy.healthCheckPingTimeout)
 		}
-		mcpPinger = NewMCPPingerWithTimeout(targetURI, pingTimeout)
 	}
 	proxy.healthChecker = healthcheck.NewHealthChecker(transportType, mcpPinger)
 
@@ -509,7 +568,20 @@ func (t *tracingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		req.Host = req.URL.Host
 	}
 
-	reqBody := readRequestBody(req)
+	slog.Debug("outbound request to upstream",
+		"method", req.Method,
+		"url", req.URL.String(),
+		"host", req.Host,
+		"accept", req.Header.Get("Accept"),
+		"content_type", req.Header.Get("Content-Type"),
+	)
+
+	reqBody, err := readRequestBody(req)
+	if err != nil {
+		// Oversized request body (chunked / no Content-Length) tripped the
+		// body-size limit; reject with 413 rather than forwarding a truncated body.
+		return plainResponse(req, http.StatusRequestEntityTooLarge, "Request Entity Too Large"), nil
+	}
 
 	// thv proxy does not provide the transport type, so we need to detect it from the request
 	path := req.URL.Path
@@ -532,18 +604,7 @@ func (t *tracingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 			if !errors.Is(err, session.ErrSessionNotFound) {
 				// Storage error (e.g. Redis timeout) — client should retry.
 				slog.Error("session store lookup failed", "error", err)
-				hdr := make(http.Header)
-				hdr.Set("Content-Type", "text/plain; charset=utf-8")
-				return &http.Response{
-					StatusCode: http.StatusServiceUnavailable,
-					Status:     fmt.Sprintf("%d %s", http.StatusServiceUnavailable, http.StatusText(http.StatusServiceUnavailable)),
-					Proto:      "HTTP/1.1",
-					ProtoMajor: 1,
-					ProtoMinor: 1,
-					Header:     hdr,
-					Body:       io.NopCloser(strings.NewReader("session store unavailable\n")),
-					Request:    req,
-				}, nil
+				return plainResponse(req, http.StatusServiceUnavailable, "session store unavailable"), nil
 			}
 			return session.NotFoundResponse(req), nil
 		}
@@ -597,6 +658,13 @@ func (t *tracingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		slog.Error("failed to forward request", "error", err)
 		return nil, err
 	}
+
+	slog.Debug("upstream response received",
+		"status", resp.StatusCode,
+		"url", req.URL.String(),
+		"content_type", resp.Header.Get("Content-Type"),
+		"mcp_session_id", resp.Header.Get("Mcp-Session-Id"),
+	)
 
 	// Check for 401 Unauthorized response (bearer token authentication failure)
 	if resp.StatusCode == http.StatusUnauthorized {
@@ -675,6 +743,10 @@ func (t *tracingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	return resp, nil
 }
 
+// isBackendSessionLostResponse reports whether the backend signalled that it no
+// longer knows the session. Upstream only treats 404 as session loss; some MCP
+// servers instead answer 400 with a "no valid session id" body, so that case is
+// recognized too (DocPlanner fork behavior, commit 8abac892).
 func isBackendSessionLostResponse(resp *http.Response) bool {
 	if resp.StatusCode == http.StatusNotFound {
 		return true
@@ -695,18 +767,41 @@ func isBackendSessionLostResponse(resp *http.Response) bool {
 	return strings.Contains(strings.ToLower(string(body)), "no valid session id")
 }
 
-func readRequestBody(req *http.Request) []byte {
+// plainResponse builds a minimal text/plain *http.Response for the given status,
+// used to synthesize error responses from within RoundTrip.
+func plainResponse(req *http.Request, status int, body string) *http.Response {
+	hdr := make(http.Header)
+	hdr.Set("Content-Type", "text/plain; charset=utf-8")
+	return &http.Response{
+		StatusCode: status,
+		Status:     fmt.Sprintf("%d %s", status, http.StatusText(status)),
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     hdr,
+		Body:       io.NopCloser(strings.NewReader(body + "\n")),
+		Request:    req,
+	}
+}
+
+func readRequestBody(req *http.Request) ([]byte, error) {
 	reqBody := []byte{}
 	if req.Body != nil {
 		buf, err := io.ReadAll(req.Body)
 		if err != nil {
+			// An oversized body (without Content-Length, e.g. chunked) trips
+			// http.MaxBytesReader here. Surface it so the caller can return 413
+			// instead of silently forwarding a truncated/empty body.
+			if bodylimit.IsRequestTooLarge(err) {
+				return nil, err
+			}
 			slog.Warn("failed to read request body", "error", err)
 		} else {
 			reqBody = buf
 		}
 		req.Body = io.NopCloser(bytes.NewReader(reqBody))
 	}
-	return reqBody
+	return reqBody, nil
 }
 
 func (t *tracingTransport) detectInitialize(body []byte) bool {
@@ -989,6 +1084,33 @@ func (p *TransparentProxy) modifyResponse(resp *http.Response) error {
 	return p.responseProcessor.ProcessResponse(resp)
 }
 
+// setXForwardedHeaders populates the standard X-Forwarded-* headers on the
+// outbound request. For remote upstreams X-Forwarded-Host is removed: a
+// third-party server may use it to construct redirect URLs pointing back at
+// the proxy, producing 307 redirect loops. X-Forwarded-For is kept so remote
+// backends can still log the client IP. Client-supplied X-Forwarded-* values
+// never pass through either way — httputil strips them from the outbound
+// request before Rewrite runs.
+//
+// For remote upstreams X-Forwarded-Proto is also rewritten to the scheme of
+// the actual upstream connection. SetXForwarded derives it from the inbound
+// connection, which behind a TLS-terminating load balancer is plain HTTP even
+// though the upstream is reached over HTTPS. Upstreams that redirect when
+// X-Forwarded-Proto != https would otherwise 301-loop forever. The upstream
+// scheme is supplied by the caller (parsed once from targetURI in Start) to
+// avoid re-parsing on every request.
+func (p *TransparentProxy) setXForwardedHeaders(pr *httputil.ProxyRequest, upstreamScheme string) {
+	pr.SetXForwarded()
+	if p.isRemote {
+		pr.Out.Header.Del("X-Forwarded-Host")
+		if upstreamScheme != "" {
+			pr.Out.Header.Set("X-Forwarded-Proto", upstreamScheme)
+			slog.Debug("set X-Forwarded-Proto for remote upstream",
+				"scheme", upstreamScheme, "target", p.targetURI)
+		}
+	}
+}
+
 // Start starts the transparent proxy.
 // nolint:gocyclo // This function handles multiple startup scenarios and is complex by design
 func (p *TransparentProxy) Start(ctx context.Context) error {
@@ -1011,7 +1133,7 @@ func (p *TransparentProxy) Start(ctx context.Context) error {
 		FlushInterval: -1,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(targetURL)
-			pr.SetXForwarded()
+			p.setXForwardedHeaders(pr, targetURL.Scheme)
 
 			// Route to the originating backend pod when session metadata contains backend_url.
 			// Falls back to static targetURL when the session doesn't exist or has no backend_url.
@@ -1132,7 +1254,11 @@ func (p *TransparentProxy) Start(ctx context.Context) error {
 
 	// 5. Catch-all proxy handler (least specific - ServeMux routing handles precedence)
 	// Note: No manual path checking needed - ServeMux longest-match routing ensures
-	// more specific paths registered above take precedence over this catch-all
+	// more specific paths registered above take precedence over this catch-all.
+	// In stateless mode, wrap with a method gate that rejects GET/DELETE with 405.
+	if p.stateless {
+		finalHandler = statelessMethodGate(finalHandler)
+	}
 	mux.Handle("/", finalHandler)
 
 	// Use ListenConfig with SO_REUSEADDR to allow port reuse after unclean shutdown
@@ -1149,6 +1275,7 @@ func (p *TransparentProxy) Start(ctx context.Context) error {
 		Addr:              fmt.Sprintf("%s:%d", p.host, p.port),
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,   // Prevent Slowloris attacks
+		ReadTimeout:       p.readTimeout,      // Bound slow body uploads
 		IdleTimeout:       defaultIdleTimeout, // Prevent idle keep-alive connections from blocking Shutdown()
 	}
 
@@ -1249,11 +1376,7 @@ func (p *TransparentProxy) handleHealthCheckFailure(
 }
 
 func (p *TransparentProxy) monitorHealth(parentCtx context.Context) {
-	interval := p.healthCheckInterval
-	if interval == 0 {
-		interval = DefaultHealthCheckInterval
-	}
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(p.healthCheckInterval)
 	defer ticker.Stop()
 
 	consecutiveFailures := 0
@@ -1390,4 +1513,19 @@ func (*TransparentProxy) SendMessageToDestination(_ jsonrpc2.Message) error {
 // This is not used in the TransparentProxy implementation as it forwards HTTP requests directly.
 func (*TransparentProxy) ForwardResponseToClients(_ context.Context, _ jsonrpc2.Message) error {
 	return fmt.Errorf("ForwardResponseToClients not implemented for TransparentProxy")
+}
+
+// statelessMethodGate wraps a handler to reject GET, HEAD, and DELETE requests with 405.
+// Used in stateless mode where the server only supports POST.
+// HEAD is blocked alongside GET because HEAD is semantically a GET without a response body;
+// a server that cannot handle GET will not handle HEAD either.
+func statelessMethodGate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodDelete {
+			w.Header().Set("Allow", "POST, OPTIONS")
+			http.Error(w, "method not allowed: server is stateless (POST only)", http.StatusMethodNotAllowed)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

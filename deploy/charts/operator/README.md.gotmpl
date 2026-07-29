@@ -21,12 +21,6 @@
 helm upgrade -i toolhive-operator oci://ghcr.io/stacklok/toolhive/toolhive-operator -n toolhive-system --create-namespace
 ```
 
-Or for a custom values file:
-
-```consoleCustom
-helm upgrade -i toolhive-operator oci://ghcr.io/stacklok/toolhive/toolhive-operator -n toolhive-system --create-namespace --values values-openshift.yaml
-```
-
 ## Prerequisites
 
 - Kubernetes 1.25+
@@ -57,4 +51,8 @@ The command removes all the Kubernetes components associated with the chart and 
 {{ template "chart.requirementsSection" . }}
 
 {{ template "chart.valuesSection" . }}
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on contributing to this chart.
 

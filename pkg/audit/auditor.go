@@ -56,6 +56,18 @@ func NewAuditLogger(w io.Writer) *slog.Logger {
 
 	handler := slog.NewJSONHandler(w, &slog.HandlerOptions{
 		Level: LevelAudit,
+		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+			// Replace the custom audit level with "AUDIT" string for better
+			// compatibility with log aggregation systems (Loki, Elasticsearch, etc.)
+			// that expect standard level names. This prevents audit events from
+			// appearing as "INFO+2" which breaks level-based filtering.
+			if a.Key == slog.LevelKey {
+				if level, ok := a.Value.Any().(slog.Level); ok && level == LevelAudit {
+					a.Value = slog.StringValue("AUDIT")
+				}
+			}
+			return a
+		},
 	})
 
 	return slog.New(handler)
@@ -106,12 +118,26 @@ func (a *Auditor) isSSETransport() bool {
 	return a.transportType == types.TransportTypeSSE.String()
 }
 
+// errorDetectionBufferSize is the maximum number of bytes buffered from the
+// response body for JSON-RPC error detection. JSON-RPC error responses have
+// the "error" field near the top of the object, so a small prefix is
+// sufficient. This buffer is allocated independently of IncludeResponseData.
+const errorDetectionBufferSize = 512
+
+// maxAuditErrorMessageLength caps the JSON-RPC error message length stored
+// in audit event metadata to keep log entries compact.
+const maxAuditErrorMessageLength = 256
+
 // responseWriter wraps http.ResponseWriter to capture response data and status.
 type responseWriter struct {
 	http.ResponseWriter
 	statusCode int
 	body       *bytes.Buffer
-	auditor    *Auditor
+	// errorDetectionBody is a small prefix buffer used exclusively for
+	// JSON-RPC error detection. It is allocated when DetectApplicationErrors
+	// is true, independent of IncludeResponseData.
+	errorDetectionBody *bytes.Buffer
+	auditor            *Auditor
 }
 
 func (rw *responseWriter) WriteHeader(statusCode int) {
@@ -125,6 +151,15 @@ func (rw *responseWriter) Write(data []byte) (int, error) {
 		// Limit the size of captured data
 		if rw.body.Len()+len(data) <= rw.auditor.config.MaxDataSize {
 			rw.body.Write(data)
+		}
+	}
+	// Capture a small prefix for JSON-RPC error detection
+	if rw.errorDetectionBody != nil && rw.errorDetectionBody.Len() < errorDetectionBufferSize {
+		remaining := errorDetectionBufferSize - rw.errorDetectionBody.Len()
+		if len(data) <= remaining {
+			rw.errorDetectionBody.Write(data)
+		} else {
+			rw.errorDetectionBody.Write(data[:remaining])
 		}
 	}
 	return rw.ResponseWriter.Write(data)
@@ -201,6 +236,13 @@ func (a *Auditor) Middleware(next http.Handler) http.Handler {
 			rw.body = &bytes.Buffer{}
 		}
 
+		// Allocate a small prefix buffer for JSON-RPC error detection,
+		// independent of IncludeResponseData. When IncludeResponseData
+		// is already true, we reuse rw.body instead of double-buffering.
+		if a.config.ShouldDetectApplicationErrors() && !a.config.IncludeResponseData {
+			rw.errorDetectionBody = &bytes.Buffer{}
+		}
+
 		// Process the request
 		next.ServeHTTP(rw, r)
 
@@ -219,6 +261,16 @@ func (a *Auditor) logAuditEvent(r *http.Request, rw *responseWriter, requestData
 
 	// Determine outcome based on status code
 	outcome := a.determineOutcome(rw.statusCode)
+
+	// When HTTP status indicates success, check for JSON-RPC errors
+	// hidden inside HTTP 200 responses.
+	var mcpResponse *mcp.ParsedMCPResponse
+	if outcome == OutcomeSuccess && a.config.ShouldDetectApplicationErrors() {
+		mcpResponse = a.detectApplicationError(rw)
+		if mcpResponse != nil && mcpResponse.HasError {
+			outcome = OutcomeApplicationError
+		}
+	}
 
 	// Check if we should audit this event
 	if !a.config.ShouldAuditEvent(eventType) {
@@ -245,6 +297,20 @@ func (a *Auditor) logAuditEvent(r *http.Request, rw *responseWriter, requestData
 
 	// Add metadata
 	a.addMetadata(event, r, duration, rw)
+
+	// Attach JSON-RPC error details so operators can see the error code
+	// and message without enabling full response data capture.
+	if outcome == OutcomeApplicationError {
+		if event.Metadata.Extra == nil {
+			event.Metadata.Extra = make(map[string]any)
+		}
+		event.Metadata.Extra["jsonrpc_error_code"] = mcpResponse.ErrorCode
+		msg := mcpResponse.ErrorMessage
+		if len(msg) > maxAuditErrorMessageLength {
+			msg = msg[:maxAuditErrorMessageLength]
+		}
+		event.Metadata.Extra["jsonrpc_error_message"] = msg
+	}
 
 	// Add request/response data if configured
 	a.addEventData(event, r, rw, requestData)
@@ -319,6 +385,25 @@ func (*Auditor) determineOutcome(statusCode int) string {
 	default:
 		return OutcomeSuccess
 	}
+}
+
+// detectApplicationError inspects the captured response body prefix for a
+// JSON-RPC error field. It reuses rw.body when IncludeResponseData is
+// enabled to avoid double-buffering.
+func (*Auditor) detectApplicationError(rw *responseWriter) *mcp.ParsedMCPResponse {
+	var prefix []byte
+	if rw.body != nil && rw.body.Len() > 0 {
+		prefix = rw.body.Bytes()
+		if len(prefix) > errorDetectionBufferSize {
+			prefix = prefix[:errorDetectionBufferSize]
+		}
+	} else if rw.errorDetectionBody != nil && rw.errorDetectionBody.Len() > 0 {
+		prefix = rw.errorDetectionBody.Bytes()
+	}
+	if len(prefix) > 0 && prefix[0] == '{' {
+		return mcp.ParseMCPResponse(prefix)
+	}
+	return nil
 }
 
 // extractSource extracts source information from the HTTP request.
@@ -484,8 +569,10 @@ func (a *Auditor) addMetadata(event *AuditEvent, r *http.Request, duration time.
 		event.Metadata.Extra[MetadataExtraKeyResponseSize] = rw.body.Len()
 	}
 
-	// Add backend routing information from context if available
-	// Backend info is populated by the backend enrichment middleware
+	// Add backend routing information from context if available.
+	// BackendInfo is populated upstream: by the backend-enrichment middleware on the
+	// vMCP legacy path, or by the vMCP Serve-path session handlers (which label the
+	// request directly). Either way the value is written before this runs.
 	if backendInfo, ok := BackendInfoFromContext(r.Context()); ok && backendInfo != nil && backendInfo.BackendName != "" {
 		event.Metadata.Extra["backend_name"] = backendInfo.BackendName
 	}

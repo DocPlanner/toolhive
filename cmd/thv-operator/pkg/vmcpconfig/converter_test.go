@@ -16,12 +16,13 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	mcpv1alpha1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1"
+	mcpv1beta1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1beta1"
+	"github.com/stacklok/toolhive/cmd/thv-operator/api/v1beta1/v1beta1test"
+	"github.com/stacklok/toolhive/cmd/thv-operator/internal/testutil"
 	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/controllerutil"
 	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/oidc"
 	oidcmocks "github.com/stacklok/toolhive/cmd/thv-operator/pkg/oidc/mocks"
@@ -30,27 +31,19 @@ import (
 	vmcpconfig "github.com/stacklok/toolhive/pkg/vmcp/config"
 )
 
-// Compile-time interface assertion to ensure VirtualMCPServer implements OIDCConfigurable.
-// This catches interface drift at compile time rather than runtime.
-// Placed here because api/v1alpha1 cannot import pkg/oidc (circular dependency).
-var _ oidc.OIDCConfigurable = (*mcpv1alpha1.VirtualMCPServer)(nil)
-
 // newNoOpMockResolver creates a mock resolver that returns (nil, nil) for all calls.
 // Use this in tests that don't care about OIDC configuration.
 func newNoOpMockResolver(t *testing.T) *oidcmocks.MockResolver {
 	t.Helper()
 	ctrl := gomock.NewController(t)
 	mockResolver := oidcmocks.NewMockResolver(ctrl)
-	mockResolver.EXPECT().Resolve(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
 	return mockResolver
 }
 
 // newTestK8sClient creates a fake Kubernetes client for testing.
 func newTestK8sClient(t *testing.T, objects ...client.Object) client.Client {
 	t.Helper()
-	scheme := runtime.NewScheme()
-	require.NoError(t, mcpv1alpha1.AddToScheme(scheme))
-	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+	return fake.NewClientBuilder().WithScheme(testutil.NewScheme(t)).WithObjects(objects...).Build()
 }
 
 // newTestConverter creates a Converter with the given resolver, failing the test if creation fails.
@@ -62,33 +55,65 @@ func newTestConverter(t *testing.T, resolver oidc.Resolver) *Converter {
 	return converter
 }
 
-// newTestVMCPServer creates a VirtualMCPServer with OIDC config for testing.
-func newTestVMCPServer(oidcConfig *mcpv1alpha1.OIDCConfigRef) *mcpv1alpha1.VirtualMCPServer {
-	return &mcpv1alpha1.VirtualMCPServer{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-vmcp", Namespace: "default"},
-		Spec: mcpv1alpha1.VirtualMCPServerSpec{
-			Config:       vmcpconfig.Config{Group: "test-group"},
-			IncomingAuth: &mcpv1alpha1.IncomingAuthConfig{Type: "oidc", OIDCConfig: oidcConfig},
+// newTestVMCPServer creates a VirtualMCPServer with an MCPOIDCConfigReference for testing.
+func newTestVMCPServer(oidcConfigRef *mcpv1beta1.MCPOIDCConfigReference) *mcpv1beta1.VirtualMCPServer {
+	return v1beta1test.NewVirtualMCPServer("test-vmcp", "default",
+		v1beta1test.WithVMCPGroupRef("test-group"),
+		v1beta1test.WithVMCPIncomingAuth(&mcpv1beta1.IncomingAuthConfig{Type: "oidc", OIDCConfigRef: oidcConfigRef}),
+	)
+}
+
+// newTestMCPOIDCConfig creates an MCPOIDCConfig resource for testing with the given spec type.
+func newTestMCPOIDCConfig(specType mcpv1beta1.MCPOIDCConfigSourceType) *mcpv1beta1.MCPOIDCConfig {
+	return &mcpv1beta1.MCPOIDCConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-oidc", Namespace: "default"},
+		Spec: mcpv1beta1.MCPOIDCConfigSpec{
+			Type: specType,
 		},
 	}
+}
+
+// newTestMCPOIDCConfigInline creates an MCPOIDCConfig resource with inline config for testing.
+func newTestMCPOIDCConfigInline(inline *mcpv1beta1.InlineOIDCSharedConfig) *mcpv1beta1.MCPOIDCConfig {
+	return &mcpv1beta1.MCPOIDCConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-oidc", Namespace: "default"},
+		Spec: mcpv1beta1.MCPOIDCConfigSpec{
+			Type:   mcpv1beta1.MCPOIDCConfigTypeInline,
+			Inline: inline,
+		},
+	}
+}
+
+// newTestConverterWithObjects creates a Converter with the given resolver and k8s objects.
+func newTestConverterWithObjects(t *testing.T, resolver oidc.Resolver, objects ...client.Object) *Converter {
+	t.Helper()
+	k8sClient := newTestK8sClient(t, objects...)
+	converter, err := NewConverter(resolver, k8sClient)
+	require.NoError(t, err)
+	return converter
 }
 
 func TestConverter_OIDCResolution(t *testing.T) {
 	t.Parallel()
 
+	const oidcConfigName = "test-oidc"
+
 	tests := []struct {
-		name       string
-		oidcConfig *mcpv1alpha1.OIDCConfigRef
-		mockReturn *oidc.OIDCConfig
-		mockErr    error
-		validate   func(t *testing.T, config *vmcpconfig.Config, err error)
+		name          string
+		oidcConfigRef *mcpv1beta1.MCPOIDCConfigReference
+		oidcConfig    *mcpv1beta1.MCPOIDCConfig // MCPOIDCConfig object to add to fake client
+		mockReturn    *oidc.OIDCConfig
+		mockErr       error
+		validate      func(t *testing.T, config *vmcpconfig.Config, err error)
 	}{
 		{
-			name:       "successful resolution maps all fields",
-			oidcConfig: &mcpv1alpha1.OIDCConfigRef{Type: mcpv1alpha1.OIDCConfigTypeKubernetes},
+			name:          "successful resolution maps all fields",
+			oidcConfigRef: &mcpv1beta1.MCPOIDCConfigReference{Name: oidcConfigName, Audience: "my-audience"},
+			oidcConfig:    newTestMCPOIDCConfig(mcpv1beta1.MCPOIDCConfigTypeKubernetesServiceAccount),
 			mockReturn: &oidc.OIDCConfig{
 				Issuer: "https://issuer.example.com", Audience: "my-audience",
-				ResourceURL: "https://resource.example.com", JWKSAllowPrivateIP: true,
+				ResourceURL:        "https://resource.example.com",
+				JWKSAllowPrivateIP: true, ProtectedResourceAllowPrivateIP: true,
 				JWKSURL: "https://issuer.example.com/jwks", IntrospectionURL: "https://issuer.example.com/introspect",
 			},
 			validate: func(t *testing.T, config *vmcpconfig.Config, err error) {
@@ -101,12 +126,30 @@ func TestConverter_OIDCResolution(t *testing.T) {
 				assert.Equal(t, "https://issuer.example.com/jwks", config.IncomingAuth.OIDC.JWKSURL)
 				assert.Equal(t, "https://issuer.example.com/introspect", config.IncomingAuth.OIDC.IntrospectionURL)
 				assert.True(t, config.IncomingAuth.OIDC.ProtectedResourceAllowPrivateIP)
+				assert.True(t, config.IncomingAuth.OIDC.JwksAllowPrivateIP)
 			},
 		},
 		{
-			name:       "resolution error returns error (fail-closed)",
-			oidcConfig: &mcpv1alpha1.OIDCConfigRef{Type: mcpv1alpha1.OIDCConfigTypeConfigMap},
-			mockErr:    errors.New("configmap not found"),
+			name:          "fields mapped independently - jwksAllowPrivateIP true, protectedResourceAllowPrivateIP false",
+			oidcConfigRef: &mcpv1beta1.MCPOIDCConfigReference{Name: oidcConfigName, Audience: "my-audience"},
+			oidcConfig:    newTestMCPOIDCConfig(mcpv1beta1.MCPOIDCConfigTypeKubernetesServiceAccount),
+			mockReturn: &oidc.OIDCConfig{
+				Issuer: "https://issuer.example.com", Audience: "my-audience",
+				JWKSAllowPrivateIP: true, ProtectedResourceAllowPrivateIP: false,
+			},
+			validate: func(t *testing.T, config *vmcpconfig.Config, err error) {
+				t.Helper()
+				require.NoError(t, err)
+				require.NotNil(t, config.IncomingAuth.OIDC)
+				assert.True(t, config.IncomingAuth.OIDC.JwksAllowPrivateIP)
+				assert.False(t, config.IncomingAuth.OIDC.ProtectedResourceAllowPrivateIP)
+			},
+		},
+		{
+			name:          "resolution error returns error (fail-closed)",
+			oidcConfigRef: &mcpv1beta1.MCPOIDCConfigReference{Name: oidcConfigName, Audience: "test-audience"},
+			oidcConfig:    newTestMCPOIDCConfig(mcpv1beta1.MCPOIDCConfigTypeInline),
+			mockErr:       errors.New("configmap not found"),
 			validate: func(t *testing.T, _ *vmcpconfig.Config, err error) {
 				t.Helper()
 				require.Error(t, err)
@@ -114,9 +157,10 @@ func TestConverter_OIDCResolution(t *testing.T) {
 			},
 		},
 		{
-			name:       "nil resolved config results in nil OIDC",
-			oidcConfig: &mcpv1alpha1.OIDCConfigRef{Type: mcpv1alpha1.OIDCConfigTypeInline},
-			mockReturn: nil,
+			name:          "nil resolved config results in nil OIDC",
+			oidcConfigRef: &mcpv1beta1.MCPOIDCConfigReference{Name: oidcConfigName, Audience: "test-audience"},
+			oidcConfig:    newTestMCPOIDCConfig(mcpv1beta1.MCPOIDCConfigTypeInline),
+			mockReturn:    nil,
 			validate: func(t *testing.T, config *vmcpconfig.Config, err error) {
 				t.Helper()
 				require.NoError(t, err)
@@ -124,16 +168,15 @@ func TestConverter_OIDCResolution(t *testing.T) {
 			},
 		},
 		{
-			name: "inline with client secret sets ClientSecretEnv",
-			oidcConfig: &mcpv1alpha1.OIDCConfigRef{
-				Type: mcpv1alpha1.OIDCConfigTypeInline,
-				Inline: &mcpv1alpha1.InlineOIDCConfig{
-					ClientSecretRef: &mcpv1alpha1.SecretKeyRef{
-						Name: "oidc-secret",
-						Key:  "client-secret",
-					},
+			name:          "inline with client secret sets ClientSecretEnv",
+			oidcConfigRef: &mcpv1beta1.MCPOIDCConfigReference{Name: oidcConfigName, Audience: "test-audience"},
+			oidcConfig: newTestMCPOIDCConfigInline(&mcpv1beta1.InlineOIDCSharedConfig{
+				Issuer: "https://issuer.example.com",
+				ClientSecretRef: &mcpv1beta1.SecretKeyRef{
+					Name: "oidc-secret",
+					Key:  "client-secret",
 				},
-			},
+			}),
 			mockReturn: &oidc.OIDCConfig{Issuer: "https://issuer.example.com"},
 			validate: func(t *testing.T, config *vmcpconfig.Config, err error) {
 				t.Helper()
@@ -142,22 +185,10 @@ func TestConverter_OIDCResolution(t *testing.T) {
 			},
 		},
 		{
-			name: "configmap with client secret sets ClientSecretEnv",
-			oidcConfig: &mcpv1alpha1.OIDCConfigRef{
-				Type:      mcpv1alpha1.OIDCConfigTypeConfigMap,
-				ConfigMap: &mcpv1alpha1.ConfigMapOIDCRef{Name: "config"},
-			},
-			mockReturn: &oidc.OIDCConfig{Issuer: "https://issuer.example.com", ClientSecret: "secret"},
-			validate: func(t *testing.T, config *vmcpconfig.Config, err error) {
-				t.Helper()
-				require.NoError(t, err)
-				assert.Equal(t, "VMCP_OIDC_CLIENT_SECRET", config.IncomingAuth.OIDC.ClientSecretEnv)
-			},
-		},
-		{
-			name:       "kubernetes type does not set ClientSecretEnv",
-			oidcConfig: &mcpv1alpha1.OIDCConfigRef{Type: mcpv1alpha1.OIDCConfigTypeKubernetes},
-			mockReturn: &oidc.OIDCConfig{Issuer: "https://kubernetes.default.svc"},
+			name:          "non-inline type does not set ClientSecretEnv",
+			oidcConfigRef: &mcpv1beta1.MCPOIDCConfigReference{Name: oidcConfigName, Audience: "test-audience"},
+			oidcConfig:    newTestMCPOIDCConfig(mcpv1beta1.MCPOIDCConfigTypeKubernetesServiceAccount),
+			mockReturn:    &oidc.OIDCConfig{Issuer: "https://kubernetes.default.svc"},
 			validate: func(t *testing.T, config *vmcpconfig.Config, err error) {
 				t.Helper()
 				require.NoError(t, err)
@@ -172,11 +203,13 @@ func TestConverter_OIDCResolution(t *testing.T) {
 
 			ctrl := gomock.NewController(t)
 			mockResolver := oidcmocks.NewMockResolver(ctrl)
-			mockResolver.EXPECT().Resolve(gomock.Any(), gomock.Any()).Return(tt.mockReturn, tt.mockErr)
+			mockResolver.EXPECT().ResolveFromConfigRef(
+				gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+			).Return(tt.mockReturn, tt.mockErr)
 
-			converter := newTestConverter(t, mockResolver)
+			converter := newTestConverterWithObjects(t, mockResolver, tt.oidcConfig)
 			ctx := log.IntoContext(context.Background(), logr.Discard())
-			config, _, err := converter.Convert(ctx, newTestVMCPServer(tt.oidcConfig))
+			config, _, err := converter.Convert(ctx, newTestVMCPServer(tt.oidcConfigRef), nil)
 
 			tt.validate(t, config, err)
 		})
@@ -186,14 +219,14 @@ func TestConverter_OIDCResolution(t *testing.T) {
 func TestConverter_MCPOIDCConfigRefMapsAllowedClientIDs(t *testing.T) {
 	t.Parallel()
 
-	sharedConfig := &mcpv1alpha1.MCPOIDCConfig{
+	sharedConfig := &mcpv1beta1.MCPOIDCConfig{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "shared-oidc",
 			Namespace: "default",
 		},
-		Spec: mcpv1alpha1.MCPOIDCConfigSpec{
-			Type: mcpv1alpha1.MCPOIDCConfigTypeInline,
-			Inline: &mcpv1alpha1.InlineOIDCSharedConfig{
+		Spec: mcpv1beta1.MCPOIDCConfigSpec{
+			Type: mcpv1beta1.MCPOIDCConfigTypeInline,
+			Inline: &mcpv1beta1.InlineOIDCSharedConfig{
 				Issuer:           "https://cognito-idp.eu-north-1.amazonaws.com/eu-north-1_Mr6I2Vf9J",
 				AllowedClientIDs: []string{"sre-audit-agent", "litellm"},
 			},
@@ -214,13 +247,13 @@ func TestConverter_MCPOIDCConfigRefMapsAllowedClientIDs(t *testing.T) {
 	converter, err := NewConverter(mockResolver, newTestK8sClient(t, sharedConfig))
 	require.NoError(t, err)
 
-	vmcp := &mcpv1alpha1.VirtualMCPServer{
+	vmcp := &mcpv1beta1.VirtualMCPServer{
 		ObjectMeta: metav1.ObjectMeta{Name: "hub-agents", Namespace: "default"},
-		Spec: mcpv1alpha1.VirtualMCPServerSpec{
+		Spec: mcpv1beta1.VirtualMCPServerSpec{
 			Config: vmcpconfig.Config{Group: "test-group"},
-			IncomingAuth: &mcpv1alpha1.IncomingAuthConfig{
+			IncomingAuth: &mcpv1beta1.IncomingAuthConfig{
 				Type: "oidc",
-				OIDCConfigRef: &mcpv1alpha1.MCPOIDCConfigReference{
+				OIDCConfigRef: &mcpv1beta1.MCPOIDCConfigReference{
 					Name:   "shared-oidc",
 					Scopes: []string{"toolhive-mcp/automation"},
 				},
@@ -228,7 +261,7 @@ func TestConverter_MCPOIDCConfigRefMapsAllowedClientIDs(t *testing.T) {
 		},
 	}
 
-	config, _, err := converter.Convert(log.IntoContext(context.Background(), logr.Discard()), vmcp)
+	config, _, err := converter.Convert(log.IntoContext(context.Background(), logr.Discard()), vmcp, nil)
 	require.NoError(t, err)
 	require.NotNil(t, config)
 	require.NotNil(t, config.IncomingAuth)
@@ -243,41 +276,35 @@ func TestConverter_MCPOIDCConfigRefMapsAllowedClientIDs(t *testing.T) {
 func TestConverter_CompositeToolsPassThrough(t *testing.T) {
 	t.Parallel()
 
-	vmcpServer := &mcpv1alpha1.VirtualMCPServer{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-vmcp",
-			Namespace: "default",
-		},
-		Spec: mcpv1alpha1.VirtualMCPServerSpec{
-			Config: vmcpconfig.Config{
-				Group: "test-group",
-				CompositeTools: []vmcpconfig.CompositeToolConfig{
-					{
-						Name:        "test-composite-tool",
-						Description: "A test composite tool",
-						Timeout:     vmcpconfig.Duration(30 * time.Second),
-						Steps: []vmcpconfig.WorkflowStepConfig{
-							{
-								ID:   "step1",
-								Type: "tool",
-								Tool: "backend.some-tool",
-							},
-							{
-								ID:        "step2",
-								Type:      "tool",
-								Tool:      "backend.other-tool",
-								DependsOn: []string{"step1"},
-							},
+	vmcpServer := v1beta1test.NewVirtualMCPServer("test-vmcp", "default",
+		v1beta1test.WithVMCPGroupRef("test-group"),
+		v1beta1test.WithVMCPConfig(vmcpconfig.Config{
+			CompositeTools: []vmcpconfig.CompositeToolConfig{
+				{
+					Name:        "test-composite-tool",
+					Description: "A test composite tool",
+					Timeout:     vmcpconfig.Duration(30 * time.Second),
+					Steps: []vmcpconfig.WorkflowStepConfig{
+						{
+							ID:   "step1",
+							Type: "tool",
+							Tool: "backend.some-tool",
+						},
+						{
+							ID:        "step2",
+							Type:      "tool",
+							Tool:      "backend.other-tool",
+							DependsOn: []string{"step1"},
 						},
 					},
 				},
 			},
-		},
-	}
+		}),
+	)
 
 	converter := newTestConverter(t, newNoOpMockResolver(t))
 	ctx := log.IntoContext(context.Background(), logr.Discard())
-	config, _, err := converter.Convert(ctx, vmcpServer)
+	config, _, err := converter.Convert(ctx, vmcpServer, nil)
 
 	require.NoError(t, err)
 	require.NotNil(t, config)
@@ -301,12 +328,16 @@ func TestConverter_CompositeToolsPassThrough(t *testing.T) {
 func TestConverter_IncomingAuthRequired(t *testing.T) {
 	t.Parallel()
 
+	const oidcConfigName = "test-oidc"
+
 	tests := []struct {
 		name               string
-		incomingAuth       *mcpv1alpha1.IncomingAuthConfig
+		incomingAuth       *mcpv1beta1.IncomingAuthConfig
+		oidcConfig         *mcpv1beta1.MCPOIDCConfig // MCPOIDCConfig object to add to fake client
 		expectedAuthType   string
 		expectedOIDCConfig *vmcpconfig.OIDCConfig
 		expectNilAuth      bool
+		mockReturn         *oidc.OIDCConfig
 		description        string
 	}{
 		{
@@ -317,24 +348,26 @@ func TestConverter_IncomingAuthRequired(t *testing.T) {
 		},
 		{
 			name: "explicit anonymous auth",
-			incomingAuth: &mcpv1alpha1.IncomingAuthConfig{
+			incomingAuth: &mcpv1beta1.IncomingAuthConfig{
 				Type: "anonymous",
 			},
 			expectedAuthType: "anonymous",
 			description:      "Should use anonymous auth when explicitly specified",
 		},
 		{
-			name: "explicit oidc auth with inline config",
-			incomingAuth: &mcpv1alpha1.IncomingAuthConfig{
-				Type: "oidc",
-				OIDCConfig: &mcpv1alpha1.OIDCConfigRef{
-					Type: "inline",
-					Inline: &mcpv1alpha1.InlineOIDCConfig{
-						Issuer:   "https://example.com",
-						ClientID: "test-client",
-						Audience: "test-audience",
-					},
-				},
+			name: "explicit oidc auth via MCPOIDCConfigRef",
+			incomingAuth: &mcpv1beta1.IncomingAuthConfig{
+				Type:          "oidc",
+				OIDCConfigRef: &mcpv1beta1.MCPOIDCConfigReference{Name: oidcConfigName, Audience: "test-audience"},
+			},
+			oidcConfig: newTestMCPOIDCConfigInline(&mcpv1beta1.InlineOIDCSharedConfig{
+				Issuer:   "https://example.com",
+				ClientID: "test-client",
+			}),
+			mockReturn: &oidc.OIDCConfig{
+				Issuer:   "https://example.com",
+				ClientID: "test-client",
+				Audience: "test-audience",
 			},
 			expectedAuthType: "oidc",
 			expectedOIDCConfig: &vmcpconfig.OIDCConfig{
@@ -342,21 +375,23 @@ func TestConverter_IncomingAuthRequired(t *testing.T) {
 				ClientID: "test-client",
 				Audience: "test-audience",
 			},
-			description: "Should correctly convert OIDC auth config",
+			description: "Should correctly convert OIDC auth config via MCPOIDCConfigRef",
 		},
 		{
 			name: "oidc auth with scopes",
-			incomingAuth: &mcpv1alpha1.IncomingAuthConfig{
-				Type: "oidc",
-				OIDCConfig: &mcpv1alpha1.OIDCConfigRef{
-					Type: "inline",
-					Inline: &mcpv1alpha1.InlineOIDCConfig{
-						Issuer:   "https://accounts.google.com",
-						ClientID: "google-client",
-						Audience: "google-audience",
-						Scopes:   []string{"https://www.googleapis.com/auth/drive.readonly", "openid"},
-					},
-				},
+			incomingAuth: &mcpv1beta1.IncomingAuthConfig{
+				Type:          "oidc",
+				OIDCConfigRef: &mcpv1beta1.MCPOIDCConfigReference{Name: oidcConfigName, Audience: "google-audience"},
+			},
+			oidcConfig: newTestMCPOIDCConfigInline(&mcpv1beta1.InlineOIDCSharedConfig{
+				Issuer:   "https://accounts.google.com",
+				ClientID: "google-client",
+			}),
+			mockReturn: &oidc.OIDCConfig{
+				Issuer:   "https://accounts.google.com",
+				ClientID: "google-client",
+				Audience: "google-audience",
+				Scopes:   []string{"https://www.googleapis.com/auth/drive.readonly", "openid"},
 			},
 			expectedAuthType: "oidc",
 			expectedOIDCConfig: &vmcpconfig.OIDCConfig{
@@ -369,18 +404,22 @@ func TestConverter_IncomingAuthRequired(t *testing.T) {
 		},
 		{
 			name: "oidc auth with jwksUrl and introspectionUrl",
-			incomingAuth: &mcpv1alpha1.IncomingAuthConfig{
-				Type: "oidc",
-				OIDCConfig: &mcpv1alpha1.OIDCConfigRef{
-					Type: "inline",
-					Inline: &mcpv1alpha1.InlineOIDCConfig{
-						Issuer:           "https://auth.example.com",
-						ClientID:         "test-client",
-						Audience:         "test-audience",
-						JWKSURL:          "https://auth.example.com/custom/jwks",
-						IntrospectionURL: "https://auth.example.com/custom/introspect",
-					},
-				},
+			incomingAuth: &mcpv1beta1.IncomingAuthConfig{
+				Type:          "oidc",
+				OIDCConfigRef: &mcpv1beta1.MCPOIDCConfigReference{Name: oidcConfigName, Audience: "test-audience"},
+			},
+			oidcConfig: newTestMCPOIDCConfigInline(&mcpv1beta1.InlineOIDCSharedConfig{
+				Issuer:           "https://auth.example.com",
+				ClientID:         "test-client",
+				JWKSURL:          "https://auth.example.com/custom/jwks",
+				IntrospectionURL: "https://auth.example.com/custom/introspect",
+			}),
+			mockReturn: &oidc.OIDCConfig{
+				Issuer:           "https://auth.example.com",
+				ClientID:         "test-client",
+				Audience:         "test-audience",
+				JWKSURL:          "https://auth.example.com/custom/jwks",
+				IntrospectionURL: "https://auth.example.com/custom/introspect",
 			},
 			expectedAuthType: "oidc",
 			expectedOIDCConfig: &vmcpconfig.OIDCConfig{
@@ -398,38 +437,35 @@ func TestConverter_IncomingAuthRequired(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			vmcpServer := &mcpv1alpha1.VirtualMCPServer{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-vmcp",
-					Namespace: "default",
-				},
-				Spec: mcpv1alpha1.VirtualMCPServerSpec{
-					Config:       vmcpconfig.Config{Group: "test-group"},
-					IncomingAuth: tt.incomingAuth,
-				},
-			}
+			vmcpServer := v1beta1test.NewVirtualMCPServer("test-vmcp", "default",
+				v1beta1test.WithVMCPGroupRef("test-group"),
+				v1beta1test.WithVMCPIncomingAuth(tt.incomingAuth),
+			)
 
 			// Set up mock resolver based on test expectations
 			ctrl := gomock.NewController(t)
 			mockResolver := oidcmocks.NewMockResolver(ctrl)
 
-			// Configure mock to return expected OIDC config
-			if tt.expectedOIDCConfig != nil {
-				mockResolver.EXPECT().Resolve(gomock.Any(), gomock.Any()).Return(&oidc.OIDCConfig{
-					Issuer:           tt.expectedOIDCConfig.Issuer,
-					ClientID:         tt.expectedOIDCConfig.ClientID,
-					Audience:         tt.expectedOIDCConfig.Audience,
-					JWKSURL:          tt.expectedOIDCConfig.JWKSURL,
-					IntrospectionURL: tt.expectedOIDCConfig.IntrospectionURL,
-					Scopes:           tt.expectedOIDCConfig.Scopes,
-				}, nil)
-			} else {
-				mockResolver.EXPECT().Resolve(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+			// Build k8s client objects
+			var objects []client.Object
+			if tt.oidcConfig != nil {
+				objects = append(objects, tt.oidcConfig)
 			}
 
-			converter := newTestConverter(t, mockResolver)
+			// Configure mock to return expected OIDC config
+			if tt.mockReturn != nil {
+				mockResolver.EXPECT().ResolveFromConfigRef(
+					gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+				).Return(tt.mockReturn, nil)
+			} else {
+				mockResolver.EXPECT().ResolveFromConfigRef(
+					gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+				).Return(nil, nil).AnyTimes()
+			}
+
+			converter := newTestConverterWithObjects(t, mockResolver, objects...)
 			ctx := log.IntoContext(context.Background(), logr.Discard())
-			config, _, err := converter.Convert(ctx, vmcpServer)
+			config, _, err := converter.Convert(ctx, vmcpServer, nil)
 
 			require.NoError(t, err, tt.description)
 			require.NotNil(t, config, tt.description)
@@ -456,72 +492,13 @@ func TestConverter_IncomingAuthRequired(t *testing.T) {
 	}
 }
 
-func TestConverter_InlineAuthzPrimaryUpstreamProvider(t *testing.T) {
-	t.Parallel()
-
-	vmcpServer := &mcpv1alpha1.VirtualMCPServer{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-vmcp",
-			Namespace: "default",
-		},
-		Spec: mcpv1alpha1.VirtualMCPServerSpec{
-			Config: vmcpconfig.Config{Group: "test-group"},
-			IncomingAuth: &mcpv1alpha1.IncomingAuthConfig{
-				Type: "oidc",
-				OIDCConfig: &mcpv1alpha1.OIDCConfigRef{
-					Type: "inline",
-					Inline: &mcpv1alpha1.InlineOIDCConfig{
-						Issuer:   "https://issuer.example.com",
-						ClientID: "test-client",
-						Audience: "test-audience",
-					},
-				},
-				AuthzConfig: &mcpv1alpha1.AuthzConfigRef{
-					Type: authzLabelValueInline,
-					Inline: &mcpv1alpha1.InlineAuthzConfig{
-						Policies:                []string{"permit(principal, action, resource);"},
-						PrimaryUpstreamProvider: "cognito",
-					},
-				},
-			},
-		},
-	}
-
-	ctrl := gomock.NewController(t)
-	mockResolver := oidcmocks.NewMockResolver(ctrl)
-	mockResolver.EXPECT().Resolve(gomock.Any(), gomock.Any()).Return(&oidc.OIDCConfig{
-		Issuer:   "https://issuer.example.com",
-		ClientID: "test-client",
-		Audience: "test-audience",
-	}, nil)
-
-	converter := newTestConverter(t, mockResolver)
-	ctx := log.IntoContext(context.Background(), logr.Discard())
-	config, _, err := converter.Convert(ctx, vmcpServer)
-
-	require.NoError(t, err)
-	require.NotNil(t, config)
-	require.NotNil(t, config.IncomingAuth)
-	require.NotNil(t, config.IncomingAuth.Authz)
-	assert.Equal(t, "cedar", config.IncomingAuth.Authz.Type)
-	assert.Equal(t, []string{"permit(principal, action, resource);"}, config.IncomingAuth.Authz.Policies)
-	assert.Equal(t, "cognito", config.IncomingAuth.Authz.PrimaryUpstreamProvider)
-}
-
-// createTestScheme creates a test scheme with required types
-func createTestScheme() *runtime.Scheme {
-	s := runtime.NewScheme()
-	_ = mcpv1alpha1.AddToScheme(s)
-	return s
-}
-
 func TestConverter_CompositeToolRefs(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name          string
-		vmcp          *mcpv1alpha1.VirtualMCPServer
-		compositeDefs []*mcpv1alpha1.VirtualMCPCompositeToolDefinition
+		vmcp          *mcpv1beta1.VirtualMCPServer
+		compositeDefs []*mcpv1beta1.VirtualMCPCompositeToolDefinition
 		k8sClient     client.Client
 		expectError   bool
 		errorContains string
@@ -529,27 +506,21 @@ func TestConverter_CompositeToolRefs(t *testing.T) {
 	}{
 		{
 			name: "successfully fetch and merge referenced composite tool",
-			vmcp: &mcpv1alpha1.VirtualMCPServer{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-vmcp",
-					Namespace: "default",
-				},
-				Spec: mcpv1alpha1.VirtualMCPServerSpec{
-					Config: vmcpconfig.Config{
-						Group: "test-group",
-						CompositeToolRefs: []vmcpconfig.CompositeToolRef{
-							{Name: "referenced-tool"},
-						},
+			vmcp: v1beta1test.NewVirtualMCPServer("test-vmcp", "default",
+				v1beta1test.WithVMCPGroupRef("test-group"),
+				v1beta1test.WithVMCPConfig(vmcpconfig.Config{
+					CompositeToolRefs: []vmcpconfig.CompositeToolRef{
+						{Name: "referenced-tool"},
 					},
-				},
-			},
-			compositeDefs: []*mcpv1alpha1.VirtualMCPCompositeToolDefinition{
+				}),
+			),
+			compositeDefs: []*mcpv1beta1.VirtualMCPCompositeToolDefinition{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "referenced-tool",
 						Namespace: "default",
 					},
-					Spec: mcpv1alpha1.VirtualMCPCompositeToolDefinitionSpec{
+					Spec: mcpv1beta1.VirtualMCPCompositeToolDefinitionSpec{
 						CompositeToolConfig: vmcpconfig.CompositeToolConfig{
 							Name:        "referenced-tool",
 							Description: "A referenced composite tool",
@@ -577,40 +548,34 @@ func TestConverter_CompositeToolRefs(t *testing.T) {
 		},
 		{
 			name: "merge inline and referenced composite tools",
-			vmcp: &mcpv1alpha1.VirtualMCPServer{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-vmcp",
-					Namespace: "default",
-				},
-				Spec: mcpv1alpha1.VirtualMCPServerSpec{
-					Config: vmcpconfig.Config{
-						Group: "test-group",
-						CompositeTools: []vmcpconfig.CompositeToolConfig{
-							{
-								Name:        "inline-tool",
-								Description: "An inline composite tool",
-								Steps: []vmcpconfig.WorkflowStepConfig{
-									{
-										ID:   "step1",
-										Type: "tool",
-										Tool: "backend.inline-tool",
-									},
+			vmcp: v1beta1test.NewVirtualMCPServer("test-vmcp", "default",
+				v1beta1test.WithVMCPGroupRef("test-group"),
+				v1beta1test.WithVMCPConfig(vmcpconfig.Config{
+					CompositeTools: []vmcpconfig.CompositeToolConfig{
+						{
+							Name:        "inline-tool",
+							Description: "An inline composite tool",
+							Steps: []vmcpconfig.WorkflowStepConfig{
+								{
+									ID:   "step1",
+									Type: "tool",
+									Tool: "backend.inline-tool",
 								},
 							},
 						},
-						CompositeToolRefs: []vmcpconfig.CompositeToolRef{
-							{Name: "referenced-tool"},
-						},
 					},
-				},
-			},
-			compositeDefs: []*mcpv1alpha1.VirtualMCPCompositeToolDefinition{
+					CompositeToolRefs: []vmcpconfig.CompositeToolRef{
+						{Name: "referenced-tool"},
+					},
+				}),
+			),
+			compositeDefs: []*mcpv1beta1.VirtualMCPCompositeToolDefinition{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "referenced-tool",
 						Namespace: "default",
 					},
-					Spec: mcpv1alpha1.VirtualMCPCompositeToolDefinitionSpec{
+					Spec: mcpv1beta1.VirtualMCPCompositeToolDefinitionSpec{
 						CompositeToolConfig: vmcpconfig.CompositeToolConfig{
 							Name:        "referenced-tool",
 							Description: "A referenced composite tool",
@@ -640,60 +605,48 @@ func TestConverter_CompositeToolRefs(t *testing.T) {
 		},
 		{
 			name: "error when referenced composite tool not found",
-			vmcp: &mcpv1alpha1.VirtualMCPServer{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-vmcp",
-					Namespace: "default",
-				},
-				Spec: mcpv1alpha1.VirtualMCPServerSpec{
-					Config: vmcpconfig.Config{
-						Group: "test-group",
-						CompositeToolRefs: []vmcpconfig.CompositeToolRef{
-							{Name: "non-existent-tool"},
-						},
+			vmcp: v1beta1test.NewVirtualMCPServer("test-vmcp", "default",
+				v1beta1test.WithVMCPGroupRef("test-group"),
+				v1beta1test.WithVMCPConfig(vmcpconfig.Config{
+					CompositeToolRefs: []vmcpconfig.CompositeToolRef{
+						{Name: "non-existent-tool"},
 					},
-				},
-			},
-			compositeDefs: []*mcpv1alpha1.VirtualMCPCompositeToolDefinition{},
+				}),
+			),
+			compositeDefs: []*mcpv1beta1.VirtualMCPCompositeToolDefinition{},
 			expectError:   true,
 			errorContains: "not found",
 		},
 		{
 			name: "error when duplicate tool names exist",
-			vmcp: &mcpv1alpha1.VirtualMCPServer{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-vmcp",
-					Namespace: "default",
-				},
-				Spec: mcpv1alpha1.VirtualMCPServerSpec{
-					Config: vmcpconfig.Config{
-						Group: "test-group",
-						CompositeTools: []vmcpconfig.CompositeToolConfig{
-							{
-								Name:        "duplicate-tool",
-								Description: "An inline tool",
-								Steps: []vmcpconfig.WorkflowStepConfig{
-									{
-										ID:   "step1",
-										Type: "tool",
-										Tool: "backend.tool1",
-									},
+			vmcp: v1beta1test.NewVirtualMCPServer("test-vmcp", "default",
+				v1beta1test.WithVMCPGroupRef("test-group"),
+				v1beta1test.WithVMCPConfig(vmcpconfig.Config{
+					CompositeTools: []vmcpconfig.CompositeToolConfig{
+						{
+							Name:        "duplicate-tool",
+							Description: "An inline tool",
+							Steps: []vmcpconfig.WorkflowStepConfig{
+								{
+									ID:   "step1",
+									Type: "tool",
+									Tool: "backend.tool1",
 								},
 							},
 						},
-						CompositeToolRefs: []vmcpconfig.CompositeToolRef{
-							{Name: "referenced-tool"},
-						},
 					},
-				},
-			},
-			compositeDefs: []*mcpv1alpha1.VirtualMCPCompositeToolDefinition{
+					CompositeToolRefs: []vmcpconfig.CompositeToolRef{
+						{Name: "referenced-tool"},
+					},
+				}),
+			),
+			compositeDefs: []*mcpv1beta1.VirtualMCPCompositeToolDefinition{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "referenced-tool",
 						Namespace: "default",
 					},
-					Spec: mcpv1alpha1.VirtualMCPCompositeToolDefinitionSpec{
+					Spec: mcpv1beta1.VirtualMCPCompositeToolDefinitionSpec{
 						CompositeToolConfig: vmcpconfig.CompositeToolConfig{
 							Name:        "duplicate-tool", // Same name as inline tool
 							Description: "A referenced tool with duplicate name",
@@ -713,44 +666,32 @@ func TestConverter_CompositeToolRefs(t *testing.T) {
 		},
 		{
 			name: "error when k8sClient is nil",
-			vmcp: &mcpv1alpha1.VirtualMCPServer{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-vmcp",
-					Namespace: "default",
-				},
-				Spec: mcpv1alpha1.VirtualMCPServerSpec{
-					Config: vmcpconfig.Config{Group: "test-group"},
-				},
-			},
-			compositeDefs: []*mcpv1alpha1.VirtualMCPCompositeToolDefinition{},
+			vmcp: v1beta1test.NewVirtualMCPServer("test-vmcp", "default",
+				v1beta1test.WithVMCPGroupRef("test-group"),
+			),
+			compositeDefs: []*mcpv1beta1.VirtualMCPCompositeToolDefinition{},
 			k8sClient:     nil, // No client provided
 			expectError:   true,
 			errorContains: "k8sClient is required",
 		},
 		{
 			name: "handle multiple referenced tools",
-			vmcp: &mcpv1alpha1.VirtualMCPServer{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-vmcp",
-					Namespace: "default",
-				},
-				Spec: mcpv1alpha1.VirtualMCPServerSpec{
-					Config: vmcpconfig.Config{
-						Group: "test-group",
-						CompositeToolRefs: []vmcpconfig.CompositeToolRef{
-							{Name: "tool1"},
-							{Name: "tool2"},
-						},
+			vmcp: v1beta1test.NewVirtualMCPServer("test-vmcp", "default",
+				v1beta1test.WithVMCPGroupRef("test-group"),
+				v1beta1test.WithVMCPConfig(vmcpconfig.Config{
+					CompositeToolRefs: []vmcpconfig.CompositeToolRef{
+						{Name: "tool1"},
+						{Name: "tool2"},
 					},
-				},
-			},
-			compositeDefs: []*mcpv1alpha1.VirtualMCPCompositeToolDefinition{
+				}),
+			),
+			compositeDefs: []*mcpv1beta1.VirtualMCPCompositeToolDefinition{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "tool1",
 						Namespace: "default",
 					},
-					Spec: mcpv1alpha1.VirtualMCPCompositeToolDefinitionSpec{
+					Spec: mcpv1beta1.VirtualMCPCompositeToolDefinitionSpec{
 						CompositeToolConfig: vmcpconfig.CompositeToolConfig{
 							Name:        "tool1",
 							Description: "First referenced tool",
@@ -769,7 +710,7 @@ func TestConverter_CompositeToolRefs(t *testing.T) {
 						Name:      "tool2",
 						Namespace: "default",
 					},
-					Spec: mcpv1alpha1.VirtualMCPCompositeToolDefinitionSpec{
+					Spec: mcpv1beta1.VirtualMCPCompositeToolDefinitionSpec{
 						CompositeToolConfig: vmcpconfig.CompositeToolConfig{
 							Name:        "tool2",
 							Description: "Second referenced tool",
@@ -798,27 +739,21 @@ func TestConverter_CompositeToolRefs(t *testing.T) {
 		},
 		{
 			name: "convert referenced tool with parameters and timeout",
-			vmcp: &mcpv1alpha1.VirtualMCPServer{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-vmcp",
-					Namespace: "default",
-				},
-				Spec: mcpv1alpha1.VirtualMCPServerSpec{
-					Config: vmcpconfig.Config{
-						Group: "test-group",
-						CompositeToolRefs: []vmcpconfig.CompositeToolRef{
-							{Name: "referenced-tool"},
-						},
+			vmcp: v1beta1test.NewVirtualMCPServer("test-vmcp", "default",
+				v1beta1test.WithVMCPGroupRef("test-group"),
+				v1beta1test.WithVMCPConfig(vmcpconfig.Config{
+					CompositeToolRefs: []vmcpconfig.CompositeToolRef{
+						{Name: "referenced-tool"},
 					},
-				},
-			},
-			compositeDefs: []*mcpv1alpha1.VirtualMCPCompositeToolDefinition{
+				}),
+			),
+			compositeDefs: []*mcpv1beta1.VirtualMCPCompositeToolDefinition{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "referenced-tool",
 						Namespace: "default",
 					},
-					Spec: mcpv1alpha1.VirtualMCPCompositeToolDefinitionSpec{
+					Spec: mcpv1beta1.VirtualMCPCompositeToolDefinitionSpec{
 						CompositeToolConfig: vmcpconfig.CompositeToolConfig{
 							Name:        "referenced-tool",
 							Description: "A referenced tool with parameters",
@@ -866,7 +801,7 @@ func TestConverter_CompositeToolRefs(t *testing.T) {
 				fakeClient = tt.k8sClient
 			} else {
 				// Create fake client with objects (or nil if we want to test nil client behavior)
-				testScheme := createTestScheme()
+				testScheme := testutil.NewScheme(t)
 				objects := []client.Object{tt.vmcp}
 				for _, def := range tt.compositeDefs {
 					objects = append(objects, def)
@@ -890,7 +825,7 @@ func TestConverter_CompositeToolRefs(t *testing.T) {
 			require.NoError(t, err)
 
 			ctx := log.IntoContext(context.Background(), logr.Discard())
-			config, _, err := converter.Convert(ctx, tt.vmcp)
+			config, _, err := converter.Convert(ctx, tt.vmcp, nil)
 
 			if tt.expectError {
 				require.Error(t, err)
@@ -964,33 +899,27 @@ func TestConverter_CompositeToolDefinitionFieldsPreserved(t *testing.T) {
 	}
 
 	// Create a VirtualMCPCompositeToolDefinition with all fields populated
-	compositeDef := &mcpv1alpha1.VirtualMCPCompositeToolDefinition{
+	compositeDef := &mcpv1beta1.VirtualMCPCompositeToolDefinition{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "comprehensive-tool",
 			Namespace: "default",
 		},
-		Spec: mcpv1alpha1.VirtualMCPCompositeToolDefinitionSpec{
+		Spec: mcpv1beta1.VirtualMCPCompositeToolDefinitionSpec{
 			CompositeToolConfig: expectedConfig,
 		},
 	}
 
-	vmcpServer := &mcpv1alpha1.VirtualMCPServer{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-vmcp",
-			Namespace: "default",
-		},
-		Spec: mcpv1alpha1.VirtualMCPServerSpec{
-			Config: vmcpconfig.Config{
-				Group: "test-group",
-				CompositeToolRefs: []vmcpconfig.CompositeToolRef{
-					{Name: "comprehensive-tool"},
-				},
+	vmcpServer := v1beta1test.NewVirtualMCPServer("test-vmcp", "default",
+		v1beta1test.WithVMCPGroupRef("test-group"),
+		v1beta1test.WithVMCPConfig(vmcpconfig.Config{
+			CompositeToolRefs: []vmcpconfig.CompositeToolRef{
+				{Name: "comprehensive-tool"},
 			},
-		},
-	}
+		}),
+	)
 
 	// Setup fake Kubernetes client
-	testScheme := createTestScheme()
+	testScheme := testutil.NewScheme(t)
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(testScheme).
 		WithObjects(vmcpServer, compositeDef).
@@ -1001,7 +930,7 @@ func TestConverter_CompositeToolDefinitionFieldsPreserved(t *testing.T) {
 	require.NoError(t, err)
 
 	ctx := log.IntoContext(context.Background(), logr.Discard())
-	cfg, _, err := converter.Convert(ctx, vmcpServer)
+	cfg, _, err := converter.Convert(ctx, vmcpServer, nil)
 	require.NoError(t, err)
 	require.NotNil(t, cfg)
 	require.Len(t, cfg.CompositeTools, 1)
@@ -1011,19 +940,19 @@ func TestConverter_CompositeToolDefinitionFieldsPreserved(t *testing.T) {
 }
 
 // Test helpers for MCPToolConfig tests
-func newMCPToolConfig(name, namespace string, filter []string, overrides map[string]mcpv1alpha1.ToolOverride) *mcpv1alpha1.MCPToolConfig {
-	return &mcpv1alpha1.MCPToolConfig{
+func newMCPToolConfig(name, namespace string, filter []string, overrides map[string]mcpv1beta1.ToolOverride) *mcpv1beta1.MCPToolConfig {
+	return &mcpv1beta1.MCPToolConfig{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
-		Spec:       mcpv1alpha1.MCPToolConfigSpec{ToolsFilter: filter, ToolsOverride: overrides},
+		Spec:       mcpv1beta1.MCPToolConfigSpec{ToolsFilter: filter, ToolsOverride: overrides},
 	}
 }
 
-func toolOverride(name, desc string) mcpv1alpha1.ToolOverride {
-	return mcpv1alpha1.ToolOverride{Name: name, Description: desc}
+func toolOverride(name, desc string) mcpv1beta1.ToolOverride {
+	return mcpv1beta1.ToolOverride{Name: name, Description: desc}
 }
 
-func toolOverrideWithAnnotations(name, desc string, ann *mcpv1alpha1.ToolAnnotationsOverride) mcpv1alpha1.ToolOverride {
-	return mcpv1alpha1.ToolOverride{Name: name, Description: desc, Annotations: ann}
+func toolOverrideWithAnnotations(name, desc string, ann *mcpv1beta1.ToolAnnotationsOverride) mcpv1beta1.ToolOverride {
+	return mcpv1beta1.ToolOverride{Name: name, Description: desc, Annotations: ann}
 }
 
 func vmcpToolOverride(name, desc string) *vmcpconfig.ToolOverride {
@@ -1044,7 +973,7 @@ func TestResolveMCPToolConfig(t *testing.T) {
 	tests := []struct {
 		name        string
 		configName  string
-		existing    *mcpv1alpha1.MCPToolConfig
+		existing    *mcpv1beta1.MCPToolConfig
 		expectError bool
 	}{
 		{
@@ -1061,7 +990,7 @@ func TestResolveMCPToolConfig(t *testing.T) {
 			name:       "successfully resolve with overrides",
 			configName: "config-with-overrides",
 			existing: newMCPToolConfig("config-with-overrides", ns, []string{"fetch"},
-				map[string]mcpv1alpha1.ToolOverride{"fetch": toolOverride("renamed_fetch", "Renamed tool")}),
+				map[string]mcpv1beta1.ToolOverride{"fetch": toolOverride("renamed_fetch", "Renamed tool")}),
 		},
 	}
 
@@ -1099,7 +1028,7 @@ func TestMergeToolConfigFilter(t *testing.T) {
 	tests := []struct {
 		name     string
 		existing []string
-		config   *mcpv1alpha1.MCPToolConfig
+		config   *mcpv1beta1.MCPToolConfig
 		expected []string
 	}{
 		{
@@ -1146,25 +1075,25 @@ func TestMergeToolConfigOverrides(t *testing.T) {
 	tests := []struct {
 		name     string
 		existing map[string]*vmcpconfig.ToolOverride
-		config   *mcpv1alpha1.MCPToolConfig
+		config   *mcpv1beta1.MCPToolConfig
 		expected map[string]*vmcpconfig.ToolOverride
 	}{
 		{
 			name:     "merge when workload has none",
 			existing: nil,
-			config:   newMCPToolConfig("", "", nil, map[string]mcpv1alpha1.ToolOverride{"tool1": toolOverride("renamed_tool1", "Renamed description")}),
+			config:   newMCPToolConfig("", "", nil, map[string]mcpv1beta1.ToolOverride{"tool1": toolOverride("renamed_tool1", "Renamed description")}),
 			expected: map[string]*vmcpconfig.ToolOverride{"tool1": vmcpToolOverride("renamed_tool1", "Renamed description")},
 		},
 		{
 			name:     "inline takes precedence",
 			existing: map[string]*vmcpconfig.ToolOverride{"tool1": vmcpToolOverride("inline_name", "Inline description")},
-			config:   newMCPToolConfig("", "", nil, map[string]mcpv1alpha1.ToolOverride{"tool1": toolOverride("config_name", "Config description")}),
+			config:   newMCPToolConfig("", "", nil, map[string]mcpv1beta1.ToolOverride{"tool1": toolOverride("config_name", "Config description")}),
 			expected: map[string]*vmcpconfig.ToolOverride{"tool1": vmcpToolOverride("inline_name", "Inline description")},
 		},
 		{
 			name:     "merge non-conflicting",
 			existing: map[string]*vmcpconfig.ToolOverride{"tool1": vmcpToolOverride("inline_tool1", "Inline description")},
-			config:   newMCPToolConfig("", "", nil, map[string]mcpv1alpha1.ToolOverride{"tool2": toolOverride("config_tool2", "Config description")}),
+			config:   newMCPToolConfig("", "", nil, map[string]mcpv1beta1.ToolOverride{"tool2": toolOverride("config_tool2", "Config description")}),
 			expected: map[string]*vmcpconfig.ToolOverride{
 				"tool1": vmcpToolOverride("inline_tool1", "Inline description"),
 				"tool2": vmcpToolOverride("config_tool2", "Config description"),
@@ -1179,8 +1108,8 @@ func TestMergeToolConfigOverrides(t *testing.T) {
 		{
 			name:     "merge preserves annotation overrides from CRD",
 			existing: nil,
-			config: newMCPToolConfig("", "", nil, map[string]mcpv1alpha1.ToolOverride{
-				"tool1": toolOverrideWithAnnotations("renamed", "desc", &mcpv1alpha1.ToolAnnotationsOverride{
+			config: newMCPToolConfig("", "", nil, map[string]mcpv1beta1.ToolOverride{
+				"tool1": toolOverrideWithAnnotations("renamed", "desc", &mcpv1beta1.ToolAnnotationsOverride{
 					Title:        stringPtr("Custom Title"),
 					ReadOnlyHint: boolPtr(true),
 				}),
@@ -1195,7 +1124,7 @@ func TestMergeToolConfigOverrides(t *testing.T) {
 		{
 			name:     "merge preserves nil annotations",
 			existing: nil,
-			config: newMCPToolConfig("", "", nil, map[string]mcpv1alpha1.ToolOverride{
+			config: newMCPToolConfig("", "", nil, map[string]mcpv1beta1.ToolOverride{
 				"tool1": toolOverride("renamed", "desc"),
 			}),
 			expected: map[string]*vmcpconfig.ToolOverride{
@@ -1221,7 +1150,7 @@ func TestConvertCRDToolOverride(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		input    mcpv1alpha1.ToolOverride
+		input    mcpv1beta1.ToolOverride
 		expected *vmcpconfig.ToolOverride
 	}{
 		{
@@ -1231,7 +1160,7 @@ func TestConvertCRDToolOverride(t *testing.T) {
 		},
 		{
 			name: "all annotation fields converted",
-			input: toolOverrideWithAnnotations("renamed", "desc", &mcpv1alpha1.ToolAnnotationsOverride{
+			input: toolOverrideWithAnnotations("renamed", "desc", &mcpv1beta1.ToolAnnotationsOverride{
 				Title:           stringPtr("My Title"),
 				ReadOnlyHint:    boolPtr(true),
 				DestructiveHint: boolPtr(false),
@@ -1248,7 +1177,7 @@ func TestConvertCRDToolOverride(t *testing.T) {
 		},
 		{
 			name:  "title annotation only",
-			input: toolOverrideWithAnnotations("renamed", "desc", &mcpv1alpha1.ToolAnnotationsOverride{Title: stringPtr("Just Title")}),
+			input: toolOverrideWithAnnotations("renamed", "desc", &mcpv1beta1.ToolAnnotationsOverride{Title: stringPtr("Just Title")}),
 			expected: vmcpToolOverrideWithAnnotations("renamed", "desc", &vmcpconfig.ToolAnnotationsOverride{
 				Title: stringPtr("Just Title"),
 			}),
@@ -1271,7 +1200,7 @@ func TestResolveToolConfigRefs(t *testing.T) {
 	tests := []struct {
 		name             string
 		tools            []*vmcpconfig.WorkloadToolConfig
-		existingConfig   *mcpv1alpha1.MCPToolConfig
+		existingConfig   *mcpv1beta1.MCPToolConfig
 		expectedWorkload string
 		expectedFilter   []string
 		expectedOverride map[string]*vmcpconfig.ToolOverride
@@ -1294,7 +1223,7 @@ func TestResolveToolConfigRefs(t *testing.T) {
 				ToolConfigRef: &vmcpconfig.ToolConfigRef{Name: "test-config"},
 			}},
 			existingConfig: newMCPToolConfig("test-config", "default", []string{"fetch"},
-				map[string]mcpv1alpha1.ToolOverride{"fetch": toolOverride("renamed_fetch", "Renamed fetch")}),
+				map[string]mcpv1beta1.ToolOverride{"fetch": toolOverride("renamed_fetch", "Renamed fetch")}),
 			expectedWorkload: "backend1",
 			expectedFilter:   []string{"fetch"},
 			expectedOverride: map[string]*vmcpconfig.ToolOverride{"fetch": vmcpToolOverride("renamed_fetch", "Renamed fetch")},
@@ -1308,7 +1237,7 @@ func TestResolveToolConfigRefs(t *testing.T) {
 				Overrides:     map[string]*vmcpconfig.ToolOverride{"fetch": vmcpToolOverride("inline_fetch", "Inline override")},
 			}},
 			existingConfig: newMCPToolConfig("test-config", "default", []string{"config_tool"},
-				map[string]mcpv1alpha1.ToolOverride{"fetch": toolOverride("config_fetch", "Config override")}),
+				map[string]mcpv1beta1.ToolOverride{"fetch": toolOverride("config_fetch", "Config override")}),
 			expectedWorkload: "backend1",
 			expectedFilter:   []string{"inline_tool"},
 			expectedOverride: map[string]*vmcpconfig.ToolOverride{"fetch": vmcpToolOverride("inline_fetch", "Inline override")},
@@ -1331,9 +1260,7 @@ func TestResolveToolConfigRefs(t *testing.T) {
 			converter.k8sClient = k8sClient
 
 			srcAgg := &vmcpconfig.AggregationConfig{Tools: tt.tools}
-			vmcp := &mcpv1alpha1.VirtualMCPServer{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-vmcp", Namespace: "default"},
-			}
+			vmcp := v1beta1test.NewVirtualMCPServer("test-vmcp", "default")
 
 			agg := &vmcpconfig.AggregationConfig{}
 			err := converter.resolveToolConfigRefs(ctx, vmcp, srcAgg, agg)
@@ -1356,7 +1283,7 @@ func TestResolveToolConfigRefs_FailClosed(t *testing.T) {
 	tests := []struct {
 		name           string
 		tools          []*vmcpconfig.WorkloadToolConfig
-		existingConfig *mcpv1alpha1.MCPToolConfig
+		existingConfig *mcpv1beta1.MCPToolConfig
 		expectError    bool
 		expectedErrMsg string
 	}{
@@ -1406,9 +1333,7 @@ func TestResolveToolConfigRefs_FailClosed(t *testing.T) {
 			converter.k8sClient = k8sClient
 
 			srcAgg := &vmcpconfig.AggregationConfig{Tools: tt.tools}
-			vmcp := &mcpv1alpha1.VirtualMCPServer{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-vmcp", Namespace: "default"},
-			}
+			vmcp := v1beta1test.NewVirtualMCPServer("test-vmcp", "default")
 
 			agg := &vmcpconfig.AggregationConfig{}
 			err := converter.resolveToolConfigRefs(ctx, vmcp, srcAgg, agg)
@@ -1430,58 +1355,49 @@ func TestConvert_MCPToolConfigFailClosed(t *testing.T) {
 
 	tests := []struct {
 		name           string
-		vmcp           *mcpv1alpha1.VirtualMCPServer
-		existingConfig *mcpv1alpha1.MCPToolConfig
+		vmcp           *mcpv1beta1.VirtualMCPServer
+		existingConfig *mcpv1beta1.MCPToolConfig
 		expectError    bool
 		expectedErrMsg string
 	}{
 		{
 			name: "Convert fails when MCPToolConfig not found",
-			vmcp: &mcpv1alpha1.VirtualMCPServer{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-vmcp", Namespace: "default"},
-				Spec: mcpv1alpha1.VirtualMCPServerSpec{
-					Config: vmcpconfig.Config{
-						Group: "test-group",
-						Aggregation: &vmcpconfig.AggregationConfig{
-							Tools: []*vmcpconfig.WorkloadToolConfig{{
-								Workload:      "backend1",
-								ToolConfigRef: &vmcpconfig.ToolConfigRef{Name: "missing-config"},
-							}},
-						},
+			vmcp: v1beta1test.NewVirtualMCPServer("test-vmcp", "default",
+				v1beta1test.WithVMCPGroupRef("test-group"),
+				v1beta1test.WithVMCPConfig(vmcpconfig.Config{
+					Aggregation: &vmcpconfig.AggregationConfig{
+						Tools: []*vmcpconfig.WorkloadToolConfig{{
+							Workload:      "backend1",
+							ToolConfigRef: &vmcpconfig.ToolConfigRef{Name: "missing-config"},
+						}},
 					},
-				},
-			},
+				}),
+			),
 			existingConfig: nil,
 			expectError:    true,
 			expectedErrMsg: "failed to convert aggregation config",
 		},
 		{
 			name: "Convert succeeds when MCPToolConfig exists",
-			vmcp: &mcpv1alpha1.VirtualMCPServer{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-vmcp", Namespace: "default"},
-				Spec: mcpv1alpha1.VirtualMCPServerSpec{
-					Config: vmcpconfig.Config{
-						Group: "test-group",
-						Aggregation: &vmcpconfig.AggregationConfig{
-							Tools: []*vmcpconfig.WorkloadToolConfig{{
-								Workload:      "backend1",
-								ToolConfigRef: &vmcpconfig.ToolConfigRef{Name: "valid-config"},
-							}},
-						},
+			vmcp: v1beta1test.NewVirtualMCPServer("test-vmcp", "default",
+				v1beta1test.WithVMCPGroupRef("test-group"),
+				v1beta1test.WithVMCPConfig(vmcpconfig.Config{
+					Aggregation: &vmcpconfig.AggregationConfig{
+						Tools: []*vmcpconfig.WorkloadToolConfig{{
+							Workload:      "backend1",
+							ToolConfigRef: &vmcpconfig.ToolConfigRef{Name: "valid-config"},
+						}},
 					},
-				},
-			},
+				}),
+			),
 			existingConfig: newMCPToolConfig("valid-config", "default", []string{"fetch"}, nil),
 			expectError:    false,
 		},
 		{
 			name: "Convert succeeds when no Aggregation specified",
-			vmcp: &mcpv1alpha1.VirtualMCPServer{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-vmcp", Namespace: "default"},
-				Spec: mcpv1alpha1.VirtualMCPServerSpec{
-					Config: vmcpconfig.Config{Group: "test-group"},
-				},
-			},
+			vmcp: v1beta1test.NewVirtualMCPServer("test-vmcp", "default",
+				v1beta1test.WithVMCPGroupRef("test-group"),
+			),
 			existingConfig: nil,
 			expectError:    false,
 		},
@@ -1502,7 +1418,7 @@ func TestConvert_MCPToolConfigFailClosed(t *testing.T) {
 			converter := newTestConverter(t, newNoOpMockResolver(t))
 			converter.k8sClient = k8sClient
 
-			config, _, err := converter.Convert(ctx, tt.vmcp)
+			config, _, err := converter.Convert(ctx, tt.vmcp, nil)
 
 			if tt.expectError {
 				require.Error(t, err)
@@ -1516,260 +1432,54 @@ func TestConvert_MCPToolConfigFailClosed(t *testing.T) {
 	}
 }
 
-// TestConverter_TelemetryConfigPreserved tests that all telemetry config fields are preserved during conversion.
-// This is a regression test for https://github.com/stacklok/toolhive/issues/XXX where
-// CustomAttributes, ServiceVersion, and EnvironmentVariables were being dropped.
-func TestConverter_TelemetryConfigPreserved(t *testing.T) {
+// TestConverter_InlineTelemetryIgnored verifies that the operator-side converter
+// ignores Config.Telemetry (the standalone CLI field) and only uses TelemetryConfigRef.
+func TestConverter_InlineTelemetryIgnored(t *testing.T) {
 	t.Parallel()
 
-	inputTelemetry := &telemetry.Config{
-		Endpoint:                    "otlp-collector:4317",
-		EnablePrometheusMetricsPath: true,
-		ServiceName:                 "custom-service-name",
-		ServiceVersion:              "v1.2.3",
-		TracingEnabled:              true,
-		MetricsEnabled:              true,
-		SamplingRate:                "0.1",
-		CustomAttributes: map[string]string{
-			"environment":  "production",
-			"region":       "us-west-2",
-			"cluster_name": "main-cluster",
-		},
-		EnvironmentVariables: []string{"PATH", "HOME", "USER"},
-		Headers: map[string]string{
-			"Authorization": "Bearer token123",
-		},
-		Insecure: true,
-	}
-
-	vmcp := &mcpv1alpha1.VirtualMCPServer{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-vmcp",
-			Namespace: "default",
-		},
-		Spec: mcpv1alpha1.VirtualMCPServerSpec{
-			IncomingAuth: &mcpv1alpha1.IncomingAuthConfig{
-				Type: "anonymous",
+	vmcp := v1beta1test.NewVirtualMCPServer("test-vmcp", "default",
+		v1beta1test.WithVMCPGroupRef("test-group"),
+		v1beta1test.WithVMCPIncomingAuth(&mcpv1beta1.IncomingAuthConfig{
+			Type: "anonymous",
+		}),
+		v1beta1test.WithVMCPConfig(vmcpconfig.Config{
+			Telemetry: &telemetry.Config{
+				Endpoint:    "otlp-collector:4317",
+				ServiceName: "should-be-ignored",
 			},
-			Config: vmcpconfig.Config{
-				Group:     "test-group",
-				Telemetry: inputTelemetry,
-			},
-		},
-	}
+		}),
+	)
 
 	converter := newTestConverter(t, newNoOpMockResolver(t))
 	ctx := log.IntoContext(context.Background(), logr.Discard())
 
-	config, _, err := converter.Convert(ctx, vmcp)
+	config, _, err := converter.Convert(ctx, vmcp, nil)
 	require.NoError(t, err)
 	require.NotNil(t, config)
-
-	// Verify telemetry config is preserved exactly (all fields)
-	require.Equal(t, inputTelemetry, config.Telemetry, "All telemetry config fields should be preserved")
-}
-
-// TestConverter_TelemetryDefaults tests the default behavior for telemetry config.
-// This documents the behavior that was previously enforced by spectoconfig.ConvertTelemetryConfig:
-// - ServiceName defaults to VirtualMCPServer name when not specified
-// - ServiceVersion defaults to ServiceName when not specified
-func TestConverter_TelemetryDefaults(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name              string
-		inputTelemetry    *telemetry.Config
-		expectedTelemetry *telemetry.Config
-	}{
-		{
-			name: "defaults ServiceName to vmcp name, ServiceVersion left for runtime",
-			inputTelemetry: &telemetry.Config{
-				Endpoint:                    "localhost:4317",
-				EnablePrometheusMetricsPath: true,
-				ServiceName:                 "",
-				ServiceVersion:              "",
-			},
-			expectedTelemetry: &telemetry.Config{
-				Endpoint:                    "localhost:4317",
-				EnablePrometheusMetricsPath: true,
-				ServiceName:                 "my-vmcp-server",
-			},
-		},
-		{
-			name: "ServiceVersion left for runtime when ServiceName is specified",
-			inputTelemetry: &telemetry.Config{
-				Endpoint:                    "localhost:4317",
-				EnablePrometheusMetricsPath: true,
-				ServiceName:                 "custom-service",
-				ServiceVersion:              "",
-			},
-			expectedTelemetry: &telemetry.Config{
-				Endpoint:                    "localhost:4317",
-				EnablePrometheusMetricsPath: true,
-				ServiceName:                 "custom-service",
-			},
-		},
-		{
-			name: "preserves both when explicitly set",
-			inputTelemetry: &telemetry.Config{
-				Endpoint:                    "localhost:4317",
-				EnablePrometheusMetricsPath: true,
-				ServiceName:                 "my-service",
-				ServiceVersion:              "v2.0.0",
-			},
-			expectedTelemetry: &telemetry.Config{
-				Endpoint:                    "localhost:4317",
-				EnablePrometheusMetricsPath: true,
-				ServiceName:                 "my-service",
-				ServiceVersion:              "v2.0.0",
-			},
-		},
-		{
-			name: "defaults ServiceName when only ServiceVersion is set",
-			inputTelemetry: &telemetry.Config{
-				Endpoint:                    "localhost:4317",
-				EnablePrometheusMetricsPath: true,
-				ServiceName:                 "",
-				ServiceVersion:              "v1.0.0",
-			},
-			expectedTelemetry: &telemetry.Config{
-				Endpoint:                    "localhost:4317",
-				EnablePrometheusMetricsPath: true,
-				ServiceName:                 "my-vmcp-server",
-				ServiceVersion:              "v1.0.0",
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			vmcp := &mcpv1alpha1.VirtualMCPServer{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "my-vmcp-server",
-					Namespace: "default",
-				},
-				Spec: mcpv1alpha1.VirtualMCPServerSpec{
-					IncomingAuth: &mcpv1alpha1.IncomingAuthConfig{
-						Type: "anonymous",
-					},
-					Config: vmcpconfig.Config{
-						Group:     "test-group",
-						Telemetry: tt.inputTelemetry,
-					},
-				},
-			}
-
-			converter := newTestConverter(t, newNoOpMockResolver(t))
-			ctx := log.IntoContext(context.Background(), logr.Discard())
-
-			config, _, err := converter.Convert(ctx, vmcp)
-			require.NoError(t, err)
-			require.NotNil(t, config)
-
-			require.Equal(t, tt.expectedTelemetry, config.Telemetry, "Telemetry config should match expected defaults")
-		})
-	}
+	assert.Nil(t, config.Telemetry, "Config.Telemetry should be ignored by the operator; use TelemetryConfigRef")
 }
 
 // TestConverter_TelemetryNil tests that nil telemetry config is handled correctly.
 func TestConverter_TelemetryNil(t *testing.T) {
 	t.Parallel()
 
-	vmcp := &mcpv1alpha1.VirtualMCPServer{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-vmcp",
-			Namespace: "default",
-		},
-		Spec: mcpv1alpha1.VirtualMCPServerSpec{
-			IncomingAuth: &mcpv1alpha1.IncomingAuthConfig{
-				Type: "anonymous",
-			},
-			Config: vmcpconfig.Config{
-				Group:     "test-group",
-				Telemetry: nil, // No telemetry config
-			},
-		},
-	}
+	vmcp := v1beta1test.NewVirtualMCPServer("test-vmcp", "default",
+		v1beta1test.WithVMCPGroupRef("test-group"),
+		v1beta1test.WithVMCPIncomingAuth(&mcpv1beta1.IncomingAuthConfig{
+			Type: "anonymous",
+		}),
+		v1beta1test.WithVMCPConfig(vmcpconfig.Config{
+			Telemetry: nil, // No telemetry config
+		}),
+	)
 
 	converter := newTestConverter(t, newNoOpMockResolver(t))
 	ctx := log.IntoContext(context.Background(), logr.Discard())
 
-	config, _, err := converter.Convert(ctx, vmcp)
+	config, _, err := converter.Convert(ctx, vmcp, nil)
 	require.NoError(t, err)
 	require.NotNil(t, config)
 	assert.Nil(t, config.Telemetry, "Telemetry should be nil when not configured")
-}
-
-// TestConverter_TelemetryEndpointPrefixStripping tests that http:// and https:// prefixes
-// are stripped from the endpoint, as the OTLP client expects host:port format.
-// This matches the behavior of spectoconfig.ConvertTelemetryConfig.
-func TestConverter_TelemetryEndpointPrefixStripping(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name             string
-		inputEndpoint    string
-		expectedEndpoint string
-	}{
-		{
-			name:             "strips https:// prefix",
-			inputEndpoint:    "https://otlp-collector:4317",
-			expectedEndpoint: "otlp-collector:4317",
-		},
-		{
-			name:             "strips http:// prefix",
-			inputEndpoint:    "http://localhost:4317",
-			expectedEndpoint: "localhost:4317",
-		},
-		{
-			name:             "preserves endpoint without prefix",
-			inputEndpoint:    "otlp-collector:4317",
-			expectedEndpoint: "otlp-collector:4317",
-		},
-		{
-			name:             "preserves localhost without prefix",
-			inputEndpoint:    "localhost:4317",
-			expectedEndpoint: "localhost:4317",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			vmcp := &mcpv1alpha1.VirtualMCPServer{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-vmcp",
-					Namespace: "default",
-				},
-				Spec: mcpv1alpha1.VirtualMCPServerSpec{
-					IncomingAuth: &mcpv1alpha1.IncomingAuthConfig{
-						Type: "anonymous",
-					},
-					Config: vmcpconfig.Config{
-						Group: "test-group",
-						Telemetry: &telemetry.Config{
-							Endpoint:                    tt.inputEndpoint,
-							EnablePrometheusMetricsPath: true,
-						},
-					},
-				},
-			}
-
-			converter := newTestConverter(t, newNoOpMockResolver(t))
-			ctx := log.IntoContext(context.Background(), logr.Discard())
-
-			config, _, err := converter.Convert(ctx, vmcp)
-			require.NoError(t, err)
-			require.NotNil(t, config)
-			require.NotNil(t, config.Telemetry)
-
-			assert.Equal(t, tt.expectedEndpoint, config.Telemetry.Endpoint,
-				"Endpoint should have http:// or https:// prefix stripped")
-		})
-	}
 }
 
 func TestConverter_SessionStorage(t *testing.T) {
@@ -1777,14 +1487,14 @@ func TestConverter_SessionStorage(t *testing.T) {
 
 	tests := []struct {
 		name            string
-		sessionStorage  *mcpv1alpha1.SessionStorageConfig
+		sessionStorage  *mcpv1beta1.SessionStorageConfig
 		inlineConfig    *vmcpconfig.SessionStorageConfig
 		expectedStorage *vmcpconfig.SessionStorageConfig
 	}{
 		{
 			name: "redis provider populates SessionStorage",
-			sessionStorage: &mcpv1alpha1.SessionStorageConfig{
-				Provider:  mcpv1alpha1.SessionStorageProviderRedis,
+			sessionStorage: &mcpv1beta1.SessionStorageConfig{
+				Provider:  mcpv1beta1.SessionStorageProviderRedis,
 				Address:   "redis:6379",
 				DB:        2,
 				KeyPrefix: "thv:",
@@ -1798,7 +1508,7 @@ func TestConverter_SessionStorage(t *testing.T) {
 		},
 		{
 			name: "memory provider results in nil SessionStorage",
-			sessionStorage: &mcpv1alpha1.SessionStorageConfig{
+			sessionStorage: &mcpv1beta1.SessionStorageConfig{
 				Provider: "memory",
 			},
 			expectedStorage: nil,
@@ -1823,30 +1533,63 @@ func TestConverter_SessionStorage(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			vmcpServer := &mcpv1alpha1.VirtualMCPServer{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-vmcp",
-					Namespace: "default",
-				},
-				Spec: mcpv1alpha1.VirtualMCPServerSpec{
-					Config: vmcpconfig.Config{
-						Group:          "test-group",
-						SessionStorage: tt.inlineConfig,
-					},
-					SessionStorage: tt.sessionStorage,
-				},
-			}
+			vmcpServer := v1beta1test.NewVirtualMCPServer("test-vmcp", "default",
+				v1beta1test.WithVMCPGroupRef("test-group"),
+				v1beta1test.WithVMCPConfig(vmcpconfig.Config{
+					SessionStorage: tt.inlineConfig,
+				}),
+				v1beta1test.WithVMCPSessionStorage(tt.sessionStorage),
+			)
 
 			converter := newTestConverter(t, newNoOpMockResolver(t))
 			ctx := log.IntoContext(context.Background(), logr.Discard())
 
-			config, _, err := converter.Convert(ctx, vmcpServer)
+			config, _, err := converter.Convert(ctx, vmcpServer, nil)
 			require.NoError(t, err)
 			require.NotNil(t, config)
 
 			assert.Equal(t, tt.expectedStorage, config.SessionStorage)
 		})
 	}
+}
+
+func TestConverter_RateLimitingPassThrough(t *testing.T) {
+	t.Parallel()
+
+	vmcpServer := v1beta1test.NewVirtualMCPServer("test-vmcp", "default",
+		v1beta1test.WithVMCPGroupRef("test-group"),
+		v1beta1test.WithVMCPConfig(vmcpconfig.Config{
+			RateLimiting: &mcpv1beta1.RateLimitConfig{
+				PerUser: &mcpv1beta1.RateLimitBucket{
+					MaxTokens:    2,
+					RefillPeriod: metav1.Duration{Duration: time.Minute},
+				},
+				Tools: []mcpv1beta1.ToolRateLimitConfig{
+					{
+						Name: "backend_a_echo",
+						Shared: &mcpv1beta1.RateLimitBucket{
+							MaxTokens:    5,
+							RefillPeriod: metav1.Duration{Duration: 30 * time.Second},
+						},
+					},
+				},
+			},
+		}),
+	)
+
+	converter := newTestConverter(t, newNoOpMockResolver(t))
+	ctx := log.IntoContext(context.Background(), logr.Discard())
+
+	config, _, err := converter.Convert(ctx, vmcpServer, nil)
+	require.NoError(t, err)
+	require.NotNil(t, config)
+	require.NotNil(t, config.RateLimiting)
+
+	assert.EqualValues(t, 2, config.RateLimiting.PerUser.MaxTokens)
+	require.Len(t, config.RateLimiting.Tools, 1)
+	assert.Equal(t, "backend_a_echo", config.RateLimiting.Tools[0].Name)
+	require.NotNil(t, config.RateLimiting.Tools[0].Shared)
+	assert.EqualValues(t, 5, config.RateLimiting.Tools[0].Shared.MaxTokens)
 }
 
 func TestDeriveAllowedAudiences(t *testing.T) {
@@ -1958,6 +1701,60 @@ func TestDeriveScopesSupported(t *testing.T) {
 	}
 }
 
+func TestDeriveResourceURL(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		config   *vmcpconfig.Config
+		expected string
+	}{
+		{
+			name:     "nil IncomingAuth returns empty",
+			config:   &vmcpconfig.Config{},
+			expected: "",
+		},
+		{
+			name: "nil OIDC returns empty",
+			config: &vmcpconfig.Config{
+				IncomingAuth: &vmcpconfig.IncomingAuthConfig{Type: "oidc"},
+			},
+			expected: "",
+		},
+		{
+			name: "empty Resource returns empty",
+			config: &vmcpconfig.Config{
+				IncomingAuth: &vmcpconfig.IncomingAuthConfig{
+					Type: "oidc",
+					OIDC: &vmcpconfig.OIDCConfig{},
+				},
+			},
+			expected: "",
+		},
+		{
+			name: "populated Resource is returned",
+			config: &vmcpconfig.Config{
+				IncomingAuth: &vmcpconfig.IncomingAuthConfig{
+					Type: "oidc",
+					OIDC: &vmcpconfig.OIDCConfig{
+						Resource: "https://resource.example.com",
+					},
+				},
+			},
+			expected: "https://resource.example.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			result := deriveResourceURL(tt.config)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
 // TestConvert_AuthServerConfigIntegration is an integration-level test that exercises the
 // full Convert() path with an AuthServerConfig set on the VirtualMCPServer. It verifies that
 // the returned RunConfig has the correct Issuer, Upstreams, and AllowedAudiences derived
@@ -1967,55 +1764,51 @@ func TestConvert_AuthServerConfigIntegration(t *testing.T) {
 
 	ctrl := gomock.NewController(t)
 	mockResolver := oidcmocks.NewMockResolver(ctrl)
-	mockResolver.EXPECT().Resolve(gomock.Any(), gomock.Any()).Return(&oidc.OIDCConfig{
+	mockResolver.EXPECT().ResolveFromConfigRef(
+		gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+	).Return(&oidc.OIDCConfig{
 		Issuer:      "https://incoming-issuer.example.com",
 		Audience:    "https://my-vmcp.example.com",
 		ResourceURL: "https://resource.example.com",
 	}, nil)
 
-	k8sClient := newTestK8sClient(t)
+	oidcCfg := newTestMCPOIDCConfigInline(&mcpv1beta1.InlineOIDCSharedConfig{
+		Issuer: "https://incoming-issuer.example.com",
+	})
+	k8sClient := newTestK8sClient(t, oidcCfg)
 	converter, err := NewConverter(mockResolver, k8sClient)
 	require.NoError(t, err)
 
-	vmcp := &mcpv1alpha1.VirtualMCPServer{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-vmcp", Namespace: "default"},
-		Spec: mcpv1alpha1.VirtualMCPServerSpec{
-			Config: vmcpconfig.Config{Group: "test-group"},
-			IncomingAuth: &mcpv1alpha1.IncomingAuthConfig{
-				Type: "oidc",
-				OIDCConfig: &mcpv1alpha1.OIDCConfigRef{
-					Type: mcpv1alpha1.OIDCConfigTypeInline,
-					Inline: &mcpv1alpha1.InlineOIDCConfig{
-						Issuer:   "https://incoming-issuer.example.com",
-						Audience: "https://my-vmcp.example.com",
-					},
-				},
+	vmcp := v1beta1test.NewVirtualMCPServer("test-vmcp", "default",
+		v1beta1test.WithVMCPGroupRef("test-group"),
+		v1beta1test.WithVMCPIncomingAuth(&mcpv1beta1.IncomingAuthConfig{
+			Type:          "oidc",
+			OIDCConfigRef: &mcpv1beta1.MCPOIDCConfigReference{Name: "test-oidc", Audience: "https://my-vmcp.example.com"},
+		}),
+		v1beta1test.WithVMCPAuthServerConfig(&mcpv1beta1.EmbeddedAuthServerConfig{
+			Issuer: "https://authserver.example.com",
+			SigningKeySecretRefs: []mcpv1beta1.SecretKeyRef{
+				{Name: "signing-key", Key: "private.pem"},
 			},
-			AuthServerConfig: &mcpv1alpha1.EmbeddedAuthServerConfig{
-				Issuer: "https://authserver.example.com",
-				SigningKeySecretRefs: []mcpv1alpha1.SecretKeyRef{
-					{Name: "signing-key", Key: "private.pem"},
-				},
-				UpstreamProviders: []mcpv1alpha1.UpstreamProviderConfig{
-					{
-						Name: "corp-idp",
-						Type: mcpv1alpha1.UpstreamProviderTypeOIDC,
-						OIDCConfig: &mcpv1alpha1.OIDCUpstreamConfig{
-							IssuerURL: "https://corp.example.com",
-							ClientID:  "corp-client-id",
-							ClientSecretRef: &mcpv1alpha1.SecretKeyRef{
-								Name: "corp-secret",
-								Key:  "client-secret",
-							},
+			UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+				{
+					Name: "corp-idp",
+					Type: mcpv1beta1.UpstreamProviderTypeOIDC,
+					OIDCConfig: &mcpv1beta1.OIDCUpstreamConfig{
+						IssuerURL: "https://corp.example.com",
+						ClientID:  "corp-client-id",
+						ClientSecretRef: &mcpv1beta1.SecretKeyRef{
+							Name: "corp-secret",
+							Key:  "client-secret",
 						},
 					},
 				},
 			},
-		},
-	}
+		}),
+	)
 
 	ctx := log.IntoContext(context.Background(), logr.Discard())
-	config, runConfig, err := converter.Convert(ctx, vmcp)
+	config, runConfig, err := converter.Convert(ctx, vmcp, nil)
 
 	require.NoError(t, err)
 	require.NotNil(t, config)
@@ -2035,4 +1828,383 @@ func TestConvert_AuthServerConfigIntegration(t *testing.T) {
 		"No file path for secret should be present; env var is used")
 	assert.Equal(t, controllerutil.UpstreamClientSecretEnvVar+"_CORP_IDP",
 		runConfig.Upstreams[0].OIDCConfig.ClientSecretEnvVar)
+}
+
+// TestConverter_TelemetryConfigRef tests that Convert uses MCPTelemetryConfig when TelemetryConfigRef is set.
+// The telemetry config is now passed directly by the controller (no longer fetched by the converter).
+func TestConverter_TelemetryConfigRef(t *testing.T) {
+	t.Parallel()
+
+	telemetryCfg := &mcpv1beta1.MCPTelemetryConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared-telemetry", Namespace: "default"},
+		Spec: mcpv1beta1.MCPTelemetryConfigSpec{
+			OpenTelemetry: &mcpv1beta1.MCPTelemetryOTelConfig{
+				Enabled:  true,
+				Endpoint: "https://otel-collector:4317",
+				Tracing: &mcpv1beta1.OpenTelemetryTracingConfig{
+					Enabled:      true,
+					SamplingRate: "0.5",
+				},
+				Metrics: &mcpv1beta1.OpenTelemetryMetricsConfig{
+					Enabled: true,
+				},
+			},
+		},
+	}
+
+	k8sClient := newTestK8sClient(t)
+	converter, err := NewConverter(newNoOpMockResolver(t), k8sClient)
+	require.NoError(t, err)
+
+	vmcp := v1beta1test.NewVirtualMCPServer("test-vmcp", "default",
+		v1beta1test.WithVMCPGroupRef("test-group"),
+		v1beta1test.WithVMCPIncomingAuth(&mcpv1beta1.IncomingAuthConfig{Type: "anonymous"}),
+		v1beta1test.MutateVMCP(func(v *mcpv1beta1.VirtualMCPServer) {
+			v.Spec.TelemetryConfigRef = &mcpv1beta1.MCPTelemetryConfigReference{
+				Name:        "shared-telemetry",
+				ServiceName: "custom-svc",
+			}
+		}),
+	)
+
+	ctx := log.IntoContext(context.Background(), logr.Discard())
+	config, _, err := converter.Convert(ctx, vmcp, telemetryCfg)
+	require.NoError(t, err)
+	require.NotNil(t, config)
+	require.NotNil(t, config.Telemetry)
+
+	assert.Equal(t, "custom-svc", config.Telemetry.ServiceName,
+		"ServiceName should come from TelemetryConfigRef.ServiceName override")
+	assert.Equal(t, "otel-collector:4317", config.Telemetry.Endpoint,
+		"Endpoint should be normalized (https:// prefix stripped)")
+	assert.True(t, config.Telemetry.TracingEnabled, "Tracing should be enabled from MCPTelemetryConfig")
+	assert.True(t, config.Telemetry.MetricsEnabled, "Metrics should be enabled from MCPTelemetryConfig")
+}
+
+// TestConvertIncomingAuth_PrimaryUpstreamProvider verifies that convertIncomingAuth
+// propagates the first configured upstream provider name into AuthzConfig so Cedar
+// evaluates claims from the upstream IDP token rather than the ToolHive-issued
+// AS token. Without this, policies referencing upstream claims (e.g. "department")
+// fail at runtime because Cedar reads the wrong token. Also verifies that the
+// user-supplied spec.authServerConfig.primaryUpstreamProvider overrides the
+// auto-selected first upstream when set.
+func TestConvertIncomingAuth_PrimaryUpstreamProvider(t *testing.T) {
+	t.Parallel()
+
+	inlineAuthzRef := &mcpv1beta1.AuthzConfigRef{
+		Type: "inline",
+		Inline: &mcpv1beta1.InlineAuthzConfig{
+			Policies: []string{`permit(principal, action, resource);`},
+		},
+	}
+
+	tests := []struct {
+		name             string
+		authServerConfig *mcpv1beta1.EmbeddedAuthServerConfig
+		authzConfig      *mcpv1beta1.AuthzConfigRef
+		expectAuthzNil   bool
+		expectedProvider string
+		expectError      bool
+	}{
+		{
+			name:             "no auth server leaves provider unset",
+			authServerConfig: nil,
+			authzConfig:      inlineAuthzRef,
+			expectedProvider: "",
+		},
+		{
+			name: "auth server with empty upstream list leaves provider unset",
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer:            "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{},
+			},
+			authzConfig:      inlineAuthzRef,
+			expectedProvider: "",
+		},
+		{
+			name: "single named upstream becomes primary",
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+			},
+			authzConfig:      inlineAuthzRef,
+			expectedProvider: "okta",
+		},
+		{
+			name: "empty upstream name resolves to default",
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+			},
+			authzConfig:      inlineAuthzRef,
+			expectedProvider: "default",
+		},
+		{
+			name: "first upstream wins with multiple providers",
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+					{Name: "github", Type: mcpv1beta1.UpstreamProviderTypeOAuth2},
+					{Name: "google", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+			},
+			authzConfig:      inlineAuthzRef,
+			expectedProvider: "okta",
+		},
+		{
+			name: "no authz config leaves Authz nil without panic",
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+			},
+			authzConfig:    nil,
+			expectAuthzNil: true,
+		},
+		{
+			// Direct-IdP flow with anonymous incoming auth: neither the embedded
+			// AS nor authz is configured. Converter must not panic and must leave
+			// Authz unset.
+			name:             "both auth server and authz nil leaves Authz nil without panic",
+			authServerConfig: nil,
+			authzConfig:      nil,
+			expectAuthzNil:   true,
+		},
+		{
+			// Explicit primaryUpstreamProvider with a single upstream is honored
+			// (and matches it). Validates the explicit branch is taken at all.
+			name: "explicit primary provider with single upstream is honored",
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+				PrimaryUpstreamProvider: "okta",
+			},
+			authzConfig:      inlineAuthzRef,
+			expectedProvider: "okta",
+		},
+		{
+			// Explicit primaryUpstreamProvider overrides the auto-selected first
+			// upstream when multiple are configured. This is the core feature.
+			name: "explicit primary provider overrides first of multiple upstreams",
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+					{Name: "github", Type: mcpv1beta1.UpstreamProviderTypeOAuth2},
+					{Name: "google", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+				PrimaryUpstreamProvider: "github",
+			},
+			authzConfig:      inlineAuthzRef,
+			expectedProvider: "github",
+		},
+		{
+			// Exercises the actual normalization step inside ResolveUpstreamName:
+			// the upstream is declared with Name:"" (which resolves to "default")
+			// and the user pins primaryUpstreamProvider to "default". The explicit
+			// branch must forward "default" — exercising both the explicit path
+			// and the resolver's empty-input handling. The previous "okta -> okta"
+			// case did not exercise normalization because ResolveUpstreamName is
+			// the identity function for non-empty input.
+			name: "explicit primary provider 'default' resolves to default upstream",
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+				PrimaryUpstreamProvider: "default",
+			},
+			authzConfig:      inlineAuthzRef,
+			expectedProvider: "default",
+		},
+		{
+			// Defense in depth: even if invoked outside the reconcile flow
+			// (CLI dry-run, webhook, test harness), Convert refuses to produce
+			// an unresolvable PrimaryUpstreamProvider. The validator rejection
+			// is the primary user-facing fail-loud point; this case locks the
+			// converter-side defense in. The provider is on the deprecated
+			// location to keep the rejection wired through ExplicitPrimaryUpstream
+			// Provider's fallback path.
+			name:             "explicit primary provider without auth server is rejected",
+			authServerConfig: nil,
+			authzConfig: &mcpv1beta1.AuthzConfigRef{
+				Type: "inline",
+				Inline: &mcpv1beta1.InlineAuthzConfig{
+					Policies:                []string{`permit(principal, action, resource);`},
+					PrimaryUpstreamProvider: "okta",
+				},
+			},
+			expectError: true,
+		},
+		{
+			name: "explicit primary provider that doesn't match any upstream is rejected",
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+				PrimaryUpstreamProvider: "ping",
+			},
+			authzConfig: inlineAuthzRef,
+			expectError: true,
+		},
+		{
+			// Backward-compatibility: the deprecated inline field is read when
+			// the canonical location is empty, with no auth server set this is
+			// rejected by the defense-in-depth check above; this case validates
+			// the deprecated value flows through when the canonical is empty and
+			// matches a declared upstream.
+			name: "deprecated inline primary provider is honored when canonical is empty",
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+					{Name: "github", Type: mcpv1beta1.UpstreamProviderTypeOAuth2},
+				},
+			},
+			authzConfig: &mcpv1beta1.AuthzConfigRef{
+				Type: "inline",
+				Inline: &mcpv1beta1.InlineAuthzConfig{
+					Policies:                []string{`permit(principal, action, resource);`},
+					PrimaryUpstreamProvider: "github",
+				},
+			},
+			expectedProvider: "github",
+		},
+		{
+			// Canonical location overrides the deprecated one when both are set.
+			name: "canonical primary provider overrides deprecated inline value",
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+					{Name: "github", Type: mcpv1beta1.UpstreamProviderTypeOAuth2},
+				},
+				PrimaryUpstreamProvider: "github",
+			},
+			authzConfig: &mcpv1beta1.AuthzConfigRef{
+				Type: "inline",
+				Inline: &mcpv1beta1.InlineAuthzConfig{
+					Policies:                []string{`permit(principal, action, resource);`},
+					PrimaryUpstreamProvider: "okta",
+				},
+			},
+			expectedProvider: "github",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			converter := newTestConverter(t, newNoOpMockResolver(t))
+
+			vmcp := v1beta1test.NewVirtualMCPServer("test-vmcp", "default",
+				v1beta1test.WithVMCPGroupRef("test-group"),
+				v1beta1test.WithVMCPIncomingAuth(&mcpv1beta1.IncomingAuthConfig{
+					Type:        "anonymous",
+					AuthzConfig: tt.authzConfig,
+				}),
+				v1beta1test.WithVMCPAuthServerConfig(tt.authServerConfig),
+			)
+
+			ctx := log.IntoContext(t.Context(), logr.Discard())
+			incoming, err := converter.convertIncomingAuth(ctx, vmcp)
+			if tt.expectError {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, incoming)
+
+			if tt.expectAuthzNil {
+				assert.Nil(t, incoming.Authz)
+				return
+			}
+
+			require.NotNil(t, incoming.Authz)
+			assert.Equal(t, tt.expectedProvider, incoming.Authz.PrimaryUpstreamProvider)
+		})
+	}
+}
+
+// TestConverter_PassthroughHeaders verifies that spec.passthroughHeaders is promoted
+// correctly, takes precedence over spec.config.passthroughHeaders, and that the
+// auto-passthrough path (only spec.config.passthroughHeaders set) is preserved.
+func TestConvertSessionStorage_GlobalDefault(t *testing.T) {
+	t.Setenv("TOOLHIVE_DEFAULT_REDIS_ADDR", "global-redis:6379")
+
+	vmcp := &mcpv1beta1.VirtualMCPServer{
+		Spec: mcpv1beta1.VirtualMCPServerSpec{
+			// sessionStorage is nil
+		},
+	}
+	got := convertSessionStorage(vmcp)
+	require.NotNil(t, got)
+	assert.Equal(t, mcpv1beta1.SessionStorageProviderRedis, got.Provider)
+	assert.Equal(t, "global-redis:6379", got.Address)
+}
+
+func TestConvertSessionStorage_SpecTakesPrecedence(t *testing.T) {
+	t.Setenv("TOOLHIVE_DEFAULT_REDIS_ADDR", "global-redis:6379")
+
+	vmcp := &mcpv1beta1.VirtualMCPServer{
+		Spec: mcpv1beta1.VirtualMCPServerSpec{
+			SessionStorage: &mcpv1beta1.SessionStorageConfig{
+				Provider: mcpv1beta1.SessionStorageProviderRedis,
+				Address:  "local-redis:6379",
+			},
+		},
+	}
+	got := convertSessionStorage(vmcp)
+	require.NotNil(t, got)
+	assert.Equal(t, "local-redis:6379", got.Address)
+}
+
+func TestConverter_PassthroughHeaders(t *testing.T) {
+	t.Parallel()
+
+	// newVMCP builds a minimal VirtualMCPServer with the given passthrough header slices.
+	newVMCP := func(topLevel, configLevel []string) *mcpv1beta1.VirtualMCPServer {
+		return v1beta1test.NewVirtualMCPServer("test-vmcp", "default",
+			v1beta1test.WithVMCPGroupRef("test-group"),
+			v1beta1test.WithVMCPIncomingAuth(&mcpv1beta1.IncomingAuthConfig{Type: "anonymous"}),
+			v1beta1test.WithVMCPConfig(vmcpconfig.Config{PassthroughHeaders: configLevel}),
+			v1beta1test.MutateVMCP(func(v *mcpv1beta1.VirtualMCPServer) {
+				v.Spec.PassthroughHeaders = topLevel
+			}),
+		)
+	}
+
+	tests := []struct {
+		name     string
+		topLevel []string // spec.passthroughHeaders
+		config   []string // spec.config.passthroughHeaders
+		want     []string
+	}{
+		{name: "top-level only sets headers", topLevel: []string{"x-env"}, want: []string{"x-env"}},
+		{name: "top-level wins over config when both set", topLevel: []string{"x-api-key"}, config: []string{"x-tenant"}, want: []string{"x-api-key"}},
+		{name: "auto-passthrough: only config-level preserves value", config: []string{"x-tenant"}, want: []string{"x-tenant"}},
+		{name: "neither set produces nil"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			converter := newTestConverter(t, newNoOpMockResolver(t))
+			ctx := log.IntoContext(context.Background(), logr.Discard())
+			config, _, err := converter.Convert(ctx, newVMCP(tt.topLevel, tt.config), nil)
+			require.NoError(t, err)
+			require.NotNil(t, config)
+			assert.Equal(t, tt.want, config.PassthroughHeaders)
+		})
+	}
 }

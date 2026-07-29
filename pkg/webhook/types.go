@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"os"
 	"time"
 
 	"github.com/stacklok/toolhive/pkg/auth"
@@ -23,8 +24,16 @@ const DefaultTimeout = 10 * time.Second
 // MaxTimeout is the maximum allowed timeout for webhook HTTP calls.
 const MaxTimeout = 30 * time.Second
 
+// MinTimeout is the minimum allowed timeout for webhook HTTP calls.
+const MinTimeout = 1 * time.Second
+
 // MaxResponseSize is the maximum allowed size in bytes for webhook responses (1 MB).
 const MaxResponseSize = 1 << 20
+
+// MaxRequestSize is the maximum allowed size in bytes for inbound webhook
+// middleware request bodies (1 MB). Requests exceeding this size are
+// rejected with HTTP 413 before the body is buffered or forwarded.
+const MaxRequestSize = 1 << 20
 
 // Type indicates whether a webhook is validating or mutating.
 type Type string
@@ -49,14 +58,14 @@ const (
 // TLSConfig holds TLS-related configuration for webhook HTTP communication.
 type TLSConfig struct {
 	// CABundlePath is the path to a CA certificate bundle for server verification.
-	CABundlePath string `json:"ca_bundle_path,omitempty"`
+	CABundlePath string `json:"ca_bundle_path,omitempty" yaml:"ca_bundle_path,omitempty"`
 	// ClientCertPath is the path to a client certificate for mTLS.
-	ClientCertPath string `json:"client_cert_path,omitempty"`
+	ClientCertPath string `json:"client_cert_path,omitempty" yaml:"client_cert_path,omitempty"`
 	// ClientKeyPath is the path to a client key for mTLS.
-	ClientKeyPath string `json:"client_key_path,omitempty"`
+	ClientKeyPath string `json:"client_key_path,omitempty" yaml:"client_key_path,omitempty"`
 	// InsecureSkipVerify disables server certificate verification.
 	// WARNING: This should only be used for development/testing.
-	InsecureSkipVerify bool `json:"insecure_skip_verify,omitempty"`
+	InsecureSkipVerify bool `json:"insecure_skip_verify,omitempty" yaml:"insecure_skip_verify,omitempty"`
 }
 
 // Config holds the configuration for a single webhook.
@@ -75,8 +84,9 @@ type Config struct {
 	HMACSecretRef string `json:"hmac_secret_ref,omitempty" yaml:"hmac_secret_ref,omitempty"`
 }
 
-// Validate checks that the WebhookConfig has valid required fields.
-func (c *Config) Validate() error {
+// ValidateDefinition checks semantic validity of a webhook config without touching the filesystem.
+// This is useful when a higher layer is responsible for mounting referenced files later.
+func (c *Config) ValidateDefinition() error {
 	if c.Name == "" {
 		return fmt.Errorf("webhook name is required")
 	}
@@ -96,17 +106,80 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("webhook failure_policy must be %q or %q, got %q",
 			FailurePolicyFail, FailurePolicyIgnore, c.FailurePolicy)
 	}
-	if c.Timeout < 0 {
-		return fmt.Errorf("webhook timeout must be non-negative")
+	if c.Timeout != 0 && c.Timeout < MinTimeout {
+		return fmt.Errorf("webhook timeout must be between %v and %v", MinTimeout, MaxTimeout)
 	}
 	if c.Timeout > MaxTimeout {
 		return fmt.Errorf("webhook timeout %v exceeds maximum %v", c.Timeout, MaxTimeout)
 	}
 	if c.TLSConfig != nil {
-		if err := validateTLSConfig(c.TLSConfig); err != nil {
+		if err := validateTLSConfigShape(c.TLSConfig); err != nil {
 			return fmt.Errorf("webhook TLS config: %w", err)
 		}
 	}
+	return nil
+}
+
+// Validate checks that the WebhookConfig has valid required fields and referenced files exist.
+func (c *Config) Validate() error {
+	if err := c.ValidateDefinition(); err != nil {
+		return err
+	}
+
+	if c.TLSConfig != nil {
+		if err := validateTLSConfigFiles(c.TLSConfig); err != nil {
+			return fmt.Errorf("webhook TLS config: %w", err)
+		}
+	}
+	return nil
+}
+
+// UnmarshalJSON accepts webhook timeout values as either strings (for example "5s")
+// or numeric nanoseconds, while keeping the rest of the struct on the standard JSON path.
+func (c *Config) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Name          string          `json:"name"`
+		URL           string          `json:"url"`
+		Timeout       json.RawMessage `json:"timeout"`
+		FailurePolicy FailurePolicy   `json:"failure_policy"`
+		TLSConfig     *TLSConfig      `json:"tls_config,omitempty"`
+		HMACSecretRef string          `json:"hmac_secret_ref,omitempty"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	*c = Config{
+		Name:          raw.Name,
+		URL:           raw.URL,
+		FailurePolicy: raw.FailurePolicy,
+		TLSConfig:     raw.TLSConfig,
+		HMACSecretRef: raw.HMACSecretRef,
+	}
+
+	if len(raw.Timeout) == 0 || string(raw.Timeout) == "null" {
+		c.Timeout = DefaultTimeout
+		return nil
+	}
+
+	if raw.Timeout[0] == '"' {
+		var timeoutStr string
+		if err := json.Unmarshal(raw.Timeout, &timeoutStr); err != nil {
+			return fmt.Errorf("invalid timeout value: %w", err)
+		}
+		d, err := time.ParseDuration(timeoutStr)
+		if err != nil {
+			return fmt.Errorf("invalid timeout value %q: %w", timeoutStr, err)
+		}
+		c.Timeout = d
+		return nil
+	}
+
+	var timeoutNanos int64
+	if err := json.Unmarshal(raw.Timeout, &timeoutNanos); err != nil {
+		return fmt.Errorf("invalid timeout value: %w", err)
+	}
+	c.Timeout = time.Duration(timeoutNanos)
 	return nil
 }
 
@@ -168,11 +241,31 @@ type MutatingResponse struct {
 	Patch json.RawMessage `json:"patch,omitempty"`
 }
 
-// validateTLSConfig validates the TLS configuration for consistency.
-func validateTLSConfig(cfg *TLSConfig) error {
+// validateTLSConfigShape validates TLS configuration for consistency.
+func validateTLSConfigShape(cfg *TLSConfig) error {
 	// If one of client cert/key is provided, both must be present.
 	if (cfg.ClientCertPath == "") != (cfg.ClientKeyPath == "") {
 		return fmt.Errorf("both client_cert_path and client_key_path must be provided for mTLS")
+	}
+	return nil
+}
+
+// validateTLSConfigFiles validates referenced TLS files exist.
+func validateTLSConfigFiles(cfg *TLSConfig) error {
+	if cfg.CABundlePath != "" {
+		if _, err := os.Stat(cfg.CABundlePath); err != nil {
+			return fmt.Errorf("ca_bundle_path %q not found: %w", cfg.CABundlePath, err)
+		}
+	}
+	if cfg.ClientCertPath != "" {
+		if _, err := os.Stat(cfg.ClientCertPath); err != nil {
+			return fmt.Errorf("client_cert_path %q not found: %w", cfg.ClientCertPath, err)
+		}
+	}
+	if cfg.ClientKeyPath != "" {
+		if _, err := os.Stat(cfg.ClientKeyPath); err != nil {
+			return fmt.Errorf("client_key_path %q not found: %w", cfg.ClientKeyPath, err)
+		}
 	}
 	return nil
 }

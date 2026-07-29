@@ -8,16 +8,16 @@ import (
 	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	mcpv1alpha1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1"
+	mcpv1beta1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1beta1"
 )
 
-func newMCPServerWithSessionStorage(name string, ss *mcpv1alpha1.SessionStorageConfig) *mcpv1alpha1.MCPServer {
-	return &mcpv1alpha1.MCPServer{
+func newMCPServerWithSessionStorage(name string, ss *mcpv1beta1.SessionStorageConfig) *mcpv1beta1.MCPServer {
+	return &mcpv1beta1.MCPServer{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: "default",
 		},
-		Spec: mcpv1alpha1.MCPServerSpec{
+		Spec: mcpv1beta1.MCPServerSpec{
 			Image:          "example/mcp-server:latest",
 			SessionStorage: ss,
 		},
@@ -28,7 +28,7 @@ var _ = Describe("CEL Validation for SessionStorageConfig on MCPServer",
 	Label("k8s", "cel", "validation"), func() {
 		Context("provider=redis", func() {
 			It("should reject when address is missing", func() {
-				server := newMCPServerWithSessionStorage("mcp-redis-no-addr", &mcpv1alpha1.SessionStorageConfig{
+				server := newMCPServerWithSessionStorage("mcp-redis-no-addr", &mcpv1beta1.SessionStorageConfig{
 					Provider: "redis",
 				})
 				err := k8sClient.Create(ctx, server)
@@ -37,7 +37,7 @@ var _ = Describe("CEL Validation for SessionStorageConfig on MCPServer",
 			})
 
 			It("should reject when address is empty string", func() {
-				server := newMCPServerWithSessionStorage("mcp-redis-empty-addr", &mcpv1alpha1.SessionStorageConfig{
+				server := newMCPServerWithSessionStorage("mcp-redis-empty-addr", &mcpv1beta1.SessionStorageConfig{
 					Provider: "redis",
 					Address:  "",
 				})
@@ -46,7 +46,7 @@ var _ = Describe("CEL Validation for SessionStorageConfig on MCPServer",
 			})
 
 			It("should accept when address is set", func() {
-				server := newMCPServerWithSessionStorage("mcp-redis-with-addr", &mcpv1alpha1.SessionStorageConfig{
+				server := newMCPServerWithSessionStorage("mcp-redis-with-addr", &mcpv1beta1.SessionStorageConfig{
 					Provider: "redis",
 					Address:  "redis:6379",
 				})
@@ -55,7 +55,7 @@ var _ = Describe("CEL Validation for SessionStorageConfig on MCPServer",
 			})
 
 			It("should accept with all fields set", func() {
-				server := newMCPServerWithSessionStorage("mcp-redis-full", &mcpv1alpha1.SessionStorageConfig{
+				server := newMCPServerWithSessionStorage("mcp-redis-full", &mcpv1beta1.SessionStorageConfig{
 					Provider:  "redis",
 					Address:   "redis:6379",
 					DB:        1,
@@ -66,7 +66,7 @@ var _ = Describe("CEL Validation for SessionStorageConfig on MCPServer",
 			})
 
 			It("should reject negative DB number", func() {
-				server := newMCPServerWithSessionStorage("mcp-redis-neg-db", &mcpv1alpha1.SessionStorageConfig{
+				server := newMCPServerWithSessionStorage("mcp-redis-neg-db", &mcpv1beta1.SessionStorageConfig{
 					Provider: "redis",
 					Address:  "redis:6379",
 					DB:       -1,
@@ -78,7 +78,7 @@ var _ = Describe("CEL Validation for SessionStorageConfig on MCPServer",
 
 		Context("provider=memory", func() {
 			It("should accept without address", func() {
-				server := newMCPServerWithSessionStorage("mcp-memory-no-addr", &mcpv1alpha1.SessionStorageConfig{
+				server := newMCPServerWithSessionStorage("mcp-memory-no-addr", &mcpv1beta1.SessionStorageConfig{
 					Provider: "memory",
 				})
 				err := k8sClient.Create(ctx, server)
@@ -88,14 +88,14 @@ var _ = Describe("CEL Validation for SessionStorageConfig on MCPServer",
 
 		Context("replicas fields", func() {
 			It("should accept nil replicas (HPA-compatible)", func() {
-				server := newMinimalMCPServer("mcp-nil-replicas", nil, nil)
+				server := newMinimalMCPServer("mcp-nil-replicas", nil)
 				err := k8sClient.Create(ctx, server)
 				Expect(err).NotTo(HaveOccurred())
 			})
 
 			It("should accept explicit replicas value", func() {
 				replicas := int32(3)
-				server := newMinimalMCPServer("mcp-explicit-replicas", nil, nil)
+				server := newMinimalMCPServer("mcp-explicit-replicas", nil)
 				server.Spec.Replicas = &replicas
 				err := k8sClient.Create(ctx, server)
 				Expect(err).NotTo(HaveOccurred())
@@ -103,7 +103,7 @@ var _ = Describe("CEL Validation for SessionStorageConfig on MCPServer",
 
 			It("should reject negative replicas", func() {
 				replicas := int32(-1)
-				server := newMinimalMCPServer("mcp-neg-replicas", nil, nil)
+				server := newMinimalMCPServer("mcp-neg-replicas", nil)
 				server.Spec.Replicas = &replicas
 				err := k8sClient.Create(ctx, server)
 				Expect(err).To(HaveOccurred())
@@ -111,7 +111,7 @@ var _ = Describe("CEL Validation for SessionStorageConfig on MCPServer",
 
 			It("should reject negative backendReplicas", func() {
 				backendReplicas := int32(-1)
-				server := newMinimalMCPServer("mcp-neg-backend-replicas", nil, nil)
+				server := newMinimalMCPServer("mcp-neg-backend-replicas", nil)
 				server.Spec.BackendReplicas = &backendReplicas
 				err := k8sClient.Create(ctx, server)
 				Expect(err).To(HaveOccurred())

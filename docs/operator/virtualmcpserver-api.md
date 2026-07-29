@@ -13,7 +13,7 @@ The `VirtualMCPServer` CRD enables aggregation of multiple backend MCPServers in
 ## API Group and Version
 
 - **Group**: `toolhive.stacklok.dev`
-- **Version**: `v1alpha1`
+- **Version**: \`v1beta1\`
 - **Kind**: `VirtualMCPServer`
 
 ## Resource Names
@@ -24,17 +24,18 @@ The `VirtualMCPServer` CRD enables aggregation of multiple backend MCPServers in
 
 ## Spec Fields
 
-### `.spec.config.groupRef` (required)
+### `.spec.groupRef` (required)
 
 References an existing `MCPGroup` that defines the backend workloads to aggregate.
+The referenced MCPGroup must exist in the same namespace.
 
-**Type**: `string`
+**Type**: `MCPGroupRef` (object with `name` field)
 
 **Example**:
 ```yaml
 spec:
-  config:
-    groupRef: engineering-team
+  groupRef:
+    name: engineering-team
 ```
 
 ### Backend Types
@@ -55,14 +56,15 @@ A `VirtualMCPServer` aggregates three types of backends from the referenced `MCP
 **Example: MCPServerEntry backend**
 
 ```yaml
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServerEntry
 metadata:
   name: context7
 spec:
-  remoteURL: https://mcp.context7.com/mcp
+  remoteUrl: https://mcp.context7.com/mcp
   transport: streamable-http
-  groupRef: engineering-team
+  groupRef:
+    name: engineering-team
   # No externalAuthConfigRef — public endpoint, no auth needed
 ```
 
@@ -76,12 +78,40 @@ Configures authentication for clients connecting to the Virtual MCP server. Reus
 - `type` (string, required): Authentication type. Must be explicitly specified.
   - `anonymous`: No authentication required (use this when no auth is needed)
   - `oidc`: OIDC/OAuth2 authentication
-- `oidcConfigRef` (MCPOIDCConfigReference, optional): Reference to a shared MCPOIDCConfig resource (preferred, required when type=oidc). Mutually exclusive with `oidcConfig`.
+- `oidcConfigRef` (MCPOIDCConfigReference, optional): Reference to a shared MCPOIDCConfig resource (required when type=oidc).
   - `name` (string, required): Name of the MCPOIDCConfig resource (same namespace)
   - `audience` (string, required): Must be unique per server to prevent token replay
   - `scopes` ([]string, optional): Defaults to `["openid"]`
-- `oidcConfig` (OIDCConfigRef, optional): Inline OIDC authentication configuration. **Deprecated**: use `oidcConfigRef` with an MCPOIDCConfig resource instead. Will be removed in v1beta1. Mutually exclusive with `oidcConfigRef` (CEL enforced).
 - `authzConfig` (AuthzConfigRef, optional): Authorization policy configuration
+  - `type` (string, required): `inline` or `configMap`
+  - `inline` (InlineAuthzConfig, required when type=inline): Inline Cedar policies
+    - `policies` ([]string, required): Cedar policy strings
+    - `entitiesJson` (string, optional): Cedar entities (JSON). Required when
+      transitive policies (e.g. `ClaimGroup` → `PlatformRole`) need a static
+      entity store. Defaults to `"[]"`.
+    - `primaryUpstreamProvider` (string, optional): **Deprecated.** Use
+      `.spec.authServerConfig.primaryUpstreamProvider` instead. Setting this
+      field still resolves a primary upstream for backward compatibility and
+      emits a Warning event with reason
+      `AuthzPrimaryUpstreamProviderDeprecated`. Planned removal one release
+      after the deprecation cycle.
+  - `configMap` (ConfigMapAuthzRef, required when type=configMap): Reference to
+    a ConfigMap holding Cedar policies. The operator resolves the ConfigMap at
+    reconcile time and bakes the policies into the rendered vmcp `config.yaml`.
+    Failures surface as `AuthConfigured=False` with reason
+    `AuthzConfigMapNotFound` (missing reference) or `AuthzConfigMapInvalid`
+    (parse, validation, or non-Cedar payload).
+  - `groupClaimName` (string, optional): JWT claim key Cedar should treat as
+    the group list (overrides the well-known defaults `groups`, `roles`,
+    `cognito:groups`). When `type` is `configMap`, the spec value overrides
+    any `group_claim_name` set in the ConfigMap payload.
+  - `roleClaimName` (string, optional): JWT claim key Cedar should treat as
+    the role list. Same spec-over-ConfigMap precedence as `groupClaimName`.
+  - `groupEntityType` (string, optional): Cedar entity type used for principal
+    parent UIDs synthesised from JWT group/role claims. Defaults to
+    `THVGroup`. Must match the entity type used in the static entity store
+    for transitive `in` checks to resolve. Same spec-over-ConfigMap
+    precedence as `groupClaimName`.
 
 **Important**: The `type` field must always be explicitly specified. When no authentication is required, use `type: anonymous`.
 
@@ -101,27 +131,6 @@ spec:
       name: corporate-idp       # references an MCPOIDCConfig resource
       audience: vmcp-api         # unique per server
       scopes: ["openid"]
-    authzConfig:
-      type: inline
-      inline:
-        policies:
-          - |
-            permit(
-              principal,
-              action == Action::"tools/call",
-              resource
-            );
-```
-
-**Example (OIDC auth with inline config — deprecated)**:
-```yaml
-spec:
-  incomingAuth:
-    type: oidc
-    oidcConfig:
-      type: kubernetes
-      kubernetes:
-        audience: vmcp
     authzConfig:
       type: inline
       inline:
@@ -163,7 +172,7 @@ spec:
     source: inline
     backends:
       github:
-        type: external_auth_config_ref
+        type: externalAuthConfigRef
         externalAuthConfigRef:
           name: github-token-exchange
       slack:
@@ -181,8 +190,32 @@ spec:
 **Fields**:
 - `type` (string, required): Authentication type
   - `discovered`: Automatically discover from backend
-  - `external_auth_config_ref`: Reference an MCPExternalAuthConfig resource
-- `externalAuthConfigRef` (ExternalAuthConfigRef, optional): Auth config reference (when type=external_auth_config_ref)
+  - `externalAuthConfigRef`: Reference an MCPExternalAuthConfig resource
+- `externalAuthConfigRef` (ExternalAuthConfigRef, optional): Auth config reference (when type=externalAuthConfigRef)
+
+### `.spec.passthroughHeaders` (optional)
+
+Allowlist of incoming client request headers forwarded verbatim to every
+backend. The value is captured at the auth boundary and injected into the
+session's outgoing backend requests. **Type**: `[]string`. Names are matched
+case-insensitively; restricted headers (`Host`, `Authorization`,
+`X-Forwarded-*`, hop-by-hop) are rejected at startup. Takes precedence over
+`spec.config.passthroughHeaders`.
+
+```yaml
+spec:
+  passthroughHeaders:
+    - x-litellm-api-key   # forwarded to all backends; absent on a request → not forwarded
+```
+
+> **Security:** forwarded headers are caller-controlled. Use only behind a
+> trusted upstream (gateway/mesh) that sets or strips them; pair with
+> `incomingAuth: anonymous` only in that case.
+>
+> **Horizontal scaling:** forwarded headers are not persisted across replicas
+> (only the `(issuer, subject)` identity tuple is). A session restored on
+> another replica re-captures them from the next request — keep clients pinned
+> with `sessionAffinity: ClientIP`.
 
 ### `.spec.config.aggregation` (optional)
 
@@ -202,8 +235,8 @@ Defines tool aggregation and conflict resolution strategies.
 **Example (prefix strategy)**:
 ```yaml
 spec:
-  config:
-    groupRef: my-services
+  groupRef:
+    name: my-services
   aggregation:
     conflictResolution: prefix
     conflictResolutionConfig:
@@ -219,8 +252,8 @@ spec:
 **Example (priority strategy)**:
 ```yaml
 spec:
-  config:
-    groupRef: my-services
+  groupRef:
+    name: my-services
   aggregation:
     conflictResolution: priority
     conflictResolutionConfig:
@@ -230,8 +263,8 @@ spec:
 **Example (manual strategy)**:
 ```yaml
 spec:
-  config:
-    groupRef: my-services
+  groupRef:
+    name: my-services
   aggregation:
     conflictResolution: manual
     tools:
@@ -374,8 +407,9 @@ Configures OpenTelemetry-based observability for the Virtual MCP server, includi
 **Example**:
 ```yaml
 spec:
+  groupRef:
+    name: my-group
   config:
-    groupRef: my-group
     telemetry:
       endpoint: "otel-collector:4317"
       serviceName: "my-vmcp"
@@ -467,16 +501,17 @@ The most recent generation observed for this VirtualMCPServer.
 ## Complete Example
 
 ```yaml
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: VirtualMCPServer
 metadata:
   name: engineering-vmcp
   namespace: default
 spec:
-  # Reference to MCPGroup defining backend workloads and tool aggregation
+  # Reference to MCPGroup defining backend workloads
+  groupRef:
+    name: engineering-team
+  # Tool aggregation
   config:
-    groupRef: engineering-team
-    # Tool aggregation
     aggregation:
       conflictResolution: prefix
       conflictResolutionConfig:
@@ -608,9 +643,9 @@ status:
 The VirtualMCPServer CRD includes comprehensive validation:
 
 1. **Required Fields**:
-   - `spec.config.groupRef` must be specified
+   - `spec.groupRef.name` must be specified
    - `spec.incomingAuth.type` must be explicitly specified (use `anonymous` when no auth is needed)
-2. **Reference Validation**: All references (config.groupRef, authConfigRef, toolConfigRef) must be valid
+2. **Reference Validation**: All references (groupRef, authConfigRef, toolConfigRef) must be valid
 3. **Conflict Resolution**: Priority strategy requires `priorityOrder` configuration
 4. **Composite Tools**: Must have unique names, valid steps with IDs, and proper dependencies
 5. **Token Cache**: Redis provider requires valid address configuration
@@ -618,10 +653,10 @@ The VirtualMCPServer CRD includes comprehensive validation:
 
 ## Related Resources
 
-- [MCPGroup](./mcpgroup-api.md): Defines groups of MCPServers
-- [MCPServer](./mcpserver-api.md): Individual MCP server instances
+- [MCPGroup](./crd-api.md#apiv1beta1mcpgroup): Defines groups of MCPServers
+- [MCPServer](./crd-api.md#apiv1beta1mcpserver): Individual MCP server instances
 - [MCPOIDCConfig](../../examples/operator/mcp-servers/mcpserver_with_oidcconfig_ref.yaml): Shared OIDC provider configuration (referenced via `oidcConfigRef`)
-- [MCPExternalAuthConfig](./mcpexternalauthconfig-api.md): External authentication configuration
-- [MCPToolConfig](./toolconfig-api.md): Tool filtering and renaming configuration
+- [MCPExternalAuthConfig](./crd-api.md#apiv1beta1mcpexternalauthconfig): External authentication configuration
+- [MCPToolConfig](./crd-api.md#apiv1beta1mcptoolconfig): Tool filtering and renaming configuration
 - [Virtual MCP Server Observability](./virtualmcpserver-observability.md): Telemetry and metrics documentation
-- [Virtual MCP Proposal](../proposals/THV-2106-virtual-mcp-server.md): Complete design proposal
+- [Virtual MCP Proposal](https://github.com/stacklok/toolhive-rfcs/blob/main/rfcs/THV-0008-virtual-mcp-server.md): Complete design proposal

@@ -13,6 +13,7 @@ import (
 	context "context"
 	reflect "reflect"
 
+	health "github.com/stacklok/toolhive/pkg/vmcp/health"
 	gomock "go.uber.org/mock/gomock"
 )
 
@@ -52,4 +53,40 @@ func (m *MockWatcher) WaitForCacheSync(ctx context.Context) bool {
 func (mr *MockWatcherMockRecorder) WaitForCacheSync(ctx any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "WaitForCacheSync", reflect.TypeOf((*MockWatcher)(nil).WaitForCacheSync), ctx)
+}
+
+// MockstatusChangeRegistrar is a mock of statusChangeRegistrar interface.
+type MockstatusChangeRegistrar struct {
+	ctrl     *gomock.Controller
+	recorder *MockstatusChangeRegistrarMockRecorder
+	isgomock struct{}
+}
+
+// MockstatusChangeRegistrarMockRecorder is the mock recorder for MockstatusChangeRegistrar.
+type MockstatusChangeRegistrarMockRecorder struct {
+	mock *MockstatusChangeRegistrar
+}
+
+// NewMockstatusChangeRegistrar creates a new mock instance.
+func NewMockstatusChangeRegistrar(ctrl *gomock.Controller) *MockstatusChangeRegistrar {
+	mock := &MockstatusChangeRegistrar{ctrl: ctrl}
+	mock.recorder = &MockstatusChangeRegistrarMockRecorder{mock}
+	return mock
+}
+
+// EXPECT returns an object that allows the caller to indicate expected use.
+func (m *MockstatusChangeRegistrar) EXPECT() *MockstatusChangeRegistrarMockRecorder {
+	return m.recorder
+}
+
+// AddOnStatusChange mocks base method.
+func (m *MockstatusChangeRegistrar) AddOnStatusChange(arg0 func(health.StatusChangeEvent)) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "AddOnStatusChange", arg0)
+}
+
+// AddOnStatusChange indicates an expected call of AddOnStatusChange.
+func (mr *MockstatusChangeRegistrarMockRecorder) AddOnStatusChange(arg0 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AddOnStatusChange", reflect.TypeOf((*MockstatusChangeRegistrar)(nil).AddOnStatusChange), arg0)
 }
