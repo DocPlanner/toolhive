@@ -9,7 +9,7 @@ permissions:
 jobs:
   build-binary:
     name: Build ToolHive Binary
-    runs-on: dp-arc-e2e-xlg
+    runs-on: runs-on=${{ github.run_id }}/pool=dp-runson-xlarge-amd
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -41,7 +41,7 @@ jobs:
 
   e2e-tests-core:
     name: E2E Tests Core (${{ matrix.title }})
-    runs-on: dp-arc-e2e-xlg
+    runs-on: runs-on=${{ github.run_id }}/pool=dp-runson-xlarge-amd
     needs: build-binary
     strategy:
       fail-fast: false
@@ -103,7 +103,7 @@ jobs:
 
       - name: Set up container runtime (Docker)
         run: |
-          # DocPlanner ARC runners expose their privileged DinD sidecar here.
+          # DocPlanner RunsOn instances provide a native Docker daemon.
           docker version
           docker info >/dev/null
 

@@ -9,7 +9,7 @@ permissions:
 jobs:
   lint-and-test:
     name: Lint and Test Helm Charts
-    runs-on: dp-arc-e2e-xlg
+    runs-on: runs-on=${{ github.run_id }}/pool=dp-runson-xlarge-amd
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6

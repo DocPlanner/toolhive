@@ -9,7 +9,7 @@ permissions:
 jobs:
   lint-go-code:
     name: Lint Go Code
-    runs-on: dp-arc-e2e-xlg
+    runs-on: runs-on=${{ github.run_id }}/pool=dp-runson-xlarge-amd
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
