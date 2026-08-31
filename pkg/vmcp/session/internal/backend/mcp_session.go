@@ -113,7 +113,7 @@ func callWithSessionRecovery[T any](
 	c *mcpSession,
 	operation func(*mcpclient.Client) (T, error),
 ) (T, error) {
-	result, generation, err := callSession(ctx, c, operation)
+	result, generation, err := callSession(c, operation)
 	if err == nil || !errors.Is(err, mcptransport.ErrSessionTerminated) || c.reconnect == nil {
 		return result, err
 	}
@@ -123,12 +123,11 @@ func callWithSessionRecovery[T any](
 		return zero, fmt.Errorf("backend session expired and reinitialization failed: %w", reconnectErr)
 	}
 
-	result, _, err = callSession(ctx, c, operation)
+	result, _, err = callSession(c, operation)
 	return result, err
 }
 
 func callSession[T any](
-	ctx context.Context,
 	c *mcpSession,
 	operation func(*mcpclient.Client) (T, error),
 ) (T, uint64, error) {
