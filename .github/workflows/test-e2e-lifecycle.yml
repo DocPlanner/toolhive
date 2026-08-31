@@ -8,6 +8,7 @@ on:
       - 'cmd/thv-operator/**'
       - 'pkg/**'
       - 'test/e2e/thv-operator/**'
+      - 'test/e2e/images/**'
       - '.github/workflows/test-e2e-lifecycle.yml'
 
 permissions:
