@@ -124,8 +124,9 @@ _Appears in:_
 
 
 UpstreamInjectConfig configures the upstream inject auth strategy.
-This strategy uses the embedded authorization server to obtain and inject
-upstream IDP tokens into backend requests.
+This strategy usually uses the embedded authorization server to obtain and
+inject upstream IDP tokens into backend requests. Set ProviderName to
+UpstreamInjectProviderCaller to forward the already-validated caller token.
 
 
 
