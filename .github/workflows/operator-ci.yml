@@ -10,7 +10,7 @@ permissions:
 jobs:
   operator-tests:
     name: Operator Tests
-    runs-on: ubuntu-8cores-32gb
+    runs-on: dp-arc-e2e-xlg
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -31,7 +31,7 @@ jobs:
 
   operator-tests-integration:
     name: Operator Tests Integration
-    runs-on: ubuntu-8cores-32gb
+    runs-on: dp-arc-e2e-xlg
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -52,7 +52,7 @@ jobs:
 
   build-operator:
     name: Build Operator
-    runs-on: ubuntu-8cores-32gb
+    runs-on: dp-arc-e2e-xlg
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -138,7 +138,7 @@ jobs:
 
   e2e-tests-operator:
     name: E2E Tests Operator
-    runs-on: ubuntu-8cores-32gb
+    runs-on: dp-arc-e2e-xlg
     timeout-minutes: 30
     defaults:
       run:
@@ -195,6 +195,15 @@ jobs:
       # --platform on docker pull is not sufficient; the image store
       # itself must be switched back to the classic overlay2 driver.
       run: |
+        docker_major="$(docker version --format '{{.Server.Version}}' | cut -d. -f1)"
+        if [ "$docker_major" -lt 29 ]; then
+          echo "Docker server is older than 29; the classic image store is already in use."
+          exit 0
+        fi
+        if [ -n "${DOCKER_HOST:-}" ]; then
+          echo "Docker 29+ on an external daemon must disable containerd-snapshotter in the runner image."
+          exit 1
+        fi
         sudo mkdir -p /etc/docker
         echo '{"features":{"containerd-snapshotter": false}}' | sudo tee /etc/docker/daemon.json
         sudo systemctl restart docker
