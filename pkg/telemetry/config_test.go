@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
@@ -21,6 +22,11 @@ import (
 func TestTelemetryProviderValidation(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
+	otlpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(otlpServer.Close)
+	otlpEndpoint := strings.TrimPrefix(otlpServer.URL, "http://")
 
 	tests := []struct {
 		name                    string
@@ -53,9 +59,9 @@ func TestTelemetryProviderValidation(t *testing.T) {
 			config: Config{
 				ServiceName:                 "test-service",
 				ServiceVersion:              "1.0.0",
-				Endpoint:                    "localhost:4318", // OTLP endpoint configured
-				TracingEnabled:              false,            // Tracing disabled
-				MetricsEnabled:              false,            // Metrics disabled
+				Endpoint:                    otlpEndpoint,
+				TracingEnabled:              false, // Tracing disabled
+				MetricsEnabled:              false, // Metrics disabled
 				EnablePrometheusMetricsPath: false,
 			},
 			expectError:   true,
@@ -67,9 +73,10 @@ func TestTelemetryProviderValidation(t *testing.T) {
 			config: Config{
 				ServiceName:                 "test-service",
 				ServiceVersion:              "1.0.0",
-				Endpoint:                    "localhost:4318", // OTLP endpoint configured
-				TracingEnabled:              false,            // Tracing disabled
-				MetricsEnabled:              true,             // Metrics enabled
+				Endpoint:                    otlpEndpoint,
+				TracingEnabled:              false, // Tracing disabled
+				MetricsEnabled:              true,  // Metrics enabled
+				Insecure:                    true,
 				EnablePrometheusMetricsPath: false,
 			},
 			expectError:             false,
@@ -83,9 +90,10 @@ func TestTelemetryProviderValidation(t *testing.T) {
 			config: Config{
 				ServiceName:                 "test-service",
 				ServiceVersion:              "1.0.0",
-				Endpoint:                    "localhost:4318", // OTLP endpoint configured
-				TracingEnabled:              true,             // Tracing enabled
-				MetricsEnabled:              true,             // Metrics enabled
+				Endpoint:                    otlpEndpoint,
+				TracingEnabled:              true, // Tracing enabled
+				MetricsEnabled:              true, // Metrics enabled
+				Insecure:                    true,
 				EnablePrometheusMetricsPath: false,
 			},
 			expectError:             false,
@@ -99,9 +107,10 @@ func TestTelemetryProviderValidation(t *testing.T) {
 			config: Config{
 				ServiceName:                 "test-service",
 				ServiceVersion:              "1.0.0",
-				Endpoint:                    "localhost:4318", // OTLP endpoint configured
-				TracingEnabled:              true,             // Tracing enabled
-				MetricsEnabled:              true,             // Metrics enabled
+				Endpoint:                    otlpEndpoint,
+				TracingEnabled:              true, // Tracing enabled
+				MetricsEnabled:              true, // Metrics enabled
+				Insecure:                    true,
 				EnablePrometheusMetricsPath: true,
 			},
 			expectError:             false,

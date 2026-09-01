@@ -4,10 +4,14 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/uuid"
@@ -87,6 +91,63 @@ func startInProcessMCPServer(t *testing.T) string {
 	return ts.URL + "/mcp"
 }
 
+// startSessionFailureMCPServer injects one HTTP failure before a tool reaches
+// the MCP server. It records Initialize handshakes and successful executions so
+// tests can distinguish safe session recovery from unsafe generic retries.
+func startSessionFailureMCPServer(t *testing.T, failureStatus int) (string, *atomic.Int32, *atomic.Int32) {
+	t.Helper()
+
+	var initializeCount atomic.Int32
+	var executionCount atomic.Int32
+	var failNext atomic.Bool
+	failNext.Store(true)
+
+	mcpSrv := mcpserver.NewMCPServer("session-failure-backend", "1.0.0")
+	mcpSrv.AddTool(
+		mcpmcp.NewTool("echo", mcpmcp.WithString("input", mcpmcp.Required())),
+		func(_ context.Context, req mcpmcp.CallToolRequest) (*mcpmcp.CallToolResult, error) {
+			executionCount.Add(1)
+			args, _ := req.Params.Arguments.(map[string]any)
+			input, _ := args["input"].(string)
+			return &mcpmcp.CallToolResult{
+				Content: []mcpmcp.Content{mcpmcp.NewTextContent(input)},
+			}, nil
+		},
+	)
+
+	streamableSrv := mcpserver.NewStreamableHTTPServer(mcpSrv)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+
+		var request struct {
+			Method string `json:"method"`
+		}
+		if err := json.Unmarshal(body, &request); err != nil {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		if request.Method == string(mcpmcp.MethodInitialize) {
+			initializeCount.Add(1)
+		}
+		if request.Method == "tools/call" && failNext.CompareAndSwap(true, false) {
+			http.Error(w, http.StatusText(failureStatus), failureStatus)
+			return
+		}
+		streamableSrv.ServeHTTP(w, r)
+	})
+
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", handler)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	return ts.URL + "/mcp", &initializeCount, &executionCount
+}
+
 // newUnauthenticatedRegistry returns a minimal OutgoingAuthRegistry that
 // uses the unauthenticated (no-op) strategy — suitable for tests where the
 // backend MCP server does not require auth.
@@ -151,6 +212,52 @@ func TestSessionFactory_Integration_CallTool(t *testing.T) {
 	require.NotNil(t, result)
 	require.Len(t, result.Content, 1)
 	assert.Equal(t, "hello world", result.Content[0].Text)
+}
+
+func TestSessionFactory_Integration_ReconnectsExpiredBackendSession(t *testing.T) {
+	t.Parallel()
+
+	baseURL, initializeCount, executionCount := startSessionFailureMCPServer(t, http.StatusNotFound)
+	backend := &vmcp.Backend{
+		ID:            "integration-backend",
+		Name:          "integration-backend",
+		BaseURL:       baseURL,
+		TransportType: "streamable-http",
+	}
+
+	factory := NewSessionFactory(newUnauthenticatedRegistry(t))
+	sess, err := factory.MakeSessionWithID(context.Background(), uuid.New().String(), nil, true, []*vmcp.Backend{backend})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sess.Close()) })
+
+	result, err := sess.CallTool(context.Background(), nil, "echo", map[string]any{"input": "recovered"}, nil)
+	require.NoError(t, err)
+	require.Len(t, result.Content, 1)
+	assert.Equal(t, "recovered", result.Content[0].Text)
+	assert.EqualValues(t, 2, initializeCount.Load(), "expired session must be reinitialized once")
+	assert.EqualValues(t, 1, executionCount.Load(), "the rejected request must execute exactly once after recovery")
+}
+
+func TestSessionFactory_Integration_DoesNotRetryAmbiguousBackendFailure(t *testing.T) {
+	t.Parallel()
+
+	baseURL, initializeCount, executionCount := startSessionFailureMCPServer(t, http.StatusInternalServerError)
+	backend := &vmcp.Backend{
+		ID:            "integration-backend",
+		Name:          "integration-backend",
+		BaseURL:       baseURL,
+		TransportType: "streamable-http",
+	}
+
+	factory := NewSessionFactory(newUnauthenticatedRegistry(t))
+	sess, err := factory.MakeSessionWithID(context.Background(), uuid.New().String(), nil, true, []*vmcp.Backend{backend})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sess.Close()) })
+
+	_, err = sess.CallTool(context.Background(), nil, "echo", map[string]any{"input": "do not retry"}, nil)
+	require.Error(t, err)
+	assert.EqualValues(t, 1, initializeCount.Load(), "ambiguous failures must not reconnect")
+	assert.EqualValues(t, 0, executionCount.Load(), "ambiguous failures must not retry the operation")
 }
 
 func TestSessionFactory_Integration_ReadResource(t *testing.T) {
