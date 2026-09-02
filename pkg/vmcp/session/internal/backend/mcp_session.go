@@ -111,6 +111,10 @@ func (c *mcpSession) Close() error {
 // surface a plain 404:
 //   - "no valid session id": HTTP 400 from TypeScript SDK servers when a request
 //     arrives without Mcp-Session-Id;
+//   - "expired session id": HTTP 400 "Invalid or expired session ID" from
+//     mcp-for-argocd (src/server/transport.ts) once the server forgot the
+//     session, e.g. after a restart. Being a 400 rather than a 404, mcp-go
+//     keeps the stale ID and every later call fails the same way;
 //   - "invalid during session initialization": go-sdk servers open a fresh
 //     session for a sessionless request and reject any non-initialize method;
 //   - "invalid session id" / "session not found" / "session terminated": mcp-go
@@ -120,6 +124,7 @@ func (c *mcpSession) Close() error {
 // single reinitialize-and-retry is safe.
 var backendSessionLostMarkers = []string{
 	"no valid session id",
+	"expired session id",
 	"invalid during session initialization",
 	"invalid session id",
 	"session not found",

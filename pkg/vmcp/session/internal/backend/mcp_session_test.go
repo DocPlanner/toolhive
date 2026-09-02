@@ -90,6 +90,7 @@ func TestIsBackendSessionLostError(t *testing.T) {
 		{name: "typescript sdk sessionless 400", err: errors.New("request failed with status 400: Bad Request: Not an initialization request and no valid session ID provided."), want: true},
 		{name: "go-sdk sessionless jsonrpc error", err: errors.New(`method "tools/call" is invalid during session initialization`), want: true},
 		{name: "mcp-go server invalid session", err: errors.New("request failed with status 400: Invalid session ID"), want: true},
+		{name: "mcp-for-argocd expired session", err: errors.New("request failed with status 400: Invalid or expired session ID: 6cce26fd-e2e2-417e-b8c2-5fded9e0b6d5"), want: true},
 		{name: "ambiguous 5xx", err: errors.New("request failed with status 502: Bad Gateway"), want: false},
 		{name: "network error", err: errors.New("dial tcp: connection refused"), want: false},
 	}

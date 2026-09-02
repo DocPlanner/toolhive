@@ -1306,6 +1306,7 @@ var staleBackendSessionMarkers = []string{
 	"need to re-initialize",
 	"session not found",
 	"no valid session id",
+	"expired session id",
 	"invalid during session initialization",
 	"backend session is closed",
 	"backend session expired",

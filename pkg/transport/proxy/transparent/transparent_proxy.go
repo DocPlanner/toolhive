@@ -700,7 +700,13 @@ func isBackendSessionLostResponse(resp *http.Response) bool {
 	_ = resp.Body.Close()
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 
-	return strings.Contains(strings.ToLower(string(body)), "no valid session id")
+	lower := strings.ToLower(string(body))
+	// TypeScript SDK servers answer a sessionless request with "no valid session
+	// ID"; mcp-for-argocd answers an unknown session with "Invalid or expired
+	// session ID" (HTTP 400 in both cases). Both mean the backend lost the
+	// session and the request can be replayed after a transparent re-initialize.
+	return strings.Contains(lower, "no valid session id") ||
+		strings.Contains(lower, "expired session id")
 }
 
 func readRequestBody(req *http.Request) []byte {
