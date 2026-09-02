@@ -30,6 +30,7 @@ import (
 	"golang.org/x/exp/jsonrpc2"
 
 	"github.com/stacklok/toolhive/pkg/auth"
+	rt "github.com/stacklok/toolhive/pkg/container/runtime"
 	"github.com/stacklok/toolhive/pkg/healthcheck"
 	"github.com/stacklok/toolhive/pkg/transport/proxy/socket"
 	"github.com/stacklok/toolhive/pkg/transport/session"
@@ -182,6 +183,13 @@ const (
 	// DefaultHealthCheckFailureThreshold is the default number of consecutive health check
 	// failures before the proxy initiates shutdown.
 	DefaultHealthCheckFailureThreshold = 5
+
+	// HealthCheckShutdownOnFailureEnvVar overrides whether the proxy exits once the
+	// failure threshold is reached ("true"/"false"). When unset, the proxy exits
+	// everywhere except on Kubernetes: there the backend is restarted by its own
+	// controller, and exiting the proxy would only drop every in-flight request,
+	// flap the workload status and force clients to rebuild their sessions.
+	HealthCheckShutdownOnFailureEnvVar = "TOOLHIVE_HEALTH_CHECK_SHUTDOWN_ON_FAILURE"
 
 	// maxRedirects is the maximum number of HTTP redirects to follow when
 	// forwarding requests to a remote MCP server. Uses the same limit as
@@ -1234,6 +1242,16 @@ func (p *TransparentProxy) handleHealthCheckFailure(
 		return consecutiveFailures, true
 	}
 
+	if !shutdownOnHealthCheckFailure() {
+		// All retries exhausted, but the platform owns the backend lifecycle:
+		// keep serving and let the counter restart so the next window is
+		// evaluated on its own.
+		//nolint:gosec // G706: logging target URI from config
+		slog.Error("health check failed after consecutive attempts; keeping proxy running (shutdown disabled)",
+			"target", p.targetURI, "attempts", p.healthCheckFailureThreshold)
+		return 0, true
+	}
+
 	// All retries exhausted, initiate shutdown
 	//nolint:gosec // G706: logging target URI from config
 	slog.Error("health check failed after consecutive attempts; initiating proxy shutdown",
@@ -1246,6 +1264,20 @@ func (p *TransparentProxy) handleHealthCheckFailure(
 			"target", p.targetURI, "error", err)
 	}
 	return consecutiveFailures, false
+}
+
+// shutdownOnHealthCheckFailure reports whether exhausting the health-check
+// failure threshold should stop the proxy. See HealthCheckShutdownOnFailureEnvVar.
+func shutdownOnHealthCheckFailure() bool {
+	if val := os.Getenv(HealthCheckShutdownOnFailureEnvVar); val != "" {
+		parsed, err := strconv.ParseBool(val)
+		if err == nil {
+			return parsed
+		}
+		slog.Warn("invalid health check shutdown override, using default",
+			"env_var", HealthCheckShutdownOnFailureEnvVar, "value", val)
+	}
+	return !rt.IsKubernetesRuntime()
 }
 
 func (p *TransparentProxy) monitorHealth(parentCtx context.Context) {

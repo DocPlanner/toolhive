@@ -379,6 +379,11 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}
 
+	// Proxy tuning knobs are declared as workload env vars (MCPServer spec.env)
+	// but are read by this process, so mirror them before the transport and the
+	// session store resolve their configuration.
+	applyProxyProcessEnv(r.Config.EnvVars)
+
 	// When Redis session storage is configured, create a Redis-backed session
 	// store so sessions are shared across proxy replicas instead of being pod-local.
 	if r.Config.ScalingConfig != nil && r.Config.ScalingConfig.SessionRedis != nil {

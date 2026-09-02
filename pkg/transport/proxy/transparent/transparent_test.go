@@ -24,6 +24,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
+	"github.com/stacklok/toolhive/pkg/healthcheck"
 	"github.com/stacklok/toolhive/pkg/transport/session"
 	"github.com/stacklok/toolhive/pkg/transport/types"
 )
@@ -2136,4 +2137,46 @@ func TestWithSessionStorage(t *testing.T) {
 	)
 	require.NotNil(t, proxy)
 	require.NotNil(t, proxy.sessionManager)
+}
+
+func TestShutdownOnHealthCheckFailure(t *testing.T) {
+	tests := []struct {
+		name     string
+		runtime  string
+		override string
+		expected bool
+	}{
+		{name: "default outside kubernetes", runtime: "", override: "", expected: true},
+		{name: "default on kubernetes", runtime: "kubernetes", override: "", expected: false},
+		{name: "explicit true on kubernetes", runtime: "kubernetes", override: "true", expected: true},
+		{name: "explicit false outside kubernetes", runtime: "", override: "false", expected: false},
+		{name: "invalid override falls back to default", runtime: "kubernetes", override: "maybe", expected: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("TOOLHIVE_RUNTIME", tt.runtime)
+			t.Setenv("KUBERNETES_SERVICE_HOST", "")
+			t.Setenv(HealthCheckShutdownOnFailureEnvVar, tt.override)
+			assert.Equal(t, tt.expected, shutdownOnHealthCheckFailure())
+		})
+	}
+}
+
+func TestHandleHealthCheckFailure_KubernetesKeepsProxyRunning(t *testing.T) {
+	t.Setenv("TOOLHIVE_RUNTIME", "kubernetes")
+	t.Setenv(HealthCheckShutdownOnFailureEnvVar, "")
+
+	stopped := false
+	p := &TransparentProxy{
+		targetURI:                   "http://backend:8080",
+		healthCheckFailureThreshold: 1,
+		onHealthCheckFailed:         func() { stopped = true },
+	}
+
+	failures, shouldContinue := p.handleHealthCheckFailure(
+		context.Background(), 0, healthcheck.StatusUnhealthy)
+
+	assert.True(t, shouldContinue, "monitoring must continue on kubernetes")
+	assert.Equal(t, 0, failures, "failure counter must restart after a logged threshold breach")
+	assert.False(t, stopped, "the shutdown callback must not fire when shutdown is disabled")
 }
