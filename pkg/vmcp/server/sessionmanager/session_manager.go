@@ -1053,7 +1053,17 @@ func (sm *Manager) GetAdaptedTools(sessionID string) ([]mcpserver.ServerTool, er
 			meta := conversion.FromMCPMeta(req.Params.Meta)
 			caller, _ := auth.IdentityFromContext(ctx)
 
-			result, callErr := capturedSess.CallTool(ctx, caller, capturedToolName, args, meta)
+			currentSess := sm.currentHandlerSession(capturedSessionID, capturedSess)
+			result, callErr := currentSess.CallTool(ctx, caller, capturedToolName, args, meta)
+			if callErr != nil {
+				if refreshed, ok := sm.refreshSessionForStaleBackend(ctx, capturedSessionID, "tool", capturedToolName, callErr); ok {
+					result, callErr = refreshed.CallTool(ctx, caller, capturedToolName, args, meta)
+					if callErr != nil {
+						slog.Warn("retry after backend session refresh failed",
+							"session_id", capturedSessionID, "tool", capturedToolName, "error", callErr)
+					}
+				}
+			}
 			if callErr != nil {
 				if errors.Is(callErr, sessiontypes.ErrUnauthorizedCaller) || errors.Is(callErr, sessiontypes.ErrNilCaller) {
 					slog.Warn("caller authorization failed, terminating session",
@@ -1114,7 +1124,17 @@ func (sm *Manager) GetAdaptedResources(sessionID string) ([]mcpserver.ServerReso
 
 			caller, _ := auth.IdentityFromContext(ctx)
 
-			result, readErr := capturedSess.ReadResource(ctx, caller, capturedResourceURI)
+			currentSess := sm.currentHandlerSession(capturedSessionID, capturedSess)
+			result, readErr := currentSess.ReadResource(ctx, caller, capturedResourceURI)
+			if readErr != nil {
+				if refreshed, ok := sm.refreshSessionForStaleBackend(ctx, capturedSessionID, "resource", capturedResourceURI, readErr); ok {
+					result, readErr = refreshed.ReadResource(ctx, caller, capturedResourceURI)
+					if readErr != nil {
+						slog.Warn("retry after backend session refresh failed",
+							"session_id", capturedSessionID, "resource", capturedResourceURI, "error", readErr)
+					}
+				}
+			}
 			if readErr != nil {
 				if errors.Is(readErr, sessiontypes.ErrUnauthorizedCaller) || errors.Is(readErr, sessiontypes.ErrNilCaller) {
 					slog.Warn("caller authorization failed, terminating session",
@@ -1177,7 +1197,17 @@ func (sm *Manager) GetAdaptedPrompts(sessionID string) ([]mcpserver.ServerPrompt
 			for k, v := range req.Params.Arguments {
 				args[k] = v
 			}
-			result, getErr := capturedSess.GetPrompt(ctx, caller, capturedPromptName, args)
+			currentSess := sm.currentHandlerSession(capturedSessionID, capturedSess)
+			result, getErr := currentSess.GetPrompt(ctx, caller, capturedPromptName, args)
+			if getErr != nil {
+				if refreshed, ok := sm.refreshSessionForStaleBackend(ctx, capturedSessionID, "prompt", capturedPromptName, getErr); ok {
+					result, getErr = refreshed.GetPrompt(ctx, caller, capturedPromptName, args)
+					if getErr != nil {
+						slog.Warn("retry after backend session refresh failed",
+							"session_id", capturedSessionID, "prompt", capturedPromptName, "error", getErr)
+					}
+				}
+			}
 			if getErr != nil {
 				if errors.Is(getErr, sessiontypes.ErrUnauthorizedCaller) || errors.Is(getErr, sessiontypes.ErrNilCaller) {
 					slog.Warn("caller authorization failed, terminating session",
@@ -1212,6 +1242,73 @@ func (sm *Manager) GetAdaptedPrompts(sessionID string) ([]mcpserver.ServerPrompt
 	}
 
 	return sdkPrompts, nil
+}
+
+func (sm *Manager) currentHandlerSession(sessionID string, fallback vmcpsession.MultiSession) vmcpsession.MultiSession {
+	current, ok := sm.GetMultiSession(sessionID)
+	if ok && current != nil {
+		return current
+	}
+	return fallback
+}
+
+func (sm *Manager) refreshSessionForStaleBackend(
+	ctx context.Context,
+	sessionID string,
+	operation string,
+	capability string,
+	err error,
+) (vmcpsession.MultiSession, bool) {
+	if !isStaleBackendSessionError(err) {
+		return nil, false
+	}
+
+	slog.Info("refreshing vMCP session after stale backend session",
+		"session_id", sessionID,
+		"operation", operation,
+		"capability", capability,
+		"error", err)
+
+	refreshed, refreshErr := sm.RefreshSession(ctx, sessionID)
+	if refreshErr != nil {
+		slog.Warn("failed to refresh vMCP session after stale backend session",
+			"session_id", sessionID,
+			"operation", operation,
+			"capability", capability,
+			"error", refreshErr)
+		return nil, false
+	}
+	return refreshed, true
+}
+
+func isStaleBackendSessionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errLower := strings.ToLower(err.Error())
+	for _, marker := range staleBackendSessionMarkers {
+		if strings.Contains(errLower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// staleBackendSessionMarkers are lower-cased substrings of backend errors that
+// mean the per-backend connection is unusable and the whole multi-session should
+// be rebuilt. The backend client (pkg/vmcp/session/internal/backend) already
+// reinitializes a single backend on these; this is the fallback when that
+// reinitialization itself failed or the captured session was already closed.
+var staleBackendSessionMarkers = []string{
+	"invalid session id",
+	"invalid session_id",
+	"session terminated",
+	"need to re-initialize",
+	"session not found",
+	"no valid session id",
+	"invalid during session initialization",
+	"backend session is closed",
+	"backend session expired",
 }
 
 // listAllBackends returns all backends from the registry as a pointer slice.

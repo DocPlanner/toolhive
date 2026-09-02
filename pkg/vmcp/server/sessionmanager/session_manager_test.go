@@ -96,6 +96,19 @@ func (alwaysFailDataStorage) Create(_ context.Context, _ string, _ map[string]st
 func (alwaysFailDataStorage) Delete(_ context.Context, _ string) error { return nil }
 func (alwaysFailDataStorage) Close() error                             { return nil }
 
+type refreshableTestSession struct {
+	sessiontypes.MultiSession
+	identity *auth.Identity
+}
+
+func (s *refreshableTestSession) CreatorIdentity() *auth.Identity {
+	if s.identity == nil {
+		return nil
+	}
+	cloned := *s.identity
+	return &cloned
+}
+
 // configurableFailDataStorage wraps a real SessionDataStorage and allows injecting
 // failures for specific operations. Used to test fallback behavior in Terminate().
 type configurableFailDataStorage struct {
@@ -1364,6 +1377,68 @@ func TestSessionManager_GetAdaptedTools(t *testing.T) {
 		assert.True(t, result.IsError, "IsError should be set for failed tool calls")
 	})
 
+	t.Run("handler refreshes and retries after stale backend session", func(t *testing.T) {
+		t.Parallel()
+
+		tools := []vmcp.Tool{{Name: "load_datadog_skill", Description: "loads a Datadog skill"}}
+		ctrl := gomock.NewController(t)
+
+		refreshedResult := &vmcp.ToolCallResult{
+			Content: []vmcp.Content{{Type: vmcp.ContentTypeText, Text: "ok"}},
+		}
+		creator := &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: "user-1"}}
+		callCount := 0
+
+		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
+		factory.EXPECT().
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+				callCount++
+				sess := newMockSession(t, ctrl, id, tools)
+				if callCount == 1 {
+					sess.EXPECT().CallTool(gomock.Any(), gomock.Any(), "load_datadog_skill", gomock.Any(), gomock.Any()).
+						Return(nil, errors.New("transport error: request failed with status 400: Invalid session ID")).Times(1)
+				} else {
+					sess.EXPECT().CallTool(gomock.Any(), gomock.Any(), "load_datadog_skill", gomock.Any(), gomock.Any()).
+						Return(refreshedResult, nil).Times(2)
+				}
+				return &refreshableTestSession{MultiSession: sess, identity: creator}, nil
+			}).Times(2)
+
+		registry := newFakeRegistry()
+		sm, _ := newTestSessionManager(t, factory, registry)
+
+		sessionID := sm.Generate()
+		_, err := sm.CreateSession(context.Background(), sessionID)
+		require.NoError(t, err)
+
+		adaptedTools, err := sm.GetAdaptedTools(sessionID)
+		require.NoError(t, err)
+		require.Len(t, adaptedTools, 1)
+
+		result, handlerErr := adaptedTools[0].Handler(
+			context.Background(),
+			newCallToolRequest("load_datadog_skill", map[string]any{"skill_name": "datadog/traces"}),
+		)
+		require.NoError(t, handlerErr)
+		require.NotNil(t, result)
+		require.False(t, result.IsError)
+		require.Len(t, result.Content, 1)
+		textContent, ok := result.Content[0].(mcp.TextContent)
+		require.True(t, ok)
+		assert.Equal(t, "ok", textContent.Text)
+		assert.Equal(t, 2, callCount)
+
+		result, handlerErr = adaptedTools[0].Handler(
+			context.Background(),
+			newCallToolRequest("load_datadog_skill", map[string]any{"skill_name": "datadog/traces"}),
+		)
+		require.NoError(t, handlerErr)
+		require.NotNil(t, result)
+		require.False(t, result.IsError)
+		assert.Equal(t, 2, callCount, "subsequent calls should use the refreshed session without another rebuild")
+	})
+
 	t.Run("handler returns error result for non-object arguments", func(t *testing.T) {
 		t.Parallel()
 
@@ -1514,6 +1589,69 @@ func TestSessionManager_GetAdaptedTools(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestIsStaleBackendSessionError(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "datadog invalid session id",
+			err:  errors.New("transport error: request failed with status 400: Invalid session ID"),
+			want: true,
+		},
+		{
+			name: "kubernetes session terminated",
+			err:  errors.New("transport error: failed to send request: session terminated (404). need to re-initialize"),
+			want: true,
+		},
+		{
+			name: "session not found",
+			err:  errors.New("session not found"),
+			want: true,
+		},
+		{
+			name: "typescript sdk sessionless request",
+			err:  errors.New("transport error: request failed with status 400: Bad Request: Not an initialization request and no valid session ID provided."),
+			want: true,
+		},
+		{
+			name: "go-sdk sessionless request",
+			err:  errors.New("method \"tools/call\" is invalid during session initialization"),
+			want: true,
+		},
+		{
+			name: "captured session already closed",
+			err:  errors.New("tool \"x\" call failed on backend y: backend session is closed"),
+			want: true,
+		},
+		{
+			name: "backend reinitialization failed",
+			err:  errors.New("backend session expired and reinitialization failed: dial tcp: connection refused"),
+			want: true,
+		},
+		{
+			name: "generic backend error",
+			err:  errors.New("backend returned 500"),
+			want: false,
+		},
+		{
+			name: "nil",
+			err:  nil,
+			want: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.want, isStaleBackendSessionError(tc.err))
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------
