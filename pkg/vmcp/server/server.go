@@ -114,7 +114,7 @@ const (
 
 	// defaultSessionCloseGracePeriod delays closing the replaced session so
 	// in-flight handlers that already captured it can drain gracefully.
-	defaultSessionCloseGracePeriod = 2 * time.Second
+	defaultSessionCloseGracePeriod = 2 * time.Minute
 
 	sessionOwnerForwardedHeader = "X-ToolHive-Session-Forwarded"
 	sessionOwnerForwardedValue  = "1"
@@ -328,6 +328,11 @@ type Server struct {
 
 	// refreshMu serializes session refresh work triggered by health transitions.
 	refreshMu sync.Mutex
+
+	// refreshSched debounces and rate-limits per-backend session refreshes so a
+	// flapping backend cannot rebuild every session on every transition.
+	refreshSched     *refreshScheduler
+	refreshSchedOnce sync.Once
 }
 
 // buildSessionDataStorage constructs the DataStorage backend from cfg.
@@ -948,6 +953,10 @@ func (s *Server) Stop(ctx context.Context) error {
 		if err := healthMon.Stop(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to stop health monitor: %w", err))
 		}
+	}
+
+	if s.refreshSched != nil {
+		s.refreshSched.stop()
 	}
 
 	// Run shutdown functions (e.g., status reporter cleanup, future components)
@@ -1960,6 +1969,12 @@ func sessionResourceCount(session server.ClientSession) int {
 	return len(sessionWithResources.GetSessionResources())
 }
 
+// handleBackendStatusChange schedules a session refresh when a backend crosses
+// the exposure boundary. A backend that becomes eligible must be added to the
+// sessions that were built without it; a backend that becomes ineligible must be
+// removed from the sessions that expose it. Triggers are debounced per backend
+// (see refreshScheduler) so a flapping backend does not rebuild every session on
+// every transition.
 func (s *Server) handleBackendStatusChange(event health.StatusChangeEvent) {
 	previousEligible := health.IsStatusEligibleForExposure(event.PreviousStatus)
 	currentEligible := health.IsStatusEligibleForExposure(event.Status)
@@ -1967,65 +1982,82 @@ func (s *Server) handleBackendStatusChange(event health.StatusChangeEvent) {
 		return
 	}
 
-	s.refreshMu.Lock()
-	defer s.refreshMu.Unlock()
-
-	targets := s.targetSessionsForRefresh(event, currentEligible)
-	if len(targets) == 0 {
-		return
+	mode := refreshSessionsContainingBackend
+	if currentEligible {
+		mode = refreshSessionsLackingBackend
 	}
 
-	slog.Info("refreshing active sessions after backend exposure change",
+	slog.Info("scheduling session refresh after backend exposure change",
 		"backend_id", event.BackendID,
 		"backend_name", event.BackendName,
 		"previous_status", event.PreviousStatus,
 		"status", event.Status,
-		"session_count", len(targets))
+		"mode", mode.String())
 
-	for _, target := range targets {
-		refreshCtx, cancel := context.WithTimeout(context.Background(), defaultSessionRefreshTimeout)
-		if err := s.refreshSessionCapabilities(refreshCtx, target.sessionID, target.session); err != nil {
-			slog.Warn("failed to refresh session capabilities",
-				"session_id", target.sessionID,
-				"backend_id", event.BackendID,
-				"error", err)
-		}
-		cancel()
-	}
+	s.scheduler().schedule(event.BackendID, mode)
 }
 
 // handleBackendCapabilityChange is called (asynchronously) when a backend
 // sends a tools/list_changed or resources/list_changed notification via the
-// persistent MCP session. It refreshes every hub session that includes the
-// backend so clients see the updated tool/resource list.
+// persistent MCP session. It schedules a refresh of the sessions that expose
+// the backend so clients see the updated tool/resource list.
 func (s *Server) handleBackendCapabilityChange(backendID string) {
+	slog.Info("scheduling session refresh after backend capability change notification",
+		"backend_id", backendID)
+	s.scheduler().schedule(backendID, refreshSessionsContainingBackend)
+}
+
+// scheduler returns the per-backend refresh scheduler, creating it on first use
+// so servers constructed without New (tests) get one as well.
+func (s *Server) scheduler() *refreshScheduler {
+	s.refreshSchedOnce.Do(func() {
+		if s.refreshSched == nil {
+			s.refreshSched = newRefreshScheduler(
+				defaultRefreshDebounceWindow,
+				defaultRefreshCooldown,
+				s.runBackendRefresh,
+			)
+		}
+	})
+	return s.refreshSched
+}
+
+// runBackendRefresh rebuilds the sessions selected by mode for backendID. It is
+// invoked by the refresh scheduler once the debounce window has elapsed.
+func (s *Server) runBackendRefresh(backendID string, mode refreshTargetMode) {
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
 
-	// backendEligible=true: the backend's tool list changed but it is still
-	// reachable, so refresh ALL sessions (same as a backend recovering).
-	targets := s.targetSessionsForRefresh(
-		health.StatusChangeEvent{BackendID: backendID},
-		true,
-	)
+	targets := s.targetSessionsForRefresh(backendID, mode)
 	if len(targets) == 0 {
+		slog.Debug("no active sessions need a refresh for backend",
+			"backend_id", backendID, "mode", mode.String())
 		return
 	}
 
-	slog.Info("refreshing sessions after backend capability change notification",
+	slog.Info("refreshing active sessions after backend change",
 		"backend_id", backendID,
+		"mode", mode.String(),
 		"session_count", len(targets))
 
+	failed := 0
 	for _, target := range targets {
 		refreshCtx, cancel := context.WithTimeout(context.Background(), defaultSessionRefreshTimeout)
 		if err := s.refreshSessionCapabilities(refreshCtx, target.sessionID, target.session); err != nil {
-			slog.Warn("failed to refresh session after capability change",
+			failed++
+			slog.Warn("failed to refresh session capabilities",
 				"session_id", target.sessionID,
 				"backend_id", backendID,
 				"error", err)
 		}
 		cancel()
 	}
+
+	slog.Info("finished refreshing active sessions after backend change",
+		"backend_id", backendID,
+		"mode", mode.String(),
+		"session_count", len(targets),
+		"failed", failed)
 }
 
 type refreshTarget struct {
@@ -2033,11 +2065,16 @@ type refreshTarget struct {
 	session   server.ClientSession
 }
 
+// targetSessionsForRefresh selects the active SDK sessions to rebuild for a
+// backend change. Entries whose MultiSession no longer exists (expired, or
+// terminated on another replica) are stale and are dropped from the registry so
+// they are not reconsidered on the next trigger.
 func (s *Server) targetSessionsForRefresh(
-	event health.StatusChangeEvent,
-	backendEligible bool,
+	backendID string,
+	mode refreshTargetMode,
 ) []refreshTarget {
 	targets := make([]refreshTarget, 0)
+	stale := 0
 	s.activeClientSessions.Range(func(key, value any) bool {
 		sessionID, ok := key.(string)
 		if !ok {
@@ -2047,14 +2084,24 @@ func (s *Server) targetSessionsForRefresh(
 		if !ok {
 			return true
 		}
-		if !backendEligible {
-			multiSess, exists := s.vmcpSessionMgr.GetMultiSession(sessionID)
-			if !exists {
+		multiSess, exists := s.vmcpSessionMgr.GetMultiSession(sessionID)
+		if !exists || multiSess == nil {
+			s.activeClientSessions.Delete(key)
+			stale++
+			return true
+		}
+		contains := sessionContainsBackend(multiSess, backendID)
+		switch mode {
+		case refreshSessionsLackingBackend:
+			if contains {
 				return true
 			}
-			if !sessionContainsBackend(multiSess, event.BackendID) {
+		case refreshSessionsContainingBackend:
+			if !contains {
 				return true
 			}
+		case refreshAllSessions:
+			// both groups
 		}
 		targets = append(targets, refreshTarget{
 			sessionID: sessionID,
@@ -2062,6 +2109,10 @@ func (s *Server) targetSessionsForRefresh(
 		})
 		return true
 	})
+	if stale > 0 {
+		slog.Info("dropped stale client session registrations",
+			"backend_id", backendID, "count", stale)
+	}
 	return targets
 }
 
