@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -105,18 +106,68 @@ func (c *mcpSession) Close() error {
 	return c.client.Close()
 }
 
+// backendSessionLostMarkers are lower-cased substrings of backend replies that
+// mean the backend no longer knows our session even though the transport did not
+// surface a plain 404:
+//   - "no valid session id": HTTP 400 from TypeScript SDK servers when a request
+//     arrives without Mcp-Session-Id;
+//   - "invalid during session initialization": go-sdk servers open a fresh
+//     session for a sessionless request and reject any non-initialize method;
+//   - "invalid session id" / "session not found" / "session terminated": mcp-go
+//     and ToolHive proxies describing a session they no longer hold.
+//
+// All of these are returned before the backend executes the operation, so a
+// single reinitialize-and-retry is safe.
+var backendSessionLostMarkers = []string{
+	"no valid session id",
+	"invalid during session initialization",
+	"invalid session id",
+	"session not found",
+	"session terminated",
+}
+
+// errBackendSessionIDLost is returned before a request is sent when the
+// streamable-HTTP transport has dropped the session ID the backend issued.
+// mark3labs/mcp-go clears the ID after any 404, so the next request would go out
+// without Mcp-Session-Id and be rejected as a non-initialize call. It wraps
+// ErrSessionTerminated so the recovery path treats it as a definitive loss.
+var errBackendSessionIDLost = fmt.Errorf(
+	"backend session ID dropped by transport: %w", mcptransport.ErrSessionTerminated)
+
+// isBackendSessionLostError reports whether err means the backend session is
+// definitively gone and the operation was not executed.
+func isBackendSessionLostError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, mcptransport.ErrSessionTerminated) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	for _, marker := range backendSessionLostMarkers {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // callWithSessionRecovery retries an operation only after a definitive MCP
-// session-terminated response. A 404 for an expired session is returned before
-// the backend executes the operation, unlike ambiguous network or 5xx errors.
+// session-lost response (see isBackendSessionLostError). Such responses are
+// returned before the backend executes the operation, unlike ambiguous network
+// or 5xx errors, which are never retried.
 func callWithSessionRecovery[T any](
 	ctx context.Context,
 	c *mcpSession,
 	operation func(*mcpclient.Client) (T, error),
 ) (T, error) {
 	result, generation, err := callSession(ctx, c, operation)
-	if err == nil || !errors.Is(err, mcptransport.ErrSessionTerminated) || c.reconnect == nil {
+	if err == nil || c.reconnect == nil || !isBackendSessionLostError(err) {
 		return result, err
 	}
+
+	slog.Info("backend session lost; reinitializing before retry",
+		"backendID", c.target.WorkloadID, "error", err)
 
 	if reconnectErr := c.reconnectIfCurrent(ctx, generation); reconnectErr != nil {
 		var zero T
@@ -138,8 +189,27 @@ func callSession[T any](
 		var zero T
 		return zero, c.generation, fmt.Errorf("backend session is closed")
 	}
+	if c.transportLostSessionID() {
+		var zero T
+		return zero, c.generation, errBackendSessionIDLost
+	}
 	result, err := operation(c.client)
 	return result, c.generation, err
+}
+
+// transportLostSessionID reports whether the streamable-HTTP transport no longer
+// carries the session ID the backend issued at initialize. Callers must hold
+// c.mu. Sending in that state is pointless: the backend would reject the
+// sessionless request, so the caller reinitializes first instead.
+func (c *mcpSession) transportLostSessionID() bool {
+	if c.backendSessionID == "" || c.reconnect == nil || c.client == nil {
+		return false
+	}
+	sh, ok := c.client.GetTransport().(*mcptransport.StreamableHTTP)
+	if !ok {
+		return false
+	}
+	return sh.GetSessionId() == ""
 }
 
 // reconnectIfCurrent serializes reinitialization. Concurrent callers that

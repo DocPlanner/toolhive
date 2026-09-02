@@ -4,9 +4,12 @@
 package backend
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
+	mcptransport "github.com/mark3labs/mcp-go/client/transport"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -71,4 +74,29 @@ func TestRequestTimeoutForWorkload(t *testing.T) {
 		defaultBackendRequestTimeout,
 		requestTimeoutForWorkload("other-backend", 0, nil),
 	)
+}
+
+func TestIsBackendSessionLostError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "mcp-go session terminated", err: fmt.Errorf("failed to send request: %w", mcptransport.ErrSessionTerminated), want: true},
+		{name: "transport dropped session id", err: errBackendSessionIDLost, want: true},
+		{name: "typescript sdk sessionless 400", err: errors.New("request failed with status 400: Bad Request: Not an initialization request and no valid session ID provided."), want: true},
+		{name: "go-sdk sessionless jsonrpc error", err: errors.New(`method "tools/call" is invalid during session initialization`), want: true},
+		{name: "mcp-go server invalid session", err: errors.New("request failed with status 400: Invalid session ID"), want: true},
+		{name: "ambiguous 5xx", err: errors.New("request failed with status 502: Bad Gateway"), want: false},
+		{name: "network error", err: errors.New("dial tcp: connection refused"), want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, isBackendSessionLostError(tt.err))
+		})
+	}
 }

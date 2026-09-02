@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -125,6 +126,19 @@ func startSlowInProcessMCPServer(t *testing.T, delay time.Duration) string {
 // tests can distinguish safe session recovery from unsafe generic retries.
 func startSessionFailureMCPServer(t *testing.T, failureStatus int) (string, *atomic.Int32, *atomic.Int32) {
 	t.Helper()
+	return startSessionFailureMCPServerWithResponse(t, func(w http.ResponseWriter, _ []byte) {
+		http.Error(w, http.StatusText(failureStatus), failureStatus)
+	})
+}
+
+// startSessionFailureMCPServerWithResponse starts a streamable-HTTP MCP server
+// whose first tools/call is answered by failFirst instead of being executed.
+// failFirst receives the raw JSON-RPC request body so it can echo the request ID.
+func startSessionFailureMCPServerWithResponse(
+	t *testing.T,
+	failFirst func(w http.ResponseWriter, body []byte),
+) (string, *atomic.Int32, *atomic.Int32) {
+	t.Helper()
 
 	var initializeCount atomic.Int32
 	var executionCount atomic.Int32
@@ -164,7 +178,7 @@ func startSessionFailureMCPServer(t *testing.T, failureStatus int) (string, *ato
 			initializeCount.Add(1)
 		}
 		if request.Method == "tools/call" && failNext.CompareAndSwap(true, false) {
-			http.Error(w, http.StatusText(failureStatus), failureStatus)
+			failFirst(w, body)
 			return
 		}
 		streamableSrv.ServeHTTP(w, r)
@@ -297,6 +311,72 @@ func TestSessionFactory_Integration_ReconnectsExpiredBackendSession(t *testing.T
 	require.Len(t, result.Content, 1)
 	assert.Equal(t, "recovered", result.Content[0].Text)
 	assert.EqualValues(t, 2, initializeCount.Load(), "expired session must be reinitialized once")
+	assert.EqualValues(t, 1, executionCount.Load(), "the rejected request must execute exactly once after recovery")
+}
+
+// TypeScript SDK servers answer a request that lost its Mcp-Session-Id with an
+// HTTP 400 and this exact body; the vMCP client must treat it like a 404.
+func TestSessionFactory_Integration_ReconnectsOnSessionlessBadRequest(t *testing.T) {
+	t.Parallel()
+
+	baseURL, initializeCount, executionCount := startSessionFailureMCPServerWithResponse(t,
+		func(w http.ResponseWriter, _ []byte) {
+			http.Error(w, "Bad Request: Not an initialization request and no valid session ID provided.", http.StatusBadRequest)
+		})
+	backend := &vmcp.Backend{
+		ID:            "integration-backend",
+		Name:          "integration-backend",
+		BaseURL:       baseURL,
+		TransportType: "streamable-http",
+	}
+
+	factory := NewSessionFactory(newUnauthenticatedRegistry(t))
+	sess, err := factory.MakeSessionWithID(context.Background(), uuid.New().String(), nil, true, []*vmcp.Backend{backend})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sess.Close()) })
+
+	result, err := sess.CallTool(context.Background(), nil, "echo", map[string]any{"input": "recovered"}, nil)
+	require.NoError(t, err)
+	require.Len(t, result.Content, 1)
+	assert.Equal(t, "recovered", result.Content[0].Text)
+	assert.EqualValues(t, 2, initializeCount.Load(), "sessionless rejection must trigger one reinitialization")
+	assert.EqualValues(t, 1, executionCount.Load(), "the rejected request must execute exactly once after recovery")
+}
+
+// go-sdk servers open a fresh session for a sessionless request and reject the
+// method with a JSON-RPC error; the vMCP client must recover from that as well.
+func TestSessionFactory_Integration_ReconnectsOnInvalidDuringInitializationError(t *testing.T) {
+	t.Parallel()
+
+	baseURL, initializeCount, executionCount := startSessionFailureMCPServerWithResponse(t,
+		func(w http.ResponseWriter, body []byte) {
+			var req struct {
+				ID json.RawMessage `json:"id"`
+			}
+			require.NoError(t, json.Unmarshal(body, &req))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w,
+				`{"jsonrpc":"2.0","id":%s,"error":{"code":-32600,"message":"method \"tools/call\" is invalid during session initialization"}}`,
+				req.ID)
+		})
+	backend := &vmcp.Backend{
+		ID:            "integration-backend",
+		Name:          "integration-backend",
+		BaseURL:       baseURL,
+		TransportType: "streamable-http",
+	}
+
+	factory := NewSessionFactory(newUnauthenticatedRegistry(t))
+	sess, err := factory.MakeSessionWithID(context.Background(), uuid.New().String(), nil, true, []*vmcp.Backend{backend})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sess.Close()) })
+
+	result, err := sess.CallTool(context.Background(), nil, "echo", map[string]any{"input": "recovered"}, nil)
+	require.NoError(t, err)
+	require.Len(t, result.Content, 1)
+	assert.Equal(t, "recovered", result.Content[0].Text)
+	assert.EqualValues(t, 2, initializeCount.Load(), "initialization-state rejection must trigger one reinitialization")
 	assert.EqualValues(t, 1, executionCount.Load(), "the rejected request must execute exactly once after recovery")
 }
 
