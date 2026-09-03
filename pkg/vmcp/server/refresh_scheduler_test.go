@@ -4,6 +4,7 @@
 package server
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -11,9 +12,11 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 
 	"github.com/stacklok/toolhive/pkg/vmcp"
 	"github.com/stacklok/toolhive/pkg/vmcp/health"
+	"github.com/stacklok/toolhive/pkg/vmcp/mocks"
 	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
 	sessiontypes "github.com/stacklok/toolhive/pkg/vmcp/session/types"
 )
@@ -213,4 +216,46 @@ func TestHandleBackendStatusChange_OnlySchedulesOnExposureTransitions(t *testing
 	srv.handleBackendCapabilityChange("b")
 	require.Eventually(t, func() bool { return len(rec.snapshot()) == 2 }, time.Second, time.Millisecond)
 	assert.Equal(t, refreshSessionsContainingBackend, rec.snapshot()[1].mode)
+}
+
+func TestReconcileSessionsLackingBackends_SchedulesOnlyMissingEligibleBackends(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	registry := mocks.NewMockBackendRegistry(ctrl)
+	registry.EXPECT().List(gomock.Any()).Return([]vmcp.Backend{
+		{ID: "complete", HealthStatus: vmcp.BackendHealthy},
+		{ID: "missing", HealthStatus: vmcp.BackendHealthy},
+		{ID: "sick", HealthStatus: vmcp.BackendUnhealthy},
+	}).AnyTimes()
+
+	sessions := map[string]sessiontypes.MultiSession{
+		"full":    &refreshTestMultiSession{backendIDs: "complete,missing,sick"},
+		"partial": &refreshTestMultiSession{backendIDs: "complete"},
+	}
+	srv := newRefreshTestServer(sessions, "full", "partial")
+	srv.backendRegistry = registry
+	t.Cleanup(func() {
+		if srv.refreshSched != nil {
+			srv.refreshSched.stop()
+		}
+	})
+
+	// "complete" is in every session and "sick" is not eligible, so only
+	// "missing" needs a lacking-backend refresh.
+	assert.Equal(t, []string{"missing"}, srv.reconcileSessionsLackingBackends(context.Background()))
+	require.NotNil(t, srv.refreshSched)
+	assert.Equal(t, 1, srv.refreshSched.pendingCount())
+
+	// A second pass before the refresh ran coalesces into the pending one.
+	assert.Equal(t, []string{"missing"}, srv.reconcileSessionsLackingBackends(context.Background()))
+	assert.Equal(t, 1, srv.refreshSched.pendingCount())
+}
+
+func TestEligibleBackends_WithoutRegistry(t *testing.T) {
+	t.Parallel()
+
+	srv := newRefreshTestServer(map[string]sessiontypes.MultiSession{})
+	assert.Nil(t, srv.eligibleBackends(context.Background()))
+	assert.Empty(t, srv.reconcileSessionsLackingBackends(context.Background()))
 }

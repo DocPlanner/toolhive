@@ -869,6 +869,19 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}
 
+	// Re-attach backends that recovered without a health transition. Sessions
+	// are built in best_effort mode, so a backend whose initialization failed
+	// once would otherwise stay missing from that session until the client
+	// reconnects.
+	if s.backendRegistry != nil {
+		reconcileCtx, reconcileCancel := context.WithCancel(ctx)
+		go s.runBackendReconciliation(reconcileCtx, defaultBackendReconcileInterval)
+		s.shutdownFuncs = append(s.shutdownFuncs, func(context.Context) error {
+			reconcileCancel()
+			return nil
+		})
+	}
+
 	// Start status reporter if configured
 	if s.statusReporter != nil {
 		shutdown, err := s.statusReporter.Start(ctx)
@@ -2069,6 +2082,69 @@ type refreshTarget struct {
 // backend change. Entries whose MultiSession no longer exists (expired, or
 // terminated on another replica) are stale and are dropped from the registry so
 // they are not reconsidered on the next trigger.
+// defaultBackendReconcileInterval bounds how long an active session keeps
+// lacking an eligible backend after a transient initialization failure before
+// it is rebuilt with that backend. Health transitions trigger refreshes
+// immediately; this is the safety net for backends that recovered without the
+// health monitor ever seeing them unhealthy (proxy restarts between two checks,
+// a slow aggregator, a transient network error during session creation).
+const defaultBackendReconcileInterval = 5 * time.Minute
+
+// runBackendReconciliation runs reconcileSessionsLackingBackends every
+// interval until ctx is cancelled.
+func (s *Server) runBackendReconciliation(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.reconcileSessionsLackingBackends(ctx)
+		}
+	}
+}
+
+// reconcileSessionsLackingBackends schedules a lacking-backend refresh for
+// every backend that is eligible for exposure but absent from at least one
+// active session. Scheduling goes through the shared refresh scheduler, so
+// the usual debounce and cooldown apply. It returns the IDs of the backends
+// scheduled, in registry order.
+func (s *Server) reconcileSessionsLackingBackends(ctx context.Context) []string {
+	scheduled := make([]string, 0)
+	for _, backend := range s.eligibleBackends(ctx) {
+		lacking := s.targetSessionsForRefresh(backend.ID, refreshSessionsLackingBackend)
+		if len(lacking) == 0 {
+			continue
+		}
+		slog.Info("scheduling session refresh for sessions lacking an eligible backend",
+			"backendID", backend.ID,
+			"session_count", len(lacking))
+		s.scheduler().schedule(backend.ID, refreshSessionsLackingBackend)
+		scheduled = append(scheduled, backend.ID)
+	}
+	return scheduled
+}
+
+// eligibleBackends returns the registered backends currently eligible for
+// exposure, consulting the health monitor when one is running.
+func (s *Server) eligibleBackends(ctx context.Context) []vmcp.Backend {
+	if s.backendRegistry == nil {
+		return nil
+	}
+
+	s.healthMonitorMu.RLock()
+	healthMon := s.healthMonitor
+	s.healthMonitorMu.RUnlock()
+
+	var healthStatusProvider health.StatusProvider
+	if healthMon != nil {
+		healthStatusProvider = healthMon
+	}
+	return health.FilterBackendsForExposure(s.backendRegistry.List(ctx), healthStatusProvider)
+}
+
 func (s *Server) targetSessionsForRefresh(
 	backendID string,
 	mode refreshTargetMode,
