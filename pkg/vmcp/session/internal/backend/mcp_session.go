@@ -65,12 +65,28 @@ type identityRoundTripper struct {
 	identity *auth.Identity
 }
 
+// RoundTrip makes sure every backend request carries an identity for the auth
+// strategies to consume.
+//
+// The identity already present in the request context wins: the incoming auth
+// middleware populates it per request, so its caller token and upstream tokens
+// are current. The identity captured when the client was created is only a
+// fallback for background work that has no caller in the context (health
+// checks, session refresh, session restore). Always preferring the captured
+// identity would keep injecting the tokens that were valid when the session
+// was built, and those expire long before a long-lived session does.
 func (i *identityRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if i.identity != nil {
-		ctx := auth.WithIdentity(req.Context(), i.identity)
-		req = req.Clone(ctx)
+	if identity := i.effectiveIdentity(req.Context()); identity != nil {
+		req = req.Clone(auth.WithIdentity(req.Context(), identity))
 	}
 	return i.base.RoundTrip(req)
+}
+
+func (i *identityRoundTripper) effectiveIdentity(ctx context.Context) *auth.Identity {
+	if current, ok := auth.IdentityFromContext(ctx); ok && current != nil {
+		return current
+	}
+	return i.identity
 }
 
 // Compile-time assertion: mcpSession must implement Session.
