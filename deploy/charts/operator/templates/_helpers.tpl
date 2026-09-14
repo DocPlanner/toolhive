@@ -24,6 +24,17 @@ If release name contains chart name it will be used as a full name.
 {{- end }}
 
 {{/*
+Name prefix for the operator's RBAC objects.
+Deliberately not "operator.fullname": fullnameOverride is set by default, so
+every release resolves it to the same string. The manager role is cluster-scoped,
+so two releases sharing that name end up owning a single object and overwriting
+each other's copy of it.
+*/}}
+{{- define "operator.rbacName" -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
 Create chart name and version as used by the chart label.
 */}}
 {{- define "operator.chart" -}}

@@ -3,13 +3,13 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: toolhive-operator-manager-rolebinding
+  name: {{ include "operator.rbacName" . }}-manager-rolebinding
   labels:
     {{- include "toolhive.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: toolhive-operator-manager-role
+  name: {{ include "operator.rbacName" . }}-manager-role
 subjects:
 - kind: ServiceAccount
   name: toolhive-operator
@@ -22,7 +22,7 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: toolhive-operator-manager-rolebinding
+  name: {{ include "operator.rbacName" $ }}-manager-rolebinding
   namespace: {{ . }}
   labels:
     {{- include "toolhive.labels" $ | nindent 4 }}
@@ -33,6 +33,6 @@ subjects:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: toolhive-operator-manager-role
+  name: {{ include "operator.rbacName" $ }}-manager-role
 {{- end }}
 {{- end }}
