@@ -18,6 +18,10 @@ import "errors"
 // is not present in the identity's UpstreamTokens map.
 var ErrUpstreamTokenNotFound = errors.New("upstream token not found")
 
+// ErrCallerTokenEmpty is returned when a strategy forwards the caller's own
+// bearer token and the identity carries none.
+var ErrCallerTokenEmpty = errors.New("caller token is empty")
+
 // UpstreamInjectProviderCaller is a reserved upstreamInject providerName that
 // forwards the already-validated caller bearer token to the backend.
 const UpstreamInjectProviderCaller = "caller"

@@ -6,7 +6,9 @@ package sessionmanager
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -164,6 +166,55 @@ type identityAwareSession struct {
 }
 
 func (s identityAwareSession) CreatorIdentity() *auth.Identity {
+	if s.identity == nil {
+		return nil
+	}
+	cloned := *s.identity
+	return &cloned
+}
+
+// metadataTestSession keeps real metadata over a mock session, for tests that
+// check what the manager writes into it.
+type metadataTestSession struct {
+	sessiontypes.MultiSession
+	identity *auth.Identity
+
+	mu       sync.Mutex
+	metadata map[string]string
+}
+
+func newMetadataTestSession(
+	t *testing.T, ctrl *gomock.Controller, sessionID string, identity *auth.Identity, metadata map[string]string,
+) *metadataTestSession {
+	t.Helper()
+	cloned := make(map[string]string, len(metadata))
+	for k, v := range metadata {
+		cloned[k] = v
+	}
+	return &metadataTestSession{
+		MultiSession: newMockSession(t, ctrl, sessionID, nil),
+		identity:     identity,
+		metadata:     cloned,
+	}
+}
+
+func (s *metadataTestSession) GetMetadata() map[string]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cloned := make(map[string]string, len(s.metadata))
+	for k, v := range s.metadata {
+		cloned[k] = v
+	}
+	return cloned
+}
+
+func (s *metadataTestSession) SetMetadata(key, value string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.metadata[key] = value
+}
+
+func (s *metadataTestSession) CreatorIdentity() *auth.Identity {
 	if s.identity == nil {
 		return nil
 	}
@@ -343,6 +394,34 @@ func TestSessionManager_CreateSession(t *testing.T) {
 		// Storage must still hold the session metadata after CreateSession.
 		_, loadErr := storage.Load(context.Background(), sessionID)
 		assert.NoError(t, loadErr, "session should still exist in storage after CreateSession")
+	})
+
+	t.Run("records the backends that rejected the credentials at creation", func(t *testing.T) {
+		t.Parallel()
+
+		const rejecting = "forbids-user"
+		ctrl := gomock.NewController(t)
+		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
+		factory.EXPECT().
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+				return newMetadataTestSession(t, ctrl, id, nil, map[string]string{
+					vmcpsession.MetadataKeyBackendIDs:         "ok",
+					vmcpsession.MetadataKeyRejectedBackendIDs: rejecting,
+				}), nil
+			}).Times(1)
+		sm, storage := newTestSessionManager(t, factory, newFakeRegistry())
+
+		sessionID := sm.Generate()
+		require.NotEmpty(t, sessionID)
+		sess, err := sm.CreateSession(context.Background(), sessionID)
+		require.NoError(t, err)
+
+		assert.Equal(t, rejecting, sess.GetMetadata()[vmcpsession.MetadataKeyCreationRejectedBackendIDs])
+		stored, err := storage.Load(context.Background(), sessionID)
+		require.NoError(t, err)
+		assert.Equal(t, rejecting, stored[vmcpsession.MetadataKeyCreationRejectedBackendIDs],
+			"the creation-time list must be persisted with the session")
 	})
 
 	t.Run("returns error for empty session ID", func(t *testing.T) {
@@ -722,6 +801,55 @@ func TestSessionManager_RefreshSession(t *testing.T) {
 		require.NotNil(t, storedIdentity)
 		assert.Equal(t, identity.Subject, storedIdentity.Subject)
 		assert.Equal(t, identity.Token, storedIdentity.Token)
+	})
+
+	t.Run("keeps the creation-time rejections instead of the rebuild's", func(t *testing.T) {
+		t.Parallel()
+
+		const rejecting = "forbids-user"
+		identity := &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: "user-123"}, Token: "bearer-token"}
+		tests := []struct {
+			name       string
+			atCreation map[string]string
+			want       string
+		}{
+			{
+				name:       "list recorded at creation",
+				atCreation: map[string]string{vmcpsession.MetadataKeyCreationRejectedBackendIDs: rejecting},
+				want:       rejecting,
+			},
+			{name: "session created before the list existed", atCreation: map[string]string{}, want: ""},
+		}
+		for i, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				ctrl := gomock.NewController(t)
+				sessionID := fmt.Sprintf("550e8400-e29b-41d4-a716-44665544001%d", i)
+				original := newMetadataTestSession(t, ctrl, sessionID, identity, tc.atCreation)
+
+				factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
+				factory.EXPECT().
+					MakeSessionWithID(gomock.Any(), sessionID, gomock.Any(), false, gomock.Any()).
+					DoAndReturn(func(_ context.Context, id string, got *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+						return newMetadataTestSession(t, ctrl, id, got, map[string]string{
+							vmcpsession.MetadataKeyRejectedBackendIDs: rejecting + ",stale-token",
+						}), nil
+					}).Times(1)
+				sm, storage := newTestSessionManager(t, factory, newFakeRegistry())
+				require.NoError(t, sm.StoreSession(original))
+
+				refreshed, err := sm.RefreshSession(context.Background(), sessionID)
+				require.NoError(t, err)
+
+				meta := refreshed.GetMetadata()
+				assert.Equal(t, tc.want, meta[vmcpsession.MetadataKeyCreationRejectedBackendIDs])
+				assert.Equal(t, rejecting+",stale-token", meta[vmcpsession.MetadataKeyRejectedBackendIDs])
+				stored, err := storage.Load(context.Background(), sessionID)
+				require.NoError(t, err)
+				assert.Equal(t, tc.want, stored[vmcpsession.MetadataKeyCreationRejectedBackendIDs])
+			})
+		}
 	})
 
 	t.Run("returns error when stored session cannot provide creator identity", func(t *testing.T) {

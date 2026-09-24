@@ -5,15 +5,19 @@ package session
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/google/uuid"
+	mcptransport "github.com/mark3labs/mcp-go/client/transport"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/stacklok/toolhive/pkg/auth"
 	"github.com/stacklok/toolhive/pkg/vmcp"
+	authtypes "github.com/stacklok/toolhive/pkg/vmcp/auth/types"
 	internalbk "github.com/stacklok/toolhive/pkg/vmcp/session/internal/backend"
 )
 
@@ -165,4 +169,100 @@ func TestRestoreSession_AbsentMetadataKeyBackendIDsReturnsError(t *testing.T) {
 	require.Error(t, err, "absent MetadataKeyBackendIDs must return an error")
 	assert.Contains(t, err.Error(), MetadataKeyBackendIDs,
 		"error message must name the missing key")
+}
+
+func TestMakeSession_RecordsBackendsThatRejectCredentials(t *testing.T) {
+	t.Parallel()
+
+	const (
+		connected    = "e-ok"
+		unauthorized = "b-unauthorized"
+		noToken      = "a-no-token"
+		forbidden    = "c-forbidden"
+		timedOut     = "d-timeout"
+	)
+	failures := map[string]error{
+		unauthorized: fmt.Errorf("failed to initialise backend %s: initialize failed: %w",
+			unauthorized, mcptransport.NewError(mcptransport.ErrUnauthorized)),
+		noToken:   fmt.Errorf("authentication failed for backend %s: %w", noToken, authtypes.ErrCallerTokenEmpty),
+		forbidden: errors.New("initialize failed: transport error: request failed with status 403: Forbidden"),
+		timedOut:  fmt.Errorf("initialize failed: %w", context.DeadlineExceeded),
+	}
+	connector := func(_ context.Context, target *vmcp.BackendTarget, _ *auth.Identity) (internalbk.Session, *vmcp.CapabilityList, error) {
+		if err, ok := failures[target.WorkloadID]; ok {
+			return nil, nil, err
+		}
+		return &mockConnectedBackend{sessID: "sess-" + target.WorkloadID}, &vmcp.CapabilityList{}, nil
+	}
+	factory := newSessionFactoryWithConnector(connector)
+
+	t.Run("lists only the backends that rejected the credentials, sorted", func(t *testing.T) {
+		t.Parallel()
+
+		backends := []*vmcp.Backend{
+			{ID: connected}, {ID: unauthorized}, {ID: timedOut}, {ID: noToken}, {ID: forbidden},
+		}
+		sess, err := factory.MakeSessionWithID(t.Context(), uuid.New().String(), nil, true, backends)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = sess.Close() })
+
+		meta := sess.GetMetadata()
+		assert.Equal(t, noToken+","+unauthorized, meta[MetadataKeyRejectedBackendIDs])
+		assert.Equal(t, connected, meta[MetadataKeyBackendIDs])
+		_, present := meta[MetadataKeyCreationRejectedBackendIDs]
+		assert.False(t, present, "the factory must leave the creation-time list to the session manager")
+	})
+
+	t.Run("no key when no backend rejected the credentials", func(t *testing.T) {
+		t.Parallel()
+
+		backends := []*vmcp.Backend{{ID: connected}, {ID: forbidden}, {ID: timedOut}}
+		sess, err := factory.MakeSessionWithID(t.Context(), uuid.New().String(), nil, true, backends)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = sess.Close() })
+
+		_, present := sess.GetMetadata()[MetadataKeyRejectedBackendIDs]
+		assert.False(t, present)
+	})
+}
+
+func TestRestoreSession_KeepsCreationRejectionsAndRecomputesCurrentOnes(t *testing.T) {
+	t.Parallel()
+
+	const (
+		kept      = "kept-backend"
+		rejecting = "token-backend"
+	)
+	rejectToken := false
+	connector := func(_ context.Context, target *vmcp.BackendTarget, _ *auth.Identity) (internalbk.Session, *vmcp.CapabilityList, error) {
+		if rejectToken && target.WorkloadID == rejecting {
+			return nil, nil, fmt.Errorf("authentication failed for backend %s: %w", rejecting, authtypes.ErrCallerTokenEmpty)
+		}
+		return &mockConnectedBackend{sessID: "sess-" + target.WorkloadID}, &vmcp.CapabilityList{}, nil
+	}
+	factory := newSessionFactoryWithConnector(connector)
+	backends := []*vmcp.Backend{{ID: kept}, {ID: rejecting}}
+	const sessionID = "restore-rejections-session"
+
+	original, err := factory.MakeSessionWithID(t.Context(), sessionID, nil, true, backends)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = original.Close() })
+
+	storedMeta := original.GetMetadata()
+	storedMeta[MetadataKeyCreationRejectedBackendIDs] = "backend-c"
+	storedMeta[MetadataKeyRejectedBackendIDs] = kept
+
+	// The restore reconnects without the caller's token, as a restore from
+	// storage does, and the token backend rejects the identity.
+	rejectToken = true
+	restored, err := factory.RestoreSession(t.Context(), sessionID, storedMeta, backends)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = restored.Close() })
+
+	meta := restored.GetMetadata()
+	assert.Equal(t, "backend-c", meta[MetadataKeyCreationRejectedBackendIDs],
+		"the creation-time list describes the session and must survive a restore")
+	assert.Equal(t, rejecting, meta[MetadataKeyRejectedBackendIDs],
+		"the current list must come from the restore, not from storage")
+	assert.Equal(t, kept, meta[MetadataKeyBackendIDs])
 }
