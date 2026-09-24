@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -2053,15 +2054,19 @@ func (s *Server) runBackendRefresh(backendID string, mode refreshTargetMode) {
 		"mode", mode.String(),
 		"session_count", len(targets))
 
-	failed := 0
+	failed, ended := 0, 0
 	for _, target := range targets {
 		refreshCtx, cancel := context.WithTimeout(context.Background(), defaultSessionRefreshTimeout)
-		if err := s.refreshSessionCapabilities(refreshCtx, target.sessionID, target.session); err != nil {
+		sessionEnded, err := s.refreshSessionCapabilities(refreshCtx, target.sessionID, target.session)
+		switch {
+		case err != nil:
 			failed++
 			slog.Warn("failed to refresh session capabilities",
 				"session_id", target.sessionID,
 				"backend_id", backendID,
 				"error", err)
+		case sessionEnded:
+			ended++
 		}
 		cancel()
 	}
@@ -2070,7 +2075,8 @@ func (s *Server) runBackendRefresh(backendID string, mode refreshTargetMode) {
 		"backend_id", backendID,
 		"mode", mode.String(),
 		"session_count", len(targets),
-		"failed", failed)
+		"failed", failed,
+		"ended", ended)
 }
 
 type refreshTarget struct {
@@ -2211,19 +2217,23 @@ func sessionContainsBackend(sess sessiontypes.MultiSession, backendID string) bo
 	return false
 }
 
+// refreshSessionCapabilities rebuilds a session and swaps the rebuilt tools and
+// resources into its SDK session. It reports ended, and swaps nothing, when
+// backends rejected the session's stored credentials and the session was
+// terminated instead (see staleCredentialBackends).
 func (s *Server) refreshSessionCapabilities(
 	ctx context.Context,
 	sessionID string,
 	clientSession server.ClientSession,
-) error {
+) (ended bool, err error) {
 	previous, ok := s.vmcpSessionMgr.GetMultiSession(sessionID)
 	if !ok {
-		return fmt.Errorf("session %q not found", sessionID)
+		return false, fmt.Errorf("session %q not found", sessionID)
 	}
 
 	refreshed, err := s.vmcpSessionMgr.RefreshSession(ctx, sessionID)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	rollback := func(refreshErr error) error {
@@ -2243,22 +2253,26 @@ func (s *Server) refreshSessionCapabilities(
 		return refreshErr
 	}
 
+	if stale := staleCredentialBackends(previous, refreshed); len(stale) > 0 {
+		return s.endSessionWithStaleCredentials(sessionID, previous, stale, rollback)
+	}
+
 	adaptedTools, err := s.vmcpSessionMgr.GetAdaptedTools(sessionID)
 	if err != nil {
-		return rollback(err)
+		return false, rollback(err)
 	}
 	adaptedResources, err := s.vmcpSessionMgr.GetAdaptedResources(sessionID)
 	if err != nil {
-		return rollback(err)
+		return false, rollback(err)
 	}
 
 	resourcesChanged, err := replaceSessionResourcesDirect(clientSession, adaptedResources)
 	if err != nil {
-		return rollback(err)
+		return false, rollback(err)
 	}
 	toolsChanged, err := replaceSessionToolsDirect(clientSession, adaptedTools)
 	if err != nil {
-		return rollback(err)
+		return false, rollback(err)
 	}
 
 	if resourcesChanged {
@@ -2292,7 +2306,70 @@ func (s *Server) refreshSessionCapabilities(
 		"tools_changed", toolsChanged,
 		"resources_changed", resourcesChanged)
 
-	return nil
+	return false, nil
+}
+
+// staleCredentialBackends returns the backends that rejected the session's
+// stored credentials when it was rebuilt, leaving out those that had already
+// rejected them when the session was created: a new session would be rejected
+// by those as well. It returns nil for a session without a subject, which has
+// no credentials that a new session could replace.
+//
+// The subject is read from the session as it was before the rebuild. A
+// rebuild of a session restored from storage has no token to bind to, so its
+// token hash says nothing about who owns it.
+func staleCredentialBackends(previous, rebuilt sessiontypes.MultiSession) []string {
+	before := previous.GetMetadata()
+	if before[vmcpsession.MetadataKeyIdentitySubject] == "" {
+		return nil
+	}
+	atCreation := strings.Split(before[vmcpsession.MetadataKeyCreationRejectedBackendIDs], ",")
+
+	var stale []string
+	for _, id := range strings.Split(rebuilt.GetMetadata()[vmcpsession.MetadataKeyRejectedBackendIDs], ",") {
+		if id != "" && !slices.Contains(atCreation, id) {
+			stale = append(stale, id)
+		}
+	}
+	return stale
+}
+
+// endSessionWithStaleCredentials terminates a session whose stored credentials
+// the given backends no longer accept. The credentials are fixed when the
+// session is created and a rebuild cannot renew them: the session would stay
+// without those backends, and every refresh would try them again for as long
+// as it lives. Once it is gone the client's next request gets 404, and the
+// client starts a new session with the credentials it holds now.
+//
+// If the session cannot be terminated, rollback restores the previous one and
+// the next refresh tries again.
+func (s *Server) endSessionWithStaleCredentials(
+	sessionID string,
+	previous sessiontypes.MultiSession,
+	stale []string,
+	rollback func(error) error,
+) (bool, error) {
+	if _, err := s.vmcpSessionMgr.Terminate(sessionID); err != nil {
+		return false, rollback(fmt.Errorf("failed to end session with stale credentials: %w", err))
+	}
+	s.activeClientSessions.Delete(sessionID)
+	if s.mcpServer != nil {
+		s.mcpServer.UnregisterSession(context.Background(), sessionID)
+	}
+
+	go func(previous sessiontypes.MultiSession) {
+		time.Sleep(defaultSessionCloseGracePeriod)
+		if err := previous.Close(); err != nil {
+			slog.Warn("failed to close replaced session",
+				"session_id", sessionID,
+				"error", err)
+		}
+	}(previous)
+
+	slog.Info("ended session: backends rejected its stored credentials",
+		"session_id", sessionID,
+		"backend_ids", stale)
+	return true, nil
 }
 
 // validateWorkflows validates workflow definitions, returning only the valid ones.

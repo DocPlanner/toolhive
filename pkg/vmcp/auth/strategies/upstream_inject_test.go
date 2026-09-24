@@ -34,6 +34,7 @@ func TestUpstreamInjectStrategy_Authenticate(t *testing.T) {
 		expectError   bool
 		errorContains string
 		checkSentinel bool
+		wantErrIs     error
 		checkHeader   func(t *testing.T, req *http.Request)
 	}{
 		{
@@ -85,6 +86,7 @@ func TestUpstreamInjectStrategy_Authenticate(t *testing.T) {
 			},
 			expectError:   true,
 			errorContains: "caller token is empty",
+			wantErrIs:     authtypes.ErrCallerTokenEmpty,
 		},
 		{
 			name:     "missing identity in context",
@@ -223,6 +225,9 @@ func TestUpstreamInjectStrategy_Authenticate(t *testing.T) {
 				if tt.checkSentinel {
 					assert.True(t, errors.Is(err, authtypes.ErrUpstreamTokenNotFound),
 						"expected error to wrap ErrUpstreamTokenNotFound, got: %v", err)
+				}
+				if tt.wantErrIs != nil {
+					assert.ErrorIs(t, err, tt.wantErrIs)
 				}
 				return
 			}

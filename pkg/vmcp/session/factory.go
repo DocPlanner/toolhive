@@ -44,6 +44,23 @@ const (
 	// Full key: MetadataKeyBackendSessionPrefix + workloadID → backend_session_id.
 	// Used by RestoreSession to reconnect backends with the correct session hint.
 	MetadataKeyBackendSessionPrefix = "vmcp.backend.session."
+
+	// MetadataKeyRejectedBackendIDs is the transport-session metadata key that
+	// holds a comma-separated, sorted list of the backends that rejected the
+	// session's credentials when the session was built: they answered 401, or
+	// the identity lacked the token their auth strategy injects (see
+	// backend.IsCredentialRejection). Absent when no backend did. Every build
+	// writes its own list.
+	MetadataKeyRejectedBackendIDs = "vmcp.backend.rejected_ids"
+
+	// MetadataKeyCreationRejectedBackendIDs holds MetadataKeyRejectedBackendIDs
+	// as it was when the session was created. The session manager records it at
+	// creation and carries it through refreshes, and RestoreSession copies it
+	// from storage. A backend that rejects the credentials on a later rebuild
+	// but is not listed here accepted them, or was not reached, while they were
+	// fresh. An absent key reads as an empty list: no backend rejected them at
+	// creation, or the session was created before this key existed.
+	MetadataKeyCreationRejectedBackendIDs = "vmcp.backend.rejected_ids_at_creation"
 )
 
 var (
@@ -281,13 +298,14 @@ type initResult struct {
 // initOneBackend attempts to connect and initialise a single backend.
 // It is called from a goroutine inside MakeSession and handles all partial-
 // initialisation cases: connector errors, and nil conn/caps without an error.
-// Returns a non-nil *initResult on success, nil when the backend should be
-// skipped (failure already logged as a warning).
+// Returns a non-nil *initResult on success. Otherwise the backend is skipped:
+// the failure is already logged as a warning, and the connector's error, if
+// any, is returned.
 func (f *defaultMultiSessionFactory) initOneBackend(
 	ctx context.Context,
 	b *vmcp.Backend,
 	identity *auth.Identity,
-) *initResult {
+) (*initResult, error) {
 	bCtx, cancel := context.WithTimeout(ctx, f.backendInitTimeout)
 	defer cancel()
 
@@ -302,7 +320,7 @@ func (f *defaultMultiSessionFactory) initOneBackend(
 			"backendName", b.Name,
 			"error", err,
 		)
-		return nil
+		return nil, err
 	}
 	if conn == nil || caps == nil {
 		if conn != nil {
@@ -312,9 +330,9 @@ func (f *defaultMultiSessionFactory) initOneBackend(
 			"backendID", b.ID,
 			"backendName", b.Name,
 		)
-		return nil
+		return nil, nil
 	}
-	return &initResult{target: target, conn: conn, caps: caps}
+	return &initResult{target: target, conn: conn, caps: caps}, nil
 }
 
 // buildRoutingTable populates a RoutingTable and capability lists from a sorted
@@ -494,6 +512,7 @@ func (f *defaultMultiSessionFactory) makeBaseSession(
 	backends = filtered
 
 	rawResults := make([]*initResult, len(backends))
+	initErrs := make([]error, len(backends))
 	sem := make(chan struct{}, f.maxConcurrency)
 	var wg sync.WaitGroup
 	wg.Add(len(backends))
@@ -502,7 +521,7 @@ func (f *defaultMultiSessionFactory) makeBaseSession(
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			rawResults[i] = f.initOneBackend(ctx, b, identity)
+			rawResults[i], initErrs[i] = f.initOneBackend(ctx, b, identity)
 		}(i, b)
 	}
 	wg.Wait()
@@ -510,8 +529,12 @@ func (f *defaultMultiSessionFactory) makeBaseSession(
 	connections := make(map[string]backend.Session, len(backends))
 	backendSessions := make(map[string]string, len(backends))
 	results := make([]initResult, 0, len(backends))
-	for _, r := range rawResults {
+	var rejected []string
+	for i, r := range rawResults {
 		if r == nil {
+			if backend.IsCredentialRejection(initErrs[i]) {
+				rejected = append(rejected, backends[i].ID)
+			}
 			continue
 		}
 		connections[r.target.WorkloadID] = r.conn
@@ -521,6 +544,7 @@ func (f *defaultMultiSessionFactory) makeBaseSession(
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].target.WorkloadID < results[j].target.WorkloadID
 	})
+	sort.Strings(rejected)
 
 	if len(results) == 0 && len(backends) > 0 {
 		slog.Warn("All backends failed to initialise; session will have no capabilities",
@@ -551,6 +575,9 @@ func (f *defaultMultiSessionFactory) makeBaseSession(
 		transportSess.SetMetadata(MetadataKeyIdentitySubject, identity.Subject)
 	}
 	populateBackendMetadata(transportSess, results)
+	if len(rejected) > 0 {
+		transportSess.SetMetadata(MetadataKeyRejectedBackendIDs, strings.Join(rejected, ","))
+	}
 
 	return &defaultMultiSession{
 		Session:         transportSess,
@@ -635,15 +662,17 @@ func (f *defaultMultiSessionFactory) RestoreSession(
 
 	// Restore only the security keys (token hash and salt) from stored metadata.
 	// MetadataKeyIdentitySubject is already set by makeBaseSession via the
-	// reconstructed identity. MetadataKeyBackendIDs and the per-backend session
-	// keys (MetadataKeyBackendSessionPrefix.*) are freshly computed by
-	// makeBaseSession from the actual reconnected backends; overwriting them with
-	// stored values would make metadata inconsistent if any backend failed to
-	// reconnect during restore.
+	// reconstructed identity. MetadataKeyBackendIDs, MetadataKeyRejectedBackendIDs
+	// and the per-backend session keys (MetadataKeyBackendSessionPrefix.*) are
+	// freshly computed by makeBaseSession from the actual reconnected backends;
+	// overwriting them with stored values would make metadata inconsistent if any
+	// backend failed to reconnect during restore. The creation-time list of
+	// rejecting backends describes the session, not this build, so it is kept.
 	for _, key := range []string{
 		sessiontypes.MetadataKeyOwnerURL,
 		sessiontypes.MetadataKeyTokenHash,
 		sessiontypes.MetadataKeyTokenSalt,
+		MetadataKeyCreationRejectedBackendIDs,
 	} {
 		if v, ok := storedMetadata[key]; ok {
 			baseSession.SetMetadata(key, v)

@@ -361,6 +361,13 @@ func (sm *Manager) CreateSession(
 		)
 	}
 
+	// Remember which backends rejected the caller's credentials while they were
+	// fresh, so a later rebuild can tell them from backends the credentials
+	// stopped working for.
+	if rejected := sess.GetMetadata()[vmcpsession.MetadataKeyRejectedBackendIDs]; rejected != "" {
+		sess.SetMetadata(vmcpsession.MetadataKeyCreationRejectedBackendIDs, rejected)
+	}
+
 	// Persist the serialisable session metadata to the pluggable backend (e.g.
 	// Redis) so that Validate() and TTL management work correctly. The live
 	// MultiSession itself is cached in the node-local multiSessions map below.
@@ -434,6 +441,10 @@ func (sm *Manager) RefreshSession(
 	if ownerURL, ok := current.GetMetadata()[sessiontypes.MetadataKeyOwnerURL]; ok && ownerURL != "" {
 		refreshed.SetMetadata(sessiontypes.MetadataKeyOwnerURL, ownerURL)
 	}
+	// The creation-time list belongs to the session: never take it from the
+	// rebuild, whose own rejections are what callers compare against it.
+	refreshed.SetMetadata(vmcpsession.MetadataKeyCreationRejectedBackendIDs,
+		current.GetMetadata()[vmcpsession.MetadataKeyCreationRejectedBackendIDs])
 
 	unlock = sm.lockSessionMutation(sessionID)
 	defer unlock()

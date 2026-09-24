@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -101,6 +103,107 @@ func TestIsBackendSessionLostError(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			assert.Equal(t, tt.want, isBackendSessionLostError(tt.err))
+		})
+	}
+}
+
+func TestIsCredentialRejection(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{
+			name: "backend 401",
+			err:  fmt.Errorf("initialize failed: %w", mcptransport.NewError(mcptransport.ErrUnauthorized)),
+			want: true,
+		},
+		{
+			name: "upstream token missing from the identity",
+			err:  fmt.Errorf("authentication failed for backend b: provider %q: %w", "idp", authtypes.ErrUpstreamTokenNotFound),
+			want: true,
+		},
+		{
+			name: "caller token missing from the identity",
+			err:  fmt.Errorf("authentication failed for backend b: %w", authtypes.ErrCallerTokenEmpty),
+			want: true,
+		},
+		{name: "backend 403", err: errors.New("initialize failed: transport error: request failed with status 403: Forbidden"), want: false},
+		{name: "401 text without the sentinel", err: errors.New("initialize failed: transport error: unauthorized (401)"), want: false},
+		{name: "auth strategy failure", err: errors.New("authentication failed for backend b: token exchange failed: connection refused"), want: false},
+		{name: "timeout", err: fmt.Errorf("initialize failed: %w", context.DeadlineExceeded), want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, IsCredentialRejection(tt.err))
+		})
+	}
+}
+
+// TestHTTPConnector_ReportsCredentialRejection checks that the errors the
+// real connector returns keep the sentinels IsCredentialRejection looks for
+// through the auth round tripper, net/http and the mcp-go transport.
+func TestHTTPConnector_ReportsCredentialRejection(t *testing.T) {
+	t.Parallel()
+
+	callerInject := &authtypes.BackendAuthStrategy{
+		Type:           authtypes.StrategyTypeUpstreamInject,
+		UpstreamInject: &authtypes.UpstreamInjectConfig{ProviderName: authtypes.UpstreamInjectProviderCaller},
+	}
+	providerInject := &authtypes.BackendAuthStrategy{
+		Type:           authtypes.StrategyTypeUpstreamInject,
+		UpstreamInject: &authtypes.UpstreamInjectConfig{ProviderName: "idp"},
+	}
+	// A session restored from storage keeps the subject but no token.
+	restored := &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: "user-1"}}
+
+	tests := []struct {
+		name       string
+		status     int
+		authConfig *authtypes.BackendAuthStrategy
+		want       bool
+		wantSent   bool
+	}{
+		{name: "backend answers 401", status: http.StatusUnauthorized, want: true, wantSent: true},
+		{name: "backend answers 403", status: http.StatusForbidden, want: false, wantSent: true},
+		{name: "backend answers 500", status: http.StatusInternalServerError, want: false, wantSent: true},
+		{name: "caller token missing", status: http.StatusOK, authConfig: callerInject, want: true},
+		{name: "upstream token missing", status: http.StatusOK, authConfig: providerInject, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var requests atomic.Int32
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests.Add(1)
+				http.Error(w, http.StatusText(tt.status), tt.status)
+			}))
+			t.Cleanup(ts.Close)
+
+			registry := newTestRegistry(t)
+			require.NoError(t, registry.RegisterStrategy(
+				authtypes.StrategyTypeUpstreamInject,
+				strategies.NewUpstreamInjectStrategy(),
+			))
+			connect := NewHTTPConnector(registry, nil, 0, nil)
+			target := &vmcp.BackendTarget{
+				WorkloadID:    "backend",
+				BaseURL:       ts.URL,
+				TransportType: "streamable-http",
+				AuthConfig:    tt.authConfig,
+			}
+
+			sess, caps, err := connect(context.Background(), target, restored)
+			require.Error(t, err)
+			assert.Nil(t, sess)
+			assert.Nil(t, caps)
+			assert.Equal(t, tt.want, IsCredentialRejection(err), "error: %v", err)
+			assert.Equal(t, tt.wantSent, requests.Load() > 0)
 		})
 	}
 }

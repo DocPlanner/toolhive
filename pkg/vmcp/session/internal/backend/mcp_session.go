@@ -173,6 +173,18 @@ func isBackendSessionLostError(err error) bool {
 	return false
 }
 
+// IsCredentialRejection reports whether err from connecting to a backend means
+// the credentials it was given cannot be used: the backend answered 401, or
+// the identity lacks the token its outgoing auth strategy injects. Retrying
+// with the same identity cannot succeed. A 403, which a fresh token for the
+// same caller would get too, and failures of the auth strategy itself (a token
+// exchange that could not be reached, for example) do not count.
+func IsCredentialRejection(err error) bool {
+	return errors.Is(err, mcptransport.ErrUnauthorized) ||
+		errors.Is(err, authtypes.ErrUpstreamTokenNotFound) ||
+		errors.Is(err, authtypes.ErrCallerTokenEmpty)
+}
+
 // callWithSessionRecovery retries an operation only after a definitive MCP
 // session-lost response (see isBackendSessionLostError). Such responses are
 // returned before the backend executes the operation, unlike ambiguous network
