@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -2680,4 +2681,158 @@ func newCallToolRequest(name string, args map[string]any) mcp.CallToolRequest {
 	req.Params.Name = name
 	req.Params.Arguments = args
 	return req
+}
+
+type metadataTestSession struct {
+	sessiontypes.MultiSession
+	mu       sync.Mutex
+	metadata map[string]string
+}
+
+func (s *metadataTestSession) GetMetadata() map[string]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return cloneStringMap(s.metadata)
+}
+
+func (s *metadataTestSession) SetMetadata(key, value string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.metadata[key] = value
+}
+
+func TestSessionManager_OwnerURLInPlaceholder(t *testing.T) {
+	t.Parallel()
+
+	const ownerURL = "http://10.1.2.3:4483/mcp"
+
+	t.Run("generate stores owner URL in placeholder", func(t *testing.T) {
+		t.Parallel()
+
+		ctrl := gomock.NewController(t)
+		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
+		sm, storage := newTestSessionManagerWithConfig(t, &FactoryConfig{Base: factory, OwnerURL: ownerURL}, newFakeRegistry(), nil)
+
+		sessionID := sm.Generate()
+		require.NotEmpty(t, sessionID)
+
+		metadata, err := storage.Load(context.Background(), sessionID)
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{sessiontypes.MetadataKeyOwnerURL: ownerURL}, metadata)
+	})
+
+	t.Run("generate stores empty placeholder without owner URL", func(t *testing.T) {
+		t.Parallel()
+
+		ctrl := gomock.NewController(t)
+		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
+		sm, storage := newTestSessionManager(t, factory, newFakeRegistry())
+
+		sessionID := sm.Generate()
+		require.NotEmpty(t, sessionID)
+
+		metadata, err := storage.Load(context.Background(), sessionID)
+		require.NoError(t, err)
+		assert.Empty(t, metadata)
+	})
+
+	t.Run("create session keeps placeholder owner URL", func(t *testing.T) {
+		t.Parallel()
+
+		ctrl := gomock.NewController(t)
+		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
+		var created *metadataTestSession
+		factory.EXPECT().
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+				created = &metadataTestSession{
+					MultiSession: newMockSession(t, ctrl, id, nil),
+					metadata:     map[string]string{sessiontypes.MetadataKeyTokenHash: ""},
+				}
+				return created, nil
+			})
+		sm, storage := newTestSessionManagerWithConfig(t, &FactoryConfig{Base: factory, OwnerURL: ownerURL}, newFakeRegistry(), nil)
+
+		sessionID := sm.Generate()
+		require.NotEmpty(t, sessionID)
+
+		sess, err := sm.CreateSession(context.Background(), sessionID)
+		require.NoError(t, err)
+		assert.Equal(t, ownerURL, sess.GetMetadata()[sessiontypes.MetadataKeyOwnerURL])
+
+		metadata, err := storage.Load(context.Background(), sessionID)
+		require.NoError(t, err)
+		assert.Equal(t, ownerURL, metadata[sessiontypes.MetadataKeyOwnerURL])
+		assert.Contains(t, metadata, sessiontypes.MetadataKeyTokenHash)
+	})
+
+	t.Run("create session keeps an owner written after generate", func(t *testing.T) {
+		t.Parallel()
+
+		const claimedOwner = "http://10.4.5.6:4483/mcp"
+		ctrl := gomock.NewController(t)
+		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
+		sm, storage := newTestSessionManagerWithConfig(t, &FactoryConfig{Base: factory, OwnerURL: ownerURL}, newFakeRegistry(), nil)
+
+		sessionID := sm.Generate()
+		require.NotEmpty(t, sessionID)
+
+		factory.EXPECT().
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(ctx context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+				require.NoError(t, storage.Upsert(ctx, id, map[string]string{sessiontypes.MetadataKeyOwnerURL: claimedOwner}))
+				return &metadataTestSession{
+					MultiSession: newMockSession(t, ctrl, id, nil),
+					metadata:     map[string]string{sessiontypes.MetadataKeyTokenHash: ""},
+				}, nil
+			})
+
+		_, err := sm.CreateSession(context.Background(), sessionID)
+		require.NoError(t, err)
+
+		metadata, err := storage.Load(context.Background(), sessionID)
+		require.NoError(t, err)
+		assert.Equal(t, claimedOwner, metadata[sessiontypes.MetadataKeyOwnerURL])
+	})
+
+	t.Run("placeholder with owner URL is not restorable", func(t *testing.T) {
+		t.Parallel()
+
+		ctrl := gomock.NewController(t)
+		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
+		factory.EXPECT().RestoreSession(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+		sm, _ := newTestSessionManagerWithConfig(t, &FactoryConfig{Base: factory, OwnerURL: ownerURL}, newFakeRegistry(), nil)
+
+		sessionID := sm.Generate()
+		require.NotEmpty(t, sessionID)
+
+		multiSess, ok := sm.GetMultiSession(sessionID)
+		assert.False(t, ok)
+		assert.Nil(t, multiSess)
+	})
+
+	t.Run("terminating a placeholder with owner URL marks it terminated", func(t *testing.T) {
+		t.Parallel()
+
+		ctrl := gomock.NewController(t)
+		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
+		sm, storage := newTestSessionManagerWithConfig(t, &FactoryConfig{Base: factory, OwnerURL: ownerURL}, newFakeRegistry(), nil)
+
+		sessionID := sm.Generate()
+		require.NotEmpty(t, sessionID)
+
+		_, err := sm.Terminate(sessionID)
+		require.NoError(t, err)
+
+		isTerminated, err := sm.Validate(sessionID)
+		require.NoError(t, err)
+		assert.True(t, isTerminated)
+
+		_, err = sm.CreateSession(context.Background(), sessionID)
+		require.Error(t, err)
+
+		metadata, err := storage.Load(context.Background(), sessionID)
+		require.NoError(t, err)
+		assert.Equal(t, ownerURL, metadata[sessiontypes.MetadataKeyOwnerURL])
+	})
 }

@@ -60,7 +60,7 @@ const sessionMutationStripeCount = 64
 // It implements a two-phase session-creation pattern:
 //
 //   - Generate(): called by SDK during initialize without context;
-//     stores an empty placeholder via storage.
+//     stores a placeholder (owner URL only) via storage.
 //   - CreateSession(): called from OnRegisterSession hook once
 //     context is available; calls factory.MakeSessionWithID(), then
 //     persists the session metadata to storage.
@@ -92,6 +92,8 @@ type Manager struct {
 
 	healthStatusProvider health.StatusProvider
 	sessionMutationMu    [sessionMutationStripeCount]sync.Mutex
+
+	ownerURL string
 }
 
 // New creates a Manager backed by the given SessionDataStorage and backend
@@ -142,6 +144,7 @@ func New(
 		storage:              storage,
 		backendReg:           backendRegistry,
 		healthStatusProvider: healthStatusProvider,
+		ownerURL:             cfg.OwnerURL,
 	}
 
 	sm.sessions = newRestorableCache(
@@ -228,7 +231,7 @@ func (sm *Manager) currentEligibleBackends(ctx context.Context) []*vmcp.Backend 
 // Generate implements the SDK's SessionIdManager.Generate().
 //
 // Phase 1 of the two-phase creation pattern: creates a unique session ID,
-// stores an empty placeholder via storage, and returns the ID to the SDK.
+// stores a placeholder carrying only the owner URL via storage, and returns the ID to the SDK.
 // No context is available at this point.
 //
 // The placeholder is replaced by CreateSession() in Phase 2 once context
@@ -244,7 +247,11 @@ func (sm *Manager) Generate() string {
 
 		// Create is an atomic SET NX on Redis, eliminating the TOCTOU
 		// race that a Load+Upsert would have in a multi-pod deployment.
-		stored, err := sm.storage.Create(ctx, sessionID, map[string]string{})
+		placeholder := map[string]string{}
+		if sm.ownerURL != "" {
+			placeholder[sessiontypes.MetadataKeyOwnerURL] = sm.ownerURL
+		}
+		stored, err := sm.storage.Create(ctx, sessionID, placeholder)
 		cancel()
 		if err != nil {
 			slog.Error("Manager: failed to store placeholder session",
@@ -364,6 +371,9 @@ func (sm *Manager) CreateSession(
 	// Persist the serialisable session metadata to the pluggable backend (e.g.
 	// Redis) so that Validate() and TTL management work correctly. The live
 	// MultiSession itself is cached in the node-local multiSessions map below.
+	if ownerURL := placeholder2[sessiontypes.MetadataKeyOwnerURL]; ownerURL != "" {
+		sess.SetMetadata(sessiontypes.MetadataKeyOwnerURL, ownerURL)
+	}
 	storeCtx, storeCancel := context.WithTimeout(ctx, createSessionStorageTimeout)
 	defer storeCancel()
 	if err := sm.storage.Upsert(storeCtx, sessionID, sess.GetMetadata()); err != nil {
@@ -797,7 +807,7 @@ func (sm *Manager) loadSession(sessionID string) (vmcpsession.MultiSession, erro
 	// completed — treat it as "not found" rather than "corrupted".
 	//
 	// Note: this is intentionally different from RestoreSession's fail-closed
-	// check (absent key → error). Here we know a placeholder's empty metadata
+	// check (absent key → error). Here we know a placeholder's metadata
 	// is valid storage state produced by Generate(), so we return the
 	// SDK-standard ErrSessionNotFound instead of an error.
 	if _, hashPresent := metadata[sessiontypes.MetadataKeyTokenHash]; !hashPresent {

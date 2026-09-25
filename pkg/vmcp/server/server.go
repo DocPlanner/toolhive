@@ -112,6 +112,12 @@ const (
 	// forwarded back to the owning replica.
 	defaultSessionOwnerLookupTimeout = 5 * time.Second
 
+	defaultSessionOwnerDialTimeout = 3 * time.Second
+
+	defaultSessionOwnerDeleteForwardTimeout = 10 * time.Second
+
+	defaultSessionOwnerMaxIdleConnsPerHost = 32
+
 	// defaultSessionCloseGracePeriod delays closing the replaced session so
 	// in-flight handlers that already captured it can drain gracefully.
 	defaultSessionCloseGracePeriod = 2 * time.Minute
@@ -121,6 +127,8 @@ const (
 )
 
 var errSessionOwnerUnavailable = errors.New("session owner unavailable")
+
+var errSessionForwardAborted = errors.New("session owner forward aborted by caller")
 
 //go:generate mockgen -destination=mocks/mock_watcher.go -package=mocks -source=server.go Watcher
 
@@ -223,8 +231,8 @@ type Config struct {
 	StatusReporter vmcpstatus.Reporter
 
 	// SessionOwnerAdvertiseURL is the pod-local HTTP endpoint used by sibling
-	// replicas to forward live-session traffic (SSE listen/delete and methodless
-	// client replies) back to the pod that owns the SDK session state.
+	// replicas to forward live-session traffic back to the pod that owns the SDK
+	// session state.
 	SessionOwnerAdvertiseURL string
 	// SessionFactory creates MultiSessions for session management.
 	// Required; must not be nil.
@@ -558,6 +566,7 @@ func New(
 		OptimizerConfig:   cfg.OptimizerConfig,
 		OptimizerFactory:  cfg.OptimizerFactory,
 		TelemetryProvider: cfg.TelemetryProvider,
+		OwnerURL:          sessionOwnerURL,
 	}
 	vmcpSessMgr, optimizerCleanup, err := sessionmanager.New(sessionDataStorage, sessMgrCfg, backendRegistry, healthMon)
 	if err != nil {
@@ -576,7 +585,7 @@ func New(
 		sessionManager:     sessionManager,
 		sessionDataStorage: sessionDataStorage,
 		sessionOwnerURL:    sessionOwnerURL,
-		ownerForwardClient: &http.Client{Transport: http.DefaultTransport},
+		ownerForwardClient: newOwnerForwardClient(),
 		capabilityAdapter:  capabilityAdapter,
 		ready:              make(chan struct{}),
 		healthMonitor:      healthMon,
@@ -1330,7 +1339,7 @@ func (s *Server) handleSessionRegistrationImpl(ctx context.Context, session serv
 			"error", retErr)
 		return retErr
 	}
-	if s.sessionOwnerURL != "" {
+	if s.sessionOwnerURL != "" && multiSession.GetMetadata()[sessiontypes.MetadataKeyOwnerURL] != s.sessionOwnerURL {
 		if retErr = s.vmcpSessionMgr.SetSessionMetadataValue(
 			ctx,
 			sessionID,
@@ -1673,7 +1682,11 @@ func (s *Server) ownerForwardingMiddleware(next http.Handler) http.Handler {
 			if errors.Is(err, errSessionOwnerUnavailable) {
 				s.handleOwnerUnavailable(r)
 			}
-			slog.Warn("failed to forward live session request to owner",
+			logForwardFailure := slog.Warn
+			if errors.Is(err, errSessionForwardAborted) {
+				logForwardFailure = slog.Debug
+			}
+			logForwardFailure("failed to forward live session request to owner",
 				"method", r.Method,
 				"path", r.URL.Path,
 				"error", err)
@@ -1695,6 +1708,9 @@ func (s *Server) handleOwnerUnavailable(r *http.Request) {
 	if s.sessionOwnerURL == "" || s.vmcpSessionMgr == nil {
 		return
 	}
+	if r.Method == http.MethodDelete || r.Method == http.MethodGet {
+		return
+	}
 	sessionID := r.Header.Get(server.HeaderKeySessionID)
 	if sessionID == "" {
 		return
@@ -1711,7 +1727,7 @@ func (s *Server) handleOwnerUnavailable(r *http.Request) {
 	}
 
 	if err := s.vmcpSessionMgr.SetSessionMetadataValue(
-		r.Context(), sessionID, ms,
+		context.WithoutCancel(r.Context()), sessionID, ms,
 		sessiontypes.MetadataKeyOwnerURL,
 		s.sessionOwnerURL,
 	); err != nil {
@@ -1777,23 +1793,14 @@ func shouldForwardToSessionOwner(r *http.Request) (bool, error) {
 		if err != nil {
 			return false, nil
 		}
-		if isSessionScopedClientResponse(envelope) {
-			return true, nil
-		}
-		if isSessionScopedClientRequest(envelope.Method) {
-			return true, nil
-		}
-		return envelope.Method == mcp.MethodSetLogLevel || envelope.Method == mcp.MethodNotificationElicitationComplete, nil
+		return envelope.Method != mcp.MethodInitialize, nil
 	default:
 		return false, nil
 	}
 }
 
 type forwardableEnvelope struct {
-	Method mcp.MCPMethod   `json:"method"`
-	ID     json.RawMessage `json:"id,omitempty"`
-	Result json.RawMessage `json:"result,omitempty"`
-	Error  json.RawMessage `json:"error,omitempty"`
+	Method mcp.MCPMethod `json:"method"`
 }
 
 func parseForwardableEnvelope(r *http.Request) (forwardableEnvelope, error) {
@@ -1829,27 +1836,6 @@ func parseForwardableEnvelope(r *http.Request) (forwardableEnvelope, error) {
 	return envelope, nil
 }
 
-func isSessionScopedClientResponse(envelope forwardableEnvelope) bool {
-	return envelope.Method == "" &&
-		len(envelope.ID) > 0 &&
-		(len(envelope.Result) > 0 || len(envelope.Error) > 0)
-}
-
-func isSessionScopedClientRequest(method mcp.MCPMethod) bool {
-	switch method {
-	case mcp.MethodToolsList,
-		mcp.MethodToolsCall,
-		mcp.MethodResourcesList,
-		mcp.MethodResourcesRead,
-		mcp.MethodResourcesTemplatesList,
-		mcp.MethodPromptsList,
-		mcp.MethodPromptsGet:
-		return true
-	default:
-		return false
-	}
-}
-
 func (s *Server) loadSessionOwnerURL(ctx context.Context, sessionID string) (string, error) {
 	loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultSessionOwnerLookupTimeout)
 	defer cancel()
@@ -1857,6 +1843,9 @@ func (s *Server) loadSessionOwnerURL(ctx context.Context, sessionID string) (str
 	metadata, err := s.sessionDataStorage.Load(loadCtx, sessionID)
 	if err != nil {
 		return "", err
+	}
+	if metadata[sessionmanager.MetadataKeyTerminated] == sessionmanager.MetadataValTrue {
+		return "", nil
 	}
 
 	ownerURL, err := normalizeSessionOwnerURL(metadata[sessiontypes.MetadataKeyOwnerURL])
@@ -1875,6 +1864,11 @@ func (s *Server) forwardRequestToSessionOwner(
 	if err != nil {
 		return err
 	}
+	if r.Method == http.MethodDelete {
+		deleteCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), defaultSessionOwnerDeleteForwardTimeout)
+		defer cancel()
+		targetReq = targetReq.WithContext(deleteCtx)
+	}
 
 	client := s.ownerForwardClient
 	if client == nil {
@@ -1883,6 +1877,9 @@ func (s *Server) forwardRequestToSessionOwner(
 
 	resp, err := client.Do(targetReq)
 	if err != nil {
+		if r.Method != http.MethodDelete && r.Context().Err() != nil {
+			return fmt.Errorf("%w: %w", errSessionForwardAborted, err)
+		}
 		return fmt.Errorf("%w: %w", errSessionOwnerUnavailable, err)
 	}
 	defer resp.Body.Close()
@@ -1901,6 +1898,24 @@ func (s *Server) forwardRequestToSessionOwner(
 		flusher.Flush()
 	}
 	return nil
+}
+
+func newOwnerForwardClient() *http.Client {
+	transport := &http.Transport{
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	}
+	if defaultTransport, ok := http.DefaultTransport.(*http.Transport); ok {
+		transport = defaultTransport.Clone()
+	}
+	transport.Proxy = nil
+	transport.MaxIdleConnsPerHost = defaultSessionOwnerMaxIdleConnsPerHost
+	transport.DialContext = (&net.Dialer{
+		Timeout:   defaultSessionOwnerDialTimeout,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	return &http.Client{Transport: transport}
 }
 
 func cloneRequestForOwner(r *http.Request, ownerURL string) (*http.Request, error) {

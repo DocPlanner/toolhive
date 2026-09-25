@@ -233,12 +233,12 @@ func TestOwnerForwardingMiddleware_SkipsRequestsOwnedLocally(t *testing.T) {
 	assert.Equal(t, http.StatusCreated, recorder.Code)
 }
 
-func TestOwnerForwardingMiddleware_DoesNotForwardNonSessionScopedPOSTRequests(t *testing.T) {
+func TestOwnerForwardingMiddleware_DoesNotForwardInitialize(t *testing.T) {
 	t.Parallel()
 
 	storage := &forwardingTestStorage{
 		metadata: map[string]map[string]string{
-			"session-ping": {
+			"session-init": {
 				sessiontypes.MetadataKeyOwnerURL: "http://10.1.2.6:4483/mcp",
 			},
 		},
@@ -265,9 +265,9 @@ func TestOwnerForwardingMiddleware_DoesNotForwardNonSessionScopedPOSTRequests(t 
 	req := httptest.NewRequest(
 		http.MethodPost,
 		"/mcp",
-		strings.NewReader(`{"jsonrpc":"2.0","id":3,"method":"ping","params":{}}`),
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`),
 	)
-	req.Header.Set(mcpserver.HeaderKeySessionID, "session-ping")
+	req.Header.Set(mcpserver.HeaderKeySessionID, "session-init")
 	recorder := httptest.NewRecorder()
 
 	handler.ServeHTTP(recorder, req)
@@ -311,6 +311,26 @@ func TestOwnerForwardingMiddleware_ForwardsSessionScopedPOSTRequests(t *testing.
 		{
 			name: "prompts get",
 			body: `{"jsonrpc":"2.0","id":9,"method":"prompts/get","params":{"name":"triage","arguments":{}}}`,
+		},
+		{
+			name: "ping",
+			body: `{"jsonrpc":"2.0","id":10,"method":"ping","params":{}}`,
+		},
+		{
+			name: "initialized notification",
+			body: `{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+		},
+		{
+			name: "cancelled notification",
+			body: `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":4}}`,
+		},
+		{
+			name: "completion",
+			body: `{"jsonrpc":"2.0","id":11,"method":"completion/complete","params":{}}`,
+		},
+		{
+			name: "set log level",
+			body: `{"jsonrpc":"2.0","id":12,"method":"logging/setLevel","params":{"level":"info"}}`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
