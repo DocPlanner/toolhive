@@ -66,6 +66,8 @@ type FactoryConfig struct {
 	// If non-nil, the optimizer factory (whether derived from OptimizerConfig or
 	// supplied via OptimizerFactory) and workflow executors are wrapped with telemetry.
 	TelemetryProvider *telemetry.Provider
+
+	OwnerURL string
 }
 
 // resolveOptimizer wires the optimizer factory from cfg, applying telemetry
