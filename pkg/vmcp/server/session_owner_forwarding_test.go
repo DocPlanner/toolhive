@@ -44,6 +44,11 @@ func (s *forwardingTestStorage) Create(context.Context, string, map[string]strin
 	return true, nil
 }
 
+func (s *forwardingTestStorage) Update(_ context.Context, id string, _ map[string]string) (bool, error) {
+	_, ok := s.metadata[id]
+	return ok, nil
+}
+
 func (s *forwardingTestStorage) Delete(context.Context, string) error {
 	return nil
 }

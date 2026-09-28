@@ -93,6 +93,9 @@ func (alwaysFailDataStorage) Load(_ context.Context, _ string) (map[string]strin
 func (alwaysFailDataStorage) Create(_ context.Context, _ string, _ map[string]string) (bool, error) {
 	return false, errors.New("storage unavailable")
 }
+func (alwaysFailDataStorage) Update(_ context.Context, _ string, _ map[string]string) (bool, error) {
+	return false, errors.New("storage unavailable")
+}
 func (alwaysFailDataStorage) Delete(_ context.Context, _ string) error { return nil }
 func (alwaysFailDataStorage) Close() error                             { return nil }
 
