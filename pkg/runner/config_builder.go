@@ -17,7 +17,7 @@ import (
 
 	"github.com/stacklok/toolhive-core/permissions"
 	regtypes "github.com/stacklok/toolhive-core/registry/types"
-	v1alpha1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1"
+	v1beta1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1beta1"
 	"github.com/stacklok/toolhive/pkg/audit"
 	"github.com/stacklok/toolhive/pkg/auth"
 	"github.com/stacklok/toolhive/pkg/auth/awssts"
@@ -338,6 +338,14 @@ func WithTrustProxyHeaders(trust bool) RunConfigBuilderOption {
 	}
 }
 
+// WithStateless declares the server is stateless (POST-only, no SSE).
+func WithStateless(stateless bool) RunConfigBuilderOption {
+	return func(b *runConfigBuilder) error {
+		b.config.Stateless = stateless
+		return nil
+	}
+}
+
 // WithEndpointPrefix sets the path prefix for SSE endpoint URLs
 func WithEndpointPrefix(prefix string) RunConfigBuilderOption {
 	return func(b *runConfigBuilder) error {
@@ -538,7 +546,7 @@ func WithTelemetryConfig(config *telemetry.Config) RunConfigBuilderOption {
 }
 
 // WithRateLimitConfig sets the rate limiting configuration.
-func WithRateLimitConfig(namespace string, config *v1alpha1.RateLimitConfig) RunConfigBuilderOption {
+func WithRateLimitConfig(namespace string, config *v1beta1.RateLimitConfig) RunConfigBuilderOption {
 	return func(b *runConfigBuilder) error {
 		b.config.RateLimitConfig = config
 		b.config.RateLimitNamespace = namespace

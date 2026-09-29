@@ -16,7 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	mcpv1alpha1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1"
+	mcpv1beta1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1beta1"
 	"github.com/stacklok/toolhive/pkg/vmcp"
 	"github.com/stacklok/toolhive/pkg/vmcp/workloads"
 )
@@ -75,9 +75,9 @@ type BackendReconciler struct {
 // SetupIndexes registers field indexes required by the reconciler's watch handlers.
 // Must be called before SetupWithManager.
 func (*BackendReconciler) SetupIndexes(ctx context.Context, mgr ctrl.Manager) error {
-	return mgr.GetFieldIndexer().IndexField(ctx, &mcpv1alpha1.MCPServerEntry{}, caBundleConfigMapIndex,
+	return mgr.GetFieldIndexer().IndexField(ctx, &mcpv1beta1.MCPServerEntry{}, caBundleConfigMapIndex,
 		func(obj client.Object) []string {
-			entry, ok := obj.(*mcpv1alpha1.MCPServerEntry)
+			entry, ok := obj.(*mcpv1beta1.MCPServerEntry)
 			if !ok {
 				return nil
 			}
@@ -150,37 +150,37 @@ func (r *BackendReconciler) fetchBackendResource(
 	ctxLogger := log.FromContext(ctx)
 
 	// Try to fetch as MCPServer first
-	mcpServer := &mcpv1alpha1.MCPServer{}
+	mcpServer := &mcpv1beta1.MCPServer{}
 	errServer := r.Get(ctx, namespacedName, mcpServer)
 
 	if errServer == nil {
 		return &backendResourceInfo{
 			Name:     mcpServer.Name,
-			GroupRef: mcpServer.Spec.GroupRef,
+			GroupRef: mcpServer.Spec.GroupRef.GetName(),
 			Type:     workloads.WorkloadTypeMCPServer,
 		}, nil
 	}
 
 	// Try to fetch as MCPRemoteProxy
-	mcpRemoteProxy := &mcpv1alpha1.MCPRemoteProxy{}
+	mcpRemoteProxy := &mcpv1beta1.MCPRemoteProxy{}
 	errProxy := r.Get(ctx, namespacedName, mcpRemoteProxy)
 
 	if errProxy == nil {
 		return &backendResourceInfo{
 			Name:     mcpRemoteProxy.Name,
-			GroupRef: mcpRemoteProxy.Spec.GroupRef,
+			GroupRef: mcpRemoteProxy.Spec.GroupRef.GetName(),
 			Type:     workloads.WorkloadTypeMCPRemoteProxy,
 		}, nil
 	}
 
 	// Try to fetch as MCPServerEntry
-	mcpServerEntry := &mcpv1alpha1.MCPServerEntry{}
+	mcpServerEntry := &mcpv1beta1.MCPServerEntry{}
 	errEntry := r.Get(ctx, namespacedName, mcpServerEntry)
 
 	if errEntry == nil {
 		return &backendResourceInfo{
 			Name:     mcpServerEntry.Name,
-			GroupRef: mcpServerEntry.Spec.GroupRef,
+			GroupRef: mcpServerEntry.Spec.GroupRef.GetName(),
 			Type:     workloads.WorkloadTypeMCPServerEntry,
 		}, nil
 	}
@@ -212,7 +212,7 @@ func (r *BackendReconciler) fetchBackendResource(
 // MapAuthConfigToEntries returns reconcile requests for MCPServerEntries that reference
 // the given ExternalAuthConfig name. Used by the ExternalAuthConfig watch handler.
 func (r *BackendReconciler) MapAuthConfigToEntries(ctx context.Context, authConfigName string) []reconcile.Request {
-	entryList := &mcpv1alpha1.MCPServerEntryList{}
+	entryList := &mcpv1beta1.MCPServerEntryList{}
 	if err := r.List(ctx, entryList, client.InNamespace(r.Namespace)); err != nil {
 		log.FromContext(ctx).Error(err, "Failed to list MCPServerEntries for ExternalAuthConfig watch")
 		return nil
@@ -220,7 +220,7 @@ func (r *BackendReconciler) MapAuthConfigToEntries(ctx context.Context, authConf
 
 	var requests []reconcile.Request
 	for _, entry := range entryList.Items {
-		if entry.Spec.GroupRef != r.GroupRef {
+		if entry.Spec.GroupRef.GetName() != r.GroupRef {
 			continue
 		}
 		if entry.Spec.ExternalAuthConfigRef != nil &&
@@ -330,7 +330,7 @@ func (r *BackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Maps ExternalAuthConfig → MCPServers/MCPRemoteProxies that reference it
 	externalAuthConfigHandler := handler.EnqueueRequestsFromMapFunc(
 		func(ctx context.Context, obj client.Object) []reconcile.Request {
-			authConfig, ok := obj.(*mcpv1alpha1.MCPExternalAuthConfig)
+			authConfig, ok := obj.(*mcpv1beta1.MCPExternalAuthConfig)
 			if !ok {
 				return nil
 			}
@@ -338,7 +338,7 @@ func (r *BackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			var requests []reconcile.Request
 
 			// Find MCPServers referencing this ExternalAuthConfig
-			mcpServerList := &mcpv1alpha1.MCPServerList{}
+			mcpServerList := &mcpv1beta1.MCPServerList{}
 			if err := r.List(ctx, mcpServerList, client.InNamespace(r.Namespace)); err != nil {
 				log.FromContext(ctx).Error(err, "Failed to list MCPServers for ExternalAuthConfig watch")
 				return nil
@@ -346,7 +346,7 @@ func (r *BackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 			for _, server := range mcpServerList.Items {
 				// Only reconcile if server matches our groupRef AND references this auth config
-				if server.Spec.GroupRef != r.GroupRef {
+				if server.Spec.GroupRef.GetName() != r.GroupRef {
 					continue
 				}
 
@@ -362,7 +362,7 @@ func (r *BackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			}
 
 			// Find MCPRemoteProxies referencing this ExternalAuthConfig
-			proxyList := &mcpv1alpha1.MCPRemoteProxyList{}
+			proxyList := &mcpv1beta1.MCPRemoteProxyList{}
 			if err := r.List(ctx, proxyList, client.InNamespace(r.Namespace)); err != nil {
 				log.FromContext(ctx).Error(err, "Failed to list MCPRemoteProxies for ExternalAuthConfig watch")
 				return nil
@@ -370,7 +370,7 @@ func (r *BackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 			for _, proxy := range proxyList.Items {
 				// Only reconcile if proxy matches our groupRef AND references this auth config
-				if proxy.Spec.GroupRef != r.GroupRef {
+				if proxy.Spec.GroupRef.GetName() != r.GroupRef {
 					continue
 				}
 
@@ -396,13 +396,13 @@ func (r *BackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Maps MCPServer events → reconcile requests with groupRef filter
 	serverHandler := handler.EnqueueRequestsFromMapFunc(
 		func(_ context.Context, obj client.Object) []reconcile.Request {
-			server, ok := obj.(*mcpv1alpha1.MCPServer)
+			server, ok := obj.(*mcpv1beta1.MCPServer)
 			if !ok {
 				return nil
 			}
 
 			// Only reconcile if matches groupRef (security + performance)
-			if server.Spec.GroupRef != r.GroupRef {
+			if server.Spec.GroupRef.GetName() != r.GroupRef {
 				return nil
 			}
 
@@ -421,13 +421,13 @@ func (r *BackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Maps MCPRemoteProxy events → reconcile requests with groupRef filter
 	proxyHandler := handler.EnqueueRequestsFromMapFunc(
 		func(_ context.Context, obj client.Object) []reconcile.Request {
-			proxy, ok := obj.(*mcpv1alpha1.MCPRemoteProxy)
+			proxy, ok := obj.(*mcpv1beta1.MCPRemoteProxy)
 			if !ok {
 				return nil
 			}
 
 			// Only reconcile if matches groupRef (security + performance)
-			if proxy.Spec.GroupRef != r.GroupRef {
+			if proxy.Spec.GroupRef.GetName() != r.GroupRef {
 				return nil
 			}
 
@@ -446,13 +446,13 @@ func (r *BackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Maps MCPServerEntry events → reconcile requests with groupRef filter
 	entryHandler := handler.EnqueueRequestsFromMapFunc(
 		func(_ context.Context, obj client.Object) []reconcile.Request {
-			entry, ok := obj.(*mcpv1alpha1.MCPServerEntry)
+			entry, ok := obj.(*mcpv1beta1.MCPServerEntry)
 			if !ok {
 				return nil
 			}
 
 			// Only reconcile if matches groupRef (security + performance)
-			if entry.Spec.GroupRef != r.GroupRef {
+			if entry.Spec.GroupRef.GetName() != r.GroupRef {
 				return nil
 			}
 
@@ -477,7 +477,7 @@ func (r *BackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			}
 
 			// Use field index to find MCPServerEntries referencing this ConfigMap
-			entryList := &mcpv1alpha1.MCPServerEntryList{}
+			entryList := &mcpv1beta1.MCPServerEntryList{}
 			if err := r.List(ctx, entryList,
 				client.InNamespace(r.Namespace),
 				client.MatchingFields{caBundleConfigMapIndex: configMap.Name},
@@ -488,7 +488,7 @@ func (r *BackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 			var requests []reconcile.Request
 			for _, entry := range entryList.Items {
-				if entry.Spec.GroupRef != r.GroupRef {
+				if entry.Spec.GroupRef.GetName() != r.GroupRef {
 					continue
 				}
 				requests = append(requests, reconcile.Request{
@@ -506,10 +506,10 @@ func (r *BackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	controllerName := "backend-reconciler-" + r.GroupRef
 	return ctrl.NewControllerManagedBy(mgr).
 		Named(controllerName).
-		Watches(&mcpv1alpha1.MCPServer{}, serverHandler).                         // Watch MCPServer as secondary controller
-		Watches(&mcpv1alpha1.MCPRemoteProxy{}, proxyHandler).                     // Watch MCPRemoteProxy
-		Watches(&mcpv1alpha1.MCPServerEntry{}, entryHandler).                     // Watch MCPServerEntry
-		Watches(&mcpv1alpha1.MCPExternalAuthConfig{}, externalAuthConfigHandler). // Watch auth configs
-		Watches(&corev1.ConfigMap{}, caBundleConfigMapHandler).                   // Watch CA bundle ConfigMaps
+		Watches(&mcpv1beta1.MCPServer{}, serverHandler).                         // Watch MCPServer as secondary controller
+		Watches(&mcpv1beta1.MCPRemoteProxy{}, proxyHandler).                     // Watch MCPRemoteProxy
+		Watches(&mcpv1beta1.MCPServerEntry{}, entryHandler).                     // Watch MCPServerEntry
+		Watches(&mcpv1beta1.MCPExternalAuthConfig{}, externalAuthConfigHandler). // Watch auth configs
+		Watches(&corev1.ConfigMap{}, caBundleConfigMapHandler).                  // Watch CA bundle ConfigMaps
 		Complete(r)
 }

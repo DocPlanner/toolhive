@@ -194,7 +194,7 @@ func TestCreateContainerWithPodTemplatePatch(t *testing.T) {
 
 			// Deploy the workload
 			_, err := client.DeployWorkload(
-				context.Background(),
+				t.Context(),
 				"test-image",
 				"test-container",
 				[]string{"test-command"},
@@ -216,7 +216,7 @@ func TestCreateContainerWithPodTemplatePatch(t *testing.T) {
 
 			// Get the created StatefulSet
 			statefulSet, err := clientset.AppsV1().StatefulSets("default").Get(
-				context.Background(),
+				t.Context(),
 				"test-container",
 				metav1.GetOptions{},
 			)
@@ -730,7 +730,7 @@ func TestCreateContainerWithMCP(t *testing.T) {
 
 			// Deploy the workload
 			_, err := client.DeployWorkload(
-				context.Background(),
+				t.Context(),
 				tc.image,
 				"test-container",
 				tc.command,
@@ -752,7 +752,7 @@ func TestCreateContainerWithMCP(t *testing.T) {
 
 			// Get the created StatefulSet
 			statefulSet, err := clientset.AppsV1().StatefulSets("default").Get(
-				context.Background(),
+				t.Context(),
 				"test-container",
 				metav1.GetOptions{},
 			)
@@ -960,7 +960,7 @@ func TestAttachToWorkloadNoPodFound(t *testing.T) {
 	client.namespaceFunc = func() string { return defaultNamespace }
 
 	// Call AttachToWorkload with a workload that has no pods
-	_, _, err := client.AttachToWorkload(context.Background(), "nonexistent-workload")
+	_, _, err := client.AttachToWorkload(t.Context(), "nonexistent-workload")
 
 	// Should return error immediately (no pods found)
 	require.Error(t, err)
@@ -1421,7 +1421,7 @@ func TestDeployWorkloadBackendReplicas(t *testing.T) {
 		client.namespaceFunc = func() string { return defaultNamespace }
 
 		_, err := client.DeployWorkload(
-			context.Background(),
+			t.Context(),
 			"test-image", "test-container", nil,
 			map[string]string{}, map[string]string{},
 			nil, "streamable-http", options, false,
@@ -1429,7 +1429,7 @@ func TestDeployWorkloadBackendReplicas(t *testing.T) {
 		require.NoError(t, err)
 
 		sts, err := clientset.AppsV1().StatefulSets(defaultNamespace).Get(
-			context.Background(), "test-container", metav1.GetOptions{},
+			t.Context(), "test-container", metav1.GetOptions{},
 		)
 		require.NoError(t, err)
 		return sts

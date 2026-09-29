@@ -12,7 +12,7 @@ import (
 	"log/slog"
 
 	"github.com/stacklok/toolhive-core/permissions"
-	v1alpha1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1"
+	v1beta1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1beta1"
 	"github.com/stacklok/toolhive/pkg/audit"
 	"github.com/stacklok/toolhive/pkg/auth"
 	"github.com/stacklok/toolhive/pkg/auth/awssts"
@@ -160,7 +160,7 @@ type RunConfig struct {
 
 	// RateLimitConfig contains the CRD rate limiting configuration.
 	// When set, rate limiting middleware is added to the proxy middleware chain.
-	RateLimitConfig *v1alpha1.RateLimitConfig `json:"rate_limit_config,omitempty" yaml:"rate_limit_config,omitempty"`
+	RateLimitConfig *v1beta1.RateLimitConfig `json:"rate_limit_config,omitempty" yaml:"rate_limit_config,omitempty"`
 
 	// RateLimitNamespace is the Kubernetes namespace for Redis key derivation.
 	RateLimitNamespace string `json:"rate_limit_namespace,omitempty" yaml:"rate_limit_namespace,omitempty"`
@@ -190,6 +190,12 @@ type RunConfig struct {
 
 	// TrustProxyHeaders indicates whether to trust X-Forwarded-* headers from reverse proxies
 	TrustProxyHeaders bool `json:"trust_proxy_headers,omitempty" yaml:"trust_proxy_headers,omitempty"`
+
+	// Stateless indicates the server only supports POST (no SSE/GET).
+	// When true, the proxy returns 405 for incoming GET requests and uses a
+	// POST-based health check instead of the default GET probe.
+	// Applies to both remote URLs and local container workloads.
+	Stateless bool `json:"stateless,omitempty" yaml:"stateless,omitempty"`
 
 	// ProxyMode is the effective HTTP protocol the proxy uses.
 	// For stdio transports, this is the configured mode (sse or streamable-http).

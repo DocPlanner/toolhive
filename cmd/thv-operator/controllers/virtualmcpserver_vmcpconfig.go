@@ -11,7 +11,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	mcpv1alpha1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1"
+	mcpv1beta1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1beta1"
 	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/kubernetes/configmaps"
 	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/oidc"
 	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/runconfig/configmap/checksum"
@@ -27,11 +27,14 @@ import (
 // ensureVmcpConfigConfigMap ensures the vmcp Config ConfigMap exists and is up to date.
 // workloadInfos is the list of workloads in the group, passed in to ensure consistency
 // across multiple calls that need the same workload list.
+// telemetryCfg is the already-fetched MCPTelemetryConfig (nil when not referenced),
+// passed through from handleConfigRefs to avoid redundant API calls.
 // statusManager is used to set auth config conditions for any conversion failures.
 func (r *VirtualMCPServerReconciler) ensureVmcpConfigConfigMap(
 	ctx context.Context,
-	vmcp *mcpv1alpha1.VirtualMCPServer,
+	vmcp *mcpv1beta1.VirtualMCPServer,
 	typedWorkloads []workloads.TypedWorkload,
+	telemetryCfg *mcpv1beta1.MCPTelemetryConfig,
 	statusManager virtualmcpserverstatus.StatusManager,
 ) error {
 	// Create OIDC resolver and converter for CRD-to-config transformation
@@ -40,7 +43,7 @@ func (r *VirtualMCPServerReconciler) ensureVmcpConfigConfigMap(
 	if err != nil {
 		return fmt.Errorf("failed to create vmcp converter: %w", err)
 	}
-	config, authServerRC, err := converter.Convert(ctx, vmcp)
+	config, authServerRC, err := converter.Convert(ctx, vmcp, telemetryCfg)
 	if err != nil {
 		return fmt.Errorf("failed to create vmcp Config from VirtualMCPServer: %w", err)
 	}
@@ -76,10 +79,10 @@ func (r *VirtualMCPServerReconciler) ensureVmcpConfigConfigMap(
 	// don't need to know about the two-step validation sequence.
 	if err := vmcpconfig.ValidateAuthServerIntegration(config, authServerRC); err != nil {
 		message := fmt.Sprintf("invalid auth server integration: %v", err)
-		statusManager.SetPhase(mcpv1alpha1.VirtualMCPServerPhaseFailed)
+		statusManager.SetPhase(mcpv1beta1.VirtualMCPServerPhaseFailed)
 		statusManager.SetMessage(message)
 		statusManager.SetAuthServerConfigValidatedCondition(
-			mcpv1alpha1.ConditionReasonAuthServerConfigInvalid,
+			mcpv1beta1.ConditionReasonAuthServerConfigInvalid,
 			message,
 			metav1.ConditionFalse,
 		)
@@ -149,7 +152,7 @@ func labelsForVmcpConfig(vmcpName string) map[string]string {
 // Used in static mode for ConfigMap generation to preserve backend metadata.
 func (r *VirtualMCPServerReconciler) discoverBackendsWithMetadata(
 	ctx context.Context,
-	vmcp *mcpv1alpha1.VirtualMCPServer,
+	vmcp *mcpv1beta1.VirtualMCPServer,
 ) ([]vmcptypes.Backend, error) {
 	groupsManager := groups.NewCRDManager(r.Client, vmcp.Namespace)
 	workloadDiscoverer := workloads.NewK8SDiscovererWithClient(r.Client, vmcp.Namespace)
@@ -157,7 +160,7 @@ func (r *VirtualMCPServerReconciler) discoverBackendsWithMetadata(
 	// Build auth config if OutgoingAuth is configured
 	var authConfig *vmcpconfig.OutgoingAuthConfig
 	if vmcp.Spec.OutgoingAuth != nil {
-		typedWorkloads, err := workloadDiscoverer.ListWorkloadsInGroup(ctx, vmcp.Spec.Config.Group)
+		typedWorkloads, err := workloadDiscoverer.ListWorkloadsInGroup(ctx, vmcp.ResolveGroupName())
 		if err != nil {
 			return nil, fmt.Errorf("failed to list workloads in group: %w", err)
 		}
@@ -169,7 +172,7 @@ func (r *VirtualMCPServerReconciler) discoverBackendsWithMetadata(
 	}
 
 	backendDiscoverer := aggregator.NewUnifiedBackendDiscoverer(workloadDiscoverer, groupsManager, authConfig)
-	backends, err := backendDiscoverer.Discover(ctx, vmcp.Spec.Config.Group)
+	backends, err := backendDiscoverer.Discover(ctx, vmcp.ResolveGroupName())
 	if err != nil {
 		return nil, fmt.Errorf("failed to discover backends: %w", err)
 	}
@@ -276,7 +279,7 @@ func (r *VirtualMCPServerReconciler) buildCABundlePathMap(
 }
 
 // extractInlineBackendNames extracts the list of inline backend names from the VirtualMCPServer spec.
-func extractInlineBackendNames(vmcp *mcpv1alpha1.VirtualMCPServer) []string {
+func extractInlineBackendNames(vmcp *mcpv1beta1.VirtualMCPServer) []string {
 	if vmcp.Spec.OutgoingAuth == nil || vmcp.Spec.OutgoingAuth.Backends == nil {
 		return nil
 	}
@@ -309,7 +312,7 @@ func determineValidInlineBackends(authConfig *vmcpconfig.OutgoingAuthConfig, inl
 // It builds auth configs, sets status conditions for all auth config types, and configures static backends for inline mode.
 func (r *VirtualMCPServerReconciler) processOutgoingAuth(
 	ctx context.Context,
-	vmcp *mcpv1alpha1.VirtualMCPServer,
+	vmcp *mcpv1beta1.VirtualMCPServer,
 	config *vmcpconfig.Config,
 	typedWorkloads []workloads.TypedWorkload,
 	statusManager virtualmcpserverstatus.StatusManager,

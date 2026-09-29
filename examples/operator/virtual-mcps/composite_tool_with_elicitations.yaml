@@ -23,7 +23,7 @@
 
 ---
 # Create MCPGroup
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPGroup
 metadata:
   name: deployment-services
@@ -33,13 +33,14 @@ spec:
 
 ---
 # Backend MCP Server: Yardstick Streamable (provides echo tool)
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: yardstick-streamable
   namespace: default
 spec:
-  groupRef: deployment-services
+  groupRef:
+    name: deployment-services
   image: ghcr.io/stackloklabs/yardstick/yardstick-server:1.1.1
   transport: streamable-http
   env:
@@ -57,7 +58,7 @@ spec:
 
 ---
 # Composite Tool Definition with Elicitations
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: VirtualMCPCompositeToolDefinition
 metadata:
   name: interactive-deploy
@@ -197,14 +198,15 @@ spec:
 
 ---
 # VirtualMCPServer using the interactive composite tool
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: VirtualMCPServer
 metadata:
   name: vmcp-interactive-deploy
   namespace: default
 spec:
+  groupRef:
+    name: deployment-services
   config:
-    groupRef: deployment-services
     # Conflict resolution for backend tools
     aggregation:
       conflictResolution: prefix

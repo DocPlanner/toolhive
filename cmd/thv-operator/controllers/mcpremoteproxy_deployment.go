@@ -14,7 +14,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	mcpv1alpha1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1"
+	mcpv1beta1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1beta1"
 	ctrlutil "github.com/stacklok/toolhive/cmd/thv-operator/pkg/controllerutil"
 	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/runconfig/configmap/checksum"
 	"github.com/stacklok/toolhive/pkg/container/kubernetes"
@@ -22,7 +22,7 @@ import (
 
 // deploymentForMCPRemoteProxy returns a MCPRemoteProxy Deployment object
 func (r *MCPRemoteProxyReconciler) deploymentForMCPRemoteProxy(
-	ctx context.Context, proxy *mcpv1alpha1.MCPRemoteProxy, runConfigChecksum string,
+	ctx context.Context, proxy *mcpv1beta1.MCPRemoteProxy, runConfigChecksum string,
 ) *appsv1.Deployment {
 	ls := labelsForMCPRemoteProxy(proxy.Name)
 	replicas := int32(1)
@@ -128,7 +128,7 @@ func (*MCPRemoteProxyReconciler) buildContainerArgs() []string {
 // Note: Embedded auth server volumes are added separately in deploymentForMCPRemoteProxy
 // to avoid duplicate API calls.
 func (*MCPRemoteProxyReconciler) buildVolumesForProxy(
-	proxy *mcpv1alpha1.MCPRemoteProxy,
+	proxy *mcpv1beta1.MCPRemoteProxy,
 ) ([]corev1.VolumeMount, []corev1.Volume) {
 	volumeMounts := []corev1.VolumeMount{}
 	volumes := []corev1.Volume{}
@@ -166,7 +166,7 @@ func (*MCPRemoteProxyReconciler) buildVolumesForProxy(
 // Must be called from deploymentForMCPRemoteProxy where the client is available.
 func (r *MCPRemoteProxyReconciler) addTelemetryCABundleVolumes(
 	ctx context.Context,
-	proxy *mcpv1alpha1.MCPRemoteProxy,
+	proxy *mcpv1beta1.MCPRemoteProxy,
 	volumes *[]corev1.Volume,
 	volumeMounts *[]corev1.VolumeMount,
 ) {
@@ -187,15 +187,9 @@ func (r *MCPRemoteProxyReconciler) addTelemetryCABundleVolumes(
 
 // buildEnvVarsForProxy builds environment variables for the proxy container
 func (r *MCPRemoteProxyReconciler) buildEnvVarsForProxy(
-	ctx context.Context, proxy *mcpv1alpha1.MCPRemoteProxy,
+	ctx context.Context, proxy *mcpv1beta1.MCPRemoteProxy,
 ) []corev1.EnvVar {
-	env := []corev1.EnvVar{}
-
-	// Add OpenTelemetry environment variables
-	if proxy.Spec.Telemetry != nil && proxy.Spec.Telemetry.OpenTelemetry != nil {
-		otelEnvVars := ctrlutil.GenerateOpenTelemetryEnvVars(proxy.Spec.Telemetry, proxy.Name, proxy.Namespace)
-		env = append(env, otelEnvVars...)
-	}
+	env := r.buildOIDCClientSecretEnvVars(ctx, proxy)
 
 	// Add token exchange environment variables
 	// Note: Embedded auth server env vars are added separately in deploymentForMCPRemoteProxy
@@ -231,9 +225,6 @@ func (r *MCPRemoteProxyReconciler) buildEnvVarsForProxy(
 		}
 	}
 
-	// Add OIDC client secret environment variable if using inline config with secretRef
-	env = append(env, r.buildOIDCClientSecretEnvVars(ctx, proxy)...)
-
 	// Add header forward secret environment variables
 	if proxy.Spec.HeaderForward != nil && len(proxy.Spec.HeaderForward.AddHeadersFromSecret) > 0 {
 		// Set secrets provider to environment so runner uses environment variables for secrets.
@@ -261,32 +252,41 @@ func (r *MCPRemoteProxyReconciler) buildEnvVarsForProxy(
 	return ctrlutil.EnsureRequiredEnvVars(ctx, env)
 }
 
-// buildOIDCClientSecretEnvVars returns OIDC client secret env vars when inline OIDC config
-// with a client secret ref is used. Returns nil when OIDCConfig is nil or not inline.
+// buildOIDCClientSecretEnvVars returns OIDC client secret env vars when the proxy
+// references an MCPOIDCConfig with an inline client secret. Returns nil otherwise.
 func (r *MCPRemoteProxyReconciler) buildOIDCClientSecretEnvVars(
-	ctx context.Context, proxy *mcpv1alpha1.MCPRemoteProxy,
+	ctx context.Context, proxy *mcpv1beta1.MCPRemoteProxy,
 ) []corev1.EnvVar {
-	if proxy.Spec.OIDCConfig == nil || proxy.Spec.OIDCConfig.Type != "inline" || proxy.Spec.OIDCConfig.Inline == nil {
+	if proxy.Spec.OIDCConfigRef == nil {
 		return nil
 	}
-	oidcClientSecretEnvVar, err := ctrlutil.GenerateOIDCClientSecretEnvVar(
-		ctx, r.Client, proxy.Namespace, proxy.Spec.OIDCConfig.Inline.ClientSecretRef,
+	oidcCfg, err := ctrlutil.GetOIDCConfigForServer(ctx, r.Client, proxy.Namespace, proxy.Spec.OIDCConfigRef)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "Failed to fetch MCPOIDCConfig for client secret")
+		return nil
+	}
+	if oidcCfg == nil ||
+		oidcCfg.Spec.Type != mcpv1beta1.MCPOIDCConfigTypeInline ||
+		oidcCfg.Spec.Inline == nil {
+		return nil
+	}
+	envVar, err := ctrlutil.GenerateOIDCClientSecretEnvVar(
+		ctx, r.Client, proxy.Namespace, oidcCfg.Spec.Inline.ClientSecretRef,
 	)
 	if err != nil {
-		ctxLogger := log.FromContext(ctx)
-		ctxLogger.Error(err, "Failed to generate OIDC client secret environment variable")
+		log.FromContext(ctx).Error(err, "Failed to generate OIDC client secret environment variable")
 		return nil
 	}
-	if oidcClientSecretEnvVar == nil {
+	if envVar == nil {
 		return nil
 	}
-	return []corev1.EnvVar{*oidcClientSecretEnvVar}
+	return []corev1.EnvVar{*envVar}
 }
 
 // buildHeaderForwardSecretEnvVars builds environment variables for header forward secrets.
 // Each secret is mounted as an env var using Kubernetes SecretKeyRef, with a name following
 // the TOOLHIVE_SECRET_<identifier> pattern expected by the secrets.EnvironmentProvider.
-func buildHeaderForwardSecretEnvVars(proxy *mcpv1alpha1.MCPRemoteProxy) []corev1.EnvVar {
+func buildHeaderForwardSecretEnvVars(proxy *mcpv1beta1.MCPRemoteProxy) []corev1.EnvVar {
 	var envVars []corev1.EnvVar
 
 	for _, headerSecret := range proxy.Spec.HeaderForward.AddHeadersFromSecret {
@@ -315,7 +315,7 @@ func buildHeaderForwardSecretEnvVars(proxy *mcpv1alpha1.MCPRemoteProxy) []corev1
 
 // buildDeploymentMetadata builds deployment-level labels and annotations
 func (*MCPRemoteProxyReconciler) buildDeploymentMetadata(
-	baseLabels map[string]string, proxy *mcpv1alpha1.MCPRemoteProxy,
+	baseLabels map[string]string, proxy *mcpv1beta1.MCPRemoteProxy,
 ) (map[string]string, map[string]string) {
 	deploymentLabels := baseLabels
 	deploymentAnnotations := make(map[string]string)
@@ -343,7 +343,7 @@ func (*MCPRemoteProxyReconciler) buildDeploymentMetadata(
 // User-specified overrides from ResourceOverrides.PodTemplateMetadataOverrides
 // are merged after the checksum annotation is set.
 func (*MCPRemoteProxyReconciler) buildPodTemplateMetadata(
-	baseLabels map[string]string, proxy *mcpv1alpha1.MCPRemoteProxy, runConfigChecksum string,
+	baseLabels map[string]string, proxy *mcpv1beta1.MCPRemoteProxy, runConfigChecksum string,
 ) (map[string]string, map[string]string) {
 	templateLabels := baseLabels
 	templateAnnotations := make(map[string]string)
@@ -370,7 +370,7 @@ func (*MCPRemoteProxyReconciler) buildPodTemplateMetadata(
 
 // buildSecurityContexts builds pod and container security contexts
 func (r *MCPRemoteProxyReconciler) buildSecurityContexts(
-	ctx context.Context, proxy *mcpv1alpha1.MCPRemoteProxy,
+	ctx context.Context, proxy *mcpv1beta1.MCPRemoteProxy,
 ) (*corev1.PodSecurityContext, *corev1.SecurityContext) {
 	if r.PlatformDetector == nil {
 		r.PlatformDetector = ctrlutil.NewSharedPlatformDetector()
@@ -387,7 +387,7 @@ func (r *MCPRemoteProxyReconciler) buildSecurityContexts(
 }
 
 // buildContainerPorts builds container port configuration
-func (*MCPRemoteProxyReconciler) buildContainerPorts(proxy *mcpv1alpha1.MCPRemoteProxy) []corev1.ContainerPort {
+func (*MCPRemoteProxyReconciler) buildContainerPorts(proxy *mcpv1beta1.MCPRemoteProxy) []corev1.ContainerPort {
 	return []corev1.ContainerPort{{
 		ContainerPort: int32(proxy.GetProxyPort()),
 		Name:          "http",
@@ -397,7 +397,7 @@ func (*MCPRemoteProxyReconciler) buildContainerPorts(proxy *mcpv1alpha1.MCPRemot
 
 // serviceForMCPRemoteProxy returns a MCPRemoteProxy Service object
 func (r *MCPRemoteProxyReconciler) serviceForMCPRemoteProxy(
-	ctx context.Context, proxy *mcpv1alpha1.MCPRemoteProxy,
+	ctx context.Context, proxy *mcpv1beta1.MCPRemoteProxy,
 ) *corev1.Service {
 	ls := labelsForMCPRemoteProxy(proxy.Name)
 	svcName := createProxyServiceName(proxy.Name)
@@ -441,7 +441,7 @@ func (r *MCPRemoteProxyReconciler) serviceForMCPRemoteProxy(
 
 // buildServiceMetadata builds service labels and annotations
 func (*MCPRemoteProxyReconciler) buildServiceMetadata(
-	baseLabels map[string]string, proxy *mcpv1alpha1.MCPRemoteProxy,
+	baseLabels map[string]string, proxy *mcpv1beta1.MCPRemoteProxy,
 ) (map[string]string, map[string]string) {
 	serviceLabels := baseLabels
 	serviceAnnotations := make(map[string]string)

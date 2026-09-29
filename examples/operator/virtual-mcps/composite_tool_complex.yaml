@@ -22,7 +22,7 @@
 
 ---
 # Create MCPGroup
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPGroup
 metadata:
   name: data-processing-services
@@ -32,13 +32,14 @@ spec:
 
 ---
 # Backend MCP Server: Fetch (for HTTP requests)
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: fetch
   namespace: default
 spec:
-  groupRef: data-processing-services
+  groupRef:
+    name: data-processing-services
   image: ghcr.io/stackloklabs/gofetch/server
   transport: streamable-http
   proxyPort: 8080
@@ -53,13 +54,14 @@ spec:
 
 ---
 # Backend MCP Server: Yardstick SSE (for echo and math operations)
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: yardstick-sse
   namespace: default
 spec:
-  groupRef: data-processing-services
+  groupRef:
+    name: data-processing-services
   image: ghcr.io/stackloklabs/yardstick/yardstick-server:1.1.1
   transport: sse
   env:
@@ -77,13 +79,14 @@ spec:
 
 ---
 # Backend MCP Server: Yardstick Streamable (for longecho and LLM)
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: yardstick-streamable
   namespace: default
 spec:
-  groupRef: data-processing-services
+  groupRef:
+    name: data-processing-services
   image: ghcr.io/stackloklabs/yardstick/yardstick-server:1.1.1
   transport: streamable-http
   env:
@@ -101,7 +104,7 @@ spec:
 
 ---
 # Complex Composite Tool Definition
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: VirtualMCPCompositeToolDefinition
 metadata:
   name: multi-source-data-processor
@@ -282,14 +285,15 @@ spec:
 
 ---
 # VirtualMCPServer using the complex composite tool
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: VirtualMCPServer
 metadata:
   name: vmcp-data-processor
   namespace: default
 spec:
+  groupRef:
+    name: data-processing-services
   config:
-    groupRef: data-processing-services
     # Conflict resolution for backend tools
     aggregation:
       conflictResolution: prefix
