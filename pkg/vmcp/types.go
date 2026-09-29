@@ -158,7 +158,7 @@ const (
 //   - healthy → ready
 //   - degraded → degraded
 //   - unhealthy → unavailable
-//   - unauthenticated → unavailable (unauthenticated is a reason, not a status)
+//   - unauthenticated → unauthenticated (backend is reachable but needs per-request user auth)
 //   - unknown → unknown
 func (s BackendHealthStatus) ToCRDStatus() string {
 	switch s {
@@ -166,8 +166,10 @@ func (s BackendHealthStatus) ToCRDStatus() string {
 		return "ready"
 	case BackendDegraded:
 		return "degraded"
-	case BackendUnhealthy, BackendUnauthenticated:
+	case BackendUnhealthy:
 		return "unavailable"
+	case BackendUnauthenticated:
+		return "unauthenticated"
 	case BackendUnknown:
 		return "unknown"
 	default:
@@ -216,7 +218,7 @@ type DiscoveredBackend struct {
 	// +optional
 	URL string `json:"url,omitempty"`
 
-	// Status is the current status of the backend (ready, degraded, unavailable, unknown).
+	// Status is the current status of the backend (ready, degraded, unavailable, unauthenticated, unknown).
 	// Use BackendHealthStatus.ToCRDStatus() to populate this field.
 	// +optional
 	Status string `json:"status,omitempty"`

@@ -24,7 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	mcpv1alpha1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1"
+	mcpv1beta1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1beta1"
 	"github.com/stacklok/toolhive/cmd/thv-operator/controllers"
 )
 
@@ -71,7 +71,7 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 	Expect(cfg).NotTo(BeNil())
 
-	err = mcpv1alpha1.AddToScheme(scheme.Scheme)
+	err = mcpv1beta1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
 
 	// Add other schemes that the controllers use
@@ -103,14 +103,15 @@ var _ = BeforeSuite(func() {
 	// Set up field indexing for MCPServer.Spec.GroupRef
 	err = k8sManager.GetFieldIndexer().IndexField(
 		context.Background(),
-		&mcpv1alpha1.MCPServer{},
+		&mcpv1beta1.MCPServer{},
 		"spec.groupRef",
 		func(obj client.Object) []string {
-			mcpServer := obj.(*mcpv1alpha1.MCPServer)
-			if mcpServer.Spec.GroupRef == "" {
+			mcpServer := obj.(*mcpv1beta1.MCPServer)
+			name := mcpServer.Spec.GroupRef.GetName()
+			if name == "" {
 				return nil
 			}
-			return []string{mcpServer.Spec.GroupRef}
+			return []string{name}
 		},
 	)
 	Expect(err).ToNot(HaveOccurred())
@@ -118,14 +119,15 @@ var _ = BeforeSuite(func() {
 	// Set up field indexing for MCPRemoteProxy.Spec.GroupRef
 	err = k8sManager.GetFieldIndexer().IndexField(
 		context.Background(),
-		&mcpv1alpha1.MCPRemoteProxy{},
+		&mcpv1beta1.MCPRemoteProxy{},
 		"spec.groupRef",
 		func(obj client.Object) []string {
-			mcpRemoteProxy := obj.(*mcpv1alpha1.MCPRemoteProxy)
-			if mcpRemoteProxy.Spec.GroupRef == "" {
+			mcpRemoteProxy := obj.(*mcpv1beta1.MCPRemoteProxy)
+			name := mcpRemoteProxy.Spec.GroupRef.GetName()
+			if name == "" {
 				return nil
 			}
-			return []string{mcpRemoteProxy.Spec.GroupRef}
+			return []string{name}
 		},
 	)
 	Expect(err).ToNot(HaveOccurred())
@@ -133,14 +135,15 @@ var _ = BeforeSuite(func() {
 	// Set up field indexing for MCPServerEntry.Spec.GroupRef
 	err = k8sManager.GetFieldIndexer().IndexField(
 		context.Background(),
-		&mcpv1alpha1.MCPServerEntry{},
+		&mcpv1beta1.MCPServerEntry{},
 		"spec.groupRef",
 		func(obj client.Object) []string {
-			mcpServerEntry := obj.(*mcpv1alpha1.MCPServerEntry)
-			if mcpServerEntry.Spec.GroupRef == "" {
+			mcpServerEntry := obj.(*mcpv1beta1.MCPServerEntry)
+			name := mcpServerEntry.Spec.GroupRef.GetName()
+			if name == "" {
 				return nil
 			}
-			return []string{mcpServerEntry.Spec.GroupRef}
+			return []string{name}
 		},
 	)
 	Expect(err).ToNot(HaveOccurred())

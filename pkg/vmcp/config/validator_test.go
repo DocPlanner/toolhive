@@ -708,7 +708,7 @@ func TestValidator_ValidateFailureHandling(t *testing.T) {
 			fh: &FailureHandlingConfig{
 				HealthCheckInterval: Duration(30 * time.Second),
 				UnhealthyThreshold:  3,
-				PartialFailureMode:  "bestEffort",
+				PartialFailureMode:  "best_effort",
 				CircuitBreaker: &CircuitBreakerConfig{
 					Enabled: false,
 				},

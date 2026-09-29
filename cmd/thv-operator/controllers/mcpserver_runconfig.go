@@ -15,7 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	mcpv1alpha1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1"
+	mcpv1beta1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1beta1"
 	ctrlutil "github.com/stacklok/toolhive/cmd/thv-operator/pkg/controllerutil"
 	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/kubernetes/configmaps"
 	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/oidc"
@@ -39,7 +39,7 @@ const defaultAPITimeout = 15 * time.Second
 // immediately after an update.
 func (r *MCPServerReconciler) ensureRunConfigConfigMap(
 	ctx context.Context,
-	m *mcpv1alpha1.MCPServer,
+	m *mcpv1beta1.MCPServer,
 ) (string, error) {
 	runConfig, err := r.createRunConfigFromMCPServer(m)
 	if err != nil {
@@ -88,7 +88,7 @@ func (r *MCPServerReconciler) ensureRunConfigConfigMap(
 // This creates a RunConfig for serialization to ConfigMap, not for direct execution
 //
 //nolint:gocyclo
-func (r *MCPServerReconciler) createRunConfigFromMCPServer(m *mcpv1alpha1.MCPServer) (*runner.RunConfig, error) {
+func (r *MCPServerReconciler) createRunConfigFromMCPServer(m *mcpv1beta1.MCPServer) (*runner.RunConfig, error) {
 	ctx := context.Background()
 	ctxLogger := log.FromContext(ctx)
 
@@ -172,13 +172,13 @@ func (r *MCPServerReconciler) createRunConfigFromMCPServer(m *mcpv1alpha1.MCPSer
 	// Add permission profile if specified
 	if m.Spec.PermissionProfile != nil {
 		switch m.Spec.PermissionProfile.Type {
-		case mcpv1alpha1.PermissionProfileTypeBuiltin:
+		case mcpv1beta1.PermissionProfileTypeBuiltin:
 			options = append(options,
 				runner.WithPermissionProfileNameOrPath(
 					m.Spec.PermissionProfile.Name,
 				),
 			)
-		case mcpv1alpha1.PermissionProfileTypeConfigMap:
+		case mcpv1beta1.PermissionProfileTypeConfigMap:
 			// For ConfigMap-based permission profiles, we store the path
 			options = append(options,
 				runner.WithPermissionProfileNameOrPath(
@@ -192,7 +192,7 @@ func (r *MCPServerReconciler) createRunConfigFromMCPServer(m *mcpv1alpha1.MCPSer
 	ctx, cancel := context.WithTimeout(context.Background(), defaultAPITimeout)
 	defer cancel()
 
-	// Add telemetry configuration: prefer TelemetryConfigRef over deprecated inline Telemetry
+	// Add telemetry configuration from TelemetryConfigRef
 	if m.Spec.TelemetryConfigRef != nil {
 		telCfg, err := getTelemetryConfigForMCPServer(ctx, r.Client, m)
 		if err != nil {
@@ -202,8 +202,6 @@ func (r *MCPServerReconciler) createRunConfigFromMCPServer(m *mcpv1alpha1.MCPSer
 			caPath := ctrlutil.TelemetryCABundleFilePath(telCfg)
 			runconfig.AddMCPTelemetryConfigRefOptions(&options, &telCfg.Spec, m.Spec.TelemetryConfigRef.ServiceName, m.Name, caPath)
 		}
-	} else {
-		runconfig.AddTelemetryConfigOptions(ctx, &options, m.Spec.Telemetry, m.Name)
 	}
 
 	// Add authorization configuration if specified
@@ -243,19 +241,6 @@ func (r *MCPServerReconciler) createRunConfigFromMCPServer(m *mcpv1alpha1.MCPSer
 				resolvedOIDCConfig.InsecureAllowHTTP,
 				resolvedOIDCConfig.Scopes,
 			))
-		}
-	} else {
-		// Legacy path: resolve from inline OIDCConfig
-		if err := ctrlutil.AddOIDCConfigOptions(ctx, r.Client, m, &options); err != nil {
-			return nil, fmt.Errorf("failed to process OIDCConfig: %w", err)
-		}
-		if m.Spec.OIDCConfig != nil {
-			resolver := oidc.NewResolver(r.Client)
-			var err error
-			resolvedOIDCConfig, err = resolver.Resolve(ctx, m)
-			if err != nil {
-				return nil, fmt.Errorf("failed to resolve OIDC config: %w", err)
-			}
 		}
 	}
 
@@ -312,9 +297,9 @@ func (r *MCPServerReconciler) createRunConfigFromMCPServer(m *mcpv1alpha1.MCPSer
 
 // populateScalingConfig sets BackendReplicas and SessionRedis on the RunConfig from the MCPServer spec.
 // Fields are only set when present in the spec; nil means "not configured" and is left as-is.
-func populateScalingConfig(runConfig *runner.RunConfig, m *mcpv1alpha1.MCPServer) {
+func populateScalingConfig(runConfig *runner.RunConfig, m *mcpv1beta1.MCPServer) {
 	hasBackendReplicas := m.Spec.BackendReplicas != nil
-	hasRedis := m.Spec.SessionStorage != nil && m.Spec.SessionStorage.Provider == mcpv1alpha1.SessionStorageProviderRedis
+	hasRedis := m.Spec.SessionStorage != nil && m.Spec.SessionStorage.Provider == mcpv1beta1.SessionStorageProviderRedis
 
 	if !hasBackendReplicas && !hasRedis {
 		return
@@ -573,7 +558,7 @@ func (*MCPServerReconciler) validateToolsFilter(config *runner.RunConfig) error 
 }
 
 // convertEnvVarsFromMCPServer converts MCPServer environment variables to builder format
-func convertEnvVarsFromMCPServer(envs []mcpv1alpha1.EnvVar) map[string]string {
+func convertEnvVarsFromMCPServer(envs []mcpv1beta1.EnvVar) map[string]string {
 	if len(envs) == 0 {
 		return nil
 	}
@@ -585,7 +570,7 @@ func convertEnvVarsFromMCPServer(envs []mcpv1alpha1.EnvVar) map[string]string {
 }
 
 // convertVolumesFromMCPServer converts MCPServer volumes to builder format
-func convertVolumesFromMCPServer(vols []mcpv1alpha1.Volume) []string {
+func convertVolumesFromMCPServer(vols []mcpv1beta1.Volume) []string {
 	if len(vols) == 0 {
 		return nil
 	}

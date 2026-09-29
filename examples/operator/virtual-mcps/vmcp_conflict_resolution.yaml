@@ -15,7 +15,7 @@
 
 ---
 # Create MCPGroup for all examples
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPGroup
 metadata:
   name: my-services
@@ -25,13 +25,14 @@ spec:
 
 ---
 # Create backend MCPServers used by all examples
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: yardstick-sse
   namespace: default
 spec:
-  groupRef: my-services
+  groupRef:
+    name: my-services
   image: ghcr.io/stackloklabs/yardstick/yardstick-server:1.1.1
   transport: sse
   env:
@@ -48,13 +49,14 @@ spec:
       memory: "64Mi"
 
 ---
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: fetch
   namespace: default
 spec:
-  groupRef: my-services
+  groupRef:
+    name: my-services
   image: ghcr.io/stackloklabs/gofetch/server
   transport: streamable-http
   proxyPort: 8080
@@ -68,13 +70,14 @@ spec:
       memory: "64Mi"
 
 ---
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: MCPServer
 metadata:
   name: yardstick-streamable
   namespace: default
 spec:
-  groupRef: my-services
+  groupRef:
+    name: my-services
   image: ghcr.io/stackloklabs/yardstick/yardstick-server:1.1.1
   transport: streamable-http
   env:
@@ -94,14 +97,15 @@ spec:
 # Strategy 1: Prefix-based Conflict Resolution
 # Tools are prefixed with workload name to avoid conflicts
 # Example: If tool "echo" exists in backend "yardstick-sse", it becomes "yardstick-sse_echo"
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: VirtualMCPServer
 metadata:
   name: vmcp-prefix-strategy
   namespace: default
 spec:
+  groupRef:
+    name: my-services
   config:
-    groupRef: my-services
     # Prefix strategy configuration
     aggregation:
       conflictResolution: prefix
@@ -134,14 +138,15 @@ spec:
 # Strategy 2: Priority-based Conflict Resolution
 # Backends are prioritized; higher priority wins conflicts
 # Lower numbers = higher priority (1 is highest)
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: VirtualMCPServer
 metadata:
   name: vmcp-priority-strategy
   namespace: default
 spec:
+  groupRef:
+    name: my-services
   config:
-    groupRef: my-services
     # Priority strategy configuration
     aggregation:
       conflictResolution: priority
@@ -177,14 +182,15 @@ spec:
 # Strategy 3: Manual Conflict Resolution with Tool Filtering
 # Use manual strategy combined with per-workload tool filtering
 # This provides explicit control over which tools are exposed from each backend
-apiVersion: toolhive.stacklok.dev/v1alpha1
+apiVersion: toolhive.stacklok.dev/v1beta1
 kind: VirtualMCPServer
 metadata:
   name: vmcp-manual-strategy
   namespace: default
 spec:
+  groupRef:
+    name: my-services
   config:
-    groupRef: my-services
     # Manual strategy configuration
     # Manual strategy validates conflicts at runtime and requires
     # per-workload tool configuration to resolve them

@@ -384,11 +384,16 @@ func NewHTTPConnector(
 	ctx context.Context,
 	target *vmcp.BackendTarget,
 	identity *auth.Identity,
+	sessionHint string,
 ) (Session, *vmcp.CapabilityList, error) {
+	// The restore-time session hint is intentionally not forwarded: backends
+	// that reject unknown Mcp-Session-Id values would fail the restore, and
+	// lost backend sessions are already recovered through reconnect.
 	return func(
 		ctx context.Context,
 		target *vmcp.BackendTarget,
 		identity *auth.Identity,
+		_ string,
 	) (Session, *vmcp.CapabilityList, error) {
 		requestTimeout := requestTimeoutForWorkload(
 			target.WorkloadID,

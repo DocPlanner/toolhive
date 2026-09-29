@@ -21,7 +21,7 @@ spec:
       try:
         - apply:
             resource:
-              apiVersion: toolhive.stacklok.dev/v1alpha1
+              apiVersion: toolhive.stacklok.dev/v1beta1
               kind: MCPGroup
               metadata:
                 name: test-audit-group
@@ -34,21 +34,22 @@ spec:
       try:
         - apply:
             resource:
-              apiVersion: toolhive.stacklok.dev/v1alpha1
+              apiVersion: toolhive.stacklok.dev/v1beta1
               kind: VirtualMCPServer
               metadata:
                 name: test-vmcp-audit-enabled
                 namespace: toolhive-system
               spec:
+                groupRef:
+                  name: test-audit-group
                 config:
-                  groupRef: test-audit-group
                   audit:
                     enabled: true
                 incomingAuth:
                   type: anonymous
         - assert:
             resource:
-              apiVersion: toolhive.stacklok.dev/v1alpha1
+              apiVersion: toolhive.stacklok.dev/v1beta1
               kind: VirtualMCPServer
               metadata:
                 name: test-vmcp-audit-enabled
@@ -82,19 +83,19 @@ spec:
       try:
         - apply:
             resource:
-              apiVersion: toolhive.stacklok.dev/v1alpha1
+              apiVersion: toolhive.stacklok.dev/v1beta1
               kind: VirtualMCPServer
               metadata:
                 name: test-vmcp-no-audit
                 namespace: toolhive-system
               spec:
-                config:
-                  groupRef: test-audit-group
+                groupRef:
+                  name: test-audit-group
                 incomingAuth:
                   type: anonymous
         - assert:
             resource:
-              apiVersion: toolhive.stacklok.dev/v1alpha1
+              apiVersion: toolhive.stacklok.dev/v1beta1
               kind: VirtualMCPServer
               metadata:
                 name: test-vmcp-no-audit
@@ -139,21 +140,22 @@ spec:
       try:
         - apply:
             resource:
-              apiVersion: toolhive.stacklok.dev/v1alpha1
+              apiVersion: toolhive.stacklok.dev/v1beta1
               kind: VirtualMCPServer
               metadata:
                 name: test-vmcp-audit-disabled
                 namespace: toolhive-system
               spec:
+                groupRef:
+                  name: test-audit-group
                 config:
-                  groupRef: test-audit-group
                   audit:
                     enabled: false
                 incomingAuth:
                   type: anonymous
         - assert:
             resource:
-              apiVersion: toolhive.stacklok.dev/v1alpha1
+              apiVersion: toolhive.stacklok.dev/v1beta1
               kind: VirtualMCPServer
               metadata:
                 name: test-vmcp-audit-disabled

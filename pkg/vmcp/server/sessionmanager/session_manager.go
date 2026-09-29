@@ -185,10 +185,17 @@ const createSessionStorageTimeout = 5 * time.Second
 // timeout bounds how long a slow or unreachable Redis can stall a request goroutine.
 const validateTimeout = 3 * time.Second
 
-// restoreStorageTimeout bounds the storage.Load call in the GetMultiSession
-// cache-miss restore path. The operation is a single Redis GETEX, so 3 s is
-// generous.
+// restoreStorageTimeout bounds storage.Load calls (GETEX) in the
+// GetMultiSession restore path (loadSession) and in the checkSession liveness
+// check. Both are single-key Redis reads; 3 s is generous.
 const restoreStorageTimeout = 3 * time.Second
+
+// restoreMetadataWriteTimeout bounds the storage.Update call that persists
+// the restored session's metadata back to Redis after a successful
+// RestoreSession. Single-key Redis SET XX operation; 5 s is consistent with
+// other write timeouts (createSessionStorageTimeout, terminateTimeout,
+// decorateTimeout, notifyBackendExpiredTimeout).
+const restoreMetadataWriteTimeout = 5 * time.Second
 
 // restoreSessionTimeout bounds factory.RestoreSession in the GetMultiSession
 // cache-miss path. RestoreSession opens HTTP connections to each backend, so
@@ -811,6 +818,37 @@ func (sm *Manager) loadSession(sessionID string) (vmcpsession.MultiSession, erro
 		slog.Warn("Manager.loadSession: failed to restore session from storage",
 			"session_id", sessionID, "error", restoreErr)
 		return nil, restoreErr
+	}
+
+	// Persist the restored session's metadata back to Redis so that
+	// per-backend session IDs are kept current. Backends that do not honor
+	// Mcp-Session-Id hints (e.g. SSE transports) assign a fresh ID on every
+	// restore; without this write the stale IDs would persist in Redis
+	// indefinitely.
+	//
+	// We use Update (SET XX) rather than Upsert so we never resurrect a key
+	// that was concurrently deleted (Terminate / TTL expiry). A (false, nil)
+	// result means the key is already gone — treat it as not found so the
+	// cache never serves a session that no longer exists in storage.
+	updateCtx, updateCancel := context.WithTimeout(context.Background(), restoreMetadataWriteTimeout)
+	defer updateCancel()
+	updated, updateErr := sm.storage.Update(updateCtx, sessionID, restored.GetMetadata())
+	if updateErr != nil {
+		slog.Warn("Manager.loadSession: failed to persist restored session metadata",
+			"session_id", sessionID, "error", updateErr)
+		// Non-fatal: the session is still usable on this pod. checkSession
+		// will detect metadata drift on the next liveness check and evict,
+		// triggering a fresh restore that will retry the write.
+	} else if !updated {
+		// Session was concurrently deleted (Terminate / TTL expiry) between
+		// RestoreSession and this write — do not cache the restored session.
+		slog.Debug("Manager.loadSession: session already gone before metadata could be persisted; treating as not found",
+			"session_id", sessionID)
+		if closeErr := restored.Close(); closeErr != nil {
+			slog.Warn("Manager.loadSession: failed to close restored session after concurrent deletion",
+				"session_id", sessionID, "error", closeErr)
+		}
+		return nil, transportsession.ErrSessionNotFound
 	}
 
 	slog.Debug("Manager.loadSession: restored session from storage", "session_id", sessionID)

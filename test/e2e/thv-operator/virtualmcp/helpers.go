@@ -29,9 +29,16 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	mcpv1alpha1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1"
+	mcpv1beta1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1beta1"
 	"github.com/stacklok/toolhive/test/e2e/images"
 	"github.com/stacklok/toolhive/test/e2e/thv-operator/testutil"
+)
+
+// Shared test constants used across all e2e test files in this package.
+const (
+	defaultNamespace = "default"
+	e2eTimeout       = 5 * time.Minute
+	e2ePollInterval  = 2 * time.Second
 )
 
 // WaitForVirtualMCPServerReady waits for a VirtualMCPServer to reach Ready status
@@ -44,7 +51,7 @@ func WaitForVirtualMCPServerReady(
 	timeout time.Duration,
 	pollingInterval time.Duration,
 ) {
-	vmcpServer := &mcpv1alpha1.VirtualMCPServer{}
+	vmcpServer := &mcpv1beta1.VirtualMCPServer{}
 
 	gomega.Eventually(func() error {
 		if err := c.Get(ctx, types.NamespacedName{
@@ -55,7 +62,7 @@ func WaitForVirtualMCPServerReady(
 		}
 
 		for _, condition := range vmcpServer.Status.Conditions {
-			if condition.Type == mcpv1alpha1.ConditionTypeVirtualMCPServerReady {
+			if condition.Type == mcpv1beta1.ConditionTypeVirtualMCPServerReady {
 				if condition.Status == "True" {
 					// Also check that at least one pod is actually running and ready
 					labels := map[string]string{
@@ -169,8 +176,8 @@ func WaitForPodsReady(
 
 // GetMCPGroupBackends returns the list of backend MCPServers in an MCPGroup
 // Note: MCPGroup status contains the list of servers in the group
-func GetMCPGroupBackends(ctx context.Context, c client.Client, groupName, namespace string) ([]mcpv1alpha1.MCPServer, error) {
-	mcpGroup := &mcpv1alpha1.MCPGroup{}
+func GetMCPGroupBackends(ctx context.Context, c client.Client, groupName, namespace string) ([]mcpv1beta1.MCPServer, error) {
+	mcpGroup := &mcpv1beta1.MCPGroup{}
 	if err := c.Get(ctx, types.NamespacedName{
 		Name:      groupName,
 		Namespace: namespace,
@@ -179,16 +186,16 @@ func GetMCPGroupBackends(ctx context.Context, c client.Client, groupName, namesp
 	}
 
 	// Get all MCPServers in the namespace
-	mcpServerList := &mcpv1alpha1.MCPServerList{}
+	mcpServerList := &mcpv1beta1.MCPServerList{}
 	if err := c.List(ctx, mcpServerList,
 		client.InNamespace(namespace)); err != nil {
 		return nil, err
 	}
 
 	// Filter MCPServers that reference this group
-	var backends []mcpv1alpha1.MCPServer
+	var backends []mcpv1beta1.MCPServer
 	for _, mcpServer := range mcpServerList.Items {
-		if mcpServer.Spec.GroupRef == groupName {
+		if mcpServer.Spec.GroupRef.GetName() == groupName {
 			backends = append(backends, mcpServer)
 		}
 	}
@@ -201,8 +208,8 @@ func GetVirtualMCPServerStatus(
 	ctx context.Context,
 	c client.Client,
 	name, namespace string,
-) (*mcpv1alpha1.VirtualMCPServerStatus, error) {
-	vmcpServer := &mcpv1alpha1.VirtualMCPServer{}
+) (*mcpv1beta1.VirtualMCPServerStatus, error) {
+	vmcpServer := &mcpv1beta1.VirtualMCPServer{}
 	if err := c.Get(ctx, types.NamespacedName{
 		Name:      name,
 		Namespace: namespace,
@@ -213,7 +220,7 @@ func GetVirtualMCPServerStatus(
 }
 
 // HasCondition checks if a VirtualMCPServer has a specific condition type with expected status
-func HasCondition(vmcpServer *mcpv1alpha1.VirtualMCPServer, conditionType string, expectedStatus string) bool {
+func HasCondition(vmcpServer *mcpv1beta1.VirtualMCPServer, conditionType string, expectedStatus string) bool {
 	for _, condition := range vmcpServer.Status.Conditions {
 		if condition.Type == conditionType && string(condition.Status) == expectedStatus {
 			return true
@@ -233,7 +240,7 @@ func WaitForCondition(
 	pollingInterval time.Duration,
 ) {
 	gomega.Eventually(func() error {
-		vmcpServer := &mcpv1alpha1.VirtualMCPServer{}
+		vmcpServer := &mcpv1beta1.VirtualMCPServer{}
 		if err := c.Get(ctx, types.NamespacedName{
 			Name:      name,
 			Namespace: namespace,
@@ -627,13 +634,13 @@ func CreateMCPGroupAndWait(
 	c client.Client,
 	name, namespace, description string,
 	timeout, pollingInterval time.Duration,
-) *mcpv1alpha1.MCPGroup {
-	mcpGroup := &mcpv1alpha1.MCPGroup{
+) *mcpv1beta1.MCPGroup {
+	mcpGroup := &mcpv1beta1.MCPGroup{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: namespace,
 		},
-		Spec: mcpv1alpha1.MCPGroupSpec{
+		Spec: mcpv1beta1.MCPGroupSpec{
 			Description: description,
 		},
 	}
@@ -647,7 +654,7 @@ func CreateMCPGroupAndWait(
 		if err != nil {
 			return false
 		}
-		return mcpGroup.Status.Phase == mcpv1alpha1.MCPGroupPhaseReady
+		return mcpGroup.Status.Phase == mcpv1beta1.MCPGroupPhaseReady
 	}, timeout, pollingInterval).Should(gomega.BeTrue(), "MCPGroup should become ready")
 
 	return mcpGroup
@@ -660,20 +667,20 @@ func CreateMCPServerAndWait(
 	c client.Client,
 	name, namespace, groupRef, image string,
 	timeout, pollingInterval time.Duration,
-) *mcpv1alpha1.MCPServer {
-	backend := &mcpv1alpha1.MCPServer{
+) *mcpv1beta1.MCPServer {
+	backend := &mcpv1beta1.MCPServer{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: namespace,
 		},
-		Spec: mcpv1alpha1.MCPServerSpec{
-			GroupRef:  groupRef,
+		Spec: mcpv1beta1.MCPServerSpec{
+			GroupRef:  &mcpv1beta1.MCPGroupRef{Name: groupRef},
 			Image:     image,
 			Transport: "streamable-http",
 			ProxyPort: 8080,
 			MCPPort:   8080,
 			Resources: defaultMCPServerResources(),
-			Env: []mcpv1alpha1.EnvVar{
+			Env: []mcpv1beta1.EnvVar{
 				{Name: "TRANSPORT", Value: "streamable-http"},
 			},
 		},
@@ -681,7 +688,7 @@ func CreateMCPServerAndWait(
 	gomega.Expect(c.Create(ctx, backend)).To(gomega.Succeed())
 
 	gomega.Eventually(func() error {
-		server := &mcpv1alpha1.MCPServer{}
+		server := &mcpv1beta1.MCPServer{}
 		err := c.Get(ctx, types.NamespacedName{
 			Name:      name,
 			Namespace: namespace,
@@ -689,7 +696,7 @@ func CreateMCPServerAndWait(
 		if err != nil {
 			return fmt.Errorf("failed to get server: %w", err)
 		}
-		if server.Status.Phase == mcpv1alpha1.MCPServerPhaseReady {
+		if server.Status.Phase == mcpv1beta1.MCPServerPhaseReady {
 			return nil
 		}
 		return fmt.Errorf("%s not ready yet, phase: %s", name, server.Status.Phase)
@@ -705,25 +712,25 @@ type BackendConfig struct {
 	GroupRef              string
 	Image                 string
 	Transport             string // defaults to "streamable-http" if empty
-	ExternalAuthConfigRef *mcpv1alpha1.ExternalAuthConfigRef
-	Secrets               []mcpv1alpha1.SecretRef
-	Env                   []mcpv1alpha1.EnvVar // additional env vars beyond TRANSPORT
+	ExternalAuthConfigRef *mcpv1beta1.ExternalAuthConfigRef
+	Secrets               []mcpv1beta1.SecretRef
+	Env                   []mcpv1beta1.EnvVar // additional env vars beyond TRANSPORT
 	// Resources overrides the default resource requests/limits. When nil,
 	// defaultMCPServerResources() is used to ensure containers are scheduled
 	// with reasonable resource guarantees and do not compete excessively.
-	Resources *mcpv1alpha1.ResourceRequirements
+	Resources *mcpv1beta1.ResourceRequirements
 }
 
 // defaultMCPServerResources returns conservative resource requests/limits that
 // mirror the quickstart example (vmcp_optimizer_quickstart.yaml) and are
 // sufficient for functional E2E testing without starving other pods.
-func defaultMCPServerResources() mcpv1alpha1.ResourceRequirements {
-	return mcpv1alpha1.ResourceRequirements{
-		Limits: mcpv1alpha1.ResourceList{
+func defaultMCPServerResources() mcpv1beta1.ResourceRequirements {
+	return mcpv1beta1.ResourceRequirements{
+		Limits: mcpv1beta1.ResourceList{
 			CPU:    "200m",
 			Memory: "256Mi",
 		},
-		Requests: mcpv1alpha1.ResourceList{
+		Requests: mcpv1beta1.ResourceList{
 			CPU:    "100m",
 			Memory: "128Mi",
 		},
@@ -751,13 +758,13 @@ func CreateMultipleMCPServersInParallel(
 			resources = *backends[idx].Resources
 		}
 
-		backend := &mcpv1alpha1.MCPServer{
+		backend := &mcpv1beta1.MCPServer{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      backends[idx].Name,
 				Namespace: backends[idx].Namespace,
 			},
-			Spec: mcpv1alpha1.MCPServerSpec{
-				GroupRef:              backends[idx].GroupRef,
+			Spec: mcpv1beta1.MCPServerSpec{
+				GroupRef:              &mcpv1beta1.MCPGroupRef{Name: backends[idx].GroupRef},
 				Image:                 backends[idx].Image,
 				Transport:             backendTransport,
 				ProxyPort:             8080,
@@ -765,7 +772,7 @@ func CreateMultipleMCPServersInParallel(
 				ExternalAuthConfigRef: backends[idx].ExternalAuthConfigRef,
 				Secrets:               backends[idx].Secrets,
 				Resources:             resources,
-				Env: append([]mcpv1alpha1.EnvVar{
+				Env: append([]mcpv1beta1.EnvVar{
 					{Name: "TRANSPORT", Value: backendTransport},
 				}, backends[idx].Env...),
 			},
@@ -776,7 +783,7 @@ func CreateMultipleMCPServersInParallel(
 	// Wait for all backends to be ready in parallel (single Eventually checking all)
 	gomega.Eventually(func() error {
 		for _, cfg := range backends {
-			server := &mcpv1alpha1.MCPServer{}
+			server := &mcpv1beta1.MCPServer{}
 			err := c.Get(ctx, types.NamespacedName{
 				Name:      cfg.Name,
 				Namespace: cfg.Namespace,
@@ -785,10 +792,10 @@ func CreateMultipleMCPServersInParallel(
 				return fmt.Errorf("failed to get server %s: %w", cfg.Name, err)
 			}
 			// Fail-fast if server enters Failed phase (e.g., bad image, crash loop)
-			if server.Status.Phase == mcpv1alpha1.MCPServerPhaseFailed {
+			if server.Status.Phase == mcpv1beta1.MCPServerPhaseFailed {
 				return gomega.StopTrying(fmt.Sprintf("%s failed: %s", cfg.Name, server.Status.Message))
 			}
-			if server.Status.Phase != mcpv1alpha1.MCPServerPhaseReady {
+			if server.Status.Phase != mcpv1beta1.MCPServerPhaseReady {
 				return fmt.Errorf("%s not ready yet, phase: %s", cfg.Name, server.Status.Phase)
 			}
 		}
@@ -828,7 +835,7 @@ func GetVMCPNodePort(
 		}
 
 		// Verify the HTTP server is ready to handle requests
-		if err := checkHTTPHealthReady(nodePort, 2*time.Second); err != nil {
+		if err := checkHTTPHealthReady(nodePort); err != nil {
 			return fmt.Errorf("nodePort %d accessible but HTTP server not ready: %w", nodePort, err)
 		}
 
@@ -847,25 +854,21 @@ func checkPortAccessible(nodePort int32, timeout time.Duration) error {
 	if err != nil {
 		return fmt.Errorf("port %d not accessible: %w", nodePort, err)
 	}
-	// Port is accessible - close connection (ignore errors as port accessibility is confirmed)
 	_ = conn.Close()
 	return nil
 }
 
 // checkHTTPHealthReady verifies the HTTP server is ready by checking the /health endpoint.
 // This is more reliable than just TCP check as it ensures the application is serving requests.
-func checkHTTPHealthReady(nodePort int32, timeout time.Duration) error {
-	httpClient := &http.Client{Timeout: timeout}
+func checkHTTPHealthReady(nodePort int32) error {
+	httpClient := &http.Client{Timeout: 2 * time.Second}
 	url := fmt.Sprintf("http://localhost:%d/health", nodePort)
 
 	resp, err := httpClient.Get(url)
 	if err != nil {
 		return fmt.Errorf("health check failed for port %d: %w", nodePort, err)
 	}
-	defer func() {
-		// Error ignored in test cleanup
-		_ = resp.Body.Close()
-	}()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("health check returned status %d for port %d", resp.StatusCode, nodePort)

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/ory/fosite"
+
 	"github.com/stacklok/toolhive/pkg/authserver/server"
 	"github.com/stacklok/toolhive/pkg/authserver/server/session"
 )
@@ -50,7 +51,7 @@ func (h *Handler) TokenHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	switch {
-	case len(resources) == 1:
+	case len(resources) == 1 && resources[0] != "":
 		resource := resources[0]
 		// Validate URI format per RFC 8707
 		if err := server.ValidateAudienceURI(resource); err != nil {
