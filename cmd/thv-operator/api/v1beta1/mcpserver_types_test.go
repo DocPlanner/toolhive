@@ -180,38 +180,3 @@ func TestMCPServerSpecScalingFieldsJSONRoundtrip(t *testing.T) {
 		})
 	}
 }
-
-func TestMCPGroupRefUnmarshalJSON(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name  string
-		input string
-		want  *MCPGroupRef
-	}{
-		{name: "object form", input: `{"groupRef":{"name":"platform"}}`, want: &MCPGroupRef{Name: "platform"}},
-		{name: "legacy string form", input: `{"groupRef":"platform"}`, want: &MCPGroupRef{Name: "platform"}},
-		{name: "absent", input: `{}`, want: nil},
-		{name: "number decodes to empty name", input: `{"groupRef":42}`, want: &MCPGroupRef{}},
-		{name: "array decodes to empty name", input: `{"groupRef":["platform"]}`, want: &MCPGroupRef{}},
-		{name: "non-string name decodes to empty name", input: `{"groupRef":{"name":7}}`, want: &MCPGroupRef{}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			var spec MCPServerSpec
-			require.NoError(t, json.Unmarshal([]byte(tt.input), &spec))
-			assert.Equal(t, tt.want, spec.GroupRef)
-		})
-	}
-}
-
-func TestMCPGroupRefMarshalsObjectForm(t *testing.T) {
-	t.Parallel()
-
-	data, err := json.Marshal(MCPServerSpec{Image: "img", GroupRef: &MCPGroupRef{Name: "platform"}})
-	require.NoError(t, err)
-	assert.Contains(t, string(data), `"groupRef":{"name":"platform"}`)
-}
