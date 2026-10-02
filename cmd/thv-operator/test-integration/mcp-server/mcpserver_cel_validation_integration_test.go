@@ -122,23 +122,15 @@ var _ = Describe("CEL Validation for AuthzConfigRef", Label("k8s", "cel", "valid
 		})
 	})
 
-	Context("groupRef transition shim", func() {
-		createRaw := func(name string, groupRef any) error {
+	Context("groupRef schema", func() {
+		It("should reject the legacy string form", func() {
 			obj := &unstructured.Unstructured{Object: map[string]any{
 				"apiVersion": "toolhive.stacklok.dev/v1beta1",
 				"kind":       "MCPServer",
-				"metadata":   map[string]any{"name": name, "namespace": "default"},
-				"spec":       map[string]any{"image": "example/mcp-server:latest", "groupRef": groupRef},
+				"metadata":   map[string]any{"name": "groupref-string", "namespace": "default"},
+				"spec":       map[string]any{"image": "example/mcp-server:latest", "groupRef": "platform"},
 			}}
-			return k8sClient.Create(ctx, obj)
-		}
-
-		It("should accept and decode the legacy string form", func() {
-			Expect(createRaw("groupref-string", "platform")).To(Succeed())
-
-			server := &mcpv1beta1.MCPServer{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "groupref-string", Namespace: "default"}, server)).To(Succeed())
-			Expect(server.Spec.GroupRef.GetName()).To(Equal("platform"))
+			Expect(k8sClient.Create(ctx, obj)).NotTo(Succeed())
 		})
 
 		It("should accept the object form", func() {
@@ -149,26 +141,6 @@ var _ = Describe("CEL Validation for AuthzConfigRef", Label("k8s", "cel", "valid
 			fetched := &mcpv1beta1.MCPServer{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "groupref-object", Namespace: "default"}, fetched)).To(Succeed())
 			Expect(fetched.Spec.GroupRef.GetName()).To(Equal("platform"))
-		})
-
-		It("should accept the legacy string form through v1alpha1", func() {
-			obj := &unstructured.Unstructured{Object: map[string]any{
-				"apiVersion": "toolhive.stacklok.dev/v1alpha1",
-				"kind":       "MCPServer",
-				"metadata":   map[string]any{"name": "groupref-string-v1alpha1", "namespace": "default"},
-				"spec":       map[string]any{"image": "example/mcp-server:latest", "groupRef": "platform"},
-			}}
-			Expect(k8sClient.Create(ctx, obj)).To(Succeed())
-		})
-
-		It("should decode an unexpected groupRef shape to an empty name without failing", func() {
-			Expect(createRaw("groupref-number", int64(42))).To(Succeed())
-
-			list := &mcpv1beta1.MCPServerList{}
-			Expect(k8sClient.List(ctx, list)).To(Succeed())
-			server := &mcpv1beta1.MCPServer{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "groupref-number", Namespace: "default"}, server)).To(Succeed())
-			Expect(server.Spec.GroupRef.GetName()).To(BeEmpty())
 		})
 	})
 

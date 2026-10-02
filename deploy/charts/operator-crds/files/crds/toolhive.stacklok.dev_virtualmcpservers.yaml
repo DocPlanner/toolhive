@@ -1844,8 +1844,6 @@ spec:
                 description: |-
                   GroupRef references the MCPGroup that defines backend workloads.
                   The referenced MCPGroup must exist in the same namespace.
-                  Optional in the schema so objects created before groupRef was introduced
-                  still validate; the controller rejects a VirtualMCPServer without it.
                 properties:
                   name:
                     description: Name is the name of the MCPGroup resource in the
@@ -2179,6 +2177,7 @@ spec:
                 - name
                 type: object
             required:
+            - groupRef
             - incomingAuth
             type: object
           status:
@@ -4174,8 +4173,6 @@ spec:
                 description: |-
                   GroupRef references the MCPGroup that defines backend workloads.
                   The referenced MCPGroup must exist in the same namespace.
-                  Optional in the schema so objects created before groupRef was introduced
-                  still validate; the controller rejects a VirtualMCPServer without it.
                 properties:
                   name:
                     description: Name is the name of the MCPGroup resource in the
@@ -4509,6 +4506,7 @@ spec:
                 - name
                 type: object
             required:
+            - groupRef
             - incomingAuth
             type: object
           status:

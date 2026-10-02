@@ -4,8 +4,6 @@
 package v1beta1
 
 import (
-	"encoding/json"
-
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -319,14 +317,7 @@ type MCPServerSpec struct {
 
 	// GroupRef references the MCPGroup this server belongs to.
 	// The referenced MCPGroup must be in the same namespace.
-	// Accepts {name: <group>} or, for objects created before v0.20, a plain
-	// group name string. Both forms decode to the same MCPGroupRef. The schema
-	// is untyped to admit both forms, so CEL cannot validate it; an invalid
-	// value decodes to an empty name and is reported by the GroupRefValidated
-	// condition.
 	// +optional
-	// +kubebuilder:validation:Schemaless
-	// +kubebuilder:pruning:PreserveUnknownFields
 	GroupRef *MCPGroupRef `json:"groupRef,omitempty"`
 
 	// SessionAffinity controls whether the Service routes repeated client connections to the same pod.
@@ -748,27 +739,6 @@ type MCPGroupRef struct {
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
-}
-
-// UnmarshalJSON accepts both the object form {"name": "<group>"} and the
-// legacy plain string form "<group>" used by MCPServer before v0.20.
-// Any other shape decodes to an empty name instead of failing, so a single
-// malformed object cannot break list/watch decoding in the operator cache.
-func (r *MCPGroupRef) UnmarshalJSON(data []byte) error {
-	var name string
-	if err := json.Unmarshal(data, &name); err == nil {
-		r.Name = name
-		return nil
-	}
-	var obj struct {
-		Name any `json:"name"`
-	}
-	if err := json.Unmarshal(data, &obj); err != nil {
-		r.Name = ""
-		return nil
-	}
-	r.Name, _ = obj.Name.(string)
-	return nil
 }
 
 // GetName returns the name, or empty string if the receiver is nil.

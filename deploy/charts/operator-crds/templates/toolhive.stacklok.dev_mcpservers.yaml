@@ -220,12 +220,15 @@ spec:
                 description: |-
                   GroupRef references the MCPGroup this server belongs to.
                   The referenced MCPGroup must be in the same namespace.
-                  Accepts {name: <group>} or, for objects created before v0.20, a plain
-                  group name string. Both forms decode to the same MCPGroupRef. The schema
-                  is untyped to admit both forms, so CEL cannot validate it; an invalid
-                  value decodes to an empty name and is reported by the GroupRefValidated
-                  condition.
-                x-kubernetes-preserve-unknown-fields: true
+                properties:
+                  name:
+                    description: Name is the name of the MCPGroup resource in the
+                      same namespace
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                type: object
               image:
                 description: Image is the container image for the MCP server
                 type: string
@@ -1092,12 +1095,15 @@ spec:
                 description: |-
                   GroupRef references the MCPGroup this server belongs to.
                   The referenced MCPGroup must be in the same namespace.
-                  Accepts {name: <group>} or, for objects created before v0.20, a plain
-                  group name string. Both forms decode to the same MCPGroupRef. The schema
-                  is untyped to admit both forms, so CEL cannot validate it; an invalid
-                  value decodes to an empty name and is reported by the GroupRefValidated
-                  condition.
-                x-kubernetes-preserve-unknown-fields: true
+                properties:
+                  name:
+                    description: Name is the name of the MCPGroup resource in the
+                      same namespace
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                type: object
               image:
                 description: Image is the container image for the MCP server
                 type: string

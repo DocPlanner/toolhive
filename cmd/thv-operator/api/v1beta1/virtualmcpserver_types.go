@@ -63,10 +63,8 @@ type VirtualMCPServerSpec struct {
 
 	// GroupRef references the MCPGroup that defines backend workloads.
 	// The referenced MCPGroup must exist in the same namespace.
-	// Optional in the schema so objects created before groupRef was introduced
-	// still validate; the controller rejects a VirtualMCPServer without it.
-	// +optional
-	GroupRef *MCPGroupRef `json:"groupRef,omitempty"`
+	// +kubebuilder:validation:Required
+	GroupRef *MCPGroupRef `json:"groupRef"`
 
 	// Config is the Virtual MCP server configuration.
 	// The audit config from here is also supported, but not required.
