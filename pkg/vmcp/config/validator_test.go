@@ -716,15 +716,6 @@ func TestValidator_ValidateFailureHandling(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "valid configuration with CRD best_effort spelling",
-			fh: &FailureHandlingConfig{
-				HealthCheckInterval: Duration(30 * time.Second),
-				UnhealthyThreshold:  3,
-				PartialFailureMode:  "best_effort",
-			},
-			wantErr: false,
-		},
-		{
 			name: "valid configuration with zero health check timeout (no timeout)",
 			fh: &FailureHandlingConfig{
 				HealthCheckInterval: Duration(30 * time.Second),
@@ -820,7 +811,7 @@ func TestValidator_ValidateFailureHandling(t *testing.T) {
 				PartialFailureMode:  "invalid",
 			},
 			wantErr: true,
-			errMsg:  "partialFailureMode must be one of: fail, best_effort, bestEffort",
+			errMsg:  "partialFailureMode must be one of: fail, best_effort",
 		},
 		{
 			name: "negative health check interval",
