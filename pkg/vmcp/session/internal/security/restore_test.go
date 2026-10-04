@@ -91,8 +91,12 @@ func TestRestoreHijackPrevention_AuthenticatedRoundTrip(t *testing.T) {
 	_, err = restored.CallTool(ctx, identity, "tool", nil, nil)
 	require.NoError(t, err)
 
-	// A different token is rejected.
-	other := &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: "user"}, Token: "wrong-token"}
+	refreshed := &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: "user"}, Token: "refreshed-token"}
+	_, err = restored.CallTool(ctx, refreshed, "tool", nil, nil)
+	require.NoError(t, err)
+
+	// A different subject is rejected.
+	other := &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: "other-user"}, Token: "bearer-token"}
 	_, err = restored.CallTool(ctx, other, "tool", nil, nil)
 	require.ErrorIs(t, err, sessiontypes.ErrUnauthorizedCaller)
 
