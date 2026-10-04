@@ -137,6 +137,8 @@ jobs:
         kubectl rollout status deployment/toolhive-operator -n toolhive-system --timeout=2m --kubeconfig kconfig.yaml
 
     - name: Run VirtualMCP Lifecycle E2E tests
+      env:
+        E2E_PROCS: "4"
       run: |
         export KUBECONFIG=kconfig.yaml
         task thv-operator-e2e-test-run
