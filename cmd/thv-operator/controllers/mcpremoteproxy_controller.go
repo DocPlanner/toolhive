@@ -83,7 +83,8 @@ func (r *MCPRemoteProxyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	// Ensure all resources
-	if err := r.ensureAllResources(ctx, proxy); err != nil {
+	result, err := r.ensureAllResources(ctx, proxy)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -93,7 +94,7 @@ func (r *MCPRemoteProxyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{}, nil
+	return result, nil
 }
 
 // validateAndHandleConfigs validates spec and handles referenced configurations
@@ -174,43 +175,45 @@ func (r *MCPRemoteProxyReconciler) validateAndHandleConfigs(ctx context.Context,
 }
 
 // ensureAllResources ensures all Kubernetes resources for the proxy
-func (r *MCPRemoteProxyReconciler) ensureAllResources(ctx context.Context, proxy *mcpv1beta1.MCPRemoteProxy) error {
+func (r *MCPRemoteProxyReconciler) ensureAllResources(
+	ctx context.Context, proxy *mcpv1beta1.MCPRemoteProxy,
+) (ctrl.Result, error) {
 	ctxLogger := log.FromContext(ctx)
 
 	// Ensure RBAC resources
 	if err := r.ensureRBACResources(ctx, proxy); err != nil {
 		ctxLogger.Error(err, "Failed to ensure RBAC resources")
-		return err
+		return ctrl.Result{}, err
 	}
 
 	// Ensure authorization ConfigMap
 	if err := r.ensureAuthzConfigMapForProxy(ctx, proxy); err != nil {
 		ctxLogger.Error(err, "Failed to ensure authorization ConfigMap")
-		return err
+		return ctrl.Result{}, err
 	}
 
 	// Ensure RunConfig ConfigMap
 	if err := r.ensureRunConfigConfigMap(ctx, proxy); err != nil {
 		ctxLogger.Error(err, "Failed to ensure RunConfig ConfigMap")
-		return err
+		return ctrl.Result{}, err
 	}
 
 	// Ensure Deployment
 	if result, err := r.ensureDeployment(ctx, proxy); err != nil {
-		return err
+		return ctrl.Result{}, err
 	} else if result.RequeueAfter > 0 {
-		return nil
+		return result, nil
 	}
 
 	// Ensure Service
 	if result, err := r.ensureService(ctx, proxy); err != nil {
-		return err
+		return ctrl.Result{}, err
 	} else if result.RequeueAfter > 0 {
-		return nil
+		return result, nil
 	}
 
 	// Update service URL in status
-	return r.ensureServiceURL(ctx, proxy)
+	return ctrl.Result{}, r.ensureServiceURL(ctx, proxy)
 }
 
 // ensureAuthzConfigMapForProxy ensures the authorization ConfigMap for inline configuration
@@ -1482,6 +1485,35 @@ func (r *MCPRemoteProxyReconciler) mapTelemetryConfigToMCPRemoteProxy(
 	return requests
 }
 
+func (r *MCPRemoteProxyReconciler) mapMCPGroupToMCPRemoteProxy(
+	ctx context.Context, obj client.Object,
+) []reconcile.Request {
+	group, ok := obj.(*mcpv1beta1.MCPGroup)
+	if !ok {
+		return nil
+	}
+
+	proxyList := &mcpv1beta1.MCPRemoteProxyList{}
+	if err := r.List(ctx, proxyList, client.InNamespace(group.Namespace)); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to list MCPRemoteProxies for MCPGroup watch")
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for _, proxy := range proxyList.Items {
+		if proxy.Spec.GroupRef != nil && proxy.Spec.GroupRef.Name == group.Name {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      proxy.Name,
+					Namespace: proxy.Namespace,
+				},
+			})
+		}
+	}
+
+	return requests
+}
+
 // SetupWithManager sets up the controller with the Manager
 func (r *MCPRemoteProxyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Create a handler that maps MCPExternalAuthConfig changes to MCPRemoteProxy reconciliation requests
@@ -1566,5 +1598,6 @@ func (r *MCPRemoteProxyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&mcpv1beta1.MCPTelemetryConfig{},
 			handler.EnqueueRequestsFromMapFunc(r.mapTelemetryConfigToMCPRemoteProxy),
 		).
+		Watches(&mcpv1beta1.MCPGroup{}, handler.EnqueueRequestsFromMapFunc(r.mapMCPGroupToMCPRemoteProxy)).
 		Complete(r)
 }

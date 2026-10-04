@@ -2565,7 +2565,10 @@ func (r *MCPServerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	telemetryConfigHandler := handler.EnqueueRequestsFromMapFunc(r.mapTelemetryConfigToServers)
 
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&mcpv1beta1.MCPServer{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		For(&mcpv1beta1.MCPServer{}, builder.WithPredicates(predicate.Or(
+			predicate.GenerationChangedPredicate{},
+			predicate.AnnotationChangedPredicate{},
+		))).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Watches(&mcpv1beta1.MCPExternalAuthConfig{}, externalAuthConfigHandler).

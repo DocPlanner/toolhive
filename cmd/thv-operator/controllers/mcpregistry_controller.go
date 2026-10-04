@@ -171,9 +171,6 @@ func (r *MCPRegistryReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				"MCPRegistry.Name", mcpRegistry.Name)
 			return ctrl.Result{}, err
 		}
-		ctxLogger.Info("Reconciliation completed successfully after adding finalizer",
-			"MCPRegistry.Name", mcpRegistry.Name)
-		return ctrl.Result{}, nil
 	}
 
 	// 3. Reconcile API service - capture error for status update

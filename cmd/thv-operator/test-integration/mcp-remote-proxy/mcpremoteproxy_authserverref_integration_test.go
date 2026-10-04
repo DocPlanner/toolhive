@@ -233,9 +233,9 @@ var _ = Describe("MCPRemoteProxy AuthServerRef Integration", Label("k8s", "remot
 			Expect(runConfig).To(HaveKey("embedded_auth_server_config"))
 
 			By("verifying the proxy is not in Failed phase")
-			phase, err := proxyHelper.GetRemoteProxyPhase(proxy.Name)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(phase).NotTo(Equal(mcpv1beta1.MCPRemoteProxyPhaseFailed))
+			Eventually(func() (mcpv1beta1.MCPRemoteProxyPhase, error) {
+				return proxyHelper.GetRemoteProxyPhase(proxy.Name)
+			}, MediumTimeout, DefaultPollingInterval).ShouldNot(Equal(mcpv1beta1.MCPRemoteProxyPhaseFailed))
 
 			By("cleaning up auth resources")
 			Expect(k8sClient.Delete(testCtx, authConfig)).To(Succeed())
