@@ -115,10 +115,11 @@ func TestMCPRegistryReconciler_Reconcile(t *testing.T) {
 					WithStatusSubresource(&mcpv1beta1.MCPRegistry{})
 				return builder, mcpRegistry
 			},
-			configureMocks: func(_ *registryapimocks.MockManager) {
-				// Returns early after adding finalizer — no API calls.
+			configureMocks: func(mock *registryapimocks.MockManager) {
+				mock.EXPECT().ReconcileAPIService(gomock.Any(), gomock.Any()).Return(nil)
+				mock.EXPECT().GetAPIStatus(gomock.Any(), gomock.Any()).Return(false, int32(0))
 			},
-			expResult: ctrl.Result{},
+			expResult: ctrl.Result{RequeueAfter: 30 * time.Second},
 			expErr:    nil,
 			assertRegistry: func(t *testing.T, fakeClient client.Client) {
 				t.Helper()
@@ -126,6 +127,7 @@ func TestMCPRegistryReconciler_Reconcile(t *testing.T) {
 				require.NoError(t, fakeClient.Get(t.Context(),
 					types.NamespacedName{Name: registryName, Namespace: registryNamespace}, &updated))
 				assert.Contains(t, updated.Finalizers, "mcpregistry.toolhive.stacklok.dev/finalizer")
+				assert.Equal(t, mcpv1beta1.MCPRegistryPhasePending, updated.Status.Phase)
 			},
 		},
 		{
