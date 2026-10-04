@@ -43,8 +43,9 @@ var _ = Describe("TimeStreamableHttpMcpServer", Label("proxy", "streamable-http"
 			By("Starting the time MCP server with streamable-http proxy")
 			e2e.NewTHVCommand(config, "run",
 				"--name", serverName,
+				"--transport", "stdio",
 				"--proxy-mode", "streamable-http",
-				"time").ExpectSuccess()
+				timeMCPServerImage).ExpectSuccess()
 
 			By("Waiting for the server to be running")
 			err := e2e.WaitForMCPServer(config, serverName, 60*time.Second)
