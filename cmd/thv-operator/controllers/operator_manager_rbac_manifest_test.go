@@ -6,6 +6,7 @@ package controllers
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -38,6 +39,8 @@ func TestOperatorClusterRoleManifestIncludesPodsDelete(t *testing.T) {
 	manifestPath := filepath.Join("..", "..", "..", "deploy", "charts", "operator", "templates", "clusterrole", "role.yaml")
 	content, err := os.ReadFile(manifestPath)
 	require.NoError(t, err)
+
+	content = regexp.MustCompile(`\{\{[^}]*\}\}`).ReplaceAll(content, []byte("operator"))
 
 	var manifest clusterRoleManifest
 	require.NoError(t, yaml.Unmarshal(content, &manifest))

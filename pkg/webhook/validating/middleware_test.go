@@ -444,7 +444,7 @@ func TestValidatingMiddleware_HTTP422AlwaysDenies(t *testing.T) {
 
 			reqBody := []byte(`{"jsonrpc":"2.0","method":"tools/call","id":1}`)
 			req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(reqBody))
-			ctx := context.WithValue(req.Context(), mcp.MCPRequestContextKey, &mcp.ParsedMCPRequest{Method: "tools/call", ID: 1})
+			ctx := context.WithValue(req.Context(), mcp.MCPRequestContextKey, &mcp.ParsedMCPRequest{Method: "tools/call", ID: 1, IsRequest: true})
 			req = req.WithContext(ctx)
 
 			var nextCalled bool

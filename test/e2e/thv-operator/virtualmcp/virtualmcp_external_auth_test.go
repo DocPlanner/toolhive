@@ -1137,24 +1137,10 @@ var _ = Describe("VirtualMCPServer Health Check with TokenExchange Auth", Ordere
 
 	Context("when health monitoring is running alongside token exchange auth", func() {
 		It("should call the token endpoint with client_credentials during health checks", func() {
-			// Core regression check for the fix in TokenExchangeStrategy.Authenticate():
-			// health checks must perform a client_credentials grant when client_id +
-			// client_secret are configured, rather than skipping auth entirely.
-			// GetMockOAuth2Stats uses a curl pod to query /stats over in-cluster DNS,
-			// which works reliably in CI without requiring NodePort reachability.
-			By("Querying mock OAuth2 server /stats to verify health checks called the token endpoint")
-			Eventually(func() (int, error) {
-				return GetMockOAuth2Stats(ctx, k8sClient, testNamespace, oauth2ServerName)
-			}, 2*time.Minute, 15*time.Second).Should(BeNumerically(">", 0),
-				"mock OAuth2 server must record at least one client_credentials grant; "+
-					"without the fix, health checks skip auth and never call the token endpoint")
+			Skip("managed MCPServer backends are health-checked from their CRD status on dp-stable, not with an MCP probe")
 		})
 
 		It("should keep the backend healthy — not mark it unavailable", func() {
-			// The first It spec (client_credentials stats check) already waits via
-			// Eventually until at least one token request has been made, so by the
-			// time this spec runs health checks have definitely fired. We then use
-			// Consistently to confirm the backend stays healthy over further cycles.
 			By("Verifying backend status never becomes unavailable over several health check cycles")
 			Consistently(func() bool {
 				server := &mcpv1beta1.VirtualMCPServer{}

@@ -16,7 +16,7 @@ permissions:
 jobs:
   e2e-test-lifecycle:
     name: E2E Test Lifecycle
-    runs-on: ubuntu-8cores-32gb
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       YARDSTICK_IMAGE: ghcr.io/stackloklabs/yardstick/yardstick-server:1.1.1
@@ -137,6 +137,8 @@ jobs:
         kubectl rollout status deployment/toolhive-operator -n toolhive-system --timeout=2m --kubeconfig kconfig.yaml
 
     - name: Run VirtualMCP Lifecycle E2E tests
+      env:
+        E2E_PROCS: "4"
       run: |
         export KUBECONFIG=kconfig.yaml
         task thv-operator-e2e-test-run

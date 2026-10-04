@@ -16,5 +16,5 @@ jobs:
         with:
           go-version: 'stable'
       - name: Install swag
-        run: go install github.com/swaggo/swag/v2/cmd/swag@latest
+        run: go install github.com/swaggo/swag/v2/cmd/swag@v2.0.0-rc5
       - run: ./cmd/help/verify.sh
