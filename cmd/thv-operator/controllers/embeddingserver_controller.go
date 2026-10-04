@@ -977,6 +977,12 @@ func (r *EmbeddingServerReconciler) updateEmbeddingServerStatus(
 		embedding.Status.Message = info.message
 	}
 
+	if cond := meta.FindStatusCondition(embedding.Status.Conditions, mcpv1beta1.ConditionPodTemplateValid); cond != nil &&
+		cond.Status == metav1.ConditionFalse {
+		embedding.Status.Phase = mcpv1beta1.EmbeddingServerPhaseFailed
+		embedding.Status.Message = cond.Message
+	}
+
 	err = r.Status().Update(ctx, embedding)
 	if err != nil {
 		ctxLogger.Error(err, "Failed to update EmbeddingServer status")
