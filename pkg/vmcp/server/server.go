@@ -122,6 +122,17 @@ const (
 
 var errSessionOwnerUnavailable = errors.New("session owner unavailable")
 
+const ownerForwardDialTimeout = 2 * time.Second
+
+func newOwnerForwardTransport() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{
+		Timeout:   ownerForwardDialTimeout,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	return transport
+}
+
 //go:generate mockgen -destination=mocks/mock_watcher.go -package=mocks -source=server.go Watcher
 
 // Watcher is the interface for Kubernetes backend watcher integration.
@@ -576,7 +587,7 @@ func New(
 		sessionManager:     sessionManager,
 		sessionDataStorage: sessionDataStorage,
 		sessionOwnerURL:    sessionOwnerURL,
-		ownerForwardClient: &http.Client{Transport: http.DefaultTransport},
+		ownerForwardClient: &http.Client{Transport: newOwnerForwardTransport()},
 		capabilityAdapter:  capabilityAdapter,
 		ready:              make(chan struct{}),
 		healthMonitor:      healthMon,
@@ -1724,7 +1735,7 @@ func (s *Server) handleOwnerUnavailable(r *http.Request) {
 	}
 
 	if err := s.vmcpSessionMgr.SetSessionMetadataValue(
-		r.Context(), sessionID, ms,
+		context.WithoutCancel(r.Context()), sessionID, ms,
 		sessiontypes.MetadataKeyOwnerURL,
 		s.sessionOwnerURL,
 	); err != nil {
