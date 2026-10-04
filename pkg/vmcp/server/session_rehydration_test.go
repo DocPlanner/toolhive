@@ -82,7 +82,7 @@ func (m *hydrationTestManager) GetAdaptedResources(string) ([]mcpserver.ServerRe
 	return m.resources, nil
 }
 
-func (m *hydrationTestManager) GetMultiSession(string) (vmcpsession.MultiSession, bool) {
+func (m *hydrationTestManager) GetMultiSession(context.Context, string) (vmcpsession.MultiSession, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.getMultiSessionCalls++

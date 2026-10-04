@@ -417,7 +417,7 @@ func (sm *Manager) RefreshSession(
 	}
 
 	unlock := sm.lockSessionMutation(sessionID)
-	current, ok := sm.GetMultiSession(sessionID)
+	current, ok := sm.GetMultiSession(ctx, sessionID)
 	if !ok {
 		unlock()
 		return nil, fmt.Errorf("Manager.RefreshSession: session %q not found or not a multi-session", sessionID)
@@ -724,17 +724,8 @@ func (sm *Manager) updateMetadata(sessionID string, metadata map[string]string) 
 // the Redis TTL). On a cache miss, the session is restored from storage via
 // factory.RestoreSession, enabling cross-pod session recovery when Redis is
 // used as the storage backend.
-//
-// Known limitation: GetMultiSession's signature is fixed by the
-// MultiSessionGetter interface and carries no context. Both the liveness
-// check and the restore path use context.Background() with per-operation
-// timeouts (restoreStorageTimeout / restoreSessionTimeout), so they are
-// bounded independently of any caller deadline. The caller's HTTP request
-// cancellation cannot propagate here.
-// TODO: add context propagation through MultiSessionGetter so the caller's
-// deadline can further bound these operations.
-func (sm *Manager) GetMultiSession(sessionID string) (vmcpsession.MultiSession, bool) {
-	return sm.sessions.Get(sessionID)
+func (sm *Manager) GetMultiSession(ctx context.Context, sessionID string) (vmcpsession.MultiSession, bool) {
+	return sm.sessions.Get(ctx, sessionID)
 }
 
 // checkSession is the liveness check supplied to sessions. It confirms the
@@ -749,8 +740,8 @@ func (sm *Manager) GetMultiSession(sessionID string) (vmcpsession.MultiSession, 
 // replacing the old session and its backend connections. This ensures that a
 // backend-expiry update written by pod A propagates to pod B on the next
 // cache access rather than waiting for natural TTL expiry.
-func (sm *Manager) checkSession(sessionID string) error {
-	checkCtx, cancel := context.WithTimeout(context.Background(), restoreStorageTimeout)
+func (sm *Manager) checkSession(ctx context.Context, sessionID string) error {
+	checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), restoreStorageTimeout)
 	defer cancel()
 	metadata, err := sm.storage.Load(checkCtx, sessionID)
 	if errors.Is(err, transportsession.ErrSessionNotFound) {
@@ -787,8 +778,8 @@ func (sm *Manager) checkSession(sessionID string) error {
 // loadSession is the restore function supplied to sessions. It loads session
 // metadata from storage and calls factory.RestoreSession to reconnect to
 // backends, returning the fully-formed MultiSession on success.
-func (sm *Manager) loadSession(sessionID string) (vmcpsession.MultiSession, error) {
-	loadCtx, loadCancel := context.WithTimeout(context.Background(), restoreStorageTimeout)
+func (sm *Manager) loadSession(ctx context.Context, sessionID string) (vmcpsession.MultiSession, error) {
+	loadCtx, loadCancel := context.WithTimeout(context.WithoutCancel(ctx), restoreStorageTimeout)
 	defer loadCancel()
 	metadata, loadErr := sm.storage.Load(loadCtx, sessionID)
 	if loadErr != nil {
@@ -818,7 +809,7 @@ func (sm *Manager) loadSession(sessionID string) (vmcpsession.MultiSession, erro
 		return nil, transportsession.ErrSessionNotFound
 	}
 
-	restoreCtx, restoreCancel := context.WithTimeout(context.Background(), restoreSessionTimeout)
+	restoreCtx, restoreCancel := context.WithTimeout(context.WithoutCancel(ctx), restoreSessionTimeout)
 	defer restoreCancel()
 	restored, restoreErr := sm.factory.RestoreSession(restoreCtx, sessionID, metadata, sm.listAllBackends(restoreCtx))
 	if restoreErr != nil {
@@ -839,7 +830,7 @@ func (sm *Manager) loadSession(sessionID string) (vmcpsession.MultiSession, erro
 	// that was concurrently deleted (Terminate / TTL expiry). A (false, nil)
 	// result means the key is already gone — treat it as not found so the
 	// cache never serves a session that no longer exists in storage.
-	updateCtx, updateCancel := context.WithTimeout(context.Background(), restoreMetadataWriteTimeout)
+	updateCtx, updateCancel := context.WithTimeout(context.WithoutCancel(ctx), restoreMetadataWriteTimeout)
 	defer updateCancel()
 	updated, updateErr := sm.storage.Update(updateCtx, sessionID, persistedMetadata(restored))
 	if updateErr != nil {
@@ -975,7 +966,7 @@ func (sm *Manager) SetSessionMetadataValue(
 // outside the mutation lock so it can safely call back into the manager.
 func (sm *Manager) DecorateSession(sessionID string, fn func(sessiontypes.MultiSession) sessiontypes.MultiSession) error {
 	unlock := sm.lockSessionMutation(sessionID)
-	sess, ok := sm.GetMultiSession(sessionID)
+	sess, ok := sm.GetMultiSession(context.Background(), sessionID)
 	unlock()
 	if !ok {
 		return fmt.Errorf("DecorateSession: session %q not found or not a multi-session", sessionID)
@@ -1088,7 +1079,7 @@ func cloneStringMap(src map[string]string) map[string]string {
 // Without an aggregator, raw backend tool names are used as-is (no overrides
 // or conflict resolution applied).
 func (sm *Manager) GetAdaptedTools(sessionID string) ([]mcpserver.ServerTool, error) {
-	multiSess, ok := sm.GetMultiSession(sessionID)
+	multiSess, ok := sm.GetMultiSession(context.Background(), sessionID)
 	if !ok {
 		return nil, fmt.Errorf("Manager.GetAdaptedTools: session %q not found or not a multi-session", sessionID)
 	}
@@ -1134,7 +1125,7 @@ func (sm *Manager) GetAdaptedTools(sessionID string) ([]mcpserver.ServerTool, er
 			meta := conversion.FromMCPMeta(req.Params.Meta)
 			caller, _ := auth.IdentityFromContext(ctx)
 
-			currentSess := sm.currentHandlerSession(capturedSessionID, capturedSess)
+			currentSess := sm.currentHandlerSession(ctx, capturedSessionID, capturedSess)
 			result, callErr := currentSess.CallTool(ctx, caller, capturedToolName, args, meta)
 			if callErr != nil {
 				if refreshed, ok := sm.refreshSessionForStaleBackend(ctx, capturedSessionID, "tool", capturedToolName, callErr); ok {
@@ -1181,7 +1172,7 @@ func (sm *Manager) GetAdaptedTools(sessionID string) ([]mcpserver.ServerTool, er
 // GetAdaptedResources returns SDK-format resources for the given session, with handlers
 // that delegate read requests directly to the session's ReadResource() method.
 func (sm *Manager) GetAdaptedResources(sessionID string) ([]mcpserver.ServerResource, error) {
-	multiSess, ok := sm.GetMultiSession(sessionID)
+	multiSess, ok := sm.GetMultiSession(context.Background(), sessionID)
 	if !ok {
 		return nil, fmt.Errorf("Manager.GetAdaptedResources: session %q not found or not a multi-session", sessionID)
 	}
@@ -1205,7 +1196,7 @@ func (sm *Manager) GetAdaptedResources(sessionID string) ([]mcpserver.ServerReso
 
 			caller, _ := auth.IdentityFromContext(ctx)
 
-			currentSess := sm.currentHandlerSession(capturedSessionID, capturedSess)
+			currentSess := sm.currentHandlerSession(ctx, capturedSessionID, capturedSess)
 			result, readErr := currentSess.ReadResource(ctx, caller, capturedResourceURI)
 			if readErr != nil {
 				if refreshed, ok := sm.refreshSessionForStaleBackend(ctx, capturedSessionID, "resource", capturedResourceURI, readErr); ok {
@@ -1245,7 +1236,7 @@ func (sm *Manager) GetAdaptedResources(sessionID string) ([]mcpserver.ServerReso
 // GetAdaptedPrompts returns SDK-format prompts for the given session, with handlers
 // that delegate prompt requests directly to the session's GetPrompt() method.
 func (sm *Manager) GetAdaptedPrompts(sessionID string) ([]mcpserver.ServerPrompt, error) {
-	multiSess, ok := sm.GetMultiSession(sessionID)
+	multiSess, ok := sm.GetMultiSession(context.Background(), sessionID)
 	if !ok {
 		return nil, fmt.Errorf("Manager.GetAdaptedPrompts: session %q not found or not a multi-session", sessionID)
 	}
@@ -1278,7 +1269,7 @@ func (sm *Manager) GetAdaptedPrompts(sessionID string) ([]mcpserver.ServerPrompt
 			for k, v := range req.Params.Arguments {
 				args[k] = v
 			}
-			currentSess := sm.currentHandlerSession(capturedSessionID, capturedSess)
+			currentSess := sm.currentHandlerSession(ctx, capturedSessionID, capturedSess)
 			result, getErr := currentSess.GetPrompt(ctx, caller, capturedPromptName, args)
 			if getErr != nil {
 				if refreshed, ok := sm.refreshSessionForStaleBackend(ctx, capturedSessionID, "prompt", capturedPromptName, getErr); ok {
@@ -1325,8 +1316,12 @@ func (sm *Manager) GetAdaptedPrompts(sessionID string) ([]mcpserver.ServerPrompt
 	return sdkPrompts, nil
 }
 
-func (sm *Manager) currentHandlerSession(sessionID string, fallback vmcpsession.MultiSession) vmcpsession.MultiSession {
-	current, ok := sm.GetMultiSession(sessionID)
+func (sm *Manager) currentHandlerSession(
+	ctx context.Context,
+	sessionID string,
+	fallback vmcpsession.MultiSession,
+) vmcpsession.MultiSession {
+	current, ok := sm.GetMultiSession(ctx, sessionID)
 	if ok && current != nil {
 		return current
 	}

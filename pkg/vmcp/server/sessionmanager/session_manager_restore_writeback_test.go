@@ -100,7 +100,7 @@ func TestSessionManager_LoadSessionPersistsRestoredMetadata(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		multiSess, ok := sm.GetMultiSession(sessionID)
+		multiSess, ok := sm.GetMultiSession(context.Background(), sessionID)
 		require.True(t, ok)
 		require.NotNil(t, multiSess)
 
@@ -129,7 +129,7 @@ func TestSessionManager_LoadSessionPersistsRestoredMetadata(t *testing.T) {
 		_, err = inner.Create(context.Background(), sessionID, map[string]string{sessiontypes.MetadataKeyTokenHash: ""})
 		require.NoError(t, err)
 
-		multiSess, ok := sm.GetMultiSession(sessionID)
+		multiSess, ok := sm.GetMultiSession(context.Background(), sessionID)
 		assert.False(t, ok)
 		assert.Nil(t, multiSess)
 	})
@@ -153,7 +153,7 @@ func TestSessionManager_LoadSessionPersistsRestoredMetadata(t *testing.T) {
 		_, err = inner.Create(context.Background(), sessionID, map[string]string{sessiontypes.MetadataKeyTokenHash: ""})
 		require.NoError(t, err)
 
-		multiSess, ok := sm.GetMultiSession(sessionID)
+		multiSess, ok := sm.GetMultiSession(context.Background(), sessionID)
 		assert.True(t, ok)
 		require.NotNil(t, multiSess)
 		assert.Equal(t, sessionID, multiSess.ID())
@@ -253,7 +253,7 @@ func TestSessionManager_TokenlessRestoreKeepsStoredBackendIDs(t *testing.T) {
 	_, err := storage.Create(context.Background(), tokenlessRestoreSessionID, fullStoredMetadata())
 	require.NoError(t, err)
 
-	first, ok := sm.GetMultiSession(tokenlessRestoreSessionID)
+	first, ok := sm.GetMultiSession(context.Background(), tokenlessRestoreSessionID)
 	require.True(t, ok)
 
 	stored, err := storage.Load(context.Background(), tokenlessRestoreSessionID)
@@ -263,7 +263,7 @@ func TestSessionManager_TokenlessRestoreKeepsStoredBackendIDs(t *testing.T) {
 	assert.Equal(t, "global-session-restored", stored[vmcpsession.MetadataKeyBackendSessionPrefix+"global"])
 	assert.NotContains(t, stored, metadataKeyRestoredFromBackendIDs)
 
-	second, ok := sm.GetMultiSession(tokenlessRestoreSessionID)
+	second, ok := sm.GetMultiSession(context.Background(), tokenlessRestoreSessionID)
 	require.True(t, ok)
 	assert.Same(t, first, second)
 }
@@ -288,10 +288,10 @@ func TestSessionManager_TokenlessRestoreOnOtherReplicaKeepsOwnerSession(t *testi
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = otherCleanup(context.Background()) })
 
-	_, ok := other.GetMultiSession(tokenlessRestoreSessionID)
+	_, ok := other.GetMultiSession(context.Background(), tokenlessRestoreSessionID)
 	require.True(t, ok)
 
-	ownerView, ok := owner.GetMultiSession(tokenlessRestoreSessionID)
+	ownerView, ok := owner.GetMultiSession(context.Background(), tokenlessRestoreSessionID)
 	require.True(t, ok)
 	assert.Same(t, vmcpsession.MultiSession(ownerSession), ownerView)
 }
@@ -306,7 +306,7 @@ func TestSessionManager_OwnershipClaimOnTokenlessRestoreKeepsStoredBackendIDs(t 
 	_, err := storage.Create(context.Background(), tokenlessRestoreSessionID, fullStoredMetadata())
 	require.NoError(t, err)
 
-	live, ok := sm.GetMultiSession(tokenlessRestoreSessionID)
+	live, ok := sm.GetMultiSession(context.Background(), tokenlessRestoreSessionID)
 	require.True(t, ok)
 	require.NoError(t, sm.SetSessionMetadataValue(context.Background(), tokenlessRestoreSessionID, live,
 		sessiontypes.MetadataKeyOwnerURL, "http://10.0.0.2:4483"))
@@ -336,7 +336,7 @@ func TestSessionManager_RefreshSessionNeverDowngradesBoundSession(t *testing.T) 
 		_, err := sm.RefreshSession(context.Background(), tokenlessRestoreSessionID)
 		require.ErrorIs(t, err, errRefreshWithoutCallerToken)
 
-		live, ok := sm.GetMultiSession(tokenlessRestoreSessionID)
+		live, ok := sm.GetMultiSession(context.Background(), tokenlessRestoreSessionID)
 		require.True(t, ok)
 		assert.Same(t, vmcpsession.MultiSession(restored), live)
 	})

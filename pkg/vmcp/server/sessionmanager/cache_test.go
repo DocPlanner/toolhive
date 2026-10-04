@@ -4,6 +4,7 @@
 package sessionmanager
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -24,7 +25,11 @@ func newStringCache(
 	check func(string) error,
 	evict func(string, string),
 ) *RestorableCache[string, string] {
-	return newRestorableCache(load, check, evict)
+	return newRestorableCache(
+		func(_ context.Context, key string) (string, error) { return load(key) },
+		func(_ context.Context, key string) error { return check(key) },
+		evict,
+	)
 }
 
 // alwaysAliveCheck returns a check function that always reports the entry as alive.
@@ -47,7 +52,7 @@ func TestRestorableCache_CacheMiss_CallsLoad(t *testing.T) {
 		nil,
 	)
 
-	v, ok := c.Get("k")
+	v, ok := c.Get(context.Background(), "k")
 	require.True(t, ok)
 	assert.Equal(t, "value-k", v)
 	assert.True(t, loaded)
@@ -66,8 +71,8 @@ func TestRestorableCache_CacheMiss_StoresResult(t *testing.T) {
 		nil,
 	)
 
-	c.Get("k") //nolint:errcheck
-	c.Get("k") //nolint:errcheck
+	c.Get(context.Background(), "k") //nolint:errcheck
+	c.Get(context.Background(), "k") //nolint:errcheck
 	assert.Equal(t, 1, calls, "load should be called only once after caching")
 }
 
@@ -81,7 +86,7 @@ func TestRestorableCache_CacheMiss_LoadError_ReturnsNotFound(t *testing.T) {
 		nil,
 	)
 
-	v, ok := c.Get("k")
+	v, ok := c.Get(context.Background(), "k")
 	assert.False(t, ok)
 	assert.Empty(t, v)
 }
@@ -98,10 +103,10 @@ func TestRestorableCache_CacheHit_AliveCheck_ReturnsCached(t *testing.T) {
 		alwaysAliveCheck,
 		nil,
 	)
-	c.Get("k") //nolint:errcheck // prime the cache
+	c.Get(context.Background(), "k") //nolint:errcheck // prime the cache
 
 	// Second Get should return cached value without calling load again.
-	v, ok := c.Get("k")
+	v, ok := c.Get(context.Background(), "k")
 	require.True(t, ok)
 	assert.Equal(t, "loaded-k", v)
 }
@@ -119,9 +124,9 @@ func TestRestorableCache_CacheHit_Expired_EvictsAndCallsOnEvict(t *testing.T) {
 			evictedVal = val
 		},
 	)
-	c.Get("k") //nolint:errcheck // prime the cache
+	c.Get(context.Background(), "k") //nolint:errcheck // prime the cache
 
-	v, ok := c.Get("k")
+	v, ok := c.Get(context.Background(), "k")
 	assert.False(t, ok)
 	assert.Empty(t, v)
 	assert.Equal(t, "k", evictedKey)
@@ -147,11 +152,11 @@ func TestRestorableCache_CacheHit_Expired_EntryRemovedFromCache(t *testing.T) {
 		nil,
 	)
 
-	c.Get("k") //nolint:errcheck // prime the cache; check returns alive
+	c.Get(context.Background(), "k") //nolint:errcheck // prime the cache; check returns alive
 	expired = true
-	c.Get("k") //nolint:errcheck // check returns ErrExpired → evict
+	c.Get(context.Background(), "k") //nolint:errcheck // check returns ErrExpired → evict
 	expired = false
-	c.Get("k") //nolint:errcheck // cache miss again → load called
+	c.Get(context.Background(), "k") //nolint:errcheck // cache miss again → load called
 
 	assert.Equal(t, 2, calls, "load should be called twice: initial + after eviction")
 }
@@ -164,9 +169,9 @@ func TestRestorableCache_CacheHit_TransientCheckError_ReturnsCached(t *testing.T
 		func(_ string) error { return errors.New("transient storage error") },
 		nil,
 	)
-	c.Get("k") //nolint:errcheck // prime the cache
+	c.Get(context.Background(), "k") //nolint:errcheck // prime the cache
 
-	v, ok := c.Get("k")
+	v, ok := c.Get(context.Background(), "k")
 	require.True(t, ok)
 	assert.Equal(t, "v", v, "transient check error should keep cached value")
 }
@@ -179,7 +184,7 @@ func TestRestorableCache_Sentinel_GetReturnsNotFound(t *testing.T) {
 	t.Parallel()
 
 	loadCalled := false
-	c := newRestorableCache(
+	c := newStringCache(
 		func(_ string) (string, error) {
 			loadCalled = true
 			return "", errors.New("should not be called")
@@ -190,7 +195,7 @@ func TestRestorableCache_Sentinel_GetReturnsNotFound(t *testing.T) {
 
 	c.Store("k", testSentinel{})
 
-	v, ok := c.Get("k")
+	v, ok := c.Get(context.Background(), "k")
 	assert.False(t, ok, "sentinel should not satisfy type assertion to V")
 	assert.Empty(t, v)
 	assert.False(t, loadCalled, "load should not be called when a sentinel is present")
@@ -199,7 +204,7 @@ func TestRestorableCache_Sentinel_GetReturnsNotFound(t *testing.T) {
 func TestRestorableCache_Peek_ReturnsSentinel(t *testing.T) {
 	t.Parallel()
 
-	c := newRestorableCache(
+	c := newStringCache(
 		func(string) (string, error) { return "", nil },
 		alwaysAliveCheck,
 		nil,
@@ -225,7 +230,7 @@ func TestRestorableCache_Sentinel_StoredDuringLoad(t *testing.T) {
 	sentinelReady := make(chan struct{})
 	loadStarted := make(chan struct{})
 
-	c := newRestorableCache(
+	c := newStringCache(
 		func(_ string) (string, error) {
 			// Signal that load has started, then wait for the sentinel to be stored.
 			close(loadStarted)
@@ -243,7 +248,7 @@ func TestRestorableCache_Sentinel_StoredDuringLoad(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		v, ok := c.Get("k")
+		v, ok := c.Get(context.Background(), "k")
 		// The sentinel should have blocked the store; Get returns not-found.
 		assert.False(t, ok)
 		assert.Empty(t, v)
@@ -284,7 +289,7 @@ func TestRestorableCache_Sentinel_BlocksRestoreViaInitialHit(t *testing.T) {
 	t.Parallel()
 
 	loadCalled := false
-	c := newRestorableCache(
+	c := newStringCache(
 		func(_ string) (string, error) {
 			loadCalled = true
 			return "loaded", nil
@@ -297,7 +302,7 @@ func TestRestorableCache_Sentinel_BlocksRestoreViaInitialHit(t *testing.T) {
 	// returns (zero, false) without entering the singleflight group.
 	c.Store("k", testSentinel{})
 
-	v, ok := c.Get("k")
+	v, ok := c.Get(context.Background(), "k")
 	assert.False(t, ok, "Get must return not-found when sentinel is present")
 	assert.Empty(t, v)
 	assert.False(t, loadCalled, "load must not be called when a sentinel is in the cache")
@@ -328,7 +333,7 @@ func TestRestorableCache_CompareAndSwap_Success(t *testing.T) {
 		alwaysAliveCheck,
 		nil,
 	)
-	c.Get("k") //nolint:errcheck // prime with "v1"
+	c.Get(context.Background(), "k") //nolint:errcheck // prime with "v1"
 
 	swapped := c.CompareAndSwap("k", "v1", "v2")
 	require.True(t, swapped)
@@ -346,7 +351,7 @@ func TestRestorableCache_CompareAndSwap_WrongOld_Fails(t *testing.T) {
 		alwaysAliveCheck,
 		nil,
 	)
-	c.Get("k") //nolint:errcheck
+	c.Get(context.Background(), "k") //nolint:errcheck
 
 	swapped := c.CompareAndSwap("k", "wrong", "v2")
 	assert.False(t, swapped)
@@ -364,7 +369,7 @@ func TestRestorableCache_Delete_RemovesEntry(t *testing.T) {
 		alwaysAliveCheck,
 		nil,
 	)
-	c.Get("k") //nolint:errcheck
+	c.Get(context.Background(), "k") //nolint:errcheck
 
 	c.Delete("k")
 
@@ -407,7 +412,7 @@ func TestRestorableCache_Singleflight_ReCheckReturnsPreStoredValue(t *testing.T)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		result, ok = c.Get("k")
+		result, ok = c.Get(context.Background(), "k")
 	}()
 
 	// Store the value externally to simulate a concurrent writer, then release
@@ -459,7 +464,7 @@ func TestRestorableCache_Singleflight_DeduplicatesConcurrentMisses(t *testing.T)
 		go func(i int) {
 			defer wg.Done()
 			allStarted.Done() // signal: about to call Get
-			results[i], oks[i] = c.Get("k")
+			results[i], oks[i] = c.Get(context.Background(), "k")
 		}(i)
 	}
 
