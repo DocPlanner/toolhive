@@ -345,6 +345,8 @@ func TestHandleRemoteAuthentication(t *testing.T) {
 }
 
 func TestNewTransportSessionStorage(t *testing.T) {
+	t.Parallel()
+
 	t.Run("returns nil when scaling config is absent", func(t *testing.T) {
 		t.Parallel()
 
@@ -361,17 +363,14 @@ func TestNewTransportSessionStorage(t *testing.T) {
 		assert.Nil(t, storage)
 	})
 
-	t.Run("uses redis storage when configured", func(t *testing.T) {
-		mr := miniredis.RunT(t)
-		mr.RequireUserAuth("toolhive-sessions", "topsecret")
+	t.Run("defaults the key prefix when unset", func(t *testing.T) {
+		t.Parallel()
 
-		t.Setenv(vmcpconfig.RedisUsernameEnvVar, "toolhive-sessions")
-		t.Setenv(vmcpconfig.RedisPasswordEnvVar, "topsecret")
+		mr := miniredis.RunT(t)
 
 		storage, err := newTransportSessionStorage(context.Background(), &ScalingConfig{
 			SessionRedis: &SessionRedisConfig{
-				Address:   mr.Addr(),
-				KeyPrefix: "test:mcp:",
+				Address: mr.Addr(),
 			},
 		})
 		require.NoError(t, err)
@@ -379,8 +378,8 @@ func TestNewTransportSessionStorage(t *testing.T) {
 			_ = storage.Close()
 		})
 
-		_, ok := storage.(*transportsession.RedisStorage)
-		assert.True(t, ok)
+		require.NoError(t, storage.Store(context.Background(), transportsession.NewProxySession("default-prefix")))
+		assert.True(t, mr.Exists(defaultProxySessionKeyPrefix+"default-prefix"), "keys: %v", mr.Keys())
 	})
 
 	t.Run("returns error for invalid redis config", func(t *testing.T) {
@@ -388,13 +387,36 @@ func TestNewTransportSessionStorage(t *testing.T) {
 
 		storage, err := newTransportSessionStorage(context.Background(), &ScalingConfig{
 			SessionRedis: &SessionRedisConfig{
-				Address: "localhost:6379",
+				Address:   "localhost:6379",
+				KeyPrefix: "missing-trailing-colon",
 			},
 		})
 		require.Error(t, err)
 		assert.Nil(t, storage)
 		assert.Contains(t, err.Error(), "creating redis session storage")
 	})
+}
+
+func TestNewTransportSessionStorage_UsesRedisCredentials(t *testing.T) {
+	mr := miniredis.RunT(t)
+	mr.RequireUserAuth("toolhive-sessions", "topsecret")
+
+	t.Setenv(vmcpconfig.RedisUsernameEnvVar, "toolhive-sessions")
+	t.Setenv(vmcpconfig.RedisPasswordEnvVar, "topsecret")
+
+	storage, err := newTransportSessionStorage(context.Background(), &ScalingConfig{
+		SessionRedis: &SessionRedisConfig{
+			Address:   mr.Addr(),
+			KeyPrefix: "test:mcp:",
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = storage.Close()
+	})
+
+	_, ok := storage.(*transportsession.RedisStorage)
+	assert.True(t, ok)
 }
 
 // mockMiddlewareImpl is a mock implementation of the types.Middleware interface
