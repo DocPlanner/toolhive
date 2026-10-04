@@ -644,7 +644,7 @@ func TestSessionManager_Validate(t *testing.T) {
 			assert.False(t, isTerminated)
 		}
 
-		_, ok := sm.GetMultiSession(sessionID)
+		_, ok := sm.GetMultiSession(context.Background(), sessionID)
 		assert.True(t, ok, "validated session should remain in the node-local cache")
 	})
 }
@@ -716,7 +716,7 @@ func TestSessionManager_RefreshSession(t *testing.T) {
 		require.NotNil(t, refreshed)
 		assert.Equal(t, sessionID, refreshed.ID())
 
-		stored, ok := sm.GetMultiSession(sessionID)
+		stored, ok := sm.GetMultiSession(context.Background(), sessionID)
 		require.True(t, ok)
 
 		identityProvider, ok := stored.(sessiontypes.CreatorIdentityProvider)
@@ -760,7 +760,7 @@ func TestSessionManager_ReplaceSession(t *testing.T) {
 		err := sm.ReplaceSession(context.Background(), sessionID, original, replacement)
 		require.NoError(t, err)
 
-		stored, ok := sm.GetMultiSession(sessionID)
+		stored, ok := sm.GetMultiSession(context.Background(), sessionID)
 		require.True(t, ok)
 		assert.Same(t, replacement, stored)
 
@@ -788,7 +788,7 @@ func TestSessionManager_ReplaceSession(t *testing.T) {
 
 		_, loadErr := storage.Load(context.Background(), sessionID)
 		assert.ErrorIs(t, loadErr, transportsession.ErrSessionNotFound)
-		_, ok := sm.GetMultiSession(sessionID)
+		_, ok := sm.GetMultiSession(context.Background(), sessionID)
 		assert.False(t, ok)
 	})
 }
@@ -1013,7 +1013,7 @@ func TestSessionManager_GetMultiSession(t *testing.T) {
 		registry := newFakeRegistry()
 		sm, _ := newTestSessionManager(t, factory, registry)
 
-		multiSess, ok := sm.GetMultiSession("ghost")
+		multiSess, ok := sm.GetMultiSession(context.Background(), "ghost")
 		assert.False(t, ok)
 		assert.Nil(t, multiSess)
 	})
@@ -1031,7 +1031,7 @@ func TestSessionManager_GetMultiSession(t *testing.T) {
 		require.NotEmpty(t, sessionID)
 
 		// Placeholder has not been upgraded yet.
-		multiSess, ok := sm.GetMultiSession(sessionID)
+		multiSess, ok := sm.GetMultiSession(context.Background(), sessionID)
 		assert.False(t, ok, "placeholder should not satisfy MultiSession type assertion")
 		assert.Nil(t, multiSess)
 	})
@@ -1058,7 +1058,7 @@ func TestSessionManager_GetMultiSession(t *testing.T) {
 		_, err := sm.CreateSession(context.Background(), sessionID)
 		require.NoError(t, err)
 
-		multiSess, ok := sm.GetMultiSession(sessionID)
+		multiSess, ok := sm.GetMultiSession(context.Background(), sessionID)
 		require.True(t, ok)
 		require.NotNil(t, multiSess)
 		assert.Equal(t, sessionID, multiSess.ID())
@@ -1085,7 +1085,7 @@ func TestSessionManager_GetMultiSession(t *testing.T) {
 		require.NoError(t, sm.storage.Upsert(context.Background(), sessionID, map[string]string{}))
 
 		// loadSession detects absent MetadataKeyTokenHash → ErrSessionNotFound.
-		multiSess, ok := sm.GetMultiSession(sessionID)
+		multiSess, ok := sm.GetMultiSession(context.Background(), sessionID)
 		assert.False(t, ok, "placeholder should not be restorable")
 		assert.Nil(t, multiSess)
 	})
@@ -1119,7 +1119,7 @@ func TestSessionManager_GetMultiSession(t *testing.T) {
 		require.NoError(t, sm.storage.Upsert(context.Background(), sessionID, initializedMeta))
 
 		// loadSession should call RestoreSession, not treat it as a placeholder.
-		multiSess, ok := sm.GetMultiSession(sessionID)
+		multiSess, ok := sm.GetMultiSession(context.Background(), sessionID)
 		require.True(t, ok, "initialized zero-backend session should be restorable")
 		require.NotNil(t, multiSess)
 		assert.Equal(t, sessionID, multiSess.ID())
@@ -1154,7 +1154,7 @@ func TestSessionManager_GetMultiSession(t *testing.T) {
 		}
 		require.NoError(t, sm.storage.Upsert(context.Background(), sessionID, legacyMeta))
 
-		multiSess, ok := sm.GetMultiSession(sessionID)
+		multiSess, ok := sm.GetMultiSession(context.Background(), sessionID)
 		require.True(t, ok, "legacy record without MetadataKeyBackendIDs must still be restorable")
 		require.NotNil(t, multiSess)
 		assert.Equal(t, sessionID, multiSess.ID())
@@ -2233,7 +2233,7 @@ func TestSessionManager_DecorateSession(t *testing.T) {
 		require.NoError(t, err)
 
 		// After decoration, GetMultiSession returns the decorated session with both tools.
-		multiSess, ok := sm.GetMultiSession(sessionID)
+		multiSess, ok := sm.GetMultiSession(context.Background(), sessionID)
 		require.True(t, ok)
 		require.Len(t, multiSess.Tools(), 2)
 		assert.Equal(t, "hello", multiSess.Tools()[0].Name)
@@ -2284,7 +2284,7 @@ func TestSessionManager_DecorateSession(t *testing.T) {
 		assert.Contains(t, err.Error(), "was terminated or concurrently modified")
 
 		// The session must not be resurrected.
-		_, ok := sm.GetMultiSession(sessionID)
+		_, ok := sm.GetMultiSession(context.Background(), sessionID)
 		assert.False(t, ok, "terminated session must not be resurrected by DecorateSession")
 	})
 }
@@ -2315,7 +2315,7 @@ func TestSessionManager_CheckSession(t *testing.T) {
 		sessionID := "alive-session"
 		require.NoError(t, storage.Upsert(context.Background(), sessionID, map[string]string{}))
 
-		err := sm.checkSession(sessionID)
+		err := sm.checkSession(context.Background(), sessionID)
 		assert.NoError(t, err, "alive session must return nil")
 	})
 
@@ -2323,7 +2323,7 @@ func TestSessionManager_CheckSession(t *testing.T) {
 		t.Parallel()
 		sm, _ := newTestSessionManager(t, makeFactory(t), newFakeRegistry())
 
-		err := sm.checkSession("nonexistent-session")
+		err := sm.checkSession(context.Background(), "nonexistent-session")
 		assert.ErrorIs(t, err, ErrExpired, "deleted session must return ErrExpired")
 	})
 
@@ -2338,7 +2338,7 @@ func TestSessionManager_CheckSession(t *testing.T) {
 			MetadataKeyTerminated: MetadataValTrue,
 		}))
 
-		err := sm.checkSession(sessionID)
+		err := sm.checkSession(context.Background(), sessionID)
 		assert.ErrorIs(t, err, ErrExpired, "terminated session must return ErrExpired")
 	})
 
@@ -2365,7 +2365,7 @@ func TestSessionManager_CheckSession(t *testing.T) {
 		}).AnyTimes()
 		sm.sessions.Store(sessionID, cached)
 
-		err := sm.checkSession(sessionID)
+		err := sm.checkSession(context.Background(), sessionID)
 		assert.ErrorIs(t, err, ErrExpired,
 			"stale backend list must return ErrExpired to trigger cross-pod eviction")
 	})
@@ -2386,7 +2386,7 @@ func TestSessionManager_CheckSession(t *testing.T) {
 		}).AnyTimes()
 		sm.sessions.Store(sessionID, cached)
 
-		err := sm.checkSession(sessionID)
+		err := sm.checkSession(context.Background(), sessionID)
 		assert.NoError(t, err, "matching backend list must return nil")
 	})
 
@@ -2406,7 +2406,7 @@ func TestSessionManager_CheckSession(t *testing.T) {
 		cached.EXPECT().GetMetadata().Return(map[string]string{}).AnyTimes()
 		sm.sessions.Store(sessionID, cached)
 
-		err := sm.checkSession(sessionID)
+		err := sm.checkSession(context.Background(), sessionID)
 		assert.NoError(t, err, "absent MetadataKeyBackendIDs in cache must not cause eviction")
 	})
 }

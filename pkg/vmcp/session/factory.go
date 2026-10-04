@@ -625,13 +625,15 @@ func (f *defaultMultiSessionFactory) RestoreSession(
 	// Filter allBackends to the subset originally connected in this session.
 	filteredBackends := filterBackendsByStoredIDs(allBackends, storedBackendIDs)
 
-	// Reconstruct a minimal identity from stored metadata. The original bearer
-	// token is never persisted (only its HMAC-SHA256 hash is), so Token is empty.
-	// The security decorator is restored from the stored hash/salt below.
 	var identity *auth.Identity
-	if subject := storedMetadata[MetadataKeyIdentitySubject]; subject != "" {
-		identity = &auth.Identity{}
-		identity.Subject = subject
+	if caller, ok := auth.IdentityFromContext(ctx); ok && ownsStoredSession(caller, storedMetadata) {
+		identity = caller
+	} else {
+		ctx = context.WithValue(ctx, auth.IdentityContextKey{}, (*auth.Identity)(nil))
+		if subject := storedMetadata[MetadataKeyIdentitySubject]; subject != "" {
+			identity = &auth.Identity{}
+			identity.Subject = subject
+		}
 	}
 
 	// Extract stored per-backend session IDs as hints so each backend can
@@ -686,6 +688,14 @@ func (f *defaultMultiSessionFactory) RestoreSession(
 		return nil, fmt.Errorf("RestoreSession: failed to restore hijack prevention: %w", err)
 	}
 	return restored, nil
+}
+
+func ownsStoredSession(caller *auth.Identity, storedMetadata map[string]string) bool {
+	if caller == nil || caller.Token == "" || caller.Subject == "" {
+		return false
+	}
+	return storedMetadata[sessiontypes.MetadataKeyTokenHash] != "" &&
+		caller.Subject == storedMetadata[MetadataKeyIdentitySubject]
 }
 
 // filterBackendsByStoredIDs returns the subset of allBackends whose ID appears in

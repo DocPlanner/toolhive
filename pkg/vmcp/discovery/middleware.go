@@ -42,7 +42,7 @@ const (
 // Returns (nil, false) if the session does not exist or has not yet been initialized.
 // This interface decouples the discovery middleware from the concrete session manager.
 type MultiSessionGetter interface {
-	GetMultiSession(sessionID string) (vmcpsession.MultiSession, bool)
+	GetMultiSession(ctx context.Context, sessionID string) (vmcpsession.MultiSession, bool)
 }
 
 // middlewareConfig holds optional configuration for Middleware.
@@ -238,7 +238,7 @@ func handleSubsequentRequest(
 	// not exist yet or is still a placeholder (CreateSession not yet complete). In either
 	// case, skip capability injection and let the SDK validate/reject the request — the
 	// SDK's own SessionIdManager.Validate() returns 404 for unknown session IDs.
-	multiSess, ok := multiSessionGetter.GetMultiSession(sessionID)
+	multiSess, ok := multiSessionGetter.GetMultiSession(ctx, sessionID)
 	if !ok {
 		//nolint:gosec // G706: session ID is not an injection vector
 		slog.Debug("session not found or still initialising, skipping capability injection",

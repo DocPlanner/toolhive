@@ -36,7 +36,7 @@ func newStubMultiSessionGetter() *stubMultiSessionGetter {
 	return &stubMultiSessionGetter{sessions: make(map[string]vmcpsession.MultiSession)}
 }
 
-func (s *stubMultiSessionGetter) GetMultiSession(sessionID string) (vmcpsession.MultiSession, bool) {
+func (s *stubMultiSessionGetter) GetMultiSession(_ context.Context, sessionID string) (vmcpsession.MultiSession, bool) {
 	sess, ok := s.sessions[sessionID]
 	return sess, ok
 }

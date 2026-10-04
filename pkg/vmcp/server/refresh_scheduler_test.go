@@ -129,7 +129,7 @@ type refreshTestManager struct {
 	sessions map[string]sessiontypes.MultiSession
 }
 
-func (m *refreshTestManager) GetMultiSession(sessionID string) (vmcpsession.MultiSession, bool) {
+func (m *refreshTestManager) GetMultiSession(_ context.Context, sessionID string) (vmcpsession.MultiSession, bool) {
 	sess, ok := m.sessions[sessionID]
 	return sess, ok
 }

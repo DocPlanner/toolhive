@@ -77,7 +77,7 @@ func (*registrationContextRecordingManager) GetAdaptedResources(string) ([]mcpse
 	return nil, nil
 }
 
-func (*registrationContextRecordingManager) GetMultiSession(string) (vmcpsession.MultiSession, bool) {
+func (*registrationContextRecordingManager) GetMultiSession(context.Context, string) (vmcpsession.MultiSession, bool) {
 	return nil, false
 }
 
