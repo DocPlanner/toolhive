@@ -431,6 +431,10 @@ func (sm *Manager) RefreshSession(
 
 	identity := identityProvider.CreatorIdentity()
 	allowAnonymous := sessiontypes.ShouldAllowAnonymous(identity)
+	if allowAnonymous && isBoundSession(current) {
+		unlock()
+		return nil, fmt.Errorf("Manager.RefreshSession: session %q: %w", sessionID, errRefreshWithoutCallerToken)
+	}
 	unlock()
 
 	backends := sm.currentEligibleBackends(ctx)
@@ -766,10 +770,13 @@ func (sm *Manager) checkSession(sessionID string) error {
 	// test mocks that return an empty metadata map).
 	if raw, ok := sm.sessions.Peek(sessionID); ok {
 		if sess, ok := raw.(vmcpsession.MultiSession); ok {
-			if cachedIDs, present := sess.GetMetadata()[vmcpsession.MetadataKeyBackendIDs]; present {
-				if cachedIDs != metadata[vmcpsession.MetadataKeyBackendIDs] {
-					return ErrExpired
-				}
+			cachedMetadata := sess.GetMetadata()
+			cachedIDs, present := cachedMetadata[vmcpsession.MetadataKeyBackendIDs]
+			if restoredFrom, restored := cachedMetadata[metadataKeyRestoredFromBackendIDs]; restored {
+				cachedIDs, present = restoredFrom, true
+			}
+			if present && cachedIDs != metadata[vmcpsession.MetadataKeyBackendIDs] {
+				return ErrExpired
 			}
 		}
 	}
@@ -820,6 +827,8 @@ func (sm *Manager) loadSession(sessionID string) (vmcpsession.MultiSession, erro
 		return nil, restoreErr
 	}
 
+	keepStoredBackendIDs(restored, metadata)
+
 	// Persist the restored session's metadata back to Redis so that
 	// per-backend session IDs are kept current. Backends that do not honor
 	// Mcp-Session-Id hints (e.g. SSE transports) assign a fresh ID on every
@@ -832,7 +841,7 @@ func (sm *Manager) loadSession(sessionID string) (vmcpsession.MultiSession, erro
 	// cache never serves a session that no longer exists in storage.
 	updateCtx, updateCancel := context.WithTimeout(context.Background(), restoreMetadataWriteTimeout)
 	defer updateCancel()
-	updated, updateErr := sm.storage.Update(updateCtx, sessionID, restored.GetMetadata())
+	updated, updateErr := sm.storage.Update(updateCtx, sessionID, persistedMetadata(restored))
 	if updateErr != nil {
 		slog.Warn("Manager.loadSession: failed to persist restored session metadata",
 			"session_id", sessionID, "error", updateErr)
@@ -864,7 +873,7 @@ func (sm *Manager) StoreSession(session vmcpsession.MultiSession) error {
 	defer unlock()
 	storeCtx, cancel := context.WithTimeout(context.Background(), createSessionStorageTimeout)
 	defer cancel()
-	if err := sm.storage.Upsert(storeCtx, session.ID(), session.GetMetadata()); err != nil {
+	if err := sm.storage.Upsert(storeCtx, session.ID(), persistedMetadata(session)); err != nil {
 		return fmt.Errorf("StoreSession: failed to store session: %w", err)
 	}
 	sm.sessions.Store(session.ID(), session)
@@ -944,7 +953,7 @@ func (sm *Manager) SetSessionMetadataValue(
 		return fmt.Errorf("SetSessionMetadataValue: session %q was concurrently replaced", sessionID)
 	}
 
-	metadata := cloneStringMap(current.GetMetadata())
+	metadata := persistedMetadata(current)
 	metadata[key] = value
 
 	storeCtx, storeCancel := context.WithTimeout(ctx, createSessionStorageTimeout)
@@ -1000,7 +1009,7 @@ func (sm *Manager) replaceSessionLocked(
 
 	storeCtx, storeCancel := context.WithTimeout(ctx, createSessionStorageTimeout)
 	defer storeCancel()
-	if err := sm.storage.Upsert(storeCtx, sessionID, replacement.GetMetadata()); err != nil {
+	if err := sm.storage.Upsert(storeCtx, sessionID, persistedMetadata(replacement)); err != nil {
 		sm.sessions.Store(sessionID, current)
 		return fmt.Errorf("failed to store replacement session metadata: %w", err)
 	}
@@ -1020,6 +1029,40 @@ func sessionMutationStripeIndex(sessionID string) int {
 		hash *= 16777619
 	}
 	return int(hash % sessionMutationStripeCount)
+}
+
+var errRefreshWithoutCallerToken = errors.New("bound session has no caller token to rebuild its backends with")
+
+const metadataKeyRestoredFromBackendIDs = "vmcp.session.restored_from_backend_ids"
+
+func isBoundSession(sess vmcpsession.MultiSession) bool {
+	return sess.GetMetadata()[sessiontypes.MetadataKeyTokenHash] != ""
+}
+
+func keepStoredBackendIDs(restored vmcpsession.MultiSession, stored map[string]string) {
+	storedIDs := stored[vmcpsession.MetadataKeyBackendIDs]
+	restoredMetadata := restored.GetMetadata()
+	if restoredMetadata[vmcpsession.MetadataKeyBackendIDs] == storedIDs {
+		return
+	}
+	restored.SetMetadata(metadataKeyRestoredFromBackendIDs, storedIDs)
+	for key, value := range stored {
+		if !strings.HasPrefix(key, vmcpsession.MetadataKeyBackendSessionPrefix) {
+			continue
+		}
+		if _, present := restoredMetadata[key]; !present {
+			restored.SetMetadata(key, value)
+		}
+	}
+}
+
+func persistedMetadata(sess vmcpsession.MultiSession) map[string]string {
+	metadata := cloneStringMap(sess.GetMetadata())
+	if storedIDs, restored := metadata[metadataKeyRestoredFromBackendIDs]; restored {
+		metadata[vmcpsession.MetadataKeyBackendIDs] = storedIDs
+		delete(metadata, metadataKeyRestoredFromBackendIDs)
+	}
+	return metadata
 }
 
 func cloneStringMap(src map[string]string) map[string]string {

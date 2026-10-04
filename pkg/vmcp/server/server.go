@@ -2169,7 +2169,7 @@ func (s *Server) targetSessionsForRefresh(
 		contains := sessionContainsBackend(multiSess, backendID)
 		switch mode {
 		case refreshSessionsLackingBackend:
-			if contains {
+			if contains || !canRebuildInBackground(multiSess) {
 				return true
 			}
 		case refreshSessionsContainingBackend:
@@ -2190,6 +2190,17 @@ func (s *Server) targetSessionsForRefresh(
 			"backend_id", backendID, "count", stale)
 	}
 	return targets
+}
+
+func canRebuildInBackground(sess sessiontypes.MultiSession) bool {
+	if sess.GetMetadata()[sessiontypes.MetadataKeyTokenHash] == "" {
+		return true
+	}
+	provider, ok := sess.(sessiontypes.CreatorIdentityProvider)
+	if !ok {
+		return false
+	}
+	return !sessiontypes.ShouldAllowAnonymous(provider.CreatorIdentity())
 }
 
 func sessionContainsBackend(sess sessiontypes.MultiSession, backendID string) bool {
