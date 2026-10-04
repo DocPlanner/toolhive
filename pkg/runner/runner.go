@@ -42,6 +42,8 @@ import (
 // ErrContainerExitedRestartNeeded is returned when a container exits and needs to be restarted
 var ErrContainerExitedRestartNeeded = errors.New("container exited, restart needed")
 
+const defaultProxySessionKeyPrefix = "thv:proxy:session:"
+
 // Runner is responsible for running an MCP server with the provided configuration
 type Runner struct {
 	// Config is the configuration for the runner
@@ -123,12 +125,17 @@ func newTransportSessionStorage(
 		return nil, nil
 	}
 
+	keyPrefix := scalingConfig.SessionRedis.KeyPrefix
+	if keyPrefix == "" {
+		keyPrefix = defaultProxySessionKeyPrefix
+	}
+
 	redisCfg := transportsession.RedisConfig{
 		Addr:      scalingConfig.SessionRedis.Address,
 		Username:  os.Getenv(vmcpconfig.RedisUsernameEnvVar),
 		Password:  os.Getenv(vmcpconfig.RedisPasswordEnvVar),
 		DB:        int(scalingConfig.SessionRedis.DB),
-		KeyPrefix: scalingConfig.SessionRedis.KeyPrefix,
+		KeyPrefix: keyPrefix,
 	}
 
 	storage, err := transportsession.NewRedisStorage(ctx, redisCfg, transportsession.ResolveSessionTTLFromEnv())
