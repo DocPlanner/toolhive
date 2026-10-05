@@ -6,6 +6,7 @@ package v1beta1
 import (
 	"fmt"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
@@ -14,6 +15,10 @@ import (
 )
 
 // VirtualMCPServerSpec defines the desired state of VirtualMCPServer
+//
+// +kubebuilder:validation:XValidation:rule="!has(self.config) || !has(self.config.rateLimiting) || (has(self.sessionStorage) && self.sessionStorage.provider == 'redis')",message="config.rateLimiting requires sessionStorage with provider 'redis'"
+// +kubebuilder:validation:XValidation:rule="!(has(self.config) && has(self.config.rateLimiting) && has(self.config.rateLimiting.perUser)) || (has(self.incomingAuth) && self.incomingAuth.type == 'oidc')",message="config.rateLimiting.perUser requires incomingAuth.type oidc"
+// +kubebuilder:validation:XValidation:rule="!has(self.config) || !has(self.config.rateLimiting) || !has(self.config.rateLimiting.tools) || self.config.rateLimiting.tools.all(t, !has(t.perUser)) || (has(self.incomingAuth) && self.incomingAuth.type == 'oidc')",message="per-tool perUser rate limiting requires incomingAuth.type oidc"
 //
 //nolint:lll // CEL validation rules exceed line length limit
 type VirtualMCPServerSpec struct {
@@ -107,6 +112,41 @@ type VirtualMCPServerSpec struct {
 	// When nil, no session storage is configured.
 	// +optional
 	SessionStorage *SessionStorageConfig `json:"sessionStorage,omitempty"`
+
+	// ImagePullSecrets allows specifying image pull secrets for the vMCP workload.
+	// These are applied to both the vMCP Deployment's PodSpec.ImagePullSecrets
+	// and to the operator-managed ServiceAccount the vMCP server runs as, so private
+	// images are pullable through either path.
+	//
+	// Merge semantics with PodTemplateSpec:
+	// The deployed PodSpec.ImagePullSecrets is the Kubernetes-native strategic-merge
+	// union of this field and spec.podTemplateSpec.spec.imagePullSecrets, merged by
+	// the patchStrategy:"merge" / patchMergeKey:"name" tags on corev1.PodSpec.
+	//   - This field is rendered first as the controller-generated default.
+	//   - spec.podTemplateSpec.spec.imagePullSecrets is then strategic-merge-patched
+	//     on top, keyed by Name. Distinct names from the two sources are unioned in
+	//     the resulting list; entries with the same Name are deduplicated and the
+	//     PodTemplateSpec entry wins on overlap (user override).
+	//   - Order in the resulting list is not guaranteed and should not be relied on:
+	//     strategic merge by name is order-insensitive.
+	//   - The operator-managed ServiceAccount's imagePullSecrets list is populated
+	//     ONLY from this field. spec.podTemplateSpec.spec.imagePullSecrets does not
+	//     reach the ServiceAccount because PodTemplateSpec has no notion of a
+	//     ServiceAccount. To make a secret usable via the ServiceAccount path
+	//     (e.g. for sidecars or init containers that pull images independently),
+	//     list it here rather than under spec.podTemplateSpec.
+	//
+	// Note on cross-CRD consistency:
+	// MCPRegistry currently uses an atomic-replace strategy for its imagePullSecrets
+	// (the user-provided value replaces the controller-generated list rather than
+	// being merged on top). VirtualMCPServer follows the Kubernetes-native
+	// strategic-merge-by-name behavior described above. Aligning the two is tracked
+	// as a separate follow-up; until then, manifests that set imagePullSecrets on
+	// both CRDs will see different override behavior between them.
+	//
+	// +listType=atomic
+	// +optional
+	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
 }
 
 // EmbeddingServerRef references an existing EmbeddingServer resource by name.
@@ -280,6 +320,12 @@ const (
 	// ConditionTypeAuthServerConfigValidated indicates whether the AuthServerConfig has been validated
 	ConditionTypeAuthServerConfigValidated = "AuthServerConfigValidated"
 
+	// ConditionTypeAuthzUpstreamSelectionWarning is an advisory condition set to True when
+	// multiple AuthServerConfig.UpstreamProviders are configured alongside AuthzConfig.
+	// Only the first upstream is authoritative for Cedar claim resolution; this warns the
+	// operator that the auto-selection has taken effect and names the selected upstream.
+	ConditionTypeAuthzUpstreamSelectionWarning = "AuthzUpstreamSelectionWarning"
+
 	// ConditionTypeVirtualMCPServerTelemetryConfigRefValidated indicates whether the TelemetryConfigRef is valid
 	ConditionTypeVirtualMCPServerTelemetryConfigRefValidated = "TelemetryConfigRefValidated"
 )
@@ -291,6 +337,13 @@ const (
 
 	// ConditionReasonIncomingAuthInvalid indicates incoming auth is invalid
 	ConditionReasonIncomingAuthInvalid = "IncomingAuthInvalid"
+
+	// Note: ConditionReasonAuthzConfigMapNotFound is shared with MCPRemoteProxy and is
+	// declared in mcpremoteproxy_types.go.
+
+	// ConditionReasonAuthzConfigMapInvalid indicates the referenced authz ConfigMap was
+	// found but its payload is missing/empty/malformed or fails Cedar validation.
+	ConditionReasonAuthzConfigMapInvalid = "AuthzConfigMapInvalid"
 
 	// ConditionReasonGroupRefValid indicates the GroupRef is valid
 	ConditionReasonVirtualMCPServerGroupRefValid = "GroupRefValid"
@@ -345,6 +398,32 @@ const (
 
 	// ConditionReasonAuthServerConfigInvalid indicates the AuthServerConfig is invalid
 	ConditionReasonAuthServerConfigInvalid = "AuthServerConfigInvalid"
+
+	// ConditionReasonAuthzRequiresUpstream indicates that authorization policies are
+	// configured but no upstream IDP is available to source claims from. Without an
+	// upstream, Cedar evaluates against the ToolHive-issued AS token, whose claim
+	// namespace (sub, aud, tsid) can overlap upstream claims and silently authorize
+	// against the wrong identity.
+	ConditionReasonAuthzRequiresUpstream = "AuthzRequiresUpstream"
+
+	// ConditionReasonAuthzUpstreamAutoSelected is set when authorization is configured
+	// alongside multiple upstream providers and the first upstream has been chosen as
+	// the Cedar claim source. The advisory message names the selected upstream.
+	ConditionReasonAuthzUpstreamAutoSelected = "AuthzUpstreamAutoSelected"
+
+	// ConditionReasonAuthzUpstreamUnknown indicates that
+	// spec.incomingAuth.authzConfig.inline.primaryUpstreamProvider names an upstream
+	// IDP that is not declared on spec.authServerConfig.upstreamProviders. Cedar
+	// would otherwise deny every request at runtime; reject at admission instead.
+	ConditionReasonAuthzUpstreamUnknown = "AuthzUpstreamUnknown"
+
+	// ConditionReasonAuthzPrimaryProviderRequiresAuthServer indicates that
+	// spec.incomingAuth.authzConfig.inline.primaryUpstreamProvider is set but
+	// spec.authServerConfig is not configured. The field names an upstream IDP
+	// on the embedded auth server, which is required for it to take effect.
+	// Distinct from AuthzUpstreamUnknown so tooling (alertmanager rules,
+	// dashboards) can route the two misconfigurations separately.
+	ConditionReasonAuthzPrimaryProviderRequiresAuthServer = "AuthzPrimaryProviderRequiresAuthServer"
 
 	// ConditionReasonVirtualMCPServerTelemetryConfigRefValid indicates the referenced MCPTelemetryConfig is valid
 	ConditionReasonVirtualMCPServerTelemetryConfigRefValid = "TelemetryConfigRefValid"
@@ -427,6 +506,28 @@ func (*VirtualMCPServer) GetProxyPort() int32 {
 // ResolveGroupName returns the group name from spec.groupRef.
 func (r *VirtualMCPServer) ResolveGroupName() string {
 	return r.Spec.GroupRef.GetName()
+}
+
+// ExplicitPrimaryUpstreamProvider returns the user-configured primary upstream
+// provider name and a flag indicating whether the value came from the
+// deprecated spec.incomingAuth.authzConfig.inline.primaryUpstreamProvider
+// location (fromDeprecated=true) or the canonical
+// spec.authServerConfig.primaryUpstreamProvider location (fromDeprecated=false).
+// Returns ("", false) when neither location is set.
+//
+// Precedence: the canonical location wins if set; the deprecated location is
+// read only as a backward-compatibility fallback. Callers should emit a
+// Warning event when fromDeprecated is true.
+func (r *VirtualMCPServer) ExplicitPrimaryUpstreamProvider() (name string, fromDeprecated bool) {
+	if r.Spec.AuthServerConfig != nil && r.Spec.AuthServerConfig.PrimaryUpstreamProvider != "" {
+		return r.Spec.AuthServerConfig.PrimaryUpstreamProvider, false
+	}
+	if r.Spec.IncomingAuth != nil {
+		if dep := r.Spec.IncomingAuth.AuthzConfig.DeprecatedInlinePrimaryUpstreamProvider(); dep != "" {
+			return dep, true
+		}
+	}
+	return "", false
 }
 
 // Validate performs validation for VirtualMCPServer

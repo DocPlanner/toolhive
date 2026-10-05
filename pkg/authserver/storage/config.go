@@ -12,7 +12,7 @@ const (
 	// TypeMemory uses in-memory storage (default).
 	TypeMemory Type = "memory"
 
-	// TypeRedis uses Redis-compatible storage for distributed deployments.
+	// TypeRedis uses Redis-backed storage for distributed deployments.
 	TypeRedis Type = "redis"
 
 	// AuthTypeACLUser is the Redis ACL user authentication type.
@@ -67,15 +67,25 @@ type RunConfig struct {
 }
 
 // RedisRunConfig is the serializable Redis configuration for RunConfig.
-// This supports either direct Redis-compatible endpoints (for example DragonflyDB)
-// or Redis Sentinel deployments with ACL user authentication.
+// Exactly one of Addr (standalone/cluster) or SentinelConfig must be set.
+// Set ClusterMode to true when Addr points to a Redis Cluster discovery endpoint.
 type RedisRunConfig struct {
-	// Address is the Redis-compatible server address for direct mode (host:port).
+	// Addr is the Redis server address (host:port). Required for standalone and cluster modes.
 	// Mutually exclusive with SentinelConfig.
-	Address string `json:"address,omitempty" yaml:"address,omitempty"`
+	Addr string `json:"addr,omitempty" yaml:"addr,omitempty"`
 
-	// SentinelConfig contains Sentinel-specific configuration for HA deployments.
-	// Mutually exclusive with Address.
+	// LegacyAddress is the pre-v0.27 serialized name of Addr. DocPlanner fork:
+	// still read so an image can start from a RunConfig written by an older
+	// operator. Never written by the current operator. Remove with PAIINFRA-228.
+	//
+	// Deprecated: use Addr.
+	LegacyAddress string `json:"address,omitempty" yaml:"address,omitempty"`
+
+	// ClusterMode enables the Redis Cluster protocol. Requires Addr to be set.
+	ClusterMode bool `json:"cluster_mode,omitempty" yaml:"cluster_mode,omitempty"`
+
+	// SentinelConfig contains Sentinel-specific configuration.
+	// Mutually exclusive with Addr.
 	SentinelConfig *SentinelRunConfig `json:"sentinel_config,omitempty" yaml:"sentinel_config,omitempty"`
 
 	// AuthType must be "aclUser" - only ACL user authentication is supported.
@@ -96,11 +106,10 @@ type RedisRunConfig struct {
 	// WriteTimeout is the timeout for write operations (e.g., "3s").
 	WriteTimeout string `json:"write_timeout,omitempty" yaml:"write_timeout,omitempty"`
 
-	// TLS configures TLS for Redis/Valkey master connections.
+	// TLS configures TLS for Redis/Valkey master or cluster node connections.
 	TLS *RedisTLSRunConfig `json:"tls,omitempty" yaml:"tls,omitempty"`
 
-	// SentinelTLS configures TLS for Sentinel connections.
-	// Falls back to TLS config when nil.
+	// SentinelTLS configures TLS for Sentinel connections. Only applies when SentinelConfig is set.
 	SentinelTLS *RedisTLSRunConfig `json:"sentinel_tls,omitempty" yaml:"sentinel_tls,omitempty"`
 }
 
@@ -134,4 +143,15 @@ type ACLUserRunConfig struct {
 
 	// PasswordEnvVar is the environment variable containing the Redis password.
 	PasswordEnvVar string `json:"password_env_var" yaml:"password_env_var"`
+}
+
+// EffectiveAddr returns Addr, falling back to the legacy serialized address.
+func (c *RedisRunConfig) EffectiveAddr() string {
+	if c == nil {
+		return ""
+	}
+	if c.Addr != "" {
+		return c.Addr
+	}
+	return c.LegacyAddress
 }

@@ -86,3 +86,16 @@ func resolveSessionOwnerAdvertiseURL(explicit, podIP string, port int) string {
 	}
 	return fmt.Sprintf("http://%s/mcp", net.JoinHostPort(podIP, fmt.Sprintf("%d", port)))
 }
+
+// sessionTTLFromConfig returns the vMCP session TTL. The --session-ttl flag
+// (upstream) wins when set; otherwise the fork's config-file sessionTTL is
+// used. Zero lets the server apply its default.
+func sessionTTLFromConfig(flagTTL time.Duration, cfg *config.Config) time.Duration {
+	if flagTTL > 0 {
+		return flagTTL
+	}
+	if cfg == nil {
+		return 0
+	}
+	return time.Duration(cfg.SessionTTL)
+}

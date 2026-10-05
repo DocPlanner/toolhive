@@ -15,6 +15,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,6 +32,7 @@ import (
 
 	mcpv1beta1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1beta1"
 	ctrlutil "github.com/stacklok/toolhive/cmd/thv-operator/pkg/controllerutil"
+	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/imagepullsecrets"
 	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/kubernetes/rbac"
 	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/runconfig/configmap/checksum"
 	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/validation"
@@ -42,6 +44,10 @@ type MCPRemoteProxyReconciler struct {
 	Scheme           *runtime.Scheme
 	Recorder         events.EventRecorder
 	PlatformDetector *ctrlutil.SharedPlatformDetector
+	// ImagePullSecretsDefaults are cluster-wide defaults sourced from the
+	// operator chart that are merged with the per-CR imagePullSecrets when
+	// constructing workloads. The zero value is a usable empty Defaults.
+	ImagePullSecretsDefaults imagepullsecrets.Defaults
 }
 
 // +kubebuilder:rbac:groups=toolhive.stacklok.dev,resources=mcpremoteproxies,verbs=get;list;watch;create;update;patch;delete
@@ -55,7 +61,7 @@ type MCPRemoteProxyReconciler struct {
 // +kubebuilder:rbac:groups="",resources=services,verbs=create;delete;get;list;patch;update;watch
 // +kubebuilder:rbac:groups="rbac.authorization.k8s.io",resources=roles,verbs=create;delete;get;list;patch;update;watch
 // +kubebuilder:rbac:groups="rbac.authorization.k8s.io",resources=rolebindings,verbs=create;delete;get;list;patch;update;watch
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=create;delete;get;list;patch;update;watch
 // +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=create;delete;get;list;patch;update;watch
@@ -120,6 +126,9 @@ func (r *MCPRemoteProxyReconciler) validateAndHandleConfigs(ctx context.Context,
 
 	// Validate the GroupRef if specified
 	r.validateGroupRef(ctx, proxy)
+
+	// Surface advisory condition when primaryUpstreamProvider is set but ignored
+	r.validateAuthzPrimaryUpstreamProviderIgnored(proxy)
 
 	// Handle MCPToolConfig
 	if err := r.handleToolConfig(ctx, proxy); err != nil {
@@ -731,6 +740,14 @@ func (r *MCPRemoteProxyReconciler) handleExternalAuthConfig(ctx context.Context,
 		return fmt.Errorf("failed to fetch MCPExternalAuthConfig: %w", err)
 	}
 
+	// Mirror the referenced MCPExternalAuthConfig's Valid=False condition onto
+	// the MCPRemoteProxy so the failure is visible on the consumer CR (e.g.
+	// obo-typed configs surface Valid=False/EnterpriseRequired here without the
+	// user having to inspect the referenced MCPExternalAuthConfig).
+	if mirrored, err := mirrorInvalidOnRemoteProxy(proxy, externalAuthConfig); mirrored {
+		return err
+	}
+
 	// MCPRemoteProxy supports only single-upstream embedded auth server configs.
 	// Multi-upstream requires VirtualMCPServer.
 	if embeddedCfg := externalAuthConfig.Spec.EmbeddedAuthServer; embeddedCfg != nil && len(embeddedCfg.UpstreamProviders) > 1 {
@@ -1026,6 +1043,7 @@ func (r *MCPRemoteProxyReconciler) updateOIDCConfigReferencingWorkloads(
 
 	// Add the workload reference
 	oidcConfig.Status.ReferencingWorkloads = append(oidcConfig.Status.ReferencingWorkloads, ref)
+	oidcConfig.Status.ReferenceCount = workloadReferenceCount(oidcConfig.Status.ReferencingWorkloads)
 	if err := r.Status().Update(ctx, oidcConfig); err != nil {
 		return fmt.Errorf("failed to update MCPOIDCConfig ReferencingWorkloads: %w", err)
 	}
@@ -1077,6 +1095,31 @@ func (r *MCPRemoteProxyReconciler) validateGroupRef(ctx context.Context, proxy *
 	}
 }
 
+// validateAuthzPrimaryUpstreamProviderIgnored surfaces an advisory condition
+// when spec.authzConfig.inline.primaryUpstreamProvider is set on an
+// MCPRemoteProxy. The proxy has no embedded auth server, so the field has no
+// runtime effect — the condition gives operators a kubectl-visible signal
+// that a configured value is being silently ignored.
+//
+// Mirrors the validateGroupRef convention: this only sets/removes the
+// condition; the caller is responsible for persisting status.
+func (*MCPRemoteProxyReconciler) validateAuthzPrimaryUpstreamProviderIgnored(proxy *mcpv1beta1.MCPRemoteProxy) {
+	provider := proxy.Spec.AuthzConfig.DeprecatedInlinePrimaryUpstreamProvider()
+	conditionType := mcpv1beta1.ConditionTypeAuthzPrimaryUpstreamProviderIgnored
+	if provider == "" {
+		meta.RemoveStatusCondition(&proxy.Status.Conditions, conditionType)
+		return
+	}
+	meta.SetStatusCondition(&proxy.Status.Conditions, metav1.Condition{
+		Type:   conditionType,
+		Status: metav1.ConditionTrue,
+		Reason: mcpv1beta1.ConditionReasonAuthzPrimaryUpstreamProviderIgnored,
+		Message: fmt.Sprintf("spec.authzConfig.inline.primaryUpstreamProvider=%q has no effect on MCPRemoteProxy; "+
+			"the field only takes effect on VirtualMCPServer with an embedded auth server", provider),
+		ObservedGeneration: proxy.Generation,
+	})
+}
+
 // ensureRBACResources ensures that the RBAC resources are in place for the remote proxy.
 // Uses the RBAC client (pkg/kubernetes/rbac) which creates or updates RBAC resources
 // automatically during operator upgrades.
@@ -1092,12 +1135,29 @@ func (r *MCPRemoteProxyReconciler) ensureRBACResources(ctx context.Context, prox
 	// Ensure Role with minimal permissions for remote proxies
 	// Remote proxies only need ConfigMap and Secret read access (no StatefulSet/Pod management)
 	_, err := rbacClient.EnsureRBACResources(ctx, rbac.EnsureRBACResourcesParams{
-		Name:      proxyRunnerNameForRBAC,
-		Namespace: proxy.Namespace,
-		Rules:     remoteProxyRBACRules,
-		Owner:     proxy,
+		Name:             proxyRunnerNameForRBAC,
+		Namespace:        proxy.Namespace,
+		Rules:            remoteProxyRBACRules,
+		Owner:            proxy,
+		ImagePullSecrets: r.imagePullSecretsForRemoteProxy(proxy),
 	})
 	return err
+}
+
+// imagePullSecretsForRemoteProxy returns the image pull secrets the operator
+// will set on the workload's PodSpec and ServiceAccount. The list is the merge
+// of cluster-wide chart defaults (from r.ImagePullSecretsDefaults) with the
+// per-CR list from spec.resourceOverrides.proxyDeployment.imagePullSecrets.
+// CR-level entries win on name collisions; chart-level entries are appended
+// additively. Returns nil when both inputs are empty.
+func (r *MCPRemoteProxyReconciler) imagePullSecretsForRemoteProxy(
+	proxy *mcpv1beta1.MCPRemoteProxy,
+) []corev1.LocalObjectReference {
+	var crLevel []corev1.LocalObjectReference
+	if proxy.Spec.ResourceOverrides != nil && proxy.Spec.ResourceOverrides.ProxyDeployment != nil {
+		crLevel = proxy.Spec.ResourceOverrides.ProxyDeployment.ImagePullSecrets
+	}
+	return r.ImagePullSecretsDefaults.Merge(crLevel)
 }
 
 // updateMCPRemoteProxyStatus updates the status of the MCPRemoteProxy
@@ -1249,6 +1309,10 @@ func (r *MCPRemoteProxyReconciler) deploymentNeedsUpdate(
 		return true
 	}
 
+	if r.podSpecNeedsUpdate(deployment, proxy) {
+		return true
+	}
+
 	return false
 }
 
@@ -1376,6 +1440,21 @@ func (r *MCPRemoteProxyReconciler) podTemplateMetadataNeedsUpdate(
 	}
 
 	return false
+}
+
+// podSpecNeedsUpdate checks if pod-level fields (not container fields) have drifted.
+//
+// Currently compares ImagePullSecrets — the merge of cluster-wide chart
+// defaults with spec.resourceOverrides.proxyDeployment.imagePullSecrets. Uses
+// equality.Semantic.DeepEqual so nil and empty slices are treated as equal,
+// which matches Kubernetes' own serialization semantics.
+func (r *MCPRemoteProxyReconciler) podSpecNeedsUpdate(
+	deployment *appsv1.Deployment,
+	proxy *mcpv1beta1.MCPRemoteProxy,
+) bool {
+	expected := r.imagePullSecretsForRemoteProxy(proxy)
+	current := deployment.Spec.Template.Spec.ImagePullSecrets
+	return !equality.Semantic.DeepEqual(current, expected)
 }
 
 // serviceNeedsUpdate checks if the service needs to be updated

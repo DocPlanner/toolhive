@@ -44,50 +44,22 @@ const docTemplate = `{
                 },
                 "type": "object"
             },
-            "github_com_stacklok_toolhive_cmd_thv-operator_api_v1beta1.RateLimitBucket": {
-                "description": "PerUser token bucket configuration for this tool.\n+optional",
-                "properties": {
-                    "maxTokens": {
-                        "description": "MaxTokens is the maximum number of tokens (bucket capacity).\nThis is also the burst size: the maximum number of requests that can be served\ninstantaneously before the bucket is depleted.\n+kubebuilder:validation:Required\n+kubebuilder:validation:Minimum=1",
-                        "type": "integer"
-                    },
-                    "refillPeriod": {
-                        "$ref": "#/components/schemas/v1.Duration"
-                    }
-                },
-                "type": "object"
-            },
             "github_com_stacklok_toolhive_cmd_thv-operator_api_v1beta1.RateLimitConfig": {
                 "description": "RateLimitConfig contains the CRD rate limiting configuration.\nWhen set, rate limiting middleware is added to the proxy middleware chain.",
                 "properties": {
                     "perUser": {
-                        "$ref": "#/components/schemas/github_com_stacklok_toolhive_cmd_thv-operator_api_v1beta1.RateLimitBucket"
+                        "$ref": "#/components/schemas/github_com_stacklok_toolhive_pkg_ratelimit_types.RateLimitBucket"
                     },
                     "shared": {
-                        "$ref": "#/components/schemas/github_com_stacklok_toolhive_cmd_thv-operator_api_v1beta1.RateLimitBucket"
+                        "$ref": "#/components/schemas/github_com_stacklok_toolhive_pkg_ratelimit_types.RateLimitBucket"
                     },
                     "tools": {
                         "description": "Tools defines per-tool rate limit overrides.\nEach entry applies additional rate limits to calls targeting a specific tool name.\nA request must pass both the server-level limit and the per-tool limit.\n+listType=map\n+listMapKey=name\n+optional",
                         "items": {
-                            "$ref": "#/components/schemas/github_com_stacklok_toolhive_cmd_thv-operator_api_v1beta1.ToolRateLimitConfig"
+                            "$ref": "#/components/schemas/github_com_stacklok_toolhive_pkg_ratelimit_types.ToolRateLimitConfig"
                         },
                         "type": "array",
                         "uniqueItems": false
-                    }
-                },
-                "type": "object"
-            },
-            "github_com_stacklok_toolhive_cmd_thv-operator_api_v1beta1.ToolRateLimitConfig": {
-                "properties": {
-                    "name": {
-                        "description": "Name is the MCP tool name this limit applies to.\n+kubebuilder:validation:Required\n+kubebuilder:validation:MinLength=1",
-                        "type": "string"
-                    },
-                    "perUser": {
-                        "$ref": "#/components/schemas/github_com_stacklok_toolhive_cmd_thv-operator_api_v1beta1.RateLimitBucket"
-                    },
-                    "shared": {
-                        "$ref": "#/components/schemas/github_com_stacklok_toolhive_cmd_thv-operator_api_v1beta1.RateLimitBucket"
                     }
                 },
                 "type": "object"
@@ -240,6 +212,10 @@ const docTemplate = `{
                     "session_name_claim": {
                         "description": "SessionNameClaim is the JWT claim to use for role session name (default: \"sub\").",
                         "type": "string"
+                    },
+                    "subject_provider_name": {
+                        "description": "SubjectProviderName identifies which upstream provider's access token to use\nfor STS AssumeRoleWithWebIdentity. Used by vMCP only. When empty, the bearer\ntoken from the incoming HTTP request is used.",
+                        "type": "string"
                     }
                 },
                 "type": "object"
@@ -276,6 +252,10 @@ const docTemplate = `{
                         "type": "string"
                     },
                     "bearer_token_file": {
+                        "type": "string"
+                    },
+                    "cached_cimd_client_id": {
+                        "description": "CachedCIMDClientID stores the CIMD metadata URL used as client_id when CIMD\nauthentication was used. Kept separate from CachedClientID (which holds\nDCR-issued IDs) so the two can have independent lifecycles — DCR credential\nrotation clears CachedClientID without touching the stable CIMD URL.\nRead by resolveClientCredentials to send the correct client_id on token refresh.",
                         "type": "string"
                     },
                     "cached_client_id": {
@@ -354,48 +334,6 @@ const docTemplate = `{
                 },
                 "type": "object"
             },
-            "github_com_stacklok_toolhive_pkg_auth_tokenexchange.Config": {
-                "description": "TokenExchangeConfig contains token exchange configuration for external authentication",
-                "properties": {
-                    "audience": {
-                        "description": "Audience is the target audience for the exchanged token",
-                        "type": "string"
-                    },
-                    "client_id": {
-                        "description": "ClientID is the OAuth 2.0 client identifier",
-                        "type": "string"
-                    },
-                    "client_secret": {
-                        "description": "ClientSecret is the OAuth 2.0 client secret",
-                        "type": "string"
-                    },
-                    "external_token_header_name": {
-                        "description": "ExternalTokenHeaderName is the name of the custom header to use when HeaderStrategy is \"custom\"",
-                        "type": "string"
-                    },
-                    "header_strategy": {
-                        "description": "HeaderStrategy determines how to inject the token\nValid values: HeaderStrategyReplace (default), HeaderStrategyCustom",
-                        "type": "string"
-                    },
-                    "scopes": {
-                        "description": "Scopes is the list of scopes to request for the exchanged token",
-                        "items": {
-                            "type": "string"
-                        },
-                        "type": "array",
-                        "uniqueItems": false
-                    },
-                    "subject_token_type": {
-                        "description": "SubjectTokenType specifies the type of the subject token being exchanged.\nCommon values: tokenTypeAccessToken (default), tokenTypeIDToken, tokenTypeJWT.\nIf empty, defaults to tokenTypeAccessToken.",
-                        "type": "string"
-                    },
-                    "token_url": {
-                        "description": "TokenURL is the OAuth 2.0 token endpoint URL",
-                        "type": "string"
-                    }
-                },
-                "type": "object"
-            },
             "github_com_stacklok_toolhive_pkg_auth_upstreamswap.Config": {
                 "description": "UpstreamSwapConfig contains configuration for upstream token swap middleware.\nWhen set along with EmbeddedAuthServerConfig, this middleware exchanges ToolHive JWTs\nfor upstream IdP tokens before forwarding requests to the MCP server.",
                 "properties": {
@@ -409,6 +347,54 @@ const docTemplate = `{
                     },
                     "provider_name": {
                         "description": "ProviderName identifies which upstream provider's tokens to retrieve for injection.\nThis is required and must match a configured upstream provider name.",
+                        "type": "string"
+                    }
+                },
+                "type": "object"
+            },
+            "github_com_stacklok_toolhive_pkg_authserver.DCRUpstreamConfig": {
+                "description": "DCRConfig enables RFC 7591 Dynamic Client Registration against the\nupstream authorization server. When set, the client credentials are\nobtained at runtime rather than being pre-provisioned via ClientID /\nClientSecretFile / ClientSecretEnvVar, and ClientID must be left empty.\nMutually exclusive with ClientID.",
+                "properties": {
+                    "discovery_url": {
+                        "description": "DiscoveryURL is the exact RFC 8414 / OIDC Discovery document URL to\nfetch at runtime. The resolver issues a single GET against this URL\n(no well-known-path fallback) and reads registration_endpoint,\nauthorization_endpoint, token_endpoint,\ntoken_endpoint_auth_methods_supported, and scopes_supported from the\nresponse. Per RFC 8414 §3.3, the document's \"issuer\" field must\nexactly match the upstream issuer configured on the parent\nrun-config.\n\nUse this field when the upstream publishes discovery metadata at a\npath that differs from the issuer-derived well-known paths — for\nexample a multi-tenant IdP whose metadata lives at\nhttps://idp.example.com/tenants/acme/.well-known/openid-configuration.\n\nMutually exclusive with RegistrationEndpoint.",
+                        "type": "string"
+                    },
+                    "initial_access_token_env_var": {
+                        "description": "InitialAccessTokenEnvVar is the name of an environment variable\ncontaining the RFC 7591 initial access token. Mutually exclusive with\nInitialAccessTokenFile.",
+                        "type": "string"
+                    },
+                    "initial_access_token_file": {
+                        "description": "InitialAccessTokenFile is the path to a file containing the RFC 7591\ninitial access token presented to the registration endpoint. Mutually\nexclusive with InitialAccessTokenEnvVar. Both may be omitted for open\nregistration endpoints.",
+                        "type": "string"
+                    },
+                    "registration_endpoint": {
+                        "description": "RegistrationEndpoint is the RFC 7591 registration endpoint URL used\ndirectly, bypassing discovery. Because no discovery is performed,\nserver-capability fields (token_endpoint_auth_methods_supported,\nscopes_supported) are unavailable on this code path; the caller is\nexpected to also supply AuthorizationEndpoint, TokenEndpoint, and an\nexplicit Scopes list on the parent OAuth2UpstreamRunConfig. Auth\nmethod falls back to the resolver's default (client_secret_basic).\n\nMutually exclusive with DiscoveryURL.",
+                        "type": "string"
+                    },
+                    "software_id": {
+                        "description": "SoftwareID is the RFC 7591 \"software_id\" registration metadata value,\nidentifying the client software independent of any particular\nregistration instance.",
+                        "type": "string"
+                    },
+                    "software_statement": {
+                        "description": "SoftwareStatement is the RFC 7591 \"software_statement\" JWT asserting\nmetadata about the client software, signed by a party the authorization\nserver trusts.",
+                        "type": "string"
+                    }
+                },
+                "type": "object"
+            },
+            "github_com_stacklok_toolhive_pkg_authserver.IdentityFromTokenRunConfig": {
+                "description": "IdentityFromToken extracts user identity (subject, name, email) directly from the\nOAuth2 token-endpoint response body using gjson dot-notation paths. When set, the\nembedded auth server skips the userinfo HTTP call entirely. Mirrors the CRD type\n(cmd/thv-operator/api/v1beta1.IdentityFromTokenConfig) — the authoritative\ntrust-model and uniqueness documentation lives there.",
+                "properties": {
+                    "email_path": {
+                        "description": "EmailPath is the dot-notation path to the email address field.",
+                        "type": "string"
+                    },
+                    "name_path": {
+                        "description": "NamePath is the dot-notation path to the display name field.",
+                        "type": "string"
+                    },
+                    "subject_path": {
+                        "description": "SubjectPath is the dot-notation path to the subject (user ID) field.\nRequired when IdentityFromToken is set.",
                         "type": "string"
                     }
                 },
@@ -429,7 +415,7 @@ const docTemplate = `{
                         "type": "string"
                     },
                     "client_id": {
-                        "description": "ClientID is the OAuth 2.0 client identifier registered with the upstream IDP.",
+                        "description": "ClientID is the OAuth 2.0 client identifier registered with the upstream IDP.\nMutually exclusive with DCRConfig: when DCRConfig is set, ClientID is obtained\nat runtime via RFC 7591 Dynamic Client Registration and must be left empty.",
                         "type": "string"
                     },
                     "client_secret_env_var": {
@@ -439,6 +425,12 @@ const docTemplate = `{
                     "client_secret_file": {
                         "description": "ClientSecretFile is the path to a file containing the OAuth 2.0 client secret.\nMutually exclusive with ClientSecretEnvVar. Optional for public clients using PKCE.",
                         "type": "string"
+                    },
+                    "dcr_config": {
+                        "$ref": "#/components/schemas/github_com_stacklok_toolhive_pkg_authserver.DCRUpstreamConfig"
+                    },
+                    "identity_from_token": {
+                        "$ref": "#/components/schemas/github_com_stacklok_toolhive_pkg_authserver.IdentityFromTokenRunConfig"
                     },
                     "redirect_uri": {
                         "description": "RedirectURI is the callback URL where the upstream IDP will redirect after authentication.\nWhen not specified, defaults to ` + "`" + `{issuer}/oauth/callback` + "`" + `.",
@@ -523,6 +515,14 @@ const docTemplate = `{
                     "authorization_endpoint_base_url": {
                         "description": "AuthorizationEndpointBaseURL overrides the base URL used for the authorization_endpoint\nin the OAuth discovery document. When set, the discovery document will advertise\n` + "`" + `{authorization_endpoint_base_url}/oauth/authorize` + "`" + ` instead of ` + "`" + `{issuer}/oauth/authorize` + "`" + `.\nAll other endpoints remain derived from the issuer.",
                         "type": "string"
+                    },
+                    "baseline_client_scopes": {
+                        "description": "BaselineClientScopes is a baseline set of OAuth 2.0 scopes unioned into every\nDCR registration. All values must appear in ScopesSupported; the auth server\nrejects this RunConfig at startup otherwise. Empty means current behavior is\npreserved (registered scope = client-requested, or DefaultScopes if empty).\nWhen ScopesSupported is empty, the subset check uses registration.DefaultScopes\n(the same set applyDefaults would substitute at startup) — so\nBaselineClientScopes containing standard OIDC scopes works without enumerating\nScopesSupported explicitly.",
+                        "items": {
+                            "type": "string"
+                        },
+                        "type": "array",
+                        "uniqueItems": false
                     },
                     "hmac_secret_files": {
                         "description": "HMACSecretFiles contains file paths to HMAC secrets for signing authorization codes\nand refresh tokens (opaque tokens).\nFirst file is the current secret (must be at least 32 bytes), subsequent files\nare for rotation/verification of existing tokens.\nIf empty, an ephemeral secret will be auto-generated (development only).",
@@ -691,7 +691,7 @@ const docTemplate = `{
                 "type": "object"
             },
             "github_com_stacklok_toolhive_pkg_authserver.UserInfoRunConfig": {
-                "description": "UserInfo contains configuration for fetching user information (required for OAuth2).",
+                "description": "UserInfo contains configuration for fetching user information.\nOptional: when nil, the upstream OAuth2 provider derives a deterministic\nsubject by SHA-256-hashing the access token (with a \"tk-\" prefix) instead\nof calling a userinfo endpoint. OIDC providers always derive Subject from\nthe ID token and are unaffected.",
                 "properties": {
                     "additional_headers": {
                         "additionalProperties": {
@@ -734,13 +734,21 @@ const docTemplate = `{
                     "acl_user_config": {
                         "$ref": "#/components/schemas/github_com_stacklok_toolhive_pkg_authserver_storage.ACLUserRunConfig"
                     },
+                    "addr": {
+                        "description": "Addr is the Redis server address (host:port). Required for standalone and cluster modes.\nMutually exclusive with SentinelConfig.",
+                        "type": "string"
+                    },
                     "address": {
-                        "description": "Address is the Redis-compatible server address for direct mode (host:port).\nMutually exclusive with SentinelConfig.",
+                        "description": "LegacyAddress is the pre-v0.27 serialized name of Addr. DocPlanner fork:\nstill read so an image can start from a RunConfig written by an older\noperator. Never written by the current operator. Remove with PAIINFRA-228.\n\nDeprecated: use Addr.",
                         "type": "string"
                     },
                     "auth_type": {
                         "description": "AuthType must be \"aclUser\" - only ACL user authentication is supported.",
                         "type": "string"
+                    },
+                    "cluster_mode": {
+                        "description": "ClusterMode enables the Redis Cluster protocol. Requires Addr to be set.",
+                        "type": "boolean"
                     },
                     "dial_timeout": {
                         "description": "DialTimeout is the timeout for establishing connections (e.g., \"5s\").",
@@ -771,7 +779,7 @@ const docTemplate = `{
                 "type": "object"
             },
             "github_com_stacklok_toolhive_pkg_authserver_storage.RedisTLSRunConfig": {
-                "description": "SentinelTLS configures TLS for Sentinel connections.\nFalls back to TLS config when nil.",
+                "description": "SentinelTLS configures TLS for Sentinel connections. Only applies when SentinelConfig is set.",
                 "properties": {
                     "ca_cert_file": {
                         "description": "CACertFile is the path to a PEM-encoded CA certificate file.",
@@ -798,7 +806,7 @@ const docTemplate = `{
                 "type": "object"
             },
             "github_com_stacklok_toolhive_pkg_authserver_storage.SentinelRunConfig": {
-                "description": "SentinelConfig contains Sentinel-specific configuration for HA deployments.\nMutually exclusive with Address.",
+                "description": "SentinelConfig contains Sentinel-specific configuration.\nMutually exclusive with Addr.",
                 "properties": {
                     "db": {
                         "description": "DB is the Redis database number (default: 0).",
@@ -862,7 +870,8 @@ const docTemplate = `{
                     "mistral-vibe",
                     "codex",
                     "kimi-cli",
-                    "factory"
+                    "factory",
+                    "copilot-cli"
                 ],
                 "type": "string",
                 "x-enum-varnames": [
@@ -892,7 +901,8 @@ const docTemplate = `{
                     "MistralVibe",
                     "Codex",
                     "KimiCli",
-                    "Factory"
+                    "Factory",
+                    "CopilotCli"
                 ]
             },
             "github_com_stacklok_toolhive_pkg_client.ClientAppStatus": {
@@ -1098,6 +1108,76 @@ const docTemplate = `{
                 },
                 "type": "object"
             },
+            "github_com_stacklok_toolhive_pkg_oauthproto_tokenexchange.Config": {
+                "description": "TokenExchangeConfig contains token exchange configuration for external authentication",
+                "properties": {
+                    "audience": {
+                        "description": "Audience is the target audience for the exchanged token",
+                        "type": "string"
+                    },
+                    "client_id": {
+                        "description": "ClientID is the OAuth 2.0 client identifier",
+                        "type": "string"
+                    },
+                    "client_secret": {
+                        "description": "ClientSecret is the OAuth 2.0 client secret",
+                        "type": "string"
+                    },
+                    "external_token_header_name": {
+                        "description": "ExternalTokenHeaderName is the name of the custom header to use when HeaderStrategy is \"custom\"",
+                        "type": "string"
+                    },
+                    "header_strategy": {
+                        "description": "HeaderStrategy determines how to inject the token\nValid values: HeaderStrategyReplace (default), HeaderStrategyCustom",
+                        "type": "string"
+                    },
+                    "scopes": {
+                        "description": "Scopes is the list of scopes to request for the exchanged token",
+                        "items": {
+                            "type": "string"
+                        },
+                        "type": "array",
+                        "uniqueItems": false
+                    },
+                    "subject_token_type": {
+                        "description": "SubjectTokenType specifies the type of the subject token being exchanged.\nCommon values: oauthproto.TokenTypeAccessToken (default), oauthproto.TokenTypeIDToken, oauthproto.TokenTypeJWT.\nIf empty, defaults to oauthproto.TokenTypeAccessToken.",
+                        "type": "string"
+                    },
+                    "token_url": {
+                        "description": "TokenURL is the OAuth 2.0 token endpoint URL",
+                        "type": "string"
+                    }
+                },
+                "type": "object"
+            },
+            "github_com_stacklok_toolhive_pkg_ratelimit_types.RateLimitBucket": {
+                "description": "PerUser token bucket configuration for this tool.\n+optional",
+                "properties": {
+                    "maxTokens": {
+                        "description": "MaxTokens is the maximum number of tokens (bucket capacity).\nThis is also the burst size: the maximum number of requests that can be served\ninstantaneously before the bucket is depleted.\n+kubebuilder:validation:Required\n+kubebuilder:validation:Minimum=1",
+                        "type": "integer"
+                    },
+                    "refillPeriod": {
+                        "$ref": "#/components/schemas/v1.Duration"
+                    }
+                },
+                "type": "object"
+            },
+            "github_com_stacklok_toolhive_pkg_ratelimit_types.ToolRateLimitConfig": {
+                "properties": {
+                    "name": {
+                        "description": "Name is the MCP tool name this limit applies to.\n+kubebuilder:validation:Required\n+kubebuilder:validation:MinLength=1",
+                        "type": "string"
+                    },
+                    "perUser": {
+                        "$ref": "#/components/schemas/github_com_stacklok_toolhive_pkg_ratelimit_types.RateLimitBucket"
+                    },
+                    "shared": {
+                        "$ref": "#/components/schemas/github_com_stacklok_toolhive_pkg_ratelimit_types.RateLimitBucket"
+                    }
+                },
+                "type": "object"
+            },
             "github_com_stacklok_toolhive_pkg_registry.OAuthPublicConfig": {
                 "description": "AuthConfig contains the non-secret OAuth configuration when auth is configured.\nNil when auth_status is \"none\".",
                 "properties": {
@@ -1238,6 +1318,10 @@ const docTemplate = `{
                         "description": "K8sPodTemplatePatch is a JSON string to patch the Kubernetes pod template\nOnly applicable when using Kubernetes runtime",
                         "type": "string"
                     },
+                    "mcpserver_generation": {
+                        "description": "MCPServerGeneration is the K8s .metadata.generation of the MCPServer CR that rendered\nthis RunConfig. The Kubernetes runtime uses it as a monotonic version to prevent stale\nrolling-update pods from overwriting a newer RunConfig's StatefulSet apply. Zero value\nmeans unversioned (backward-compat with older operators, or non-operator callers).",
+                        "type": "integer"
+                    },
                     "middleware_configs": {
                         "description": "MiddlewareConfigs contains the list of middleware to apply to the transport\nand the configuration for each middleware.",
                         "items": {
@@ -1324,6 +1408,11 @@ const docTemplate = `{
                         "type": "array",
                         "uniqueItems": false
                     },
+                    "session_ttl": {
+                        "description": "SessionTTL is the inactivity timeout for proxy sessions, expressed as a Go\nduration string (e.g. \"30m\", \"2h\", \"168h\"). Empty uses the transport\ndefault (2h). Negative durations and values that fail time.ParseDuration\nare rejected at runtime.\nString (not time.Duration) keeps the wire format unit-explicit: a\ntime.Duration field serializes as nanoseconds in JSON.",
+                        "example": "2h",
+                        "type": "string"
+                    },
                     "stateless": {
                         "description": "Stateless indicates the server only supports POST (no SSE/GET).\nWhen true, the proxy returns 405 for incoming GET requests and uses a\nPOST-based health check instead of the default GET probe.\nApplies to both remote URLs and local container workloads.",
                         "type": "boolean"
@@ -1344,7 +1433,7 @@ const docTemplate = `{
                         "type": "string"
                     },
                     "token_exchange_config": {
-                        "$ref": "#/components/schemas/github_com_stacklok_toolhive_pkg_auth_tokenexchange.Config"
+                        "$ref": "#/components/schemas/github_com_stacklok_toolhive_pkg_oauthproto_tokenexchange.Config"
                     },
                     "tools_filter": {
                         "description": "DEPRECATED: Middleware configuration.\nToolsFilter is the list of tools to filter",
@@ -4817,6 +4906,71 @@ const docTemplate = `{
                 ]
             }
         },
+        "/api/v1beta/registry/{name}/refresh": {
+            "post": {
+                "description": "Force a refresh of the server-side registry cache for the default registry",
+                "parameters": [
+                    {
+                        "description": "Registry name (must be 'default')",
+                        "in": "path",
+                        "name": "name",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "additionalProperties": {
+                                        "type": "string"
+                                    },
+                                    "type": "object"
+                                }
+                            }
+                        },
+                        "description": "Registry refreshed"
+                    },
+                    "404": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "description": "Not Found"
+                    },
+                    "500": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "description": "Internal Server Error"
+                    },
+                    "503": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/pkg_api_v1.registryErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "Registry authentication required or upstream registry unavailable"
+                    }
+                },
+                "summary": "Refresh registry cache",
+                "tags": [
+                    "registry"
+                ]
+            }
+        },
         "/api/v1beta/registry/{name}/servers": {
             "get": {
                 "description": "Get a list of servers in a specific registry",
@@ -5423,6 +5577,26 @@ const docTemplate = `{
                         },
                         "description": "Bad Request"
                     },
+                    "401": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "description": "Unauthorized (registry refused credentials)"
+                    },
+                    "404": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "description": "Not Found (artifact not present in registry)"
+                    },
                     "409": {
                         "content": {
                             "application/json": {
@@ -5432,6 +5606,16 @@ const docTemplate = `{
                             }
                         },
                         "description": "Conflict"
+                    },
+                    "429": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "description": "Too Many Requests (registry rate limit)"
                     },
                     "500": {
                         "content": {
@@ -5451,7 +5635,17 @@ const docTemplate = `{
                                 }
                             }
                         },
-                        "description": "Bad Gateway"
+                        "description": "Bad Gateway (upstream registry failure)"
+                    },
+                    "504": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "description": "Gateway Timeout (upstream pull timed out)"
                     }
                 },
                 "summary": "Install a skill",
@@ -5639,6 +5833,36 @@ const docTemplate = `{
                         },
                         "description": "Bad Request"
                     },
+                    "401": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "description": "Unauthorized (registry refused credentials)"
+                    },
+                    "404": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "description": "Not Found (artifact not present in registry)"
+                    },
+                    "429": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "description": "Too Many Requests (registry rate limit)"
+                    },
                     "500": {
                         "content": {
                             "application/json": {
@@ -5657,7 +5881,17 @@ const docTemplate = `{
                                 }
                             }
                         },
-                        "description": "Bad Gateway"
+                        "description": "Bad Gateway (upstream registry or git resolver failure)"
+                    },
+                    "504": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "description": "Gateway Timeout (upstream pull timed out)"
                     }
                 },
                 "summary": "Get skill content",

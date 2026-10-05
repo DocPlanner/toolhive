@@ -5,6 +5,7 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -19,6 +20,7 @@ import (
 
 	mcpv1beta1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1beta1"
 	ctrlutil "github.com/stacklok/toolhive/cmd/thv-operator/pkg/controllerutil"
+	"github.com/stacklok/toolhive/pkg/auth/obo"
 	"github.com/stacklok/toolhive/pkg/authserver"
 	authtypes "github.com/stacklok/toolhive/pkg/vmcp/auth/types"
 	vmcpconfig "github.com/stacklok/toolhive/pkg/vmcp/config"
@@ -849,6 +851,180 @@ func TestConvertBackendAuthConfigToVMCP(t *testing.T) {
 	}
 }
 
+// TestConvertBackendAuthConfigToVMCP_MirrorsInvalidExternalAuthConfig verifies
+// the mirror added for #5347: when the referenced MCPExternalAuthConfig has
+// Status.Conditions[Valid]=False (e.g. obo-typed configs in upstream-only
+// builds), the conversion must short-circuit before reaching the converter and
+// return a typed error that carries the source's reason+message so callers
+// (buildOutgoingAuthConfig) can propagate the reason onto the per-backend
+// AuthConfigError.
+func TestConvertBackendAuthConfigToVMCP_MirrorsInvalidExternalAuthConfig(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, mcpv1beta1.AddToScheme(scheme))
+
+	invalidSource := &mcpv1beta1.MCPExternalAuthConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "obo-source", Namespace: "default"},
+		Spec: mcpv1beta1.MCPExternalAuthConfigSpec{
+			Type: mcpv1beta1.ExternalAuthTypeOBO,
+		},
+		Status: mcpv1beta1.MCPExternalAuthConfigStatus{
+			Conditions: []metav1.Condition{{
+				Type:    mcpv1beta1.ConditionTypeValid,
+				Status:  metav1.ConditionFalse,
+				Reason:  mcpv1beta1.ConditionReasonEnterpriseRequired,
+				Message: "obo enterprise required",
+			}},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(invalidSource).
+		Build()
+
+	r := &VirtualMCPServerReconciler{
+		Client:           fakeClient,
+		Scheme:           scheme,
+		PlatformDetector: ctrlutil.NewSharedPlatformDetector(),
+	}
+
+	strategy, err := r.convertBackendAuthConfigToVMCP(context.Background(), "default", &mcpv1beta1.BackendAuthConfig{
+		Type:                  mcpv1beta1.BackendAuthTypeExternalAuthConfigRef,
+		ExternalAuthConfigRef: &mcpv1beta1.ExternalAuthConfigRef{Name: "obo-source"},
+	})
+
+	require.Error(t, err, "must short-circuit when source Valid=False")
+	require.Nil(t, strategy)
+	assert.Equal(t, mcpv1beta1.ConditionReasonEnterpriseRequired, mirroredReasonFromError(err),
+		"buildOutgoingAuthConfig depends on this reason flowing through mirroredReasonFromError")
+
+	// Wrap the error exactly as buildOutgoingAuthConfig does in production
+	// (fmt.Errorf("...: %w", err)) and assert the reason still survives the
+	// errors.As walk. A future refactor that drops %w in favour of %v or
+	// errors.New(fmt.Sprintf(...)) would silently break per-backend reason
+	// propagation and surface ConversionFailed instead of EnterpriseRequired.
+	wrapped := fmt.Errorf("failed to convert backend auth config: %w", err)
+	assert.Equal(t, mcpv1beta1.ConditionReasonEnterpriseRequired, mirroredReasonFromError(wrapped),
+		"buildOutgoingAuthConfig wraps the err once before extracting the reason; "+
+			"the contract must survive that wrap")
+}
+
+// TestMirroredExternalAuthConfigInvalid verifies the source-condition probe
+// returns the typed pointer exactly when Status.Conditions[Valid] is False,
+// and nil otherwise. Also asserts that the typed value satisfies the error
+// interface so callers can pass it through error-returning APIs (notably
+// convertBackendAuthConfigToVMCP -> buildOutgoingAuthConfig) and recover the
+// reason via mirroredReasonFromError.
+func TestMirroredExternalAuthConfigInvalid(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		conditions  []metav1.Condition
+		wantReason  string
+		wantMessage string
+	}{
+		{
+			name: "Valid=False/EnterpriseRequired returns mirrored pointer",
+			conditions: []metav1.Condition{{
+				Type:    mcpv1beta1.ConditionTypeValid,
+				Status:  metav1.ConditionFalse,
+				Reason:  mcpv1beta1.ConditionReasonEnterpriseRequired,
+				Message: "obo enterprise required",
+			}},
+			wantReason:  mcpv1beta1.ConditionReasonEnterpriseRequired,
+			wantMessage: "obo enterprise required",
+		},
+		{
+			name: "Valid=True returns nil",
+			conditions: []metav1.Condition{{
+				Type:   mcpv1beta1.ConditionTypeValid,
+				Status: metav1.ConditionTrue,
+				Reason: "ValidationSucceeded",
+			}},
+		},
+		{
+			name:       "no Valid condition returns nil",
+			conditions: nil,
+		},
+		{
+			// F6 defense-in-depth: metav1.Condition requires Reason to be
+			// non-empty (apiserver rejects empty-Reason patches). If a source
+			// ever surfaces Valid=False with an empty Reason (corrupt status
+			// or a bug in the source reconciler), the mirror must substitute
+			// a fallback rather than copy the empty string through and trap
+			// the consumer in a noisy reconcile loop.
+			name: "Valid=False with empty Reason gets a fallback reason",
+			conditions: []metav1.Condition{{
+				Type:    mcpv1beta1.ConditionTypeValid,
+				Status:  metav1.ConditionFalse,
+				Reason:  "",
+				Message: "source surfaced an empty Reason",
+			}},
+			wantReason:  fallbackInvalidReason,
+			wantMessage: "source surfaced an empty Reason",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := &mcpv1beta1.MCPExternalAuthConfig{
+				Status: mcpv1beta1.MCPExternalAuthConfigStatus{Conditions: tt.conditions},
+			}
+			mirrored := mirroredExternalAuthConfigInvalid(cfg)
+			if tt.wantReason == "" {
+				assert.Nil(t, mirrored)
+				return
+			}
+			require.NotNil(t, mirrored)
+			assert.Equal(t, tt.wantReason, mirrored.Reason)
+			assert.Equal(t, tt.wantMessage, mirrored.Message)
+			// Round-trips through error-typed APIs.
+			assert.Equal(t, tt.wantReason, mirroredReasonFromError(mirrored))
+		})
+	}
+}
+
+// TestAuthConfigErrorReason verifies the conversion of an AuthConfigError into
+// the reason string used by setAuthConfigConditions: the mirrored source
+// reason when present, otherwise the generic "ConversionFailed".
+func TestAuthConfigErrorReason(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   *AuthConfigError
+		want string
+	}{
+		{
+			name: "nil falls back to ConversionFailed",
+			in:   nil,
+			want: "ConversionFailed",
+		},
+		{
+			name: "empty Reason falls back to ConversionFailed",
+			in:   &AuthConfigError{},
+			want: "ConversionFailed",
+		},
+		{
+			name: "non-empty Reason is propagated verbatim",
+			in:   &AuthConfigError{Reason: mcpv1beta1.ConditionReasonEnterpriseRequired},
+			want: mcpv1beta1.ConditionReasonEnterpriseRequired,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, authConfigErrorReason(tt.in))
+		})
+	}
+}
+
 // TestGenerateUniqueTokenExchangeEnvVarName tests the generateUniqueTokenExchangeEnvVarName function
 func TestGenerateUniqueTokenExchangeEnvVarName(t *testing.T) {
 	t.Parallel()
@@ -964,7 +1140,18 @@ func TestGenerateUniqueHeaderInjectionEnvVarName(t *testing.T) {
 	}
 }
 
-// tokenExchangeStrategy returns a minimal token_exchange BackendAuthStrategy for tests.
+// awsStsStrategy returns a minimal aws_sts BackendAuthStrategy for tests.
+func awsStsStrategy(subjectProviderName string) *authtypes.BackendAuthStrategy {
+	return &authtypes.BackendAuthStrategy{
+		Type: authtypes.StrategyTypeAwsSts,
+		AwsSts: &authtypes.AwsStsConfig{
+			Region:              "us-east-1",
+			FallbackRoleArn:     "arn:aws:iam::123456789012:role/test",
+			SubjectProviderName: subjectProviderName,
+		},
+	}
+}
+
 func tokenExchangeStrategy(subjectProviderName string) *authtypes.BackendAuthStrategy {
 	return &authtypes.BackendAuthStrategy{
 		Type: authtypes.StrategyTypeTokenExchange,
@@ -1054,6 +1241,26 @@ func TestInjectSubjectProviderIfNeeded(t *testing.T) {
 			embeddedCfg:             embeddedAuthServerCfg("first", "second"),
 			wantSubjectProviderName: "first",
 		},
+		// aws_sts strategy cases
+		{
+			name:                    "aws_sts_populates_subject_provider_name",
+			strategy:                awsStsStrategy(""),
+			embeddedCfg:             embeddedAuthServerCfg("github"),
+			wantSubjectProviderName: "github",
+		},
+		{
+			name:                    "aws_sts_already_set_provider_not_overridden",
+			strategy:                awsStsStrategy("explicit-provider"),
+			embeddedCfg:             embeddedAuthServerCfg("github"),
+			wantSamePointer:         true,
+			wantSubjectProviderName: "explicit-provider",
+		},
+		{
+			name:            "aws_sts_nil_AwsSts_config_returned_unchanged",
+			strategy:        &authtypes.BackendAuthStrategy{Type: authtypes.StrategyTypeAwsSts, AwsSts: nil},
+			embeddedCfg:     embeddedAuthServerCfg("github"),
+			wantSamePointer: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1065,20 +1272,35 @@ func TestInjectSubjectProviderIfNeeded(t *testing.T) {
 			if tt.wantSamePointer {
 				assert.Same(t, tt.strategy, result)
 				// When the pointer is unchanged and a provider was set, verify it wasn't mutated.
-				if tt.wantSubjectProviderName != "" && result != nil && result.TokenExchange != nil {
-					assert.Equal(t, tt.wantSubjectProviderName, result.TokenExchange.SubjectProviderName)
+				if tt.wantSubjectProviderName != "" && result != nil {
+					switch {
+					case result.TokenExchange != nil:
+						assert.Equal(t, tt.wantSubjectProviderName, result.TokenExchange.SubjectProviderName)
+					case result.AwsSts != nil:
+						assert.Equal(t, tt.wantSubjectProviderName, result.AwsSts.SubjectProviderName)
+					}
 				}
 				return
 			}
 
 			require.NotNil(t, result)
-			require.NotNil(t, result.TokenExchange)
-			assert.Equal(t, tt.wantSubjectProviderName, result.TokenExchange.SubjectProviderName)
-
-			// Verify the original strategy was not mutated.
-			if tt.strategy != nil && tt.strategy.TokenExchange != nil {
-				assert.Empty(t, tt.strategy.TokenExchange.SubjectProviderName,
-					"original strategy must not be mutated")
+			switch result.Type {
+			case authtypes.StrategyTypeTokenExchange:
+				require.NotNil(t, result.TokenExchange)
+				assert.Equal(t, tt.wantSubjectProviderName, result.TokenExchange.SubjectProviderName)
+				// Verify the original strategy was not mutated.
+				if tt.strategy != nil && tt.strategy.TokenExchange != nil {
+					assert.Empty(t, tt.strategy.TokenExchange.SubjectProviderName,
+						"original strategy must not be mutated")
+				}
+			case authtypes.StrategyTypeAwsSts:
+				require.NotNil(t, result.AwsSts)
+				assert.Equal(t, tt.wantSubjectProviderName, result.AwsSts.SubjectProviderName)
+				// Verify the original strategy was not mutated.
+				if tt.strategy != nil && tt.strategy.AwsSts != nil {
+					assert.Empty(t, tt.strategy.AwsSts.SubjectProviderName,
+						"original strategy must not be mutated")
+				}
 			}
 		})
 	}
@@ -1602,4 +1824,49 @@ func TestBuildOutgoingAuthConfig_InlineBackendSubjectProviderInjection(t *testin
 	require.NotNil(t, config.Backends["inline-backend"].TokenExchange)
 	assert.Equal(t, "corporate-idp", config.Backends["inline-backend"].TokenExchange.SubjectProviderName,
 		"inline backend SubjectProviderName should be injected from first upstream")
+}
+
+// TestGetExternalAuthConfigSecretEnvVar_OBO proves the obo arm of the
+// getExternalAuthConfigSecretEnvVar switch dispatches through the registered
+// OBO handler. With the default handler the method must return an error
+// wrapping obo.ErrEnterpriseRequired AND must not silently fall through to
+// nil, nil — that would mask the wired-but-disabled state behind a no-op.
+func TestGetExternalAuthConfigSecretEnvVar_OBO(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, mcpv1beta1.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+
+	authCfg := &mcpv1beta1.MCPExternalAuthConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "obo-config",
+			Namespace: "default",
+		},
+		Spec: mcpv1beta1.MCPExternalAuthConfigSpec{
+			Type: mcpv1beta1.ExternalAuthTypeOBO,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(authCfg).
+		Build()
+
+	r := &VirtualMCPServerReconciler{
+		Client:           fakeClient,
+		Scheme:           scheme,
+		PlatformDetector: ctrlutil.NewSharedPlatformDetector(),
+	}
+
+	envVar, err := r.getExternalAuthConfigSecretEnvVar(t.Context(), "default", authCfg.Name)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, obo.ErrEnterpriseRequired,
+		"the default OBO handler returns obo.ErrEnterpriseRequired; the dispatch arm must propagate it")
+	assert.Nil(t, envVar, "no env var should be returned on the error path")
+
+	// Generic-error guard: per issue #5328 AC, neither generic substring may
+	// leak from any of the three consumer dispatch paths.
+	assert.NotContains(t, err.Error(), "unsupported external auth type")
+	assert.NotContains(t, err.Error(), "unknown middleware type")
 }

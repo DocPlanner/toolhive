@@ -151,6 +151,7 @@ func (r *MCPServerReconciler) createRunConfigFromMCPServer(m *mcpv1beta1.MCPServ
 	options := []runner.RunConfigBuilderOption{
 		runner.WithName(m.Name),
 		runner.WithImage(m.Spec.Image),
+		runner.WithMCPServerGeneration(m.Generation),
 		runner.WithCmdArgs(m.Spec.Args),
 		runner.WithTransportAndPorts(m.Spec.Transport, int(m.GetProxyPort()), int(m.GetMCPPort())),
 		runner.WithProxyMode(transporttypes.ProxyMode(effectiveProxyMode)),
@@ -259,6 +260,13 @@ func (r *MCPServerReconciler) createRunConfigFromMCPServer(m *mcpv1beta1.MCPServ
 		m.Spec.ExternalAuthConfigRef, resolvedOIDCConfig, &options,
 	); err != nil {
 		return nil, fmt.Errorf("failed to process authServerRef: %w", err)
+	}
+
+	// Add webhook configuration if specified
+	if err := ctrlutil.AddWebhookConfigOptions(
+		ctx, r.Client, m.Namespace, m.Spec.WebhookConfigRef, &options,
+	); err != nil {
+		return nil, fmt.Errorf("failed to process WebhookConfig: %w", err)
 	}
 
 	// Add audit configuration if specified

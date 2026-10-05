@@ -71,6 +71,17 @@ type RunConfig struct {
 	// If empty, defaults to registration.DefaultScopes (["openid", "profile", "email", "offline_access"]).
 	ScopesSupported []string `json:"scopes_supported,omitempty" yaml:"scopes_supported,omitempty"`
 
+	// BaselineClientScopes is a baseline set of OAuth 2.0 scopes unioned into every
+	// DCR registration. All values must appear in ScopesSupported; the auth server
+	// rejects this RunConfig at startup otherwise. Empty means current behavior is
+	// preserved (registered scope = client-requested, or DefaultScopes if empty).
+	// When ScopesSupported is empty, the subset check uses registration.DefaultScopes
+	// (the same set applyDefaults would substitute at startup) — so
+	// BaselineClientScopes containing standard OIDC scopes works without enumerating
+	// ScopesSupported explicitly.
+	//nolint:lll // field tags require full JSON+YAML names
+	BaselineClientScopes []string `json:"baseline_client_scopes,omitempty" yaml:"baseline_client_scopes,omitempty"`
+
 	// AllowedAudiences is the list of valid resource URIs that tokens can be issued for.
 	// Per RFC 8707, the "resource" parameter in authorization and token requests is
 	// validated against this list. Required for MCP compliance.
@@ -79,6 +90,32 @@ type RunConfig struct {
 	// Storage configures the storage backend for the auth server.
 	// If nil, defaults to in-memory storage.
 	Storage *storage.RunConfig `json:"storage,omitempty" yaml:"storage,omitempty"`
+}
+
+// Validate checks that the on-disk RunConfig is internally consistent. Called
+// by the runner before resolving secrets and building the runtime Config; it
+// catches operator-supplied misconfiguration early so server startup fails
+// loudly instead of degrading silently at runtime.
+func (c *RunConfig) Validate() error {
+	return c.validateBaselineClientScopes()
+}
+
+// validateBaselineClientScopes ensures every entry in BaselineClientScopes is
+// also present in ScopesSupported. If a baseline scope is not advertised by
+// ScopesSupported, the embedded DCR handler would later try to register a
+// client with a scope the server does not support, which fosite rejects at
+// /oauth/authorize with invalid_scope.
+//
+// When ScopesSupported is empty, the check uses registration.DefaultScopes as
+// the superset (matching what applyDefaults would substitute at startup), so
+// operators can omit ScopesSupported and still configure standard OIDC scopes
+// as baseline without error.
+func (c *RunConfig) validateBaselineClientScopes() error {
+	effective := c.ScopesSupported
+	if len(effective) == 0 {
+		effective = registration.DefaultScopes
+	}
+	return registration.ValidateScopeSubset(c.BaselineClientScopes, effective, "baseline_client_scopes")
 }
 
 // SigningKeyRunConfig configures where to load signing keys from.
@@ -211,6 +248,8 @@ type OAuth2UpstreamRunConfig struct {
 	TokenEndpoint string `json:"token_endpoint" yaml:"token_endpoint"`
 
 	// ClientID is the OAuth 2.0 client identifier registered with the upstream IDP.
+	// Mutually exclusive with DCRConfig: when DCRConfig is set, ClientID is obtained
+	// at runtime via RFC 7591 Dynamic Client Registration and must be left empty.
 	ClientID string `json:"client_id" yaml:"client_id"`
 
 	// ClientSecretFile is the path to a file containing the OAuth 2.0 client secret.
@@ -228,8 +267,12 @@ type OAuth2UpstreamRunConfig struct {
 	// Scopes are the OAuth scopes to request from the upstream IDP.
 	Scopes []string `json:"scopes,omitempty" yaml:"scopes,omitempty"`
 
-	// UserInfo contains configuration for fetching user information (required for OAuth2).
-	UserInfo *UserInfoRunConfig `json:"userinfo" yaml:"userinfo"`
+	// UserInfo contains configuration for fetching user information.
+	// Optional: when nil, the upstream OAuth2 provider derives a deterministic
+	// subject by SHA-256-hashing the access token (with a "tk-" prefix) instead
+	// of calling a userinfo endpoint. OIDC providers always derive Subject from
+	// the ID token and are unaffected.
+	UserInfo *UserInfoRunConfig `json:"userinfo,omitempty" yaml:"userinfo,omitempty"`
 
 	// TokenResponseMapping configures custom field extraction from non-standard token responses.
 	// When set, the token exchange bypasses golang.org/x/oauth2 and extracts fields using
@@ -237,11 +280,99 @@ type OAuth2UpstreamRunConfig struct {
 	//nolint:lll // field tags require full JSON+YAML names
 	TokenResponseMapping *TokenResponseMappingRunConfig `json:"token_response_mapping,omitempty" yaml:"token_response_mapping,omitempty"`
 
+	// IdentityFromToken extracts user identity (subject, name, email) directly from the
+	// OAuth2 token-endpoint response body using gjson dot-notation paths. When set, the
+	// embedded auth server skips the userinfo HTTP call entirely. Mirrors the CRD type
+	// (cmd/thv-operator/api/v1beta1.IdentityFromTokenConfig) — the authoritative
+	// trust-model and uniqueness documentation lives there.
+	//nolint:lll // field tags require full JSON+YAML names
+	IdentityFromToken *IdentityFromTokenRunConfig `json:"identity_from_token,omitempty" yaml:"identity_from_token,omitempty"`
+
 	// AdditionalAuthorizationParams are extra query parameters to include in
 	// authorization requests. Useful for provider-specific parameters like
 	// Google's access_type=offline.
 	//nolint:lll // field tags require full JSON+YAML names
 	AdditionalAuthorizationParams map[string]string `json:"additional_authorization_params,omitempty" yaml:"additional_authorization_params,omitempty"`
+
+	// DCRConfig enables RFC 7591 Dynamic Client Registration against the
+	// upstream authorization server. When set, the client credentials are
+	// obtained at runtime rather than being pre-provisioned via ClientID /
+	// ClientSecretFile / ClientSecretEnvVar, and ClientID must be left empty.
+	// Mutually exclusive with ClientID.
+	DCRConfig *DCRUpstreamConfig `json:"dcr_config,omitempty" yaml:"dcr_config,omitempty"`
+}
+
+// DCRUpstreamConfig configures RFC 7591 Dynamic Client Registration for an
+// upstream authorization server. When present on an OAuth2 upstream, the
+// authserver performs registration at runtime to obtain client credentials,
+// replacing the need to pre-provision a ClientID.
+//
+// Exactly one of DiscoveryURL or RegistrationEndpoint must be set. DiscoveryURL
+// points at RFC 8414 / OIDC Discovery metadata from which the registration
+// endpoint is resolved; RegistrationEndpoint is used directly when the upstream
+// does not publish discovery metadata.
+//
+// Trust assumption: DiscoveryURL and RegistrationEndpoint are operator-supplied
+// URLs validated only for HTTPS-or-loopback. The DCR resolver will issue
+// outbound HTTP requests — possibly carrying the RFC 7591 initial access token
+// as a bearer header — to whatever address those URLs resolve to. There is
+// currently no allowlist or RFC1918 / link-local / cloud-metadata-service
+// guard, because the operator role is fully trusted today. If the trust
+// boundary ever changes (e.g. a multi-tenant operator deployment, or a less-
+// privileged role gains write access to this struct via a CRD or YAML
+// surface), this field becomes a confused-deputy SSRF vector. Hardening is
+// tracked in https://github.com/stacklok/toolhive/issues/5135.
+type DCRUpstreamConfig struct {
+	// DiscoveryURL is the exact RFC 8414 / OIDC Discovery document URL to
+	// fetch at runtime. The resolver issues a single GET against this URL
+	// (no well-known-path fallback) and reads registration_endpoint,
+	// authorization_endpoint, token_endpoint,
+	// token_endpoint_auth_methods_supported, and scopes_supported from the
+	// response. Per RFC 8414 §3.3, the document's "issuer" field must
+	// exactly match the upstream issuer configured on the parent
+	// run-config.
+	//
+	// Use this field when the upstream publishes discovery metadata at a
+	// path that differs from the issuer-derived well-known paths — for
+	// example a multi-tenant IdP whose metadata lives at
+	// https://idp.example.com/tenants/acme/.well-known/openid-configuration.
+	//
+	// Mutually exclusive with RegistrationEndpoint.
+	DiscoveryURL string `json:"discovery_url,omitempty" yaml:"discovery_url,omitempty"`
+
+	// RegistrationEndpoint is the RFC 7591 registration endpoint URL used
+	// directly, bypassing discovery. Because no discovery is performed,
+	// server-capability fields (token_endpoint_auth_methods_supported,
+	// scopes_supported) are unavailable on this code path; the caller is
+	// expected to also supply AuthorizationEndpoint, TokenEndpoint, and an
+	// explicit Scopes list on the parent OAuth2UpstreamRunConfig. Auth
+	// method falls back to the resolver's default (client_secret_basic).
+	//
+	// Mutually exclusive with DiscoveryURL.
+	RegistrationEndpoint string `json:"registration_endpoint,omitempty" yaml:"registration_endpoint,omitempty"`
+
+	// InitialAccessTokenFile is the path to a file containing the RFC 7591
+	// initial access token presented to the registration endpoint. Mutually
+	// exclusive with InitialAccessTokenEnvVar. Both may be omitted for open
+	// registration endpoints.
+	//nolint:lll // field tags require full JSON+YAML names
+	InitialAccessTokenFile string `json:"initial_access_token_file,omitempty" yaml:"initial_access_token_file,omitempty"`
+
+	// InitialAccessTokenEnvVar is the name of an environment variable
+	// containing the RFC 7591 initial access token. Mutually exclusive with
+	// InitialAccessTokenFile.
+	//nolint:lll // field tags require full JSON+YAML names
+	InitialAccessTokenEnvVar string `json:"initial_access_token_env_var,omitempty" yaml:"initial_access_token_env_var,omitempty"`
+
+	// SoftwareID is the RFC 7591 "software_id" registration metadata value,
+	// identifying the client software independent of any particular
+	// registration instance.
+	SoftwareID string `json:"software_id,omitempty" yaml:"software_id,omitempty"`
+
+	// SoftwareStatement is the RFC 7591 "software_statement" JWT asserting
+	// metadata about the client software, signed by a party the authorization
+	// server trusts.
+	SoftwareStatement string `json:"software_statement,omitempty" yaml:"software_statement,omitempty"`
 }
 
 // TokenResponseMappingRunConfig maps non-standard token response fields to standard fields.
@@ -258,6 +389,22 @@ type TokenResponseMappingRunConfig struct {
 
 	// ExpiresInPath is the dot-notation path to the expires_in value. Defaults to "expires_in".
 	ExpiresInPath string `json:"expires_in_path,omitempty" yaml:"expires_in_path,omitempty"`
+}
+
+// IdentityFromTokenRunConfig configures extracting user identity claims directly from
+// the token-endpoint response body. Mirrors the CRD type
+// (cmd/thv-operator/api/v1beta1.IdentityFromTokenConfig) — the authoritative
+// trust-model and uniqueness documentation lives there.
+type IdentityFromTokenRunConfig struct {
+	// SubjectPath is the dot-notation path to the subject (user ID) field.
+	// Required when IdentityFromToken is set.
+	SubjectPath string `json:"subject_path" yaml:"subject_path"`
+
+	// NamePath is the dot-notation path to the display name field.
+	NamePath string `json:"name_path,omitempty" yaml:"name_path,omitempty"`
+
+	// EmailPath is the dot-notation path to the email address field.
+	EmailPath string `json:"email_path,omitempty" yaml:"email_path,omitempty"`
 }
 
 // UserInfoRunConfig contains UserInfo endpoint configuration.
@@ -370,6 +517,16 @@ type Config struct {
 	// /.well-known/oauth-authorization-server discovery endpoints.
 	ScopesSupported []string
 
+	// BaselineClientScopes is a baseline set of OAuth 2.0 scopes the embedded
+	// DCR handler unions into every newly registered client's scope set. Empty
+	// means current behavior is preserved (DCR registers exactly what the client
+	// requested, or registration.DefaultScopes if the client requested none).
+	// All entries must also be present in ScopesSupported. When ScopesSupported
+	// is empty, the validation gate uses registration.DefaultScopes as the
+	// superset — so standard OIDC scopes (e.g. "offline_access") work without
+	// enumerating ScopesSupported explicitly.
+	BaselineClientScopes []string
+
 	// AllowedAudiences is the list of valid resource URIs that tokens can be issued for.
 	// Per RFC 8707, the "resource" parameter in authorization and token requests is
 	// validated against this list. MCP clients are required to include the resource
@@ -416,10 +573,127 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("at least one allowed audience is required for MCP compliance (RFC 8707 resource parameter validation)")
 	}
 
+	// BaselineClientScopes must be a subset of ScopesSupported. RunConfig.Validate
+	// catches this for the YAML-loaded path, but a caller that constructs Config
+	// directly bypasses that; failing here gives them a clearer call stack than
+	// the inner validateParams in the provider layer.
+	// When ScopesSupported is empty, use DefaultScopes as the superset (matching
+	// what applyDefaults substitutes at startup).
+	{
+		effective := c.ScopesSupported
+		if len(effective) == 0 {
+			effective = registration.DefaultScopes
+		}
+		if err := registration.ValidateScopeSubset(c.BaselineClientScopes, effective, "baseline_client_scopes"); err != nil {
+			return err
+		}
+	}
+
 	slog.Debug("authserver config validation passed",
 		"issuer", c.Issuer,
 		"upstream_count", len(c.Upstreams),
 	)
+	return nil
+}
+
+// Validate checks that the OAuth2UpstreamRunConfig is internally consistent.
+// It enforces the mutual exclusivity of ClientID and DCRConfig: exactly one must
+// be set. A ClientID is required for pre-provisioned clients; a DCRConfig is
+// required when client credentials are obtained at runtime via RFC 7591
+// Dynamic Client Registration. When DCRConfig is present, its own validity is
+// also checked via DCRUpstreamConfig.Validate.
+//
+// Validate intentionally does not verify fields handled by the shared
+// CommonOAuthConfig or upstream.OAuth2Config validators — it only covers the
+// run-config surface area unique to OAuth2UpstreamRunConfig.
+//
+// Called from buildPureOAuth2Config at the RunConfig → upstream.OAuth2Config
+// conversion boundary so that DCR-specific fields are validated before they
+// are dropped during conversion.
+func (c *OAuth2UpstreamRunConfig) Validate() error {
+	hasClientID := c.ClientID != ""
+	hasDCR := c.DCRConfig != nil
+	switch {
+	case !hasClientID && !hasDCR:
+		return fmt.Errorf("oauth2 upstream: either client_id or dcr_config is required")
+	case hasClientID && hasDCR:
+		return fmt.Errorf("oauth2 upstream: client_id and dcr_config are mutually exclusive")
+	}
+
+	if hasDCR {
+		if err := c.DCRConfig.Validate(); err != nil {
+			return fmt.Errorf("oauth2 upstream: invalid dcr_config: %w", err)
+		}
+
+		// When the operator configures DCRConfig.RegistrationEndpoint, the
+		// resolver bypasses discovery and therefore cannot populate
+		// AuthorizationEndpoint or TokenEndpoint from server metadata. The
+		// run-config must supply both explicitly or the upstream is
+		// unusable: registration would succeed and the first authorize or
+		// token-exchange call would silently fail with empty endpoints.
+		// Discovery flow (DCRConfig.DiscoveryURL) is unaffected — those
+		// fields populate from metadata.
+		if c.DCRConfig.RegistrationEndpoint != "" {
+			if c.AuthorizationEndpoint == "" || c.TokenEndpoint == "" {
+				return fmt.Errorf(
+					"oauth2 upstream: authorization_endpoint and token_endpoint are required " +
+						"when dcr_config.registration_endpoint is set (no discovery to populate them)")
+			}
+		}
+	}
+
+	if c.IdentityFromToken != nil && c.IdentityFromToken.SubjectPath == "" {
+		return fmt.Errorf("oauth2 upstream: identity_from_token.subject_path must not be empty when identity_from_token is configured")
+	}
+
+	return nil
+}
+
+// Validate checks that the DCRUpstreamConfig specifies exactly one of
+// DiscoveryURL or RegistrationEndpoint, that the configured URL is well-formed
+// and uses HTTPS (or http on a loopback host for local development), and that
+// the two initial-access-token sources (InitialAccessTokenFile and
+// InitialAccessTokenEnvVar) are not both set.
+//
+// DiscoveryURL triggers runtime resolution of the registration endpoint via
+// RFC 8414 / OIDC Discovery; RegistrationEndpoint bypasses discovery for
+// providers that do not publish metadata. Requiring exactly one prevents
+// ambiguity about which URL the authserver should contact for registration.
+//
+// URL well-formedness and HTTPS are enforced here at the schema-validation
+// boundary so misconfiguration fails fast at startup rather than at first DCR
+// attempt; the runtime callers (pkg/oauthproto/discovery.go and
+// pkg/oauthproto/dcr.go) defend in depth, but this is the natural fail-fast
+// point.
+//
+// Rejecting a config that supplies both an InitialAccessTokenFile and an
+// InitialAccessTokenEnvVar prevents a credential-rotation footgun: if both
+// were accepted, an operator updating the env-var value would not realize
+// the file source still wins (or vice versa) and would silently keep
+// presenting a stale token at registration.
+func (c *DCRUpstreamConfig) Validate() error {
+	hasDiscovery := c.DiscoveryURL != ""
+	hasRegistration := c.RegistrationEndpoint != ""
+	switch {
+	case !hasDiscovery && !hasRegistration:
+		return fmt.Errorf("dcr_config: either discovery_url or registration_endpoint is required")
+	case hasDiscovery && hasRegistration:
+		return fmt.Errorf("dcr_config: discovery_url and registration_endpoint are mutually exclusive")
+	case hasDiscovery:
+		if err := networking.ValidateEndpointURL(c.DiscoveryURL); err != nil {
+			return fmt.Errorf("dcr_config: invalid discovery_url: %w", err)
+		}
+	case hasRegistration:
+		if err := networking.ValidateEndpointURL(c.RegistrationEndpoint); err != nil {
+			return fmt.Errorf("dcr_config: invalid registration_endpoint: %w", err)
+		}
+	}
+
+	if c.InitialAccessTokenFile != "" && c.InitialAccessTokenEnvVar != "" {
+		return fmt.Errorf(
+			"dcr_config: initial_access_token_file and initial_access_token_env_var are mutually exclusive")
+	}
+
 	return nil
 }
 

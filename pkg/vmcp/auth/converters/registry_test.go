@@ -94,6 +94,19 @@ func TestDefaultRegistry(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, upstreamInjectConverter)
 		assert.Equal(t, "upstream_inject", upstreamInjectConverter.StrategyType())
+
+		// Test AWS STS converter
+		awsStsConverter, err := registry.GetConverter(mcpv1beta1.ExternalAuthTypeAWSSts)
+		require.NoError(t, err)
+		require.NotNil(t, awsStsConverter)
+		assert.Equal(t, "aws_sts", awsStsConverter.StrategyType())
+
+		// Test OBO converter stub
+		oboConverter, err := registry.GetConverter(mcpv1beta1.ExternalAuthTypeOBO)
+		require.NoError(t, err)
+		require.NotNil(t, oboConverter)
+		assert.Equal(t, "obo", oboConverter.StrategyType())
+		assert.IsType(t, &OBOConverter{}, oboConverter)
 	})
 }
 
@@ -123,6 +136,14 @@ func TestNewRegistry(t *testing.T) {
 		upstreamInjectConverter, err := registry.GetConverter(mcpv1beta1.ExternalAuthTypeUpstreamInject)
 		require.NoError(t, err)
 		assert.NotNil(t, upstreamInjectConverter)
+
+		awsStsConverter, err := registry.GetConverter(mcpv1beta1.ExternalAuthTypeAWSSts)
+		require.NoError(t, err)
+		assert.NotNil(t, awsStsConverter)
+
+		oboConverter, err := registry.GetConverter(mcpv1beta1.ExternalAuthTypeOBO)
+		require.NoError(t, err)
+		assert.NotNil(t, oboConverter)
 	})
 
 	t.Run("creates independent instances", func(t *testing.T) {
@@ -149,6 +170,8 @@ func TestNewRegistry(t *testing.T) {
 			{mcpv1beta1.ExternalAuthTypeHeaderInjection, "header_injection"},
 			{mcpv1beta1.ExternalAuthTypeUnauthenticated, "unauthenticated"},
 			{mcpv1beta1.ExternalAuthTypeUpstreamInject, "upstream_inject"},
+			{mcpv1beta1.ExternalAuthTypeAWSSts, "aws_sts"},
+			{mcpv1beta1.ExternalAuthTypeOBO, "obo"},
 		}
 
 		for _, tc := range testCases {

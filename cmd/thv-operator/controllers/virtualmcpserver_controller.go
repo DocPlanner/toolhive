@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"maps"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -38,6 +39,7 @@ import (
 
 	mcpv1beta1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1beta1"
 	ctrlutil "github.com/stacklok/toolhive/cmd/thv-operator/pkg/controllerutil"
+	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/imagepullsecrets"
 	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/kubernetes/rbac"
 	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/runconfig/configmap/checksum"
 	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/virtualmcpserverstatus"
@@ -76,6 +78,11 @@ type AuthConfigError struct {
 	BackendName string
 	// Error is the underlying error that occurred during conversion
 	Error error
+	// Reason, when non-empty, overrides the default "ConversionFailed" condition reason.
+	// Used to mirror upstream MCPExternalAuthConfig.Status.Conditions[Valid].Reason
+	// (e.g. "EnterpriseRequired") onto the per-backend auth config condition so the
+	// failure surfaces with the same taxonomy on the consumer CR.
+	Reason string
 }
 
 // SpecValidationError represents a spec validation failure that the user must fix.
@@ -87,6 +94,16 @@ type SpecValidationError struct {
 
 func (e *SpecValidationError) Error() string {
 	return e.Message
+}
+
+// authConfigErrorReason returns the reason string to use when surfacing an
+// auth-config error via SetAuthConfigCondition: the mirrored source reason
+// when present, otherwise the generic "ConversionFailed".
+func authConfigErrorReason(authErr *AuthConfigError) string {
+	if authErr != nil && authErr.Reason != "" {
+		return authErr.Reason
+	}
+	return "ConversionFailed"
 }
 
 // VirtualMCPServerReconciler reconciles a VirtualMCPServer object
@@ -107,6 +124,10 @@ type VirtualMCPServerReconciler struct {
 	Scheme           *runtime.Scheme
 	Recorder         events.EventRecorder
 	PlatformDetector *ctrlutil.SharedPlatformDetector
+	// ImagePullSecretsDefaults are cluster-wide defaults sourced from the
+	// operator chart that are merged with vmcp.Spec.ImagePullSecrets when
+	// constructing workloads. The zero value is a usable empty Defaults.
+	ImagePullSecretsDefaults imagepullsecrets.Defaults
 }
 
 // +kubebuilder:rbac:groups=toolhive.stacklok.dev,resources=virtualmcpservers,verbs=get;list;watch;create;update;patch;delete
@@ -122,7 +143,7 @@ type VirtualMCPServerReconciler struct {
 // +kubebuilder:rbac:groups="",resources=services,verbs=create;delete;get;list;patch;update;watch
 // +kubebuilder:rbac:groups="rbac.authorization.k8s.io",resources=roles,verbs=create;delete;get;list;patch;update;watch
 // +kubebuilder:rbac:groups="rbac.authorization.k8s.io",resources=rolebindings,verbs=create;delete;get;list;patch;update;watch
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=create;get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=create;delete;get;list;patch;update;watch
 // +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=create;delete;get;list;patch;update;watch
@@ -302,8 +323,10 @@ func (r *VirtualMCPServerReconciler) applyStatusUpdates(
 	return nil
 }
 
-// runValidations runs all pre-reconciliation validations (PodTemplateSpec, GroupRef,
-// CompositeToolRefs, EmbeddingServerRef, AuthServerConfig).
+// runValidations runs all pre-reconciliation validations in order: schema-level
+// spec validation, PodTemplateSpec, GroupRef, CompositeToolRefs, EmbeddingServerRef,
+// auth-related checks (inline AuthServerConfig + AuthzConfig/upstream coherence,
+// delegated to runAuthValidations), and the advisory SessionStorage warning.
 // Returns (true, nil) to continue reconciliation.
 // Returns (false, nil) for spec validation errors that should NOT trigger requeue
 // (user must fix the spec; next reconciliation is triggered by spec changes).
@@ -356,23 +379,63 @@ func (r *VirtualMCPServerReconciler) runValidations(
 		}
 	}
 
-	// Validate inline AuthServerConfig (when specified).
-	if vmcp.Spec.AuthServerConfig != nil {
-		if err := r.validateAuthServerConfig(vmcp, statusManager); err != nil {
-			if applyErr := r.applyStatusUpdates(ctx, vmcp, statusManager); applyErr != nil {
-				ctxLogger.Error(applyErr, "Failed to apply status updates after AuthServerConfig validation error")
-			}
-			return false, nil
-		}
-	} else {
-		// Remove stale condition if AuthServerConfig was previously set then removed.
-		statusManager.RemoveConditionsWithPrefix(mcpv1beta1.ConditionTypeAuthServerConfigValidated, []string{})
+	// Validate auth-related spec fields (AuthServerConfig + AuthzConfig coherence).
+	if ok := r.runAuthValidations(ctx, vmcp, statusManager); !ok {
+		return false, nil
 	}
 
 	// Advisory: warn when replicas > 1 but session storage is not Redis-backed.
 	r.validateSessionStorageForReplicas(vmcp, statusManager)
 
 	return true, nil
+}
+
+// runAuthValidations runs the auth-related spec validations: the inline
+// AuthServerConfig (when specified) and the AuthzConfig/upstream coherence
+// check. Returns false when a validation fails and the caller should stop
+// reconciliation (user must fix the spec); true to continue.
+func (r *VirtualMCPServerReconciler) runAuthValidations(
+	ctx context.Context,
+	vmcp *mcpv1beta1.VirtualMCPServer,
+	statusManager virtualmcpserverstatus.StatusManager,
+) bool {
+	ctxLogger := log.FromContext(ctx)
+
+	// Validate inline AuthServerConfig (when specified).
+	if vmcp.Spec.AuthServerConfig != nil {
+		// Surface the IdentitySynthesized advisory upfront, before validation.
+		// The advisory is a pure function of the upstream provider field shape
+		// (which OAuth2 upstreams have nil userInfo) and is independent of
+		// issuer URL validity or other validation concerns. Running it before
+		// validateAuthServerConfig keeps the condition consistent with the
+		// current spec on every reconcile — including paths that early-return
+		// from validation — so a broken edit cannot leave a stale True with
+		// an upstream name the new spec no longer mentions.
+		r.applyAuthServerIdentitySynthesizedCondition(vmcp, statusManager)
+		if err := r.validateAuthServerConfig(vmcp, statusManager); err != nil {
+			if applyErr := r.applyStatusUpdates(ctx, vmcp, statusManager); applyErr != nil {
+				ctxLogger.Error(applyErr, "Failed to apply status updates after AuthServerConfig validation error")
+			}
+			return false
+		}
+	} else {
+		// Remove stale conditions if AuthServerConfig was previously set then removed.
+		statusManager.RemoveConditionsWithPrefix(mcpv1beta1.ConditionTypeAuthServerConfigValidated, []string{})
+		statusManager.RemoveConditionsWithPrefix(mcpv1beta1.ConditionTypeIdentitySynthesized, []string{})
+	}
+
+	// Validate that authz policies have an upstream IDP available to source
+	// claims from. Runs after the AuthServerConfig branch so it can set the
+	// AuthServerConfigValidated condition without being clobbered by the
+	// RemoveConditionsWithPrefix call above when AuthServerConfig is nil.
+	if err := r.validateAuthzUpstreamAvailable(ctx, vmcp, statusManager); err != nil {
+		if applyErr := r.applyStatusUpdates(ctx, vmcp, statusManager); applyErr != nil {
+			ctxLogger.Error(applyErr, "Failed to apply status updates after AuthzUpstreamAvailable validation error")
+		}
+		return false
+	}
+
+	return true
 }
 
 // validateSessionStorageForReplicas emits a SessionStorageWarning condition when
@@ -468,6 +531,239 @@ func (*VirtualMCPServerReconciler) validateAuthServerConfig(
 		metav1.ConditionTrue,
 	)
 	statusManager.SetObservedGeneration(vmcp.Generation)
+
+	return nil
+}
+
+// applyAuthServerIdentitySynthesizedCondition surfaces the IdentitySynthesized
+// advisory derived from the inline AuthServerConfig's upstream provider field
+// shape. Pure function of spec — does not depend on validation results — so
+// callers can run it before the validation guards and the advisory will track
+// the current spec on both pass and fail paths. Parity with
+// MCPExternalAuthConfigReconciler.applyIdentitySynthesizedCondition.
+func (*VirtualMCPServerReconciler) applyAuthServerIdentitySynthesizedCondition(
+	vmcp *mcpv1beta1.VirtualMCPServer,
+	statusManager virtualmcpserverstatus.StatusManager,
+) {
+	cfg := vmcp.Spec.AuthServerConfig
+	if cfg == nil {
+		return
+	}
+	syntheticUpstreams := cfg.SyntheticIdentityUpstreams()
+	if len(syntheticUpstreams) > 0 {
+		statusManager.SetCondition(
+			mcpv1beta1.ConditionTypeIdentitySynthesized,
+			mcpv1beta1.ConditionReasonIdentitySynthesizedActive,
+			fmt.Sprintf(
+				"OAuth2 upstream(s) %v have no userInfo configured; the embedded auth server will "+
+					"synthesize a non-PII subject from the access token (no Name/Email claims). "+
+					"If a userInfo endpoint exists for these upstreams, configure it to resolve real identity.",
+				syntheticUpstreams,
+			),
+			metav1.ConditionTrue,
+		)
+		return
+	}
+	statusManager.SetCondition(
+		mcpv1beta1.ConditionTypeIdentitySynthesized,
+		mcpv1beta1.ConditionReasonIdentitySynthesizedInactive,
+		"All OAuth2 upstreams have userInfo configured; user identity is resolved from the upstream",
+		metav1.ConditionFalse,
+	)
+}
+
+// rejectAuthzAdmission centralizes the boilerplate shared by every
+// authz-spec rejection branch in validateAuthzUpstreamAvailable: clear any
+// stale advisory, log the rejection, set Phase=Failed plus the
+// AuthServerConfigValidated=False condition, and return a *SpecValidationError
+// the reconciler converts into a non-requeueing outcome.
+func rejectAuthzAdmission(
+	ctx context.Context,
+	vmcp *mcpv1beta1.VirtualMCPServer,
+	statusManager virtualmcpserverstatus.StatusManager,
+	logMsg, reason, userMessage, errSummary string,
+	extraLogFields ...any,
+) *SpecValidationError {
+	statusManager.RemoveConditionsWithPrefix(mcpv1beta1.ConditionTypeAuthzUpstreamSelectionWarning, []string{})
+	logFields := append([]any{
+		"name", vmcp.Name,
+		"namespace", vmcp.Namespace,
+		"reason", reason,
+	}, extraLogFields...)
+	log.FromContext(ctx).Info(logMsg, logFields...)
+	statusManager.SetPhase(mcpv1beta1.VirtualMCPServerPhaseFailed)
+	statusManager.SetMessage(userMessage)
+	statusManager.SetAuthServerConfigValidatedCondition(reason, userMessage, metav1.ConditionFalse)
+	statusManager.SetObservedGeneration(vmcp.Generation)
+	return &SpecValidationError{Message: errSummary}
+}
+
+// validateAuthzUpstreamAvailable ensures that when authorization policies are
+// configured via IncomingAuth.AuthzConfig AND an embedded AuthServer is in use,
+// at least one upstream IDP is declared so Cedar evaluates claim references
+// (e.g. principal.claim_department) against the upstream token rather than the
+// ToolHive-issued AS token — whose claim namespace (sub, aud, tsid) can overlap
+// upstream claims and silently authorize against the wrong identity.
+//
+// Direct-IdP incoming auth (clients present an already-validated IdP token, no
+// embedded AS) is legitimate: Cedar evaluates against the identity's claims via
+// the default branch and no upstream is needed. The validator ignores that case.
+//
+// When multiple upstream providers are declared alongside AuthzConfig, only the
+// first one is authoritative for Cedar. Surface an advisory
+// AuthzUpstreamSelectionWarning condition naming the selected provider so the
+// operator can reorder or prune the list if the auto-selection is wrong.
+//
+// When spec.incomingAuth.authzConfig.inline.primaryUpstreamProvider is set
+// explicitly, the validator additionally rejects (a) the direct-IdP case (no
+// embedded AS) because the field is meaningless without an AS, and (b) any
+// name that does not resolve to one of spec.authServerConfig.upstreamProviders.
+// emitPrimaryUpstreamProviderDeprecatedEvent emits a Warning event with reason
+// AuthzPrimaryUpstreamProviderDeprecated when the resolved primary upstream
+// provider value came from the deprecated
+// spec.incomingAuth.authzConfig.inline.primaryUpstreamProvider location.
+// Called from every validation branch that observes the explicit provider so
+// the kubectl-visible hint is consistent regardless of the validation outcome.
+func (r *VirtualMCPServerReconciler) emitPrimaryUpstreamProviderDeprecatedEvent(
+	vmcp *mcpv1beta1.VirtualMCPServer,
+	fromDeprecated bool,
+) {
+	if !fromDeprecated || r.Recorder == nil {
+		return
+	}
+	r.Recorder.Eventf(vmcp, nil, corev1.EventTypeWarning,
+		"AuthzPrimaryUpstreamProviderDeprecated", "ResolvePrimaryUpstreamProvider",
+		"spec.incomingAuth.authzConfig.inline.primaryUpstreamProvider is deprecated; "+
+			"move the value to spec.authServerConfig.primaryUpstreamProvider")
+}
+
+func (r *VirtualMCPServerReconciler) validateAuthzUpstreamAvailable(
+	ctx context.Context,
+	vmcp *mcpv1beta1.VirtualMCPServer,
+	statusManager virtualmcpserverstatus.StatusManager,
+) error {
+	// No authz configured, or no incoming auth at all: nothing to check and
+	// no advisory to maintain. Remove any stale condition from a previous
+	// multi-upstream configuration.
+	if vmcp.Spec.IncomingAuth == nil || vmcp.Spec.IncomingAuth.AuthzConfig == nil {
+		statusManager.RemoveConditionsWithPrefix(mcpv1beta1.ConditionTypeAuthzUpstreamSelectionWarning, []string{})
+		return nil
+	}
+
+	// Direct-IdP flow: no embedded AS. Cedar evaluates against identity.Claims
+	// populated by incoming OIDC middleware from the IdP token. No upstream
+	// needed; nothing to warn about. Remove any stale condition.
+	//
+	// However, an explicit primaryUpstreamProvider is meaningless in this mode
+	// — there is no upstream-token table for Cedar to look it up in — so the
+	// converter would forward a name that cannot resolve at runtime. Reject at
+	// admission for the same "fail loudly instead of denying every request"
+	// reason as the configured-AS mismatch path below.
+	if vmcp.Spec.AuthServerConfig == nil {
+		explicitProvider, fromDeprecated := vmcp.ExplicitPrimaryUpstreamProvider()
+		if explicitProvider != "" {
+			// A user mid-migration may still have the deprecated inline field
+			// set while removing AuthServerConfig (or before configuring it).
+			// Emit the deprecation event here too so the kubectl-visible hint
+			// is consistent across both reject and accept paths.
+			r.emitPrimaryUpstreamProviderDeprecatedEvent(vmcp, fromDeprecated)
+			message := fmt.Sprintf(
+				"primaryUpstreamProvider=%q is set but spec.authServerConfig is not configured. "+
+					"The field names an upstream IDP on the embedded auth server, which is required "+
+					"for it to take effect. Remove primaryUpstreamProvider, or configure "+
+					"spec.authServerConfig with an upstream of that name.",
+				explicitProvider,
+			)
+			return rejectAuthzAdmission(ctx, vmcp, statusManager,
+				"authz primaryUpstreamProvider set without an embedded auth server; rejecting VirtualMCPServer",
+				mcpv1beta1.ConditionReasonAuthzPrimaryProviderRequiresAuthServer,
+				message,
+				fmt.Sprintf("authz primaryUpstreamProvider %q set without an embedded auth server", explicitProvider),
+				"primaryUpstreamProvider", explicitProvider,
+			)
+		}
+		statusManager.RemoveConditionsWithPrefix(mcpv1beta1.ConditionTypeAuthzUpstreamSelectionWarning, []string{})
+		return nil
+	}
+
+	// Embedded AS configured but no upstreams: this is the misconfiguration
+	// that silently evaluates policies against the AS-issued token.
+	if len(vmcp.Spec.AuthServerConfig.UpstreamProviders) == 0 {
+		// User-facing message includes full remediation guidance and ends with
+		// a period, matching other validator messages. The returned error uses
+		// a trimmed form without trailing punctuation to satisfy staticcheck.
+		message := "spec.authServerConfig is set but has no upstream providers, and " +
+			"spec.incomingAuth.authzConfig references claims. Cedar would evaluate " +
+			"against the ToolHive-issued AS token rather than the upstream IDP token. " +
+			"Configure spec.authServerConfig.upstreamProviders with at least one " +
+			"upstream IDP, or remove authServerConfig if clients will present IdP " +
+			"tokens directly."
+		return rejectAuthzAdmission(ctx, vmcp, statusManager,
+			"authz configured without an upstream IDP; rejecting VirtualMCPServer",
+			mcpv1beta1.ConditionReasonAuthzRequiresUpstream,
+			message,
+			"authz configured without an upstream IDP",
+		)
+	}
+
+	// If the user has set primaryUpstreamProvider explicitly (either on the
+	// canonical spec.authServerConfig location or on the deprecated
+	// spec.incomingAuth.authzConfig.inline location), the name must resolve to
+	// one of the declared upstreams after normalization on both sides. A
+	// mismatch would cause Cedar to deny every request at runtime — fail loudly
+	// at admission instead.
+	explicitProvider, fromDeprecated := vmcp.ExplicitPrimaryUpstreamProvider()
+	if explicitProvider != "" {
+		r.emitPrimaryUpstreamProviderDeprecatedEvent(vmcp, fromDeprecated)
+	}
+	if explicitProvider != "" {
+		resolved := authserver.ResolveUpstreamName(explicitProvider)
+		matched := slices.ContainsFunc(
+			vmcp.Spec.AuthServerConfig.UpstreamProviders,
+			func(up mcpv1beta1.UpstreamProviderConfig) bool {
+				return authserver.ResolveUpstreamName(up.Name) == resolved
+			},
+		)
+		if !matched {
+			message := fmt.Sprintf(
+				"primaryUpstreamProvider=%q does not match any upstream declared on "+
+					"spec.authServerConfig.upstreamProviders. Set primaryUpstreamProvider "+
+					"to one of the configured upstream names, or leave it empty to default "+
+					"to the first upstream.",
+				explicitProvider,
+			)
+			return rejectAuthzAdmission(ctx, vmcp, statusManager,
+				"authz primaryUpstreamProvider does not match any upstream; rejecting VirtualMCPServer",
+				mcpv1beta1.ConditionReasonAuthzUpstreamUnknown,
+				message,
+				fmt.Sprintf("authz primaryUpstreamProvider %q does not match any configured upstream", explicitProvider),
+				"primaryUpstreamProvider", explicitProvider,
+			)
+		}
+	}
+
+	// Valid configuration. When multiple upstreams are declared AND the user has
+	// not pinned a choice via primaryUpstreamProvider, surface an advisory naming
+	// the auto-selected upstream so the operator can reorder or set the explicit
+	// field. Otherwise — single upstream, or an explicit choice that disambiguates
+	// the multi-upstream case — ensure any stale warning is cleared.
+	if len(vmcp.Spec.AuthServerConfig.UpstreamProviders) > 1 && explicitProvider == "" {
+		selected := vmcp.Spec.AuthServerConfig.UpstreamProviders[0].Name
+		statusManager.SetCondition(
+			mcpv1beta1.ConditionTypeAuthzUpstreamSelectionWarning,
+			mcpv1beta1.ConditionReasonAuthzUpstreamAutoSelected,
+			fmt.Sprintf(
+				"multiple upstreamProviders configured; Cedar policies will evaluate "+
+					"claims from the first upstream (%q). If another upstream should be "+
+					"authoritative, set spec.incomingAuth.authzConfig.inline."+
+					"primaryUpstreamProvider explicitly, or remove or reorder the list.",
+				selected,
+			),
+			metav1.ConditionTrue,
+		)
+	} else {
+		statusManager.RemoveConditionsWithPrefix(mcpv1beta1.ConditionTypeAuthzUpstreamSelectionWarning, []string{})
+	}
 
 	return nil
 }
@@ -785,14 +1081,18 @@ func (r *VirtualMCPServerReconciler) ensureAllResources(
 	return ctrl.Result{}, nil
 }
 
-// ensureAuthSecretsValid validates secret references and sets the AuthConfigured condition.
+// ensureAuthSecretsValid validates secret references and the authz ConfigMap reference
+// (when configured), and sets the AuthConfigured condition. Catches configuration errors
+// early so the user gets a status-level diagnostic instead of an opaque conversion error
+// or, worse, a silently degraded runtime.
 func (r *VirtualMCPServerReconciler) ensureAuthSecretsValid(
 	ctx context.Context,
 	vmcp *mcpv1beta1.VirtualMCPServer,
 	statusManager virtualmcpserverstatus.StatusManager,
 ) error {
+	ctxLogger := log.FromContext(ctx)
+
 	if err := r.validateSecretReferences(ctx, vmcp); err != nil {
-		ctxLogger := log.FromContext(ctx)
 		ctxLogger.Error(err, "Secret validation failed")
 		statusManager.SetAuthConfiguredCondition(
 			mcpv1beta1.ConditionReasonAuthInvalid,
@@ -803,6 +1103,27 @@ func (r *VirtualMCPServerReconciler) ensureAuthSecretsValid(
 		if r.Recorder != nil {
 			r.Recorder.Eventf(vmcp, nil, corev1.EventTypeWarning, "SecretValidationFailed", "ValidateSecrets",
 				"Secret validation failed: %v", err)
+		}
+		return err
+	}
+
+	if err := r.validateAuthzConfigMapRef(ctx, vmcp); err != nil {
+		ctxLogger.Error(err, "Authz ConfigMap validation failed")
+		reason := mcpv1beta1.ConditionReasonAuthzConfigMapInvalid
+		eventReason := "AuthzConfigMapInvalid"
+		if errors.IsNotFound(err) {
+			reason = mcpv1beta1.ConditionReasonAuthzConfigMapNotFound
+			eventReason = "AuthzConfigMapNotFound"
+		}
+		statusManager.SetAuthConfiguredCondition(
+			reason,
+			fmt.Sprintf("Authorization ConfigMap is invalid: %v", err),
+			metav1.ConditionFalse,
+		)
+		statusManager.SetObservedGeneration(vmcp.Generation)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(vmcp, nil, corev1.EventTypeWarning, eventReason, "ValidateAuthzConfigMap",
+				"Authz ConfigMap validation failed: %v", err)
 		}
 		return err
 	}
@@ -851,12 +1172,29 @@ func (r *VirtualMCPServerReconciler) ensureRBACResources(
 
 	// Ensure Role with appropriate permissions based on mode
 	_, err := rbacClient.EnsureRBACResources(ctx, rbac.EnsureRBACResourcesParams{
-		Name:      serviceAccountName,
-		Namespace: vmcp.Namespace,
-		Rules:     rules,
-		Owner:     vmcp,
+		Name:             serviceAccountName,
+		Namespace:        vmcp.Namespace,
+		Rules:            rules,
+		Owner:            vmcp,
+		ImagePullSecrets: r.imagePullSecretsForVMCP(vmcp),
 	})
 	return err
+}
+
+// imagePullSecretsForVMCP returns the image pull secrets the operator will set
+// on the workload's PodSpec and ServiceAccount: the merge of cluster-wide
+// chart defaults (from r.ImagePullSecretsDefaults) with vmcp.Spec.ImagePullSecrets.
+// CR-level entries win on name collisions; chart-level entries are appended
+// additively. Returns nil when both inputs are empty.
+//
+// Note: the live Deployment.Spec.Template.Spec.ImagePullSecrets is the
+// strategic-merge union of this list with anything the user supplied under
+// spec.podTemplateSpec.spec.imagePullSecrets — see imagePullSecretsNeedsUpdate
+// for how drift is detected without comparing the live field directly.
+func (r *VirtualMCPServerReconciler) imagePullSecretsForVMCP(
+	vmcp *mcpv1beta1.VirtualMCPServer,
+) []corev1.LocalObjectReference {
+	return r.ImagePullSecretsDefaults.Merge(vmcp.Spec.ImagePullSecrets)
 }
 
 // ensureHMACSecret ensures the HMAC secret exists for session token binding.
@@ -1293,6 +1631,10 @@ func (r *VirtualMCPServerReconciler) deploymentNeedsUpdate(
 		return true
 	}
 
+	if r.imagePullSecretsNeedsUpdate(ctx, deployment, vmcp) {
+		return true
+	}
+
 	// Check if spec.replicas has changed. Only compare when spec.replicas is non-nil;
 	// nil means hands-off mode (HPA or external controller manages replicas) and the live count is authoritative.
 	if vmcp.Spec.Replicas != nil {
@@ -1468,6 +1810,39 @@ func (*VirtualMCPServerReconciler) podTemplateSpecNeedsUpdate(
 	}
 
 	return false
+}
+
+// imagePullSecretsNeedsUpdate detects drift on the desired imagePullSecrets
+// list (chart-level defaults merged with vmcp.Spec.ImagePullSecrets) by
+// comparing a hash of the desired list against the value stored in
+// imagePullRefsHashAnnotation. We cannot compare
+// deployment.Spec.Template.Spec.ImagePullSecrets directly because the live
+// list is the strategic-merge union with anything the user supplied under
+// spec.podTemplateSpec.spec.imagePullSecrets, so a direct equality check
+// would either flag spurious drift or miss real changes depending on
+// PodTemplateSpec content. PodTemplateSpec drift is covered separately by
+// podTemplateSpecNeedsUpdate.
+func (r *VirtualMCPServerReconciler) imagePullSecretsNeedsUpdate(
+	ctx context.Context,
+	deployment *appsv1.Deployment,
+	vmcp *mcpv1beta1.VirtualMCPServer,
+) bool {
+	if deployment == nil || vmcp == nil {
+		return true
+	}
+
+	expectedHash, err := imagePullSecretsHash(r.imagePullSecretsForVMCP(vmcp))
+	if err != nil {
+		log.FromContext(ctx).Error(err, "Failed to hash imagePullSecrets, assuming update needed")
+		return true
+	}
+	// An empty desired list means the annotation should be absent; an absent annotation
+	// with an empty desired list is the steady state and must not trigger an update.
+	_, present := deployment.Annotations[imagePullRefsHashAnnotation]
+	if expectedHash == "" {
+		return present
+	}
+	return deployment.Annotations[imagePullRefsHashAnnotation] != expectedHash
 }
 
 // serviceNeedsUpdate checks if the service needs to be updated
@@ -1882,6 +2257,12 @@ func (r *VirtualMCPServerReconciler) convertBackendAuthConfigToVMCP(
 			return nil, fmt.Errorf("failed to get MCPExternalAuthConfig %s: %w", crdConfig.ExternalAuthConfigRef.Name, err)
 		}
 
+		// Mirror the source's Valid=False condition before attempting conversion
+		// so the per-backend condition surfaces with the same reason taxonomy.
+		if mirrored := mirroredExternalAuthConfigInvalid(externalAuthConfig); mirrored != nil {
+			return nil, mirrored
+		}
+
 		// Convert the external auth config to strategy
 		return r.convertExternalAuthConfigToStrategy(externalAuthConfig)
 	}
@@ -1997,6 +2378,19 @@ func (r *VirtualMCPServerReconciler) discoverExternalAuthConfigs(
 			continue
 		}
 
+		// Mirror the source's Valid=False condition (e.g. EnterpriseRequired for
+		// obo-typed configs in upstream-only builds) onto the per-backend
+		// condition so the failure surfaces with the same reason taxonomy.
+		if mirrored := mirroredExternalAuthConfigInvalid(externalAuthConfig); mirrored != nil {
+			authErrors = append(authErrors, AuthConfigError{
+				Context:     fmt.Sprintf("%s%s", authContextDiscoveredPrefix, workloadInfo.Name),
+				BackendName: workloadInfo.Name,
+				Error:       mirrored,
+				Reason:      mirrored.Reason,
+			})
+			continue
+		}
+
 		// Convert MCPExternalAuthConfig to BackendAuthStrategy
 		strategy, err := r.convertExternalAuthConfigToStrategy(externalAuthConfig)
 		if err != nil {
@@ -2094,6 +2488,7 @@ func (r *VirtualMCPServerReconciler) buildOutgoingAuthConfig(
 				Context:     authContextDefault,
 				BackendName: "",
 				Error:       fmt.Errorf("failed to convert default auth config: %w", err),
+				Reason:      mirroredReasonFromError(err),
 			})
 		} else {
 			outgoing.Default = injectSubjectProviderIfNeeded(defaultStrategy, vmcp.Spec.AuthServerConfig)
@@ -2119,6 +2514,7 @@ func (r *VirtualMCPServerReconciler) buildOutgoingAuthConfig(
 					Context:     fmt.Sprintf("%s%s", authContextBackendPrefix, backendName),
 					BackendName: backendName,
 					Error:       fmt.Errorf("failed to convert backend auth config: %w", err),
+					Reason:      mirroredReasonFromError(err),
 				})
 			} else {
 				outgoing.Backends[backendName] = injectSubjectProviderIfNeeded(strategy, vmcp.Spec.AuthServerConfig)
@@ -2129,37 +2525,59 @@ func (r *VirtualMCPServerReconciler) buildOutgoingAuthConfig(
 	return outgoing, backendsWithAuthConfig, allAuthErrors
 }
 
-// injectSubjectProviderIfNeeded auto-populates SubjectProviderName on a token_exchange
-// strategy when it is empty and an embedded auth server is configured on the VirtualMCPServer.
-// Mirrors injectUpstreamProviderIfNeeded in pkg/runner/middleware.go, which does the same
-// for Cedar's PrimaryUpstreamProvider.
-// Returns strategy unchanged when it is nil, not a token_exchange strategy, already has
-// SubjectProviderName set, or no embedded auth server is configured.
+// injectSubjectProviderIfNeeded auto-populates the upstream provider name on
+// token_exchange and aws_sts strategies when the field is empty and an embedded
+// auth server is configured on the VirtualMCPServer.
+// Both strategies use SubjectProviderName for the same concept: which upstream
+// provider's token to pull from Identity.UpstreamTokens. Mirrors
+// injectUpstreamProviderIfNeeded in pkg/runner/middleware.go, which does the
+// same for Cedar's PrimaryUpstreamProvider.
+// Returns strategy unchanged when it is nil, not an applicable strategy type,
+// already has the provider name set, or no embedded auth server is configured.
 func injectSubjectProviderIfNeeded(
 	strategy *authtypes.BackendAuthStrategy,
 	embeddedCfg *mcpv1beta1.EmbeddedAuthServerConfig,
 ) *authtypes.BackendAuthStrategy {
-	if strategy == nil ||
-		strategy.Type != authtypes.StrategyTypeTokenExchange ||
-		strategy.TokenExchange == nil ||
-		strategy.TokenExchange.SubjectProviderName != "" ||
-		embeddedCfg == nil {
+	if strategy == nil || embeddedCfg == nil {
 		return strategy
 	}
 
-	providerName := func() string {
-		if len(embeddedCfg.UpstreamProviders) > 0 {
-			return authserver.ResolveUpstreamName(embeddedCfg.UpstreamProviders[0].Name)
+	switch strategy.Type {
+	case authtypes.StrategyTypeTokenExchange:
+		if strategy.TokenExchange == nil || strategy.TokenExchange.SubjectProviderName != "" {
+			return strategy
 		}
-		return authserver.DefaultUpstreamName
-	}()
+		providerName := resolveFirstUpstreamProvider(embeddedCfg)
+		copied := *strategy
+		teCopied := *strategy.TokenExchange
+		teCopied.SubjectProviderName = providerName
+		copied.TokenExchange = &teCopied
+		return &copied
 
-	// Copy the strategy to avoid mutating the original.
-	copied := *strategy
-	teCopied := *strategy.TokenExchange
-	teCopied.SubjectProviderName = providerName
-	copied.TokenExchange = &teCopied
-	return &copied
+	case authtypes.StrategyTypeAwsSts:
+		if strategy.AwsSts == nil || strategy.AwsSts.SubjectProviderName != "" {
+			return strategy
+		}
+		providerName := resolveFirstUpstreamProvider(embeddedCfg)
+		copied := *strategy
+		stsCopied := *strategy.AwsSts
+		stsCopied.SubjectProviderName = providerName
+		copied.AwsSts = &stsCopied
+		return &copied
+
+	default:
+		return strategy
+	}
+}
+
+// resolveFirstUpstreamProvider returns the resolved name of the first upstream
+// provider configured on the embedded auth server, or the default name if none
+// are configured.
+func resolveFirstUpstreamProvider(embeddedCfg *mcpv1beta1.EmbeddedAuthServerConfig) string {
+	if len(embeddedCfg.UpstreamProviders) > 0 {
+		return authserver.ResolveUpstreamName(embeddedCfg.UpstreamProviders[0].Name)
+	}
+	return authserver.DefaultUpstreamName
 }
 
 // convertBackendsToStaticBackends converts Backend objects to StaticBackendConfig for ConfigMap embedding.
@@ -2318,6 +2736,15 @@ func (r *VirtualMCPServerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(
 			&mcpv1beta1.MCPTelemetryConfig{},
 			handler.EnqueueRequestsFromMapFunc(r.mapTelemetryConfigToVirtualMCPServer),
+		).
+		// Watch ConfigMaps referenced via spec.incomingAuth.authzConfig.configMap so that
+		// policy changes trigger reconciliation. The predicate filters out metadata-only
+		// updates; the mapper narrows to VirtualMCPServers that actually reference the
+		// changed ConfigMap. See #5270.
+		Watches(
+			&corev1.ConfigMap{},
+			handler.EnqueueRequestsFromMapFunc(r.mapAuthzConfigMapToVirtualMCPServer),
+			builder.WithPredicates(configMapDataChangedPredicate()),
 		).
 		Complete(r)
 }
@@ -2844,27 +3271,32 @@ func setAuthConfigConditions(
 	allAuthErrors []AuthConfigError,
 ) {
 	// Build error maps by context for quick lookup
-	var defaultAuthError error
-	backendAuthErrors := make(map[string]error)
-	discoveredAuthErrors := make(map[string]error)
+	var defaultAuthError *AuthConfigError
+	backendAuthErrors := make(map[string]*AuthConfigError)
+	discoveredAuthErrors := make(map[string]*AuthConfigError)
 
-	for _, authError := range allAuthErrors {
-		if authError.Context == authContextDefault {
-			defaultAuthError = authError.Error
-		} else if strings.HasPrefix(authError.Context, authContextBackendPrefix) {
-			backendAuthErrors[authError.BackendName] = authError.Error
-		} else if strings.HasPrefix(authError.Context, authContextDiscoveredPrefix) {
-			discoveredAuthErrors[authError.BackendName] = authError.Error
+	for i := range allAuthErrors {
+		authError := &allAuthErrors[i]
+		switch {
+		case authError.Context == authContextDefault:
+			defaultAuthError = authError
+		case strings.HasPrefix(authError.Context, authContextBackendPrefix):
+			backendAuthErrors[authError.BackendName] = authError
+		case strings.HasPrefix(authError.Context, authContextDiscoveredPrefix):
+			discoveredAuthErrors[authError.BackendName] = authError
 		}
 	}
 
 	// Handle DefaultAuthConfig condition
 	if defaultAuthError != nil {
-		// Default auth has error - set False condition
+		// Default auth has error - set False condition. When the source's
+		// MCPExternalAuthConfig surfaced a Valid=False condition we propagate
+		// the source's reason (e.g. EnterpriseRequired); otherwise we report
+		// ConversionFailed.
 		statusManager.SetAuthConfigCondition(
 			"DefaultAuthConfig",
-			"ConversionFailed",
-			fmt.Sprintf("Failed to convert default auth config: %v", defaultAuthError),
+			authConfigErrorReason(defaultAuthError),
+			fmt.Sprintf("Failed to convert default auth config: %v", defaultAuthError.Error),
 			metav1.ConditionFalse,
 		)
 	} else if hasValidDefaultAuth {
@@ -2903,12 +3335,15 @@ func setAuthConfigConditions(
 	for _, backendName := range backendsWithAuthConfig {
 		conditionType := fmt.Sprintf("DiscoveredAuthConfig-%s", backendName)
 
-		if err, hasError := discoveredAuthErrors[backendName]; hasError {
-			// Backend has discovered auth config error - set False condition
+		if authErr, hasError := discoveredAuthErrors[backendName]; hasError {
+			// Backend has discovered auth config error - set False condition.
+			// Propagate the source's reason when the underlying
+			// MCPExternalAuthConfig surfaced Valid=False; otherwise report
+			// ConversionFailed.
 			statusManager.SetAuthConfigCondition(
 				conditionType,
-				"ConversionFailed",
-				fmt.Sprintf("Failed to convert discovered auth config: %v", err),
+				authConfigErrorReason(authErr),
+				fmt.Sprintf("Failed to convert discovered auth config: %v", authErr.Error),
 				metav1.ConditionFalse,
 			)
 		} else {
@@ -2922,14 +3357,16 @@ func setAuthConfigConditions(
 		}
 	}
 
-	// Set BackendAuthConfig conditions for inline backend-specific auth configs
-	// First, set error conditions
-	for backendName, err := range backendAuthErrors {
+	// Set BackendAuthConfig conditions for inline backend-specific auth configs.
+	// First, set error conditions. Propagate the source's reason when the
+	// underlying MCPExternalAuthConfig surfaced Valid=False; otherwise report
+	// ConversionFailed.
+	for backendName, authErr := range backendAuthErrors {
 		conditionType := fmt.Sprintf("BackendAuthConfig-%s", backendName)
 		statusManager.SetAuthConfigCondition(
 			conditionType,
-			"ConversionFailed",
-			fmt.Sprintf("Failed to convert backend auth config: %v", err),
+			authConfigErrorReason(authErr),
+			fmt.Sprintf("Failed to convert backend auth config: %v", authErr.Error),
 			metav1.ConditionFalse,
 		)
 	}
@@ -3086,6 +3523,7 @@ func (r *VirtualMCPServerReconciler) updateOIDCConfigReferencingWorkloads(
 
 	// Add the workload reference
 	oidcConfig.Status.ReferencingWorkloads = append(oidcConfig.Status.ReferencingWorkloads, ref)
+	oidcConfig.Status.ReferenceCount = workloadReferenceCount(oidcConfig.Status.ReferencingWorkloads)
 	if err := r.Status().Update(ctx, oidcConfig); err != nil {
 		return fmt.Errorf("failed to update MCPOIDCConfig ReferencingWorkloads: %w", err)
 	}

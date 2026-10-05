@@ -87,6 +87,29 @@ spec:
                       Must be a valid HTTPS URL (or HTTP for localhost) without query, fragment, or trailing slash.
                     pattern: ^https?://[^\s?#]+[^/\s?#]$
                     type: string
+                  baselineClientScopes:
+                    description: |-
+                      BaselineClientScopes is a baseline set of OAuth 2.0 scopes guaranteed to be
+                      included in every client registration. The embedded auth server unions these
+                      scopes into the registered set returned by RFC 7591 Dynamic Client
+                      Registration, so a client that narrows the `scope` field at /oauth/register
+                      can still request the baseline scopes at /oauth/authorize. All values must
+                      be present in the upstream-derived scopesSupported set; the auth server
+                      fails to start if any value is missing.
+
+                      Security: every client registered via /oauth/register will gain the
+                      ability to request these scopes at /oauth/authorize, regardless of what
+                      the client itself requested. Keep the baseline narrow (typically
+                      "openid" and "offline_access"). Adding a privileged scope here — e.g.
+                      "admin:read" — would grant it to every DCR-registered client, including
+                      public clients like Claude Code, Cursor, and VS Code.
+                    items:
+                      minLength: 1
+                      pattern: ^[\x21\x23-\x5B\x5D-\x7E]+$
+                      type: string
+                    maxItems: 10
+                    type: array
+                    x-kubernetes-list-type: atomic
                   hmacSecretRefs:
                     description: |-
                       HMACSecretRefs references Kubernetes Secrets containing symmetric secrets for signing
@@ -116,6 +139,26 @@ spec:
                       This will be included in the "iss" claim of issued tokens.
                       Must be a valid HTTPS URL (or HTTP for localhost) without query, fragment, or trailing slash (per RFC 8414).
                     pattern: ^https?://[^\s?#]+[^/\s?#]$
+                    type: string
+                  primaryUpstreamProvider:
+                    description: |-
+                      PrimaryUpstreamProvider names the upstream IDP whose access token Cedar
+                      should read claims from when authorising a request. Must match the name
+                      of one of the entries in UpstreamProviders. When empty, the controller
+                      auto-selects the first entry of UpstreamProviders.
+
+                      Only meaningful on VirtualMCPServer, where multiple upstream providers
+                      can be configured and Cedar needs to pick which token's claims to
+                      evaluate. The VirtualMCPServer controller validates this field against
+                      UpstreamProviders at admission and rejects unresolvable values.
+
+                      On MCPServer and MCPRemoteProxy this field is structurally present (the
+                      EmbeddedAuthServerConfig struct is shared) but has no runtime effect:
+                      those CRDs are restricted to a single upstream so there is no choice to
+                      make. Setting it on those CRDs is silently ignored.
+                    maxLength: 63
+                    minLength: 1
+                    pattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$
                     type: string
                   signingKeySecretRefs:
                     description: |-
@@ -167,8 +210,12 @@ spec:
                                 - name
                                 type: object
                               usernameSecretRef:
-                                description: UsernameSecretRef references a Secret
-                                  containing the Redis ACL username.
+                                description: |-
+                                  UsernameSecretRef references a Secret containing the Redis ACL username.
+                                  When omitted, connections use legacy password-only AUTH. Omit for managed
+                                  Redis tiers that do not support ACL users (e.g. GCP Memorystore Basic/Standard
+                                  HA, Azure Cache for Redis). Set for services that support ACL users (e.g. AWS
+                                  ElastiCache non-cluster with Redis 6+ RBAC).
                                 properties:
                                   key:
                                     description: Key is the key within the secret
@@ -182,13 +229,27 @@ spec:
                                 type: object
                             required:
                             - passwordSecretRef
-                            - usernameSecretRef
                             type: object
+                          addr:
+                            description: |-
+                              Addr is the Redis server address (host:port). Required for standalone and cluster modes.
+                              Use for managed Redis services that expose a single endpoint (GCP Memorystore basic tier,
+                              AWS ElastiCache without cluster mode, or cluster-mode services when clusterMode is true).
+                              Mutually exclusive with sentinelConfig.
+                            type: string
                           address:
                             description: |-
-                              Address is the Redis-compatible server address for direct mode (host:port).
-                              Mutually exclusive with SentinelConfig.
+                              Address is a deprecated alias of addr, kept by the DocPlanner fork for
+                              configurations written before upstream renamed the field. Use addr instead.
+
+                              Deprecated: use Addr.
                             type: string
+                          clusterMode:
+                            description: |-
+                              ClusterMode enables the Redis Cluster protocol. Set to true when addr points to a
+                              Redis Cluster discovery endpoint (e.g., GCP Memorystore Cluster, AWS ElastiCache
+                              cluster mode enabled). Requires addr to be set.
+                            type: boolean
                           dialTimeout:
                             default: 5s
                             description: |-
@@ -205,8 +266,8 @@ spec:
                             type: string
                           sentinelConfig:
                             description: |-
-                              SentinelConfig holds Redis Sentinel configuration for HA mode.
-                              Mutually exclusive with Address.
+                              SentinelConfig holds Redis Sentinel configuration.
+                              Use for self-managed Redis with Sentinel-based HA. Mutually exclusive with addr.
                             properties:
                               db:
                                 default: 0
@@ -251,8 +312,7 @@ spec:
                           sentinelTls:
                             description: |-
                               SentinelTLS configures TLS for connections to Sentinel instances.
-                              Presence of this field enables TLS. Omit to use plaintext.
-                              When omitted, sentinel connections use plaintext (no fallback to TLS config).
+                              Only applies when sentinelConfig is set. Presence of this field enables TLS.
                             properties:
                               caCertSecretRef:
                                 description: |-
@@ -311,6 +371,19 @@ spec:
                         required:
                         - aclUserConfig
                         type: object
+                        x-kubernetes-validations:
+                        - message: addr and address are mutually exclusive; address
+                            is a deprecated alias of addr
+                          rule: '!(has(self.addr) && self.addr.size() > 0 && has(self.address)
+                            && self.address.size() > 0)'
+                        - message: exactly one of addr (or its deprecated alias address)
+                            or sentinelConfig must be set
+                          rule: ((has(self.addr) && self.addr.size() > 0) || (has(self.address)
+                            && self.address.size() > 0)) != has(self.sentinelConfig)
+                        - message: clusterMode requires addr to be set
+                          rule: '!(has(self.clusterMode) && self.clusterMode) || (has(self.addr)
+                            && self.addr.size() > 0) || (has(self.address) && self.address.size()
+                            > 0)'
                       type:
                         default: memory
                         description: |-
@@ -354,8 +427,19 @@ spec:
                       The embedded auth server delegates authentication to these providers.
                       MCPServer and MCPRemoteProxy support a single upstream; VirtualMCPServer supports multiple.
                     items:
-                      description: UpstreamProviderConfig defines configuration for
-                        an upstream Identity Provider.
+                      description: |-
+                        UpstreamProviderConfig defines configuration for an upstream Identity Provider.
+
+                        Exactly one of OIDCConfig or OAuth2Config must be set and must match the
+                        declared Type: oidc-typed providers set OIDCConfig, oauth2-typed providers
+                        set OAuth2Config. The CEL rule below enforces the pairing at admission; the
+                        matching Go-level check in validateUpstreamProvider provides defense-in-depth
+                        for stored objects.
+
+                        The rule is structured as a chain of equality checks ending in an explicit
+                        `false`, so adding a new UpstreamProviderType value without extending this
+                        rule fails admission instead of silently demanding the OAuth2 shape. When
+                        adding a new type, extend both this rule and validateUpstreamProvider.
                       properties:
                         name:
                           description: |-
@@ -389,8 +473,10 @@ spec:
                               pattern: ^https?://.*$
                               type: string
                             clientId:
-                              description: ClientID is the OAuth 2.0 client identifier
-                                registered with the upstream IDP.
+                              description: |-
+                                ClientID is the OAuth 2.0 client identifier registered with the upstream IDP.
+                                Mutually exclusive with DCRConfig: when DCRConfig is set, ClientID is obtained
+                                at runtime via RFC 7591 Dynamic Client Registration and must be left empty.
                               type: string
                             clientSecretRef:
                               description: |-
@@ -406,6 +492,131 @@ spec:
                               required:
                               - key
                               - name
+                              type: object
+                            dcrConfig:
+                              description: |-
+                                DCRConfig enables RFC 7591 Dynamic Client Registration against the upstream
+                                authorization server. When set, the client credentials are obtained at
+                                runtime rather than being pre-provisioned, and ClientID must be left empty.
+                                Mutually exclusive with ClientID.
+                              properties:
+                                discoveryUrl:
+                                  description: |-
+                                    DiscoveryURL is the RFC 8414 / OIDC Discovery document URL. The resolver
+                                    issues a single GET against this URL (no well-known-path fallback) and
+                                    reads registration_endpoint, authorization_endpoint, token_endpoint,
+                                    token_endpoint_auth_methods_supported, and scopes_supported from the
+                                    response.
+                                    Mutually exclusive with RegistrationEndpoint.
+                                    HTTPS is required because the registration endpoint resolved from this
+                                    document carries the initial access token and the issued client_secret
+                                    (RFC 7591 §3, RFC 8414 §3). MaxLength is a defensive size cap (etcd
+                                    object budget, regex evaluation cost) and matches the conventional URL
+                                    length cap.
+                                  maxLength: 2048
+                                  pattern: ^https://[^\s?#]+[^/\s?#]$
+                                  type: string
+                                initialAccessTokenRef:
+                                  description: |-
+                                    InitialAccessTokenRef is an optional reference to a Kubernetes Secret
+                                    carrying an RFC 7591 §3 initial access token. When set, the resolver
+                                    presents the token value as a Bearer credential on the registration
+                                    request. Mirrors the ClientSecretRef pattern.
+                                  properties:
+                                    key:
+                                      description: Key is the key within the secret
+                                      type: string
+                                    name:
+                                      description: Name is the name of the secret
+                                      type: string
+                                  required:
+                                  - key
+                                  - name
+                                  type: object
+                                registrationEndpoint:
+                                  description: |-
+                                    RegistrationEndpoint is the RFC 7591 registration endpoint URL used
+                                    directly, bypassing discovery. When using this field, the caller is
+                                    expected to also supply AuthorizationEndpoint, TokenEndpoint, and an
+                                    explicit Scopes list on the parent OAuth2UpstreamConfig.
+                                    Mutually exclusive with DiscoveryURL.
+                                    HTTPS is required because the registration endpoint carries the initial
+                                    access token and the issued client_secret (RFC 7591 §3, RFC 8414 §3).
+                                    MaxLength is a defensive size cap (etcd object budget, regex evaluation
+                                    cost) and matches the conventional URL length cap.
+                                  maxLength: 2048
+                                  pattern: ^https://[^\s?#]+[^/\s?#]$
+                                  type: string
+                                softwareId:
+                                  description: |-
+                                    SoftwareID is the RFC 7591 "software_id" registration metadata value,
+                                    identifying the client software independent of any particular
+                                    registration instance. Typically a UUID or short identifier.
+                                  maxLength: 255
+                                  type: string
+                                softwareStatement:
+                                  description: |-
+                                    SoftwareStatement is the RFC 7591 "software_statement" JWT asserting
+                                    metadata about the client software, signed by a party the authorization
+                                    server trusts.
+
+                                    Stored inline on the CR. The JWT is signed but not encrypted, so its
+                                    contents are visible to anyone with get/list/watch on this resource and
+                                    appear in etcd backups in plaintext. Treat the value as non-confidential
+                                    (signed attestation, not a secret). Operators that rotate software
+                                    statements like bearer credentials should keep them at the authorization
+                                    server side and rely on the registration endpoint's initial access
+                                    token (see InitialAccessTokenRef) instead of placing them on the CR.
+
+                                    Bounded to 16384 characters as a defensive size cap (etcd object
+                                    budget, regex evaluation cost). Real-world signed statements with
+                                    embedded x5c certificate chains, JWKS keys, or OIDC-Federation
+                                    trust-framework metadata routinely exceed 4 KB.
+                                  maxLength: 16384
+                                  type: string
+                              type: object
+                              x-kubernetes-validations:
+                              - message: exactly one of discoveryUrl or registrationEndpoint
+                                  must be set
+                                rule: has(self.discoveryUrl) != has(self.registrationEndpoint)
+                            identityFromToken:
+                              description: |-
+                                IdentityFromToken extracts user identity (subject, name, email) directly
+                                from the OAuth2 token-endpoint response body using gjson dot-notation paths.
+                                When set, the embedded auth server skips the userinfo HTTP call entirely
+                                and resolves identity from the token response. See IdentityFromTokenConfig
+                                for trust-model and uniqueness considerations.
+                              properties:
+                                emailPath:
+                                  description: |-
+                                    EmailPath is the dot-notation path to the email address field in the token response.
+                                    If not specified or if the path does not resolve to a string, the email is omitted.
+                                    Omit the field entirely rather than setting it to an empty string.
+                                  maxLength: 256
+                                  minLength: 1
+                                  type: string
+                                namePath:
+                                  description: |-
+                                    NamePath is the dot-notation path to the display name field in the token response.
+                                    If not specified or if the path does not resolve to a string, the display name is omitted.
+                                    Omit the field entirely rather than setting it to an empty string.
+                                  maxLength: 256
+                                  minLength: 1
+                                  type: string
+                                subjectPath:
+                                  description: |-
+                                    SubjectPath is the dot-notation path to the subject (user ID) field in the token response.
+                                    Warning: claims read from the token response are trusted only via TLS, not
+                                    cryptographically verified; prefer OIDC ID tokens when verifiable claims are required.
+                                    Example: "authed_user.id" for Slack (top-level token-response field). For providers
+                                    whose token response embeds the access token as a JWT (e.g. Snowflake), use the
+                                    "@upstreamjwt" modifier to decode the payload, e.g. "access_token|@upstreamjwt|sub".
+                                    The "@upstreamjwt" modifier performs no signature verification either.
+                                  maxLength: 256
+                                  minLength: 1
+                                  type: string
+                              required:
+                              - subjectPath
                               type: object
                             redirectUri:
                               description: |-
@@ -432,6 +643,7 @@ spec:
                                 instead of returning them at the top level. When set, ToolHive performs the token
                                 exchange HTTP call directly and extracts fields using the configured dot-notation paths.
                                 If nil, standard OAuth 2.0 token response parsing is used.
+                                For extracting user identity from the token response, see IdentityFromToken.
                               properties:
                                 accessTokenPath:
                                   description: |-
@@ -460,7 +672,13 @@ spec:
                             userInfo:
                               description: |-
                                 UserInfo contains configuration for fetching user information from the upstream provider.
-                                Required for OAuth2 providers to resolve user identity.
+                                When omitted and IdentityFromToken is also unset, the embedded auth server runs in
+                                synthesis mode for this upstream: a non-PII subject derived from the access token, no
+                                Name/Email. Use this shape for upstreams with no userinfo surface and no identity in
+                                the token response (e.g., MCP authorization servers per the MCP spec). When
+                                IdentityFromToken is set instead, identity is resolved from the token response body
+                                (e.g., Snowflake's "username" field, Slack's "authed_user.id"); the userinfo HTTP call
+                                is skipped entirely.
                               properties:
                                 additionalHeaders:
                                   additionalProperties:
@@ -520,10 +738,17 @@ spec:
                               type: object
                           required:
                           - authorizationEndpoint
-                          - clientId
                           - tokenEndpoint
-                          - userInfo
                           type: object
+                          x-kubernetes-validations:
+                          - message: exactly one of clientId or dcrConfig must be
+                              set
+                            rule: '(has(self.clientId) && size(self.clientId) > 0)
+                              ? !has(self.dcrConfig) : has(self.dcrConfig)'
+                          - message: clientSecretRef must not be set when dcrConfig
+                              is set; the client_secret is obtained at runtime via
+                              Dynamic Client Registration
+                            rule: '!(has(self.dcrConfig) && has(self.clientSecretRef))'
                         oidcConfig:
                           description: |-
                             OIDCConfig contains OIDC-specific configuration.
@@ -663,6 +888,13 @@ spec:
                       - name
                       - type
                       type: object
+                      x-kubernetes-validations:
+                      - message: type must be 'oidc' or 'oauth2'; oidcConfig must
+                          be set when type is 'oidc' and oauth2Config must be set
+                          when type is 'oauth2' (and the other must not be set)
+                        rule: 'self.type == ''oidc'' ? (has(self.oidcConfig) && !has(self.oauth2Config))
+                          : self.type == ''oauth2'' ? (has(self.oauth2Config) && !has(self.oidcConfig))
+                          : false'
                     minItems: 1
                     type: array
                     x-kubernetes-list-map-keys:
@@ -1225,6 +1457,29 @@ spec:
                       authz:
                         description: Authz contains authorization configuration (optional).
                         properties:
+                          entitiesJson:
+                            description: |-
+                              EntitiesJSON is a JSON string representing Cedar entities. Required for
+                              enterprise policies that rely on transitive relationships (e.g.
+                              `ClaimGroup → PlatformRole`) — without it the Cedar authorizer is
+                              constructed with an empty entity store and `in` checks against absent
+                              entities silently evaluate to false. Defaults to "[]" when empty.
+                            type: string
+                          groupClaimName:
+                            description: |-
+                              GroupClaimName is the JWT claim key that contains group membership for
+                              the principal. When set, takes priority over the well-known defaults
+                              ("groups", "roles", "cognito:groups"). Use this for IDPs that place
+                              groups under a URI-style claim (e.g. "https://example.com/groups").
+                              When empty, only the well-known claim names are checked.
+                            type: string
+                          groupEntityType:
+                            description: |-
+                              GroupEntityType is the Cedar entity type name used for principal parent
+                              UIDs synthesised from JWT group/role claims. Defaults to "THVGroup" when
+                              empty. Must match the entity type used in EntitiesJSON for transitive
+                              `in` checks to resolve. Namespaced names (`Foo::Bar`) are not yet supported.
+                            type: string
                           policies:
                             description: Policies contains Cedar policy definitions
                               (when Type = "cedar").
@@ -1238,6 +1493,13 @@ spec:
                               When empty, claims from the ToolHive-issued token are used.
                               Must match an upstream provider name configured in the embedded auth server
                               (e.g. "default", "github"). Only relevant when the embedded auth server is active.
+                            type: string
+                          roleClaimName:
+                            description: |-
+                              RoleClaimName is the JWT claim key that contains role membership for the
+                              principal. When set, the claim is extracted separately from GroupClaimName
+                              and both are mapped to the configured group entity type. When empty, no
+                              role extraction is performed.
                             type: string
                           type:
                             description: 'Type is the authz type: "cedar", "none"'
@@ -1497,6 +1759,77 @@ spec:
                             This struct provides type-safe configuration for different authentication strategies
                             using HeaderInjection or TokenExchange fields based on the Type field.
                           properties:
+                            awsSts:
+                              description: |-
+                                AwsSts contains configuration for AWS STS auth strategy.
+                                Used when Type = "aws_sts".
+                              properties:
+                                fallbackRoleArn:
+                                  description: FallbackRoleArn is the IAM role ARN
+                                    to assume when no role mappings match.
+                                  type: string
+                                region:
+                                  description: Region is the AWS region for the STS
+                                    endpoint and service.
+                                  type: string
+                                roleClaim:
+                                  description: RoleClaim is the JWT claim to use for
+                                    role mapping evaluation.
+                                  type: string
+                                roleMappings:
+                                  description: RoleMappings defines claim-based role
+                                    selection rules.
+                                  items:
+                                    description: |-
+                                      RoleMapping defines a rule for mapping JWT claims to IAM roles.
+                                      Mappings are evaluated in priority order (lower number = higher priority).
+                                    properties:
+                                      claim:
+                                        description: Claim is a simple claim value
+                                          to match against the RoleClaim field.
+                                        type: string
+                                      matcher:
+                                        description: Matcher is a CEL expression for
+                                          complex matching against JWT claims.
+                                        type: string
+                                      priority:
+                                        description: |-
+                                          Priority determines evaluation order (lower values = higher priority).
+                                          Mirrors awssts.RoleMapping.Priority, which is *int because the role mapper
+                                          uses math.MaxInt for nil-priority semantics in effectivePriority.
+                                        type: integer
+                                      roleArn:
+                                        description: RoleArn is the IAM role ARN to
+                                          assume when this mapping matches.
+                                        type: string
+                                    required:
+                                    - roleArn
+                                    type: object
+                                  type: array
+                                  x-kubernetes-list-type: atomic
+                                service:
+                                  description: Service is the AWS service name for
+                                    SigV4 signing.
+                                  type: string
+                                sessionDuration:
+                                  description: SessionDuration is the duration in
+                                    seconds for the STS session.
+                                  format: int32
+                                  type: integer
+                                sessionNameClaim:
+                                  description: SessionNameClaim is the JWT claim to
+                                    use for the role session name.
+                                  type: string
+                                subjectProviderName:
+                                  description: |-
+                                    SubjectProviderName selects which upstream provider's token to use as the
+                                    web identity token for AssumeRoleWithWebIdentity. When set, the token is
+                                    looked up from Identity.UpstreamTokens instead of the request's
+                                    Authorization header.
+                                  type: string
+                              required:
+                              - region
+                              type: object
                             headerInjection:
                               description: |-
                                 HeaderInjection contains configuration for header injection auth strategy.
@@ -1572,7 +1905,8 @@ spec:
                               type: object
                             type:
                               description: 'Type is the auth strategy: "unauthenticated",
-                                "header_injection", "token_exchange", "upstream_inject"'
+                                "header_injection", "token_exchange", "upstream_inject",
+                                "aws_sts", "obo"'
                               type: string
                             upstreamInject:
                               description: |-
@@ -1596,6 +1930,77 @@ spec:
                         description: Default is the default auth strategy for backends
                           without explicit config.
                         properties:
+                          awsSts:
+                            description: |-
+                              AwsSts contains configuration for AWS STS auth strategy.
+                              Used when Type = "aws_sts".
+                            properties:
+                              fallbackRoleArn:
+                                description: FallbackRoleArn is the IAM role ARN to
+                                  assume when no role mappings match.
+                                type: string
+                              region:
+                                description: Region is the AWS region for the STS
+                                  endpoint and service.
+                                type: string
+                              roleClaim:
+                                description: RoleClaim is the JWT claim to use for
+                                  role mapping evaluation.
+                                type: string
+                              roleMappings:
+                                description: RoleMappings defines claim-based role
+                                  selection rules.
+                                items:
+                                  description: |-
+                                    RoleMapping defines a rule for mapping JWT claims to IAM roles.
+                                    Mappings are evaluated in priority order (lower number = higher priority).
+                                  properties:
+                                    claim:
+                                      description: Claim is a simple claim value to
+                                        match against the RoleClaim field.
+                                      type: string
+                                    matcher:
+                                      description: Matcher is a CEL expression for
+                                        complex matching against JWT claims.
+                                      type: string
+                                    priority:
+                                      description: |-
+                                        Priority determines evaluation order (lower values = higher priority).
+                                        Mirrors awssts.RoleMapping.Priority, which is *int because the role mapper
+                                        uses math.MaxInt for nil-priority semantics in effectivePriority.
+                                      type: integer
+                                    roleArn:
+                                      description: RoleArn is the IAM role ARN to
+                                        assume when this mapping matches.
+                                      type: string
+                                  required:
+                                  - roleArn
+                                  type: object
+                                type: array
+                                x-kubernetes-list-type: atomic
+                              service:
+                                description: Service is the AWS service name for SigV4
+                                  signing.
+                                type: string
+                              sessionDuration:
+                                description: SessionDuration is the duration in seconds
+                                  for the STS session.
+                                format: int32
+                                type: integer
+                              sessionNameClaim:
+                                description: SessionNameClaim is the JWT claim to
+                                  use for the role session name.
+                                type: string
+                              subjectProviderName:
+                                description: |-
+                                  SubjectProviderName selects which upstream provider's token to use as the
+                                  web identity token for AssumeRoleWithWebIdentity. When set, the token is
+                                  looked up from Identity.UpstreamTokens instead of the request's
+                                  Authorization header.
+                                type: string
+                            required:
+                            - region
+                            type: object
                           headerInjection:
                             description: |-
                               HeaderInjection contains configuration for header injection auth strategy.
@@ -1671,7 +2076,8 @@ spec:
                             type: object
                           type:
                             description: 'Type is the auth strategy: "unauthenticated",
-                              "header_injection", "token_exchange", "upstream_inject"'
+                              "header_injection", "token_exchange", "upstream_inject",
+                              "aws_sts", "obo"'
                             type: string
                           upstreamInject:
                             description: |-
@@ -1698,6 +2104,131 @@ spec:
                     required:
                     - source
                     type: object
+                  rateLimiting:
+                    description: |-
+                      RateLimiting defines rate limiting configuration for the Virtual MCP server.
+                      Requires Redis session storage to be configured for distributed rate limiting.
+                    properties:
+                      perUser:
+                        description: |-
+                          PerUser is a token bucket applied independently to each authenticated user
+                          at the server level. Requires authentication to be enabled.
+                          Each unique userID creates Redis keys that expire after 2x refillPeriod.
+                          Memory formula: unique_users_per_TTL_window * (1 + num_tools_with_per_user_limits) keys.
+                        properties:
+                          maxTokens:
+                            description: |-
+                              MaxTokens is the maximum number of tokens (bucket capacity).
+                              This is also the burst size: the maximum number of requests that can be served
+                              instantaneously before the bucket is depleted.
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          refillPeriod:
+                            description: |-
+                              RefillPeriod is the duration to fully refill the bucket from zero to maxTokens.
+                              The effective refill rate is maxTokens / refillPeriod tokens per second.
+                              Format: Go duration string (e.g., "1m0s", "30s", "1h0m0s").
+                            type: string
+                        required:
+                        - maxTokens
+                        - refillPeriod
+                        type: object
+                      shared:
+                        description: Shared is a token bucket shared across all users
+                          for the entire server.
+                        properties:
+                          maxTokens:
+                            description: |-
+                              MaxTokens is the maximum number of tokens (bucket capacity).
+                              This is also the burst size: the maximum number of requests that can be served
+                              instantaneously before the bucket is depleted.
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          refillPeriod:
+                            description: |-
+                              RefillPeriod is the duration to fully refill the bucket from zero to maxTokens.
+                              The effective refill rate is maxTokens / refillPeriod tokens per second.
+                              Format: Go duration string (e.g., "1m0s", "30s", "1h0m0s").
+                            type: string
+                        required:
+                        - maxTokens
+                        - refillPeriod
+                        type: object
+                      tools:
+                        description: |-
+                          Tools defines per-tool rate limit overrides.
+                          Each entry applies additional rate limits to calls targeting a specific tool name.
+                          A request must pass both the server-level limit and the per-tool limit.
+                        items:
+                          description: |-
+                            ToolRateLimitConfig defines rate limits for a specific tool.
+                            At least one of shared or perUser must be configured.
+                          properties:
+                            name:
+                              description: Name is the MCP tool name this limit applies
+                                to.
+                              minLength: 1
+                              type: string
+                            perUser:
+                              description: PerUser token bucket configuration for
+                                this tool.
+                              properties:
+                                maxTokens:
+                                  description: |-
+                                    MaxTokens is the maximum number of tokens (bucket capacity).
+                                    This is also the burst size: the maximum number of requests that can be served
+                                    instantaneously before the bucket is depleted.
+                                  format: int32
+                                  minimum: 1
+                                  type: integer
+                                refillPeriod:
+                                  description: |-
+                                    RefillPeriod is the duration to fully refill the bucket from zero to maxTokens.
+                                    The effective refill rate is maxTokens / refillPeriod tokens per second.
+                                    Format: Go duration string (e.g., "1m0s", "30s", "1h0m0s").
+                                  type: string
+                              required:
+                              - maxTokens
+                              - refillPeriod
+                              type: object
+                            shared:
+                              description: Shared token bucket for this specific tool.
+                              properties:
+                                maxTokens:
+                                  description: |-
+                                    MaxTokens is the maximum number of tokens (bucket capacity).
+                                    This is also the burst size: the maximum number of requests that can be served
+                                    instantaneously before the bucket is depleted.
+                                  format: int32
+                                  minimum: 1
+                                  type: integer
+                                refillPeriod:
+                                  description: |-
+                                    RefillPeriod is the duration to fully refill the bucket from zero to maxTokens.
+                                    The effective refill rate is maxTokens / refillPeriod tokens per second.
+                                    Format: Go duration string (e.g., "1m0s", "30s", "1h0m0s").
+                                  type: string
+                              required:
+                              - maxTokens
+                              - refillPeriod
+                              type: object
+                          required:
+                          - name
+                          type: object
+                          x-kubernetes-validations:
+                          - message: at least one of shared or perUser must be configured
+                            rule: has(self.shared) || has(self.perUser)
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                    type: object
+                    x-kubernetes-validations:
+                    - message: at least one of shared, perUser, or tools must be configured
+                      rule: has(self.shared) || has(self.perUser) || (has(self.tools)
+                        && size(self.tools) > 0)
                   sessionStorage:
                     description: |-
                       SessionStorage configures session storage for stateful horizontal scaling.
@@ -1853,6 +2384,56 @@ spec:
                 required:
                 - name
                 type: object
+              imagePullSecrets:
+                description: |-
+                  ImagePullSecrets allows specifying image pull secrets for the vMCP workload.
+                  These are applied to both the vMCP Deployment's PodSpec.ImagePullSecrets
+                  and to the operator-managed ServiceAccount the vMCP server runs as, so private
+                  images are pullable through either path.
+
+                  Merge semantics with PodTemplateSpec:
+                  The deployed PodSpec.ImagePullSecrets is the Kubernetes-native strategic-merge
+                  union of this field and spec.podTemplateSpec.spec.imagePullSecrets, merged by
+                  the patchStrategy:"merge" / patchMergeKey:"name" tags on corev1.PodSpec.
+                    - This field is rendered first as the controller-generated default.
+                    - spec.podTemplateSpec.spec.imagePullSecrets is then strategic-merge-patched
+                      on top, keyed by Name. Distinct names from the two sources are unioned in
+                      the resulting list; entries with the same Name are deduplicated and the
+                      PodTemplateSpec entry wins on overlap (user override).
+                    - Order in the resulting list is not guaranteed and should not be relied on:
+                      strategic merge by name is order-insensitive.
+                    - The operator-managed ServiceAccount's imagePullSecrets list is populated
+                      ONLY from this field. spec.podTemplateSpec.spec.imagePullSecrets does not
+                      reach the ServiceAccount because PodTemplateSpec has no notion of a
+                      ServiceAccount. To make a secret usable via the ServiceAccount path
+                      (e.g. for sidecars or init containers that pull images independently),
+                      list it here rather than under spec.podTemplateSpec.
+
+                  Note on cross-CRD consistency:
+                  MCPRegistry currently uses an atomic-replace strategy for its imagePullSecrets
+                  (the user-provided value replaces the controller-generated list rather than
+                  being merged on top). VirtualMCPServer follows the Kubernetes-native
+                  strategic-merge-by-name behavior described above. Aligning the two is tracked
+                  as a separate follow-up; until then, manifests that set imagePullSecrets on
+                  both CRDs will see different override behavior between them.
+                items:
+                  description: |-
+                    LocalObjectReference contains enough information to let you locate the
+                    referenced object inside the same namespace.
+                  properties:
+                    name:
+                      default: ""
+                      description: |-
+                        Name of the referent.
+                        This field is effectively required, but due to backwards compatibility is
+                        allowed to be empty. Instances of this type with an empty value here are
+                        almost certainly wrong.
+                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                      type: string
+                  type: object
+                  x-kubernetes-map-type: atomic
+                type: array
+                x-kubernetes-list-type: atomic
               incomingAuth:
                 description: |-
                   IncomingAuth configures authentication for clients connecting to the Virtual MCP server.
@@ -1882,6 +2463,28 @@ spec:
                         required:
                         - name
                         type: object
+                      groupClaimName:
+                        description: |-
+                          GroupClaimName is the JWT claim key that contains group membership for the
+                          principal. When set, takes priority over the well-known defaults
+                          ("groups", "roles", "cognito:groups"). Use this for IDPs that place
+                          groups under a URI-style claim (e.g. "https://example.com/groups"). When
+                          Type is "configMap", a group_claim_name entry in the referenced ConfigMap
+                          is overridden by this field if both are set.
+                        maxLength: 253
+                        type: string
+                      groupEntityType:
+                        description: |-
+                          GroupEntityType is the Cedar entity type name used for principal parent
+                          UIDs synthesised from JWT group/role claims. Defaults to "THVGroup" when
+                          empty. Must match the entity type used in the static entity store for
+                          transitive `in` checks (e.g. `ClaimGroup → PlatformRole`) to resolve.
+                          Namespaced names (`Foo::Bar`) are not yet supported. When Type is
+                          "configMap", a group_entity_type entry in the referenced ConfigMap is
+                          overridden by this field if both are set.
+                        maxLength: 63
+                        pattern: ^[A-Za-z_][A-Za-z0-9_]*$
+                        type: string
                       inline:
                         description: |-
                           Inline contains direct authorization configuration
@@ -1889,8 +2492,10 @@ spec:
                         properties:
                           entitiesJson:
                             default: '[]'
-                            description: EntitiesJSON is a JSON string representing
-                              Cedar entities
+                            description: |-
+                              EntitiesJSON is a JSON string representing Cedar entities. Required when
+                              transitive policies (e.g. `ClaimGroup → PlatformRole`) need a static
+                              entity store; defaults to "[]".
                             type: string
                           policies:
                             description: Policies is a list of Cedar policy strings
@@ -1901,15 +2506,36 @@ spec:
                             x-kubernetes-list-type: atomic
                           primaryUpstreamProvider:
                             description: |-
-                              PrimaryUpstreamProvider names the upstream IDP provider whose access
-                              token should be used as the source of JWT claims for Cedar evaluation.
-                              When empty, claims from the ToolHive-issued token are used.
-                              Must match an upstream provider name configured in the embedded auth server
-                              (e.g. "default", "github"). Only relevant when the embedded auth server is active.
+                              PrimaryUpstreamProvider names the upstream IDP whose access token's
+                              claims Cedar should evaluate.
+
+                              Deprecated: on VirtualMCPServer this field has moved to
+                              spec.authServerConfig.primaryUpstreamProvider. The old location is
+                              still read for one release for backward compatibility; the
+                              VirtualMCPServer controller emits an AuthzPrimaryUpstreamProviderDeprecated
+                              Warning event whenever it is consumed, and removal is planned for the
+                              release after the deprecation cycle.
+
+                              On MCPServer and MCPRemoteProxy this field has always been a structural
+                              no-op (those CRDs do not run an embedded auth server). Setting it
+                              continues to surface the AuthzPrimaryUpstreamProviderIgnored advisory
+                              condition; the deprecation does not change that behaviour.
+                            maxLength: 63
+                            minLength: 1
+                            pattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$
                             type: string
                         required:
                         - policies
                         type: object
+                      roleClaimName:
+                        description: |-
+                          RoleClaimName is the JWT claim key that contains role membership for the
+                          principal. When set, the claim is extracted separately from GroupClaimName
+                          and both are mapped to the configured GroupEntityType. When Type is
+                          "configMap", a role_claim_name entry in the referenced ConfigMap is
+                          overridden by this field if both are set.
+                        maxLength: 253
+                        type: string
                       type:
                         default: configMap
                         description: Type is the type of authorization configuration
@@ -2180,6 +2806,17 @@ spec:
             - groupRef
             - incomingAuth
             type: object
+            x-kubernetes-validations:
+            - message: config.rateLimiting requires sessionStorage with provider 'redis'
+              rule: '!has(self.config) || !has(self.config.rateLimiting) || (has(self.sessionStorage)
+                && self.sessionStorage.provider == ''redis'')'
+            - message: config.rateLimiting.perUser requires incomingAuth.type oidc
+              rule: '!(has(self.config) && has(self.config.rateLimiting) && has(self.config.rateLimiting.perUser))
+                || (has(self.incomingAuth) && self.incomingAuth.type == ''oidc'')'
+            - message: per-tool perUser rate limiting requires incomingAuth.type oidc
+              rule: '!has(self.config) || !has(self.config.rateLimiting) || !has(self.config.rateLimiting.tools)
+                || self.config.rateLimiting.tools.all(t, !has(t.perUser)) || (has(self.incomingAuth)
+                && self.incomingAuth.type == ''oidc'')'
           status:
             description: VirtualMCPServerStatus defines the observed state of VirtualMCPServer
             properties:
@@ -2416,6 +3053,29 @@ spec:
                       Must be a valid HTTPS URL (or HTTP for localhost) without query, fragment, or trailing slash.
                     pattern: ^https?://[^\s?#]+[^/\s?#]$
                     type: string
+                  baselineClientScopes:
+                    description: |-
+                      BaselineClientScopes is a baseline set of OAuth 2.0 scopes guaranteed to be
+                      included in every client registration. The embedded auth server unions these
+                      scopes into the registered set returned by RFC 7591 Dynamic Client
+                      Registration, so a client that narrows the `scope` field at /oauth/register
+                      can still request the baseline scopes at /oauth/authorize. All values must
+                      be present in the upstream-derived scopesSupported set; the auth server
+                      fails to start if any value is missing.
+
+                      Security: every client registered via /oauth/register will gain the
+                      ability to request these scopes at /oauth/authorize, regardless of what
+                      the client itself requested. Keep the baseline narrow (typically
+                      "openid" and "offline_access"). Adding a privileged scope here — e.g.
+                      "admin:read" — would grant it to every DCR-registered client, including
+                      public clients like Claude Code, Cursor, and VS Code.
+                    items:
+                      minLength: 1
+                      pattern: ^[\x21\x23-\x5B\x5D-\x7E]+$
+                      type: string
+                    maxItems: 10
+                    type: array
+                    x-kubernetes-list-type: atomic
                   hmacSecretRefs:
                     description: |-
                       HMACSecretRefs references Kubernetes Secrets containing symmetric secrets for signing
@@ -2445,6 +3105,26 @@ spec:
                       This will be included in the "iss" claim of issued tokens.
                       Must be a valid HTTPS URL (or HTTP for localhost) without query, fragment, or trailing slash (per RFC 8414).
                     pattern: ^https?://[^\s?#]+[^/\s?#]$
+                    type: string
+                  primaryUpstreamProvider:
+                    description: |-
+                      PrimaryUpstreamProvider names the upstream IDP whose access token Cedar
+                      should read claims from when authorising a request. Must match the name
+                      of one of the entries in UpstreamProviders. When empty, the controller
+                      auto-selects the first entry of UpstreamProviders.
+
+                      Only meaningful on VirtualMCPServer, where multiple upstream providers
+                      can be configured and Cedar needs to pick which token's claims to
+                      evaluate. The VirtualMCPServer controller validates this field against
+                      UpstreamProviders at admission and rejects unresolvable values.
+
+                      On MCPServer and MCPRemoteProxy this field is structurally present (the
+                      EmbeddedAuthServerConfig struct is shared) but has no runtime effect:
+                      those CRDs are restricted to a single upstream so there is no choice to
+                      make. Setting it on those CRDs is silently ignored.
+                    maxLength: 63
+                    minLength: 1
+                    pattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$
                     type: string
                   signingKeySecretRefs:
                     description: |-
@@ -2496,8 +3176,12 @@ spec:
                                 - name
                                 type: object
                               usernameSecretRef:
-                                description: UsernameSecretRef references a Secret
-                                  containing the Redis ACL username.
+                                description: |-
+                                  UsernameSecretRef references a Secret containing the Redis ACL username.
+                                  When omitted, connections use legacy password-only AUTH. Omit for managed
+                                  Redis tiers that do not support ACL users (e.g. GCP Memorystore Basic/Standard
+                                  HA, Azure Cache for Redis). Set for services that support ACL users (e.g. AWS
+                                  ElastiCache non-cluster with Redis 6+ RBAC).
                                 properties:
                                   key:
                                     description: Key is the key within the secret
@@ -2511,13 +3195,27 @@ spec:
                                 type: object
                             required:
                             - passwordSecretRef
-                            - usernameSecretRef
                             type: object
+                          addr:
+                            description: |-
+                              Addr is the Redis server address (host:port). Required for standalone and cluster modes.
+                              Use for managed Redis services that expose a single endpoint (GCP Memorystore basic tier,
+                              AWS ElastiCache without cluster mode, or cluster-mode services when clusterMode is true).
+                              Mutually exclusive with sentinelConfig.
+                            type: string
                           address:
                             description: |-
-                              Address is the Redis-compatible server address for direct mode (host:port).
-                              Mutually exclusive with SentinelConfig.
+                              Address is a deprecated alias of addr, kept by the DocPlanner fork for
+                              configurations written before upstream renamed the field. Use addr instead.
+
+                              Deprecated: use Addr.
                             type: string
+                          clusterMode:
+                            description: |-
+                              ClusterMode enables the Redis Cluster protocol. Set to true when addr points to a
+                              Redis Cluster discovery endpoint (e.g., GCP Memorystore Cluster, AWS ElastiCache
+                              cluster mode enabled). Requires addr to be set.
+                            type: boolean
                           dialTimeout:
                             default: 5s
                             description: |-
@@ -2534,8 +3232,8 @@ spec:
                             type: string
                           sentinelConfig:
                             description: |-
-                              SentinelConfig holds Redis Sentinel configuration for HA mode.
-                              Mutually exclusive with Address.
+                              SentinelConfig holds Redis Sentinel configuration.
+                              Use for self-managed Redis with Sentinel-based HA. Mutually exclusive with addr.
                             properties:
                               db:
                                 default: 0
@@ -2580,8 +3278,7 @@ spec:
                           sentinelTls:
                             description: |-
                               SentinelTLS configures TLS for connections to Sentinel instances.
-                              Presence of this field enables TLS. Omit to use plaintext.
-                              When omitted, sentinel connections use plaintext (no fallback to TLS config).
+                              Only applies when sentinelConfig is set. Presence of this field enables TLS.
                             properties:
                               caCertSecretRef:
                                 description: |-
@@ -2640,6 +3337,19 @@ spec:
                         required:
                         - aclUserConfig
                         type: object
+                        x-kubernetes-validations:
+                        - message: addr and address are mutually exclusive; address
+                            is a deprecated alias of addr
+                          rule: '!(has(self.addr) && self.addr.size() > 0 && has(self.address)
+                            && self.address.size() > 0)'
+                        - message: exactly one of addr (or its deprecated alias address)
+                            or sentinelConfig must be set
+                          rule: ((has(self.addr) && self.addr.size() > 0) || (has(self.address)
+                            && self.address.size() > 0)) != has(self.sentinelConfig)
+                        - message: clusterMode requires addr to be set
+                          rule: '!(has(self.clusterMode) && self.clusterMode) || (has(self.addr)
+                            && self.addr.size() > 0) || (has(self.address) && self.address.size()
+                            > 0)'
                       type:
                         default: memory
                         description: |-
@@ -2683,8 +3393,19 @@ spec:
                       The embedded auth server delegates authentication to these providers.
                       MCPServer and MCPRemoteProxy support a single upstream; VirtualMCPServer supports multiple.
                     items:
-                      description: UpstreamProviderConfig defines configuration for
-                        an upstream Identity Provider.
+                      description: |-
+                        UpstreamProviderConfig defines configuration for an upstream Identity Provider.
+
+                        Exactly one of OIDCConfig or OAuth2Config must be set and must match the
+                        declared Type: oidc-typed providers set OIDCConfig, oauth2-typed providers
+                        set OAuth2Config. The CEL rule below enforces the pairing at admission; the
+                        matching Go-level check in validateUpstreamProvider provides defense-in-depth
+                        for stored objects.
+
+                        The rule is structured as a chain of equality checks ending in an explicit
+                        `false`, so adding a new UpstreamProviderType value without extending this
+                        rule fails admission instead of silently demanding the OAuth2 shape. When
+                        adding a new type, extend both this rule and validateUpstreamProvider.
                       properties:
                         name:
                           description: |-
@@ -2718,8 +3439,10 @@ spec:
                               pattern: ^https?://.*$
                               type: string
                             clientId:
-                              description: ClientID is the OAuth 2.0 client identifier
-                                registered with the upstream IDP.
+                              description: |-
+                                ClientID is the OAuth 2.0 client identifier registered with the upstream IDP.
+                                Mutually exclusive with DCRConfig: when DCRConfig is set, ClientID is obtained
+                                at runtime via RFC 7591 Dynamic Client Registration and must be left empty.
                               type: string
                             clientSecretRef:
                               description: |-
@@ -2735,6 +3458,131 @@ spec:
                               required:
                               - key
                               - name
+                              type: object
+                            dcrConfig:
+                              description: |-
+                                DCRConfig enables RFC 7591 Dynamic Client Registration against the upstream
+                                authorization server. When set, the client credentials are obtained at
+                                runtime rather than being pre-provisioned, and ClientID must be left empty.
+                                Mutually exclusive with ClientID.
+                              properties:
+                                discoveryUrl:
+                                  description: |-
+                                    DiscoveryURL is the RFC 8414 / OIDC Discovery document URL. The resolver
+                                    issues a single GET against this URL (no well-known-path fallback) and
+                                    reads registration_endpoint, authorization_endpoint, token_endpoint,
+                                    token_endpoint_auth_methods_supported, and scopes_supported from the
+                                    response.
+                                    Mutually exclusive with RegistrationEndpoint.
+                                    HTTPS is required because the registration endpoint resolved from this
+                                    document carries the initial access token and the issued client_secret
+                                    (RFC 7591 §3, RFC 8414 §3). MaxLength is a defensive size cap (etcd
+                                    object budget, regex evaluation cost) and matches the conventional URL
+                                    length cap.
+                                  maxLength: 2048
+                                  pattern: ^https://[^\s?#]+[^/\s?#]$
+                                  type: string
+                                initialAccessTokenRef:
+                                  description: |-
+                                    InitialAccessTokenRef is an optional reference to a Kubernetes Secret
+                                    carrying an RFC 7591 §3 initial access token. When set, the resolver
+                                    presents the token value as a Bearer credential on the registration
+                                    request. Mirrors the ClientSecretRef pattern.
+                                  properties:
+                                    key:
+                                      description: Key is the key within the secret
+                                      type: string
+                                    name:
+                                      description: Name is the name of the secret
+                                      type: string
+                                  required:
+                                  - key
+                                  - name
+                                  type: object
+                                registrationEndpoint:
+                                  description: |-
+                                    RegistrationEndpoint is the RFC 7591 registration endpoint URL used
+                                    directly, bypassing discovery. When using this field, the caller is
+                                    expected to also supply AuthorizationEndpoint, TokenEndpoint, and an
+                                    explicit Scopes list on the parent OAuth2UpstreamConfig.
+                                    Mutually exclusive with DiscoveryURL.
+                                    HTTPS is required because the registration endpoint carries the initial
+                                    access token and the issued client_secret (RFC 7591 §3, RFC 8414 §3).
+                                    MaxLength is a defensive size cap (etcd object budget, regex evaluation
+                                    cost) and matches the conventional URL length cap.
+                                  maxLength: 2048
+                                  pattern: ^https://[^\s?#]+[^/\s?#]$
+                                  type: string
+                                softwareId:
+                                  description: |-
+                                    SoftwareID is the RFC 7591 "software_id" registration metadata value,
+                                    identifying the client software independent of any particular
+                                    registration instance. Typically a UUID or short identifier.
+                                  maxLength: 255
+                                  type: string
+                                softwareStatement:
+                                  description: |-
+                                    SoftwareStatement is the RFC 7591 "software_statement" JWT asserting
+                                    metadata about the client software, signed by a party the authorization
+                                    server trusts.
+
+                                    Stored inline on the CR. The JWT is signed but not encrypted, so its
+                                    contents are visible to anyone with get/list/watch on this resource and
+                                    appear in etcd backups in plaintext. Treat the value as non-confidential
+                                    (signed attestation, not a secret). Operators that rotate software
+                                    statements like bearer credentials should keep them at the authorization
+                                    server side and rely on the registration endpoint's initial access
+                                    token (see InitialAccessTokenRef) instead of placing them on the CR.
+
+                                    Bounded to 16384 characters as a defensive size cap (etcd object
+                                    budget, regex evaluation cost). Real-world signed statements with
+                                    embedded x5c certificate chains, JWKS keys, or OIDC-Federation
+                                    trust-framework metadata routinely exceed 4 KB.
+                                  maxLength: 16384
+                                  type: string
+                              type: object
+                              x-kubernetes-validations:
+                              - message: exactly one of discoveryUrl or registrationEndpoint
+                                  must be set
+                                rule: has(self.discoveryUrl) != has(self.registrationEndpoint)
+                            identityFromToken:
+                              description: |-
+                                IdentityFromToken extracts user identity (subject, name, email) directly
+                                from the OAuth2 token-endpoint response body using gjson dot-notation paths.
+                                When set, the embedded auth server skips the userinfo HTTP call entirely
+                                and resolves identity from the token response. See IdentityFromTokenConfig
+                                for trust-model and uniqueness considerations.
+                              properties:
+                                emailPath:
+                                  description: |-
+                                    EmailPath is the dot-notation path to the email address field in the token response.
+                                    If not specified or if the path does not resolve to a string, the email is omitted.
+                                    Omit the field entirely rather than setting it to an empty string.
+                                  maxLength: 256
+                                  minLength: 1
+                                  type: string
+                                namePath:
+                                  description: |-
+                                    NamePath is the dot-notation path to the display name field in the token response.
+                                    If not specified or if the path does not resolve to a string, the display name is omitted.
+                                    Omit the field entirely rather than setting it to an empty string.
+                                  maxLength: 256
+                                  minLength: 1
+                                  type: string
+                                subjectPath:
+                                  description: |-
+                                    SubjectPath is the dot-notation path to the subject (user ID) field in the token response.
+                                    Warning: claims read from the token response are trusted only via TLS, not
+                                    cryptographically verified; prefer OIDC ID tokens when verifiable claims are required.
+                                    Example: "authed_user.id" for Slack (top-level token-response field). For providers
+                                    whose token response embeds the access token as a JWT (e.g. Snowflake), use the
+                                    "@upstreamjwt" modifier to decode the payload, e.g. "access_token|@upstreamjwt|sub".
+                                    The "@upstreamjwt" modifier performs no signature verification either.
+                                  maxLength: 256
+                                  minLength: 1
+                                  type: string
+                              required:
+                              - subjectPath
                               type: object
                             redirectUri:
                               description: |-
@@ -2761,6 +3609,7 @@ spec:
                                 instead of returning them at the top level. When set, ToolHive performs the token
                                 exchange HTTP call directly and extracts fields using the configured dot-notation paths.
                                 If nil, standard OAuth 2.0 token response parsing is used.
+                                For extracting user identity from the token response, see IdentityFromToken.
                               properties:
                                 accessTokenPath:
                                   description: |-
@@ -2789,7 +3638,13 @@ spec:
                             userInfo:
                               description: |-
                                 UserInfo contains configuration for fetching user information from the upstream provider.
-                                Required for OAuth2 providers to resolve user identity.
+                                When omitted and IdentityFromToken is also unset, the embedded auth server runs in
+                                synthesis mode for this upstream: a non-PII subject derived from the access token, no
+                                Name/Email. Use this shape for upstreams with no userinfo surface and no identity in
+                                the token response (e.g., MCP authorization servers per the MCP spec). When
+                                IdentityFromToken is set instead, identity is resolved from the token response body
+                                (e.g., Snowflake's "username" field, Slack's "authed_user.id"); the userinfo HTTP call
+                                is skipped entirely.
                               properties:
                                 additionalHeaders:
                                   additionalProperties:
@@ -2849,10 +3704,17 @@ spec:
                               type: object
                           required:
                           - authorizationEndpoint
-                          - clientId
                           - tokenEndpoint
-                          - userInfo
                           type: object
+                          x-kubernetes-validations:
+                          - message: exactly one of clientId or dcrConfig must be
+                              set
+                            rule: '(has(self.clientId) && size(self.clientId) > 0)
+                              ? !has(self.dcrConfig) : has(self.dcrConfig)'
+                          - message: clientSecretRef must not be set when dcrConfig
+                              is set; the client_secret is obtained at runtime via
+                              Dynamic Client Registration
+                            rule: '!(has(self.dcrConfig) && has(self.clientSecretRef))'
                         oidcConfig:
                           description: |-
                             OIDCConfig contains OIDC-specific configuration.
@@ -2992,6 +3854,13 @@ spec:
                       - name
                       - type
                       type: object
+                      x-kubernetes-validations:
+                      - message: type must be 'oidc' or 'oauth2'; oidcConfig must
+                          be set when type is 'oidc' and oauth2Config must be set
+                          when type is 'oauth2' (and the other must not be set)
+                        rule: 'self.type == ''oidc'' ? (has(self.oidcConfig) && !has(self.oauth2Config))
+                          : self.type == ''oauth2'' ? (has(self.oauth2Config) && !has(self.oidcConfig))
+                          : false'
                     minItems: 1
                     type: array
                     x-kubernetes-list-map-keys:
@@ -3554,6 +4423,29 @@ spec:
                       authz:
                         description: Authz contains authorization configuration (optional).
                         properties:
+                          entitiesJson:
+                            description: |-
+                              EntitiesJSON is a JSON string representing Cedar entities. Required for
+                              enterprise policies that rely on transitive relationships (e.g.
+                              `ClaimGroup → PlatformRole`) — without it the Cedar authorizer is
+                              constructed with an empty entity store and `in` checks against absent
+                              entities silently evaluate to false. Defaults to "[]" when empty.
+                            type: string
+                          groupClaimName:
+                            description: |-
+                              GroupClaimName is the JWT claim key that contains group membership for
+                              the principal. When set, takes priority over the well-known defaults
+                              ("groups", "roles", "cognito:groups"). Use this for IDPs that place
+                              groups under a URI-style claim (e.g. "https://example.com/groups").
+                              When empty, only the well-known claim names are checked.
+                            type: string
+                          groupEntityType:
+                            description: |-
+                              GroupEntityType is the Cedar entity type name used for principal parent
+                              UIDs synthesised from JWT group/role claims. Defaults to "THVGroup" when
+                              empty. Must match the entity type used in EntitiesJSON for transitive
+                              `in` checks to resolve. Namespaced names (`Foo::Bar`) are not yet supported.
+                            type: string
                           policies:
                             description: Policies contains Cedar policy definitions
                               (when Type = "cedar").
@@ -3567,6 +4459,13 @@ spec:
                               When empty, claims from the ToolHive-issued token are used.
                               Must match an upstream provider name configured in the embedded auth server
                               (e.g. "default", "github"). Only relevant when the embedded auth server is active.
+                            type: string
+                          roleClaimName:
+                            description: |-
+                              RoleClaimName is the JWT claim key that contains role membership for the
+                              principal. When set, the claim is extracted separately from GroupClaimName
+                              and both are mapped to the configured group entity type. When empty, no
+                              role extraction is performed.
                             type: string
                           type:
                             description: 'Type is the authz type: "cedar", "none"'
@@ -3826,6 +4725,77 @@ spec:
                             This struct provides type-safe configuration for different authentication strategies
                             using HeaderInjection or TokenExchange fields based on the Type field.
                           properties:
+                            awsSts:
+                              description: |-
+                                AwsSts contains configuration for AWS STS auth strategy.
+                                Used when Type = "aws_sts".
+                              properties:
+                                fallbackRoleArn:
+                                  description: FallbackRoleArn is the IAM role ARN
+                                    to assume when no role mappings match.
+                                  type: string
+                                region:
+                                  description: Region is the AWS region for the STS
+                                    endpoint and service.
+                                  type: string
+                                roleClaim:
+                                  description: RoleClaim is the JWT claim to use for
+                                    role mapping evaluation.
+                                  type: string
+                                roleMappings:
+                                  description: RoleMappings defines claim-based role
+                                    selection rules.
+                                  items:
+                                    description: |-
+                                      RoleMapping defines a rule for mapping JWT claims to IAM roles.
+                                      Mappings are evaluated in priority order (lower number = higher priority).
+                                    properties:
+                                      claim:
+                                        description: Claim is a simple claim value
+                                          to match against the RoleClaim field.
+                                        type: string
+                                      matcher:
+                                        description: Matcher is a CEL expression for
+                                          complex matching against JWT claims.
+                                        type: string
+                                      priority:
+                                        description: |-
+                                          Priority determines evaluation order (lower values = higher priority).
+                                          Mirrors awssts.RoleMapping.Priority, which is *int because the role mapper
+                                          uses math.MaxInt for nil-priority semantics in effectivePriority.
+                                        type: integer
+                                      roleArn:
+                                        description: RoleArn is the IAM role ARN to
+                                          assume when this mapping matches.
+                                        type: string
+                                    required:
+                                    - roleArn
+                                    type: object
+                                  type: array
+                                  x-kubernetes-list-type: atomic
+                                service:
+                                  description: Service is the AWS service name for
+                                    SigV4 signing.
+                                  type: string
+                                sessionDuration:
+                                  description: SessionDuration is the duration in
+                                    seconds for the STS session.
+                                  format: int32
+                                  type: integer
+                                sessionNameClaim:
+                                  description: SessionNameClaim is the JWT claim to
+                                    use for the role session name.
+                                  type: string
+                                subjectProviderName:
+                                  description: |-
+                                    SubjectProviderName selects which upstream provider's token to use as the
+                                    web identity token for AssumeRoleWithWebIdentity. When set, the token is
+                                    looked up from Identity.UpstreamTokens instead of the request's
+                                    Authorization header.
+                                  type: string
+                              required:
+                              - region
+                              type: object
                             headerInjection:
                               description: |-
                                 HeaderInjection contains configuration for header injection auth strategy.
@@ -3901,7 +4871,8 @@ spec:
                               type: object
                             type:
                               description: 'Type is the auth strategy: "unauthenticated",
-                                "header_injection", "token_exchange", "upstream_inject"'
+                                "header_injection", "token_exchange", "upstream_inject",
+                                "aws_sts", "obo"'
                               type: string
                             upstreamInject:
                               description: |-
@@ -3925,6 +4896,77 @@ spec:
                         description: Default is the default auth strategy for backends
                           without explicit config.
                         properties:
+                          awsSts:
+                            description: |-
+                              AwsSts contains configuration for AWS STS auth strategy.
+                              Used when Type = "aws_sts".
+                            properties:
+                              fallbackRoleArn:
+                                description: FallbackRoleArn is the IAM role ARN to
+                                  assume when no role mappings match.
+                                type: string
+                              region:
+                                description: Region is the AWS region for the STS
+                                  endpoint and service.
+                                type: string
+                              roleClaim:
+                                description: RoleClaim is the JWT claim to use for
+                                  role mapping evaluation.
+                                type: string
+                              roleMappings:
+                                description: RoleMappings defines claim-based role
+                                  selection rules.
+                                items:
+                                  description: |-
+                                    RoleMapping defines a rule for mapping JWT claims to IAM roles.
+                                    Mappings are evaluated in priority order (lower number = higher priority).
+                                  properties:
+                                    claim:
+                                      description: Claim is a simple claim value to
+                                        match against the RoleClaim field.
+                                      type: string
+                                    matcher:
+                                      description: Matcher is a CEL expression for
+                                        complex matching against JWT claims.
+                                      type: string
+                                    priority:
+                                      description: |-
+                                        Priority determines evaluation order (lower values = higher priority).
+                                        Mirrors awssts.RoleMapping.Priority, which is *int because the role mapper
+                                        uses math.MaxInt for nil-priority semantics in effectivePriority.
+                                      type: integer
+                                    roleArn:
+                                      description: RoleArn is the IAM role ARN to
+                                        assume when this mapping matches.
+                                      type: string
+                                  required:
+                                  - roleArn
+                                  type: object
+                                type: array
+                                x-kubernetes-list-type: atomic
+                              service:
+                                description: Service is the AWS service name for SigV4
+                                  signing.
+                                type: string
+                              sessionDuration:
+                                description: SessionDuration is the duration in seconds
+                                  for the STS session.
+                                format: int32
+                                type: integer
+                              sessionNameClaim:
+                                description: SessionNameClaim is the JWT claim to
+                                  use for the role session name.
+                                type: string
+                              subjectProviderName:
+                                description: |-
+                                  SubjectProviderName selects which upstream provider's token to use as the
+                                  web identity token for AssumeRoleWithWebIdentity. When set, the token is
+                                  looked up from Identity.UpstreamTokens instead of the request's
+                                  Authorization header.
+                                type: string
+                            required:
+                            - region
+                            type: object
                           headerInjection:
                             description: |-
                               HeaderInjection contains configuration for header injection auth strategy.
@@ -4000,7 +5042,8 @@ spec:
                             type: object
                           type:
                             description: 'Type is the auth strategy: "unauthenticated",
-                              "header_injection", "token_exchange", "upstream_inject"'
+                              "header_injection", "token_exchange", "upstream_inject",
+                              "aws_sts", "obo"'
                             type: string
                           upstreamInject:
                             description: |-
@@ -4027,6 +5070,131 @@ spec:
                     required:
                     - source
                     type: object
+                  rateLimiting:
+                    description: |-
+                      RateLimiting defines rate limiting configuration for the Virtual MCP server.
+                      Requires Redis session storage to be configured for distributed rate limiting.
+                    properties:
+                      perUser:
+                        description: |-
+                          PerUser is a token bucket applied independently to each authenticated user
+                          at the server level. Requires authentication to be enabled.
+                          Each unique userID creates Redis keys that expire after 2x refillPeriod.
+                          Memory formula: unique_users_per_TTL_window * (1 + num_tools_with_per_user_limits) keys.
+                        properties:
+                          maxTokens:
+                            description: |-
+                              MaxTokens is the maximum number of tokens (bucket capacity).
+                              This is also the burst size: the maximum number of requests that can be served
+                              instantaneously before the bucket is depleted.
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          refillPeriod:
+                            description: |-
+                              RefillPeriod is the duration to fully refill the bucket from zero to maxTokens.
+                              The effective refill rate is maxTokens / refillPeriod tokens per second.
+                              Format: Go duration string (e.g., "1m0s", "30s", "1h0m0s").
+                            type: string
+                        required:
+                        - maxTokens
+                        - refillPeriod
+                        type: object
+                      shared:
+                        description: Shared is a token bucket shared across all users
+                          for the entire server.
+                        properties:
+                          maxTokens:
+                            description: |-
+                              MaxTokens is the maximum number of tokens (bucket capacity).
+                              This is also the burst size: the maximum number of requests that can be served
+                              instantaneously before the bucket is depleted.
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          refillPeriod:
+                            description: |-
+                              RefillPeriod is the duration to fully refill the bucket from zero to maxTokens.
+                              The effective refill rate is maxTokens / refillPeriod tokens per second.
+                              Format: Go duration string (e.g., "1m0s", "30s", "1h0m0s").
+                            type: string
+                        required:
+                        - maxTokens
+                        - refillPeriod
+                        type: object
+                      tools:
+                        description: |-
+                          Tools defines per-tool rate limit overrides.
+                          Each entry applies additional rate limits to calls targeting a specific tool name.
+                          A request must pass both the server-level limit and the per-tool limit.
+                        items:
+                          description: |-
+                            ToolRateLimitConfig defines rate limits for a specific tool.
+                            At least one of shared or perUser must be configured.
+                          properties:
+                            name:
+                              description: Name is the MCP tool name this limit applies
+                                to.
+                              minLength: 1
+                              type: string
+                            perUser:
+                              description: PerUser token bucket configuration for
+                                this tool.
+                              properties:
+                                maxTokens:
+                                  description: |-
+                                    MaxTokens is the maximum number of tokens (bucket capacity).
+                                    This is also the burst size: the maximum number of requests that can be served
+                                    instantaneously before the bucket is depleted.
+                                  format: int32
+                                  minimum: 1
+                                  type: integer
+                                refillPeriod:
+                                  description: |-
+                                    RefillPeriod is the duration to fully refill the bucket from zero to maxTokens.
+                                    The effective refill rate is maxTokens / refillPeriod tokens per second.
+                                    Format: Go duration string (e.g., "1m0s", "30s", "1h0m0s").
+                                  type: string
+                              required:
+                              - maxTokens
+                              - refillPeriod
+                              type: object
+                            shared:
+                              description: Shared token bucket for this specific tool.
+                              properties:
+                                maxTokens:
+                                  description: |-
+                                    MaxTokens is the maximum number of tokens (bucket capacity).
+                                    This is also the burst size: the maximum number of requests that can be served
+                                    instantaneously before the bucket is depleted.
+                                  format: int32
+                                  minimum: 1
+                                  type: integer
+                                refillPeriod:
+                                  description: |-
+                                    RefillPeriod is the duration to fully refill the bucket from zero to maxTokens.
+                                    The effective refill rate is maxTokens / refillPeriod tokens per second.
+                                    Format: Go duration string (e.g., "1m0s", "30s", "1h0m0s").
+                                  type: string
+                              required:
+                              - maxTokens
+                              - refillPeriod
+                              type: object
+                          required:
+                          - name
+                          type: object
+                          x-kubernetes-validations:
+                          - message: at least one of shared or perUser must be configured
+                            rule: has(self.shared) || has(self.perUser)
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                    type: object
+                    x-kubernetes-validations:
+                    - message: at least one of shared, perUser, or tools must be configured
+                      rule: has(self.shared) || has(self.perUser) || (has(self.tools)
+                        && size(self.tools) > 0)
                   sessionStorage:
                     description: |-
                       SessionStorage configures session storage for stateful horizontal scaling.
@@ -4182,6 +5350,56 @@ spec:
                 required:
                 - name
                 type: object
+              imagePullSecrets:
+                description: |-
+                  ImagePullSecrets allows specifying image pull secrets for the vMCP workload.
+                  These are applied to both the vMCP Deployment's PodSpec.ImagePullSecrets
+                  and to the operator-managed ServiceAccount the vMCP server runs as, so private
+                  images are pullable through either path.
+
+                  Merge semantics with PodTemplateSpec:
+                  The deployed PodSpec.ImagePullSecrets is the Kubernetes-native strategic-merge
+                  union of this field and spec.podTemplateSpec.spec.imagePullSecrets, merged by
+                  the patchStrategy:"merge" / patchMergeKey:"name" tags on corev1.PodSpec.
+                    - This field is rendered first as the controller-generated default.
+                    - spec.podTemplateSpec.spec.imagePullSecrets is then strategic-merge-patched
+                      on top, keyed by Name. Distinct names from the two sources are unioned in
+                      the resulting list; entries with the same Name are deduplicated and the
+                      PodTemplateSpec entry wins on overlap (user override).
+                    - Order in the resulting list is not guaranteed and should not be relied on:
+                      strategic merge by name is order-insensitive.
+                    - The operator-managed ServiceAccount's imagePullSecrets list is populated
+                      ONLY from this field. spec.podTemplateSpec.spec.imagePullSecrets does not
+                      reach the ServiceAccount because PodTemplateSpec has no notion of a
+                      ServiceAccount. To make a secret usable via the ServiceAccount path
+                      (e.g. for sidecars or init containers that pull images independently),
+                      list it here rather than under spec.podTemplateSpec.
+
+                  Note on cross-CRD consistency:
+                  MCPRegistry currently uses an atomic-replace strategy for its imagePullSecrets
+                  (the user-provided value replaces the controller-generated list rather than
+                  being merged on top). VirtualMCPServer follows the Kubernetes-native
+                  strategic-merge-by-name behavior described above. Aligning the two is tracked
+                  as a separate follow-up; until then, manifests that set imagePullSecrets on
+                  both CRDs will see different override behavior between them.
+                items:
+                  description: |-
+                    LocalObjectReference contains enough information to let you locate the
+                    referenced object inside the same namespace.
+                  properties:
+                    name:
+                      default: ""
+                      description: |-
+                        Name of the referent.
+                        This field is effectively required, but due to backwards compatibility is
+                        allowed to be empty. Instances of this type with an empty value here are
+                        almost certainly wrong.
+                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                      type: string
+                  type: object
+                  x-kubernetes-map-type: atomic
+                type: array
+                x-kubernetes-list-type: atomic
               incomingAuth:
                 description: |-
                   IncomingAuth configures authentication for clients connecting to the Virtual MCP server.
@@ -4211,6 +5429,28 @@ spec:
                         required:
                         - name
                         type: object
+                      groupClaimName:
+                        description: |-
+                          GroupClaimName is the JWT claim key that contains group membership for the
+                          principal. When set, takes priority over the well-known defaults
+                          ("groups", "roles", "cognito:groups"). Use this for IDPs that place
+                          groups under a URI-style claim (e.g. "https://example.com/groups"). When
+                          Type is "configMap", a group_claim_name entry in the referenced ConfigMap
+                          is overridden by this field if both are set.
+                        maxLength: 253
+                        type: string
+                      groupEntityType:
+                        description: |-
+                          GroupEntityType is the Cedar entity type name used for principal parent
+                          UIDs synthesised from JWT group/role claims. Defaults to "THVGroup" when
+                          empty. Must match the entity type used in the static entity store for
+                          transitive `in` checks (e.g. `ClaimGroup → PlatformRole`) to resolve.
+                          Namespaced names (`Foo::Bar`) are not yet supported. When Type is
+                          "configMap", a group_entity_type entry in the referenced ConfigMap is
+                          overridden by this field if both are set.
+                        maxLength: 63
+                        pattern: ^[A-Za-z_][A-Za-z0-9_]*$
+                        type: string
                       inline:
                         description: |-
                           Inline contains direct authorization configuration
@@ -4218,8 +5458,10 @@ spec:
                         properties:
                           entitiesJson:
                             default: '[]'
-                            description: EntitiesJSON is a JSON string representing
-                              Cedar entities
+                            description: |-
+                              EntitiesJSON is a JSON string representing Cedar entities. Required when
+                              transitive policies (e.g. `ClaimGroup → PlatformRole`) need a static
+                              entity store; defaults to "[]".
                             type: string
                           policies:
                             description: Policies is a list of Cedar policy strings
@@ -4230,15 +5472,36 @@ spec:
                             x-kubernetes-list-type: atomic
                           primaryUpstreamProvider:
                             description: |-
-                              PrimaryUpstreamProvider names the upstream IDP provider whose access
-                              token should be used as the source of JWT claims for Cedar evaluation.
-                              When empty, claims from the ToolHive-issued token are used.
-                              Must match an upstream provider name configured in the embedded auth server
-                              (e.g. "default", "github"). Only relevant when the embedded auth server is active.
+                              PrimaryUpstreamProvider names the upstream IDP whose access token's
+                              claims Cedar should evaluate.
+
+                              Deprecated: on VirtualMCPServer this field has moved to
+                              spec.authServerConfig.primaryUpstreamProvider. The old location is
+                              still read for one release for backward compatibility; the
+                              VirtualMCPServer controller emits an AuthzPrimaryUpstreamProviderDeprecated
+                              Warning event whenever it is consumed, and removal is planned for the
+                              release after the deprecation cycle.
+
+                              On MCPServer and MCPRemoteProxy this field has always been a structural
+                              no-op (those CRDs do not run an embedded auth server). Setting it
+                              continues to surface the AuthzPrimaryUpstreamProviderIgnored advisory
+                              condition; the deprecation does not change that behaviour.
+                            maxLength: 63
+                            minLength: 1
+                            pattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$
                             type: string
                         required:
                         - policies
                         type: object
+                      roleClaimName:
+                        description: |-
+                          RoleClaimName is the JWT claim key that contains role membership for the
+                          principal. When set, the claim is extracted separately from GroupClaimName
+                          and both are mapped to the configured GroupEntityType. When Type is
+                          "configMap", a role_claim_name entry in the referenced ConfigMap is
+                          overridden by this field if both are set.
+                        maxLength: 253
+                        type: string
                       type:
                         default: configMap
                         description: Type is the type of authorization configuration
@@ -4509,6 +5772,17 @@ spec:
             - groupRef
             - incomingAuth
             type: object
+            x-kubernetes-validations:
+            - message: config.rateLimiting requires sessionStorage with provider 'redis'
+              rule: '!has(self.config) || !has(self.config.rateLimiting) || (has(self.sessionStorage)
+                && self.sessionStorage.provider == ''redis'')'
+            - message: config.rateLimiting.perUser requires incomingAuth.type oidc
+              rule: '!(has(self.config) && has(self.config.rateLimiting) && has(self.config.rateLimiting.perUser))
+                || (has(self.incomingAuth) && self.incomingAuth.type == ''oidc'')'
+            - message: per-tool perUser rate limiting requires incomingAuth.type oidc
+              rule: '!has(self.config) || !has(self.config.rateLimiting) || !has(self.config.rateLimiting.tools)
+                || self.config.rateLimiting.tools.all(t, !has(t.perUser)) || (has(self.incomingAuth)
+                && self.incomingAuth.type == ''oidc'')'
           status:
             description: VirtualMCPServerStatus defines the observed state of VirtualMCPServer
             properties:

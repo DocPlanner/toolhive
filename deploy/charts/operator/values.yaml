@@ -5,41 +5,49 @@ fullnameOverride: "toolhive-operator"
 
 # -- All values for the operator deployment and associated resources
 operator:
-  # Feature flags to enable/disable controller groups
   features:
     # -- Enable experimental features
     experimental: false
-    # -- Enable server-related controllers (MCPServer, MCPExternalAuthConfig, MCPRemoteProxy, and ToolConfig).
-    # This automatically sets ENABLE_SERVER environment variable.
-    server: true
-    # -- Enable registry controller (MCPRegistry).
-    # This automatically sets ENABLE_REGISTRY environment variable.
-    registry: true
-    # -- Enable Virtual MCP aggregation features (VirtualMCPServer, MCPGroup controllers and webhooks).
-    # Set to false to disable Virtual MCP controllers when Virtual MCP CRDs are not installed.
-    # This automatically sets ENABLE_VMCP environment variable.
-    # Requires server to be enabled (server: true).
-    virtualMCP: true
   # -- Number of replicas for the operator deployment
   replicaCount: 1
 
   # -- List of image pull secrets to use
   imagePullSecrets: []
+
+  # -- List of image pull secrets that the operator applies as defaults to every
+  # workload it spawns (proxy runners, vMCP servers, registry API, etc.).
+  # Per-CR `imagePullSecrets` take precedence on name collisions; chart-level
+  # entries are appended additively. The operator parses these once at startup
+  # from the TOOLHIVE_DEFAULT_IMAGE_PULL_SECRETS environment variable. The
+  # Secrets must exist in the namespace where each workload is created.
+  #
+  # Each entry may be either a plain string (the Secret name) or an object
+  # with a `name` field, e.g.:
+  #   defaultImagePullSecrets:
+  #     - regcred
+  #     - name: otherscred
+  # The two shapes are equivalent; the object form matches `operator.imagePullSecrets`
+  # above for convenience.
+  defaultImagePullSecrets: []
   # -- Container image for the operator
-  image: ghcr.io/stacklok/toolhive/operator:v0.23.1
+  image: ghcr.io/stacklok/toolhive/operator:v0.28.3
   # -- Image pull policy for the operator container
   imagePullPolicy: IfNotPresent
 
   # -- Image to use for Toolhive runners
-  toolhiveRunnerImage: ghcr.io/stacklok/toolhive/proxyrunner:v0.23.1
+  toolhiveRunnerImage: ghcr.io/stacklok/toolhive/proxyrunner:v0.28.3
 
   # -- Image to use for Virtual MCP Server (vMCP) deployments
-  vmcpImage: ghcr.io/stacklok/toolhive/vmcp:v0.23.1
+  vmcpImage: ghcr.io/stacklok/toolhive/vmcp:v0.28.3
 
   # -- Host for the proxy deployed by the operator
   proxyHost: 0.0.0.0
 
-  # -- Environment variables to set in the operator container
+  # -- Environment variables to set in the operator container. Supported
+  # toolhive-specific variables include:
+  # - TOOLHIVE_SKIP_UPDATE_CHECK: set to "true" to disable the operator's
+  #   periodic update check against the ToolHive update API. Also disables
+  #   the usage-metrics collection that is gated on the same check.
   env: []
 
   # -- List of ports to expose from the operator container
@@ -181,7 +189,7 @@ operator:
       - patch
       - delete
     - apiGroups:
-      - ""
+      - events.k8s.io
       resources:
       - events
       verbs:
@@ -213,4 +221,4 @@ operator:
 # -- All values for the registry API deployment and associated resources
 registryAPI:
   # -- Container image for the registry API
-  image: "ghcr.io/stacklok/thv-registry-api:v1.1.1"
+  image: "ghcr.io/stacklok/thv-registry-api:v1.3.0"

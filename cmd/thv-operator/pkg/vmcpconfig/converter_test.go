@@ -508,45 +508,6 @@ func TestConverter_IncomingAuthRequired(t *testing.T) {
 	}
 }
 
-func TestConverter_InlineAuthzPrimaryUpstreamProvider(t *testing.T) {
-	t.Parallel()
-
-	vmcpServer := &mcpv1beta1.VirtualMCPServer{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-vmcp",
-			Namespace: "default",
-		},
-		Spec: mcpv1beta1.VirtualMCPServerSpec{
-			Config: vmcpconfig.Config{Group: "test-group"},
-			IncomingAuth: &mcpv1beta1.IncomingAuthConfig{
-				Type: "anonymous",
-				AuthzConfig: &mcpv1beta1.AuthzConfigRef{
-					Type: authzLabelValueInline,
-					Inline: &mcpv1beta1.InlineAuthzConfig{
-						Policies:                []string{"permit(principal, action, resource);"},
-						PrimaryUpstreamProvider: "cognito",
-					},
-				},
-			},
-		},
-	}
-
-	ctrl := gomock.NewController(t)
-	mockResolver := oidcmocks.NewMockResolver(ctrl)
-
-	converter := newTestConverter(t, mockResolver)
-	ctx := log.IntoContext(context.Background(), logr.Discard())
-	config, _, err := converter.Convert(ctx, vmcpServer, nil)
-
-	require.NoError(t, err)
-	require.NotNil(t, config)
-	require.NotNil(t, config.IncomingAuth)
-	require.NotNil(t, config.IncomingAuth.Authz)
-	assert.Equal(t, "cedar", config.IncomingAuth.Authz.Type)
-	assert.Equal(t, []string{"permit(principal, action, resource);"}, config.IncomingAuth.Authz.Policies)
-	assert.Equal(t, "cognito", config.IncomingAuth.Authz.PrimaryUpstreamProvider)
-}
-
 // createTestScheme creates a test scheme with required types
 func createTestScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
@@ -1694,6 +1655,51 @@ func TestConverter_SessionStorage(t *testing.T) {
 	}
 }
 
+func TestConverter_RateLimitingPassThrough(t *testing.T) {
+	t.Parallel()
+
+	vmcpServer := &mcpv1beta1.VirtualMCPServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-vmcp",
+			Namespace: "default",
+		},
+		Spec: mcpv1beta1.VirtualMCPServerSpec{
+			GroupRef: &mcpv1beta1.MCPGroupRef{Name: "test-group"},
+			Config: vmcpconfig.Config{
+				RateLimiting: &mcpv1beta1.RateLimitConfig{
+					PerUser: &mcpv1beta1.RateLimitBucket{
+						MaxTokens:    2,
+						RefillPeriod: metav1.Duration{Duration: time.Minute},
+					},
+					Tools: []mcpv1beta1.ToolRateLimitConfig{
+						{
+							Name: "backend_a_echo",
+							Shared: &mcpv1beta1.RateLimitBucket{
+								MaxTokens:    5,
+								RefillPeriod: metav1.Duration{Duration: 30 * time.Second},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	converter := newTestConverter(t, newNoOpMockResolver(t))
+	ctx := log.IntoContext(context.Background(), logr.Discard())
+
+	config, _, err := converter.Convert(ctx, vmcpServer, nil)
+	require.NoError(t, err)
+	require.NotNil(t, config)
+	require.NotNil(t, config.RateLimiting)
+
+	assert.EqualValues(t, 2, config.RateLimiting.PerUser.MaxTokens)
+	require.Len(t, config.RateLimiting.Tools, 1)
+	assert.Equal(t, "backend_a_echo", config.RateLimiting.Tools[0].Name)
+	require.NotNil(t, config.RateLimiting.Tools[0].Shared)
+	assert.EqualValues(t, 5, config.RateLimiting.Tools[0].Shared.MaxTokens)
+}
+
 func TestDeriveAllowedAudiences(t *testing.T) {
 	t.Parallel()
 
@@ -1985,4 +1991,262 @@ func TestConverter_TelemetryConfigRef(t *testing.T) {
 		"Endpoint should be normalized (https:// prefix stripped)")
 	assert.True(t, config.Telemetry.TracingEnabled, "Tracing should be enabled from MCPTelemetryConfig")
 	assert.True(t, config.Telemetry.MetricsEnabled, "Metrics should be enabled from MCPTelemetryConfig")
+}
+
+// TestConvertIncomingAuth_PrimaryUpstreamProvider verifies that convertIncomingAuth
+// propagates the first configured upstream provider name into AuthzConfig so Cedar
+// evaluates claims from the upstream IDP token rather than the ToolHive-issued
+// AS token. Without this, policies referencing upstream claims (e.g. "department")
+// fail at runtime because Cedar reads the wrong token. Also verifies that the
+// user-supplied spec.authServerConfig.primaryUpstreamProvider overrides the
+// auto-selected first upstream when set.
+func TestConvertIncomingAuth_PrimaryUpstreamProvider(t *testing.T) {
+	t.Parallel()
+
+	inlineAuthzRef := &mcpv1beta1.AuthzConfigRef{
+		Type: "inline",
+		Inline: &mcpv1beta1.InlineAuthzConfig{
+			Policies: []string{`permit(principal, action, resource);`},
+		},
+	}
+
+	tests := []struct {
+		name             string
+		authServerConfig *mcpv1beta1.EmbeddedAuthServerConfig
+		authzConfig      *mcpv1beta1.AuthzConfigRef
+		expectAuthzNil   bool
+		expectedProvider string
+		expectError      bool
+	}{
+		{
+			name:             "no auth server leaves provider unset",
+			authServerConfig: nil,
+			authzConfig:      inlineAuthzRef,
+			expectedProvider: "",
+		},
+		{
+			name: "auth server with empty upstream list leaves provider unset",
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer:            "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{},
+			},
+			authzConfig:      inlineAuthzRef,
+			expectedProvider: "",
+		},
+		{
+			name: "single named upstream becomes primary",
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+			},
+			authzConfig:      inlineAuthzRef,
+			expectedProvider: "okta",
+		},
+		{
+			name: "empty upstream name resolves to default",
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+			},
+			authzConfig:      inlineAuthzRef,
+			expectedProvider: "default",
+		},
+		{
+			name: "first upstream wins with multiple providers",
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+					{Name: "github", Type: mcpv1beta1.UpstreamProviderTypeOAuth2},
+					{Name: "google", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+			},
+			authzConfig:      inlineAuthzRef,
+			expectedProvider: "okta",
+		},
+		{
+			name: "no authz config leaves Authz nil without panic",
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+			},
+			authzConfig:    nil,
+			expectAuthzNil: true,
+		},
+		{
+			// Direct-IdP flow with anonymous incoming auth: neither the embedded
+			// AS nor authz is configured. Converter must not panic and must leave
+			// Authz unset.
+			name:             "both auth server and authz nil leaves Authz nil without panic",
+			authServerConfig: nil,
+			authzConfig:      nil,
+			expectAuthzNil:   true,
+		},
+		{
+			// Explicit primaryUpstreamProvider with a single upstream is honored
+			// (and matches it). Validates the explicit branch is taken at all.
+			name: "explicit primary provider with single upstream is honored",
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+				PrimaryUpstreamProvider: "okta",
+			},
+			authzConfig:      inlineAuthzRef,
+			expectedProvider: "okta",
+		},
+		{
+			// Explicit primaryUpstreamProvider overrides the auto-selected first
+			// upstream when multiple are configured. This is the core feature.
+			name: "explicit primary provider overrides first of multiple upstreams",
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+					{Name: "github", Type: mcpv1beta1.UpstreamProviderTypeOAuth2},
+					{Name: "google", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+				PrimaryUpstreamProvider: "github",
+			},
+			authzConfig:      inlineAuthzRef,
+			expectedProvider: "github",
+		},
+		{
+			// Exercises the actual normalization step inside ResolveUpstreamName:
+			// the upstream is declared with Name:"" (which resolves to "default")
+			// and the user pins primaryUpstreamProvider to "default". The explicit
+			// branch must forward "default" — exercising both the explicit path
+			// and the resolver's empty-input handling. The previous "okta -> okta"
+			// case did not exercise normalization because ResolveUpstreamName is
+			// the identity function for non-empty input.
+			name: "explicit primary provider 'default' resolves to default upstream",
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+				PrimaryUpstreamProvider: "default",
+			},
+			authzConfig:      inlineAuthzRef,
+			expectedProvider: "default",
+		},
+		{
+			// Defense in depth: even if invoked outside the reconcile flow
+			// (CLI dry-run, webhook, test harness), Convert refuses to produce
+			// an unresolvable PrimaryUpstreamProvider. The validator rejection
+			// is the primary user-facing fail-loud point; this case locks the
+			// converter-side defense in. The provider is on the deprecated
+			// location to keep the rejection wired through ExplicitPrimaryUpstream
+			// Provider's fallback path.
+			name:             "explicit primary provider without auth server is rejected",
+			authServerConfig: nil,
+			authzConfig: &mcpv1beta1.AuthzConfigRef{
+				Type: "inline",
+				Inline: &mcpv1beta1.InlineAuthzConfig{
+					Policies:                []string{`permit(principal, action, resource);`},
+					PrimaryUpstreamProvider: "okta",
+				},
+			},
+			expectError: true,
+		},
+		{
+			name: "explicit primary provider that doesn't match any upstream is rejected",
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+				PrimaryUpstreamProvider: "ping",
+			},
+			authzConfig: inlineAuthzRef,
+			expectError: true,
+		},
+		{
+			// Backward-compatibility: the deprecated inline field is read when
+			// the canonical location is empty, with no auth server set this is
+			// rejected by the defense-in-depth check above; this case validates
+			// the deprecated value flows through when the canonical is empty and
+			// matches a declared upstream.
+			name: "deprecated inline primary provider is honored when canonical is empty",
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+					{Name: "github", Type: mcpv1beta1.UpstreamProviderTypeOAuth2},
+				},
+			},
+			authzConfig: &mcpv1beta1.AuthzConfigRef{
+				Type: "inline",
+				Inline: &mcpv1beta1.InlineAuthzConfig{
+					Policies:                []string{`permit(principal, action, resource);`},
+					PrimaryUpstreamProvider: "github",
+				},
+			},
+			expectedProvider: "github",
+		},
+		{
+			// Canonical location overrides the deprecated one when both are set.
+			name: "canonical primary provider overrides deprecated inline value",
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+					{Name: "github", Type: mcpv1beta1.UpstreamProviderTypeOAuth2},
+				},
+				PrimaryUpstreamProvider: "github",
+			},
+			authzConfig: &mcpv1beta1.AuthzConfigRef{
+				Type: "inline",
+				Inline: &mcpv1beta1.InlineAuthzConfig{
+					Policies:                []string{`permit(principal, action, resource);`},
+					PrimaryUpstreamProvider: "okta",
+				},
+			},
+			expectedProvider: "github",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			converter := newTestConverter(t, newNoOpMockResolver(t))
+
+			vmcp := &mcpv1beta1.VirtualMCPServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-vmcp", Namespace: "default"},
+				Spec: mcpv1beta1.VirtualMCPServerSpec{
+					GroupRef: &mcpv1beta1.MCPGroupRef{Name: "test-group"},
+					IncomingAuth: &mcpv1beta1.IncomingAuthConfig{
+						Type:        "anonymous",
+						AuthzConfig: tt.authzConfig,
+					},
+					AuthServerConfig: tt.authServerConfig,
+				},
+			}
+
+			ctx := log.IntoContext(t.Context(), logr.Discard())
+			incoming, err := converter.convertIncomingAuth(ctx, vmcp)
+			if tt.expectError {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, incoming)
+
+			if tt.expectAuthzNil {
+				assert.Nil(t, incoming.Authz)
+				return
+			}
+
+			require.NotNil(t, incoming.Authz)
+			assert.Equal(t, tt.expectedProvider, incoming.Authz.PrimaryUpstreamProvider)
+		})
+	}
 }

@@ -55,7 +55,7 @@ var registryAPIRBACRules = []rbacv1.PolicyRule{
 	},
 	// Event creation for leader election status
 	{
-		APIGroups: []string{""},
+		APIGroups: []string{"events.k8s.io"},
 		Resources: []string{"events"},
 		Verbs:     []string{"create", "patch"},
 	},
@@ -78,11 +78,12 @@ func (m *manager) ensureRBACResources(
 	labels := labelsForRegistryAPI(mcpRegistry, resourceName)
 
 	if _, err := rbacClient.EnsureRBACResources(ctx, rbac.EnsureRBACResourcesParams{
-		Name:      resourceName,
-		Namespace: mcpRegistry.Namespace,
-		Rules:     registryAPIRBACRules,
-		Owner:     mcpRegistry,
-		Labels:    labels,
+		Name:             resourceName,
+		Namespace:        mcpRegistry.Namespace,
+		Rules:            registryAPIRBACRules,
+		Owner:            mcpRegistry,
+		Labels:           labels,
+		ImagePullSecrets: m.imagePullSecretsDefaults.Merge(mcpRegistry.Spec.ImagePullSecrets),
 	}); err != nil {
 		return err
 	}

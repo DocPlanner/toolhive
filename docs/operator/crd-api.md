@@ -4,6 +4,7 @@
 - [toolhive.stacklok.dev/audit](#toolhivestacklokdevaudit)
 - [toolhive.stacklok.dev/authtypes](#toolhivestacklokdevauthtypes)
 - [toolhive.stacklok.dev/config](#toolhivestacklokdevconfig)
+- [toolhive.stacklok.dev/ratelimit](#toolhivestacklokdevratelimit)
 - [toolhive.stacklok.dev/telemetry](#toolhivestacklokdevtelemetry)
 - [toolhive.stacklok.dev/v1alpha1](#toolhivestacklokdevv1alpha1)
 - [toolhive.stacklok.dev/v1beta1](#toolhivestacklokdevv1beta1)
@@ -56,6 +57,30 @@ _Appears in:_
 ## toolhive.stacklok.dev/authtypes
 
 
+#### auth.types.AwsStsConfig
+
+
+
+AwsStsConfig configures AWS STS authentication with SigV4 request signing.
+This strategy exchanges incoming tokens for AWS STS temporary credentials.
+
+
+
+_Appears in:_
+- [auth.types.BackendAuthStrategy](#authtypesbackendauthstrategy)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `region` _string_ | Region is the AWS region for the STS endpoint and service. |  |  |
+| `service` _string_ | Service is the AWS service name for SigV4 signing. |  |  |
+| `fallbackRoleArn` _string_ | FallbackRoleArn is the IAM role ARN to assume when no role mappings match. |  |  |
+| `roleMappings` _[auth.types.RoleMapping](#authtypesrolemapping) array_ | RoleMappings defines claim-based role selection rules. |  |  |
+| `roleClaim` _string_ | RoleClaim is the JWT claim to use for role mapping evaluation. |  |  |
+| `sessionDuration` _integer_ | SessionDuration is the duration in seconds for the STS session. |  |  |
+| `sessionNameClaim` _string_ | SessionNameClaim is the JWT claim to use for the role session name. |  |  |
+| `subjectProviderName` _string_ | SubjectProviderName selects which upstream provider's token to use as the<br />web identity token for AssumeRoleWithWebIdentity. When set, the token is<br />looked up from Identity.UpstreamTokens instead of the request's<br />Authorization header. |  |  |
+
+
 #### auth.types.BackendAuthStrategy
 
 
@@ -72,10 +97,11 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `type` _string_ | Type is the auth strategy: "unauthenticated", "header_injection", "token_exchange", "upstream_inject" |  |  |
+| `type` _string_ | Type is the auth strategy: "unauthenticated", "header_injection", "token_exchange", "upstream_inject", "aws_sts", "obo" |  |  |
 | `headerInjection` _[auth.types.HeaderInjectionConfig](#authtypesheaderinjectionconfig)_ | HeaderInjection contains configuration for header injection auth strategy.<br />Used when Type = "header_injection". |  |  |
 | `tokenExchange` _[auth.types.TokenExchangeConfig](#authtypestokenexchangeconfig)_ | TokenExchange contains configuration for token exchange auth strategy.<br />Used when Type = "token_exchange". |  |  |
 | `upstreamInject` _[auth.types.UpstreamInjectConfig](#authtypesupstreaminjectconfig)_ | UpstreamInject contains configuration for upstream inject auth strategy.<br />Used when Type = "upstream_inject". |  |  |
+| `awsSts` _[auth.types.AwsStsConfig](#authtypesawsstsconfig)_ | AwsSts contains configuration for AWS STS auth strategy.<br />Used when Type = "aws_sts". |  |  |
 
 
 #### auth.types.HeaderInjectionConfig
@@ -95,6 +121,26 @@ _Appears in:_
 | `headerName` _string_ | HeaderName is the name of the header to inject (e.g., "Authorization"). |  |  |
 | `headerValue` _string_ | HeaderValue is the static header value to inject.<br />Either HeaderValue or HeaderValueEnv should be set, not both. |  |  |
 | `headerValueEnv` _string_ | HeaderValueEnv is the environment variable name containing the header value.<br />The value will be resolved at runtime from this environment variable.<br />Either HeaderValue or HeaderValueEnv should be set, not both. |  |  |
+
+
+#### auth.types.RoleMapping
+
+
+
+RoleMapping defines a rule for mapping JWT claims to IAM roles.
+Mappings are evaluated in priority order (lower number = higher priority).
+
+
+
+_Appears in:_
+- [auth.types.AwsStsConfig](#authtypesawsstsconfig)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `claim` _string_ | Claim is a simple claim value to match against the RoleClaim field. |  |  |
+| `matcher` _string_ | Matcher is a CEL expression for complex matching against JWT claims. |  |  |
+| `roleArn` _string_ | RoleArn is the IAM role ARN to assume when this mapping matches. |  |  |
+| `priority` _integer_ | Priority determines evaluation order (lower values = higher priority).<br />Mirrors awssts.RoleMapping.Priority, which is *int because the role mapper<br />uses math.MaxInt for nil-priority semantics in effectivePriority. |  |  |
 
 
 #### auth.types.TokenExchangeConfig
@@ -186,7 +232,11 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `type` _string_ | Type is the authz type: "cedar", "none" |  |  |
 | `policies` _string array_ | Policies contains Cedar policy definitions (when Type = "cedar"). |  |  |
+| `entitiesJson` _string_ | EntitiesJSON is a JSON string representing Cedar entities. Required for<br />enterprise policies that rely on transitive relationships (e.g.<br />`ClaimGroup → PlatformRole`) — without it the Cedar authorizer is<br />constructed with an empty entity store and `in` checks against absent<br />entities silently evaluate to false. Defaults to "[]" when empty. |  | Optional: \{\} <br /> |
 | `primaryUpstreamProvider` _string_ | PrimaryUpstreamProvider names the upstream IDP provider whose access<br />token should be used as the source of JWT claims for Cedar evaluation.<br />When empty, claims from the ToolHive-issued token are used.<br />Must match an upstream provider name configured in the embedded auth server<br />(e.g. "default", "github"). Only relevant when the embedded auth server is active. |  | Optional: \{\} <br /> |
+| `groupClaimName` _string_ | GroupClaimName is the JWT claim key that contains group membership for<br />the principal. When set, takes priority over the well-known defaults<br />("groups", "roles", "cognito:groups"). Use this for IDPs that place<br />groups under a URI-style claim (e.g. "https://example.com/groups").<br />When empty, only the well-known claim names are checked. |  | Optional: \{\} <br /> |
+| `roleClaimName` _string_ | RoleClaimName is the JWT claim key that contains role membership for the<br />principal. When set, the claim is extracted separately from GroupClaimName<br />and both are mapped to the configured group entity type. When empty, no<br />role extraction is performed. |  | Optional: \{\} <br /> |
+| `groupEntityType` _string_ | GroupEntityType is the Cedar entity type name used for principal parent<br />UIDs synthesised from JWT group/role claims. Defaults to "THVGroup" when<br />empty. Must match the entity type used in EntitiesJSON for transitive<br />`in` checks to resolve. Namespaced names (`Foo::Bar`) are not yet supported. |  | Optional: \{\} <br /> |
 
 
 #### vmcp.config.CircuitBreakerConfig
@@ -280,6 +330,7 @@ _Appears in:_
 | `optimizer` _[vmcp.config.OptimizerConfig](#vmcpconfigoptimizerconfig)_ | Optimizer configures the MCP optimizer for context optimization on large toolsets.<br />When enabled, vMCP exposes only find_tool and call_tool operations to clients<br />instead of all backend tools directly. This reduces token usage by allowing<br />LLMs to discover relevant tools on demand rather than receiving all tool definitions. |  | Optional: \{\} <br /> |
 | `sessionStorage` _[vmcp.config.SessionStorageConfig](#vmcpconfigsessionstorageconfig)_ | SessionStorage configures session storage for stateful horizontal scaling.<br />When provider is "redis", the operator injects Redis connection parameters<br />(address, db, keyPrefix) here. The Redis password is provided separately via<br />the THV_SESSION_REDIS_PASSWORD environment variable. |  | Optional: \{\} <br /> |
 | `sessionTTL` _[vmcp.config.Duration](#vmcpconfigduration)_ | SessionTTL configures the idle TTL for vMCP sessions.<br />When omitted, the server default is used. |  | Pattern: `^([0-9]+(\.[0-9]+)?(ns\|us\|µs\|ms\|s\|m\|h))+$` <br />Type: string <br />Optional: \{\} <br /> |
+| `rateLimiting` _[ratelimit.types.RateLimitConfig](#ratelimittypesratelimitconfig)_ | RateLimiting defines rate limiting configuration for the Virtual MCP server.<br />Requires Redis session storage to be configured for distributed rate limiting. |  | Optional: \{\} <br /> |
 
 
 #### vmcp.config.ConflictResolutionConfig
@@ -695,6 +746,68 @@ _Appears in:_
 
 
 
+## toolhive.stacklok.dev/ratelimit
+
+
+#### ratelimit.types.RateLimitBucket
+
+
+
+RateLimitBucket defines a token bucket configuration with a maximum capacity
+and a refill period. Used by both shared and per-user rate limits.
+
+
+
+_Appears in:_
+- [ratelimit.types.RateLimitConfig](#ratelimittypesratelimitconfig)
+- [ratelimit.types.ToolRateLimitConfig](#ratelimittypestoolratelimitconfig)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `maxTokens` _integer_ | MaxTokens is the maximum number of tokens (bucket capacity).<br />This is also the burst size: the maximum number of requests that can be served<br />instantaneously before the bucket is depleted. |  | Minimum: 1 <br />Required: \{\} <br /> |
+| `refillPeriod` _[Duration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.27/#duration-v1-meta)_ | RefillPeriod is the duration to fully refill the bucket from zero to maxTokens.<br />The effective refill rate is maxTokens / refillPeriod tokens per second.<br />Format: Go duration string (e.g., "1m0s", "30s", "1h0m0s"). |  | Required: \{\} <br /> |
+
+
+#### ratelimit.types.RateLimitConfig
+
+
+
+RateLimitConfig defines rate limiting configuration for an MCP server.
+At least one of shared, perUser, or tools must be configured.
+
+
+
+_Appears in:_
+- [vmcp.config.Config](#vmcpconfigconfig)
+- [api.v1beta1.MCPServerSpec](#apiv1beta1mcpserverspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `shared` _[ratelimit.types.RateLimitBucket](#ratelimittypesratelimitbucket)_ | Shared is a token bucket shared across all users for the entire server. |  | Optional: \{\} <br /> |
+| `perUser` _[ratelimit.types.RateLimitBucket](#ratelimittypesratelimitbucket)_ | PerUser is a token bucket applied independently to each authenticated user<br />at the server level. Requires authentication to be enabled.<br />Each unique userID creates Redis keys that expire after 2x refillPeriod.<br />Memory formula: unique_users_per_TTL_window * (1 + num_tools_with_per_user_limits) keys. |  | Optional: \{\} <br /> |
+| `tools` _[ratelimit.types.ToolRateLimitConfig](#ratelimittypestoolratelimitconfig) array_ | Tools defines per-tool rate limit overrides.<br />Each entry applies additional rate limits to calls targeting a specific tool name.<br />A request must pass both the server-level limit and the per-tool limit. |  | Optional: \{\} <br /> |
+
+
+#### ratelimit.types.ToolRateLimitConfig
+
+
+
+ToolRateLimitConfig defines rate limits for a specific tool.
+At least one of shared or perUser must be configured.
+
+
+
+_Appears in:_
+- [ratelimit.types.RateLimitConfig](#ratelimittypesratelimitconfig)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `name` _string_ | Name is the MCP tool name this limit applies to. |  | MinLength: 1 <br />Required: \{\} <br /> |
+| `shared` _[ratelimit.types.RateLimitBucket](#ratelimittypesratelimitbucket)_ | Shared token bucket for this specific tool. |  | Optional: \{\} <br /> |
+| `perUser` _[ratelimit.types.RateLimitBucket](#ratelimittypesratelimitbucket)_ | PerUser token bucket configuration for this tool. |  | Optional: \{\} <br /> |
+
+
+
 ## toolhive.stacklok.dev/telemetry
 
 
@@ -759,10 +872,16 @@ _Appears in:_
 - [api.v1alpha1.MCPTelemetryConfigList](#apiv1alpha1mcptelemetryconfiglist)
 - [api.v1alpha1.MCPToolConfig](#apiv1alpha1mcptoolconfig)
 - [api.v1alpha1.MCPToolConfigList](#apiv1alpha1mcptoolconfiglist)
+- [api.v1alpha1.MCPWebhookConfig](#apiv1alpha1mcpwebhookconfig)
+- [api.v1alpha1.MCPWebhookConfigList](#apiv1alpha1mcpwebhookconfiglist)
 - [api.v1alpha1.VirtualMCPCompositeToolDefinition](#apiv1alpha1virtualmcpcompositetooldefinition)
 - [api.v1alpha1.VirtualMCPCompositeToolDefinitionList](#apiv1alpha1virtualmcpcompositetooldefinitionlist)
 - [api.v1alpha1.VirtualMCPServer](#apiv1alpha1virtualmcpserver)
 - [api.v1alpha1.VirtualMCPServerList](#apiv1alpha1virtualmcpserverlist)
+
+
+
+
 
 
 
@@ -866,6 +985,7 @@ _Appears in:_
 | `roleClaim` _string_ | RoleClaim is the JWT claim to use for role mapping evaluation<br />Defaults to "groups" to match common OIDC group claims | groups | Optional: \{\} <br /> |
 | `sessionDuration` _integer_ | SessionDuration is the duration in seconds for the STS session<br />Must be between 900 (15 minutes) and 43200 (12 hours)<br />Defaults to 3600 (1 hour) if not specified | 3600 | Maximum: 43200 <br />Minimum: 900 <br />Optional: \{\} <br /> |
 | `sessionNameClaim` _string_ | SessionNameClaim is the JWT claim to use for role session name<br />Defaults to "sub" to use the subject claim | sub | Optional: \{\} <br /> |
+| `subjectProviderName` _string_ | SubjectProviderName is the name of the upstream provider whose access token<br />is used as the web identity token for STS AssumeRoleWithWebIdentity.<br />This field is used exclusively by VirtualMCPServer, where there is no<br />upstream swap middleware to replace the bearer token before the strategy runs.<br />When left empty and an embedded authorization server is configured on the<br />VirtualMCPServer, the controller automatically populates this field with<br />the first configured upstream provider name. Set it explicitly to override<br />that default or to select a specific provider when multiple upstreams are<br />configured.<br />When no embedded auth server is present, the bearer token from the incoming<br />request's Authorization header is used instead. |  | Optional: \{\} <br /> |
 
 
 #### api.v1beta1.AuditConfig
@@ -957,6 +1077,9 @@ _Appears in:_
 | `type` _string_ | Type is the type of authorization configuration | configMap | Enum: [configMap inline] <br /> |
 | `configMap` _[api.v1beta1.ConfigMapAuthzRef](#apiv1beta1configmapauthzref)_ | ConfigMap references a ConfigMap containing authorization configuration<br />Only used when Type is "configMap" |  | Optional: \{\} <br /> |
 | `inline` _[api.v1beta1.InlineAuthzConfig](#apiv1beta1inlineauthzconfig)_ | Inline contains direct authorization configuration<br />Only used when Type is "inline" |  | Optional: \{\} <br /> |
+| `groupClaimName` _string_ | GroupClaimName is the JWT claim key that contains group membership for the<br />principal. When set, takes priority over the well-known defaults<br />("groups", "roles", "cognito:groups"). Use this for IDPs that place<br />groups under a URI-style claim (e.g. "https://example.com/groups"). When<br />Type is "configMap", a group_claim_name entry in the referenced ConfigMap<br />is overridden by this field if both are set. |  | MaxLength: 253 <br />Optional: \{\} <br /> |
+| `roleClaimName` _string_ | RoleClaimName is the JWT claim key that contains role membership for the<br />principal. When set, the claim is extracted separately from GroupClaimName<br />and both are mapped to the configured GroupEntityType. When Type is<br />"configMap", a role_claim_name entry in the referenced ConfigMap is<br />overridden by this field if both are set. |  | MaxLength: 253 <br />Optional: \{\} <br /> |
+| `groupEntityType` _string_ | GroupEntityType is the Cedar entity type name used for principal parent<br />UIDs synthesised from JWT group/role claims. Defaults to "THVGroup" when<br />empty. Must match the entity type used in the static entity store for<br />transitive `in` checks (e.g. `ClaimGroup → PlatformRole`) to resolve.<br />Namespaced names (`Foo::Bar`) are not yet supported. When Type is<br />"configMap", a group_entity_type entry in the referenced ConfigMap is<br />overridden by this field if both are set. |  | MaxLength: 63 <br />Pattern: `^[A-Za-z_][A-Za-z0-9_]*$` <br />Optional: \{\} <br /> |
 
 
 #### api.v1beta1.BackendAuthConfig
@@ -1029,6 +1152,40 @@ _Appears in:_
 | `key` _string_ | Key is the key in the ConfigMap that contains the authorization configuration | authz.json | Optional: \{\} <br /> |
 
 
+#### api.v1beta1.DCRUpstreamConfig
+
+
+
+DCRUpstreamConfig configures RFC 7591 Dynamic Client Registration for an
+OAuth 2.0 upstream. When present on an OAuth2 upstream, the authserver
+performs registration at runtime to obtain client credentials, replacing
+the need to pre-provision a ClientID.
+
+Exactly one of DiscoveryURL or RegistrationEndpoint must be set. DiscoveryURL
+points at an RFC 8414 / OIDC Discovery document from which the registration
+endpoint is resolved; RegistrationEndpoint is used directly when the upstream
+does not publish discovery metadata.
+
+The XOR rule uses has() alone (not has() + size() > 0) to keep the rule's
+estimated CEL cost under the apiserver's per-rule static budget. With
+`omitempty` on both fields, an unset field is absent on the wire and has()
+returns false; the explicit-empty-string edge case is rejected at reconcile
+time by ValidateOAuth2DCRConfig.
+
+
+
+_Appears in:_
+- [api.v1beta1.OAuth2UpstreamConfig](#apiv1beta1oauth2upstreamconfig)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `discoveryUrl` _string_ | DiscoveryURL is the RFC 8414 / OIDC Discovery document URL. The resolver<br />issues a single GET against this URL (no well-known-path fallback) and<br />reads registration_endpoint, authorization_endpoint, token_endpoint,<br />token_endpoint_auth_methods_supported, and scopes_supported from the<br />response.<br />Mutually exclusive with RegistrationEndpoint.<br />HTTPS is required because the registration endpoint resolved from this<br />document carries the initial access token and the issued client_secret<br />(RFC 7591 §3, RFC 8414 §3). MaxLength is a defensive size cap (etcd<br />object budget, regex evaluation cost) and matches the conventional URL<br />length cap. |  | MaxLength: 2048 <br />Pattern: `^https://[^\s?#]+[^/\s?#]$` <br />Optional: \{\} <br /> |
+| `registrationEndpoint` _string_ | RegistrationEndpoint is the RFC 7591 registration endpoint URL used<br />directly, bypassing discovery. When using this field, the caller is<br />expected to also supply AuthorizationEndpoint, TokenEndpoint, and an<br />explicit Scopes list on the parent OAuth2UpstreamConfig.<br />Mutually exclusive with DiscoveryURL.<br />HTTPS is required because the registration endpoint carries the initial<br />access token and the issued client_secret (RFC 7591 §3, RFC 8414 §3).<br />MaxLength is a defensive size cap (etcd object budget, regex evaluation<br />cost) and matches the conventional URL length cap. |  | MaxLength: 2048 <br />Pattern: `^https://[^\s?#]+[^/\s?#]$` <br />Optional: \{\} <br /> |
+| `initialAccessTokenRef` _[api.v1beta1.SecretKeyRef](#apiv1beta1secretkeyref)_ | InitialAccessTokenRef is an optional reference to a Kubernetes Secret<br />carrying an RFC 7591 §3 initial access token. When set, the resolver<br />presents the token value as a Bearer credential on the registration<br />request. Mirrors the ClientSecretRef pattern. |  | Optional: \{\} <br /> |
+| `softwareId` _string_ | SoftwareID is the RFC 7591 "software_id" registration metadata value,<br />identifying the client software independent of any particular<br />registration instance. Typically a UUID or short identifier. |  | MaxLength: 255 <br />Optional: \{\} <br /> |
+| `softwareStatement` _string_ | SoftwareStatement is the RFC 7591 "software_statement" JWT asserting<br />metadata about the client software, signed by a party the authorization<br />server trusts.<br />Stored inline on the CR. The JWT is signed but not encrypted, so its<br />contents are visible to anyone with get/list/watch on this resource and<br />appear in etcd backups in plaintext. Treat the value as non-confidential<br />(signed attestation, not a secret). Operators that rotate software<br />statements like bearer credentials should keep them at the authorization<br />server side and rely on the registration endpoint's initial access<br />token (see InitialAccessTokenRef) instead of placing them on the CR.<br />Bounded to 16384 characters as a defensive size cap (etcd object<br />budget, regex evaluation cost). Real-world signed statements with<br />embedded x5c certificate chains, JWKS keys, or OIDC-Federation<br />trust-framework metadata routinely exceed 4 KB. |  | MaxLength: 16384 <br />Optional: \{\} <br /> |
+
+
 
 
 #### api.v1beta1.EmbeddedAuthServerConfig
@@ -1052,7 +1209,9 @@ _Appears in:_
 | `hmacSecretRefs` _[api.v1beta1.SecretKeyRef](#apiv1beta1secretkeyref) array_ | HMACSecretRefs references Kubernetes Secrets containing symmetric secrets for signing<br />authorization codes and refresh tokens (opaque tokens).<br />Current secret must be at least 32 bytes and cryptographically random.<br />Supports secret rotation via multiple entries (first is current, rest are for verification).<br />If not specified, an ephemeral secret will be auto-generated (development only -<br />auth codes and refresh tokens will be invalid after restart). |  | Optional: \{\} <br /> |
 | `tokenLifespans` _[api.v1beta1.TokenLifespanConfig](#apiv1beta1tokenlifespanconfig)_ | TokenLifespans configures the duration that various tokens are valid.<br />If not specified, defaults are applied (access: 1h, refresh: 7d, authCode: 10m). |  | Optional: \{\} <br /> |
 | `upstreamProviders` _[api.v1beta1.UpstreamProviderConfig](#apiv1beta1upstreamproviderconfig) array_ | UpstreamProviders configures connections to upstream Identity Providers.<br />The embedded auth server delegates authentication to these providers.<br />MCPServer and MCPRemoteProxy support a single upstream; VirtualMCPServer supports multiple. |  | MinItems: 1 <br />Required: \{\} <br /> |
+| `primaryUpstreamProvider` _string_ | PrimaryUpstreamProvider names the upstream IDP whose access token Cedar<br />should read claims from when authorising a request. Must match the name<br />of one of the entries in UpstreamProviders. When empty, the controller<br />auto-selects the first entry of UpstreamProviders.<br />Only meaningful on VirtualMCPServer, where multiple upstream providers<br />can be configured and Cedar needs to pick which token's claims to<br />evaluate. The VirtualMCPServer controller validates this field against<br />UpstreamProviders at admission and rejects unresolvable values.<br />On MCPServer and MCPRemoteProxy this field is structurally present (the<br />EmbeddedAuthServerConfig struct is shared) but has no runtime effect:<br />those CRDs are restricted to a single upstream so there is no choice to<br />make. Setting it on those CRDs is silently ignored. |  | MaxLength: 63 <br />MinLength: 1 <br />Pattern: `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$` <br />Optional: \{\} <br /> |
 | `storage` _[api.v1beta1.AuthServerStorageConfig](#apiv1beta1authserverstorageconfig)_ | Storage configures the storage backend for the embedded auth server.<br />If not specified, defaults to in-memory storage. |  | Optional: \{\} <br /> |
+| `baselineClientScopes` _string array_ | BaselineClientScopes is a baseline set of OAuth 2.0 scopes guaranteed to be<br />included in every client registration. The embedded auth server unions these<br />scopes into the registered set returned by RFC 7591 Dynamic Client<br />Registration, so a client that narrows the `scope` field at /oauth/register<br />can still request the baseline scopes at /oauth/authorize. All values must<br />be present in the upstream-derived scopesSupported set; the auth server<br />fails to start if any value is missing.<br />Security: every client registered via /oauth/register will gain the<br />ability to request these scopes at /oauth/authorize, regardless of what<br />the client itself requested. Keep the baseline narrow (typically<br />"openid" and "offline_access"). Adding a privileged scope here — e.g.<br />"admin:read" — would grant it to every DCR-registered client, including<br />public clients like Claude Code, Cursor, and VS Code. |  | MaxItems: 10 <br />items:MinLength: 1 <br />items:Pattern: `^[\x21\x23-\x5B\x5D-\x7E]+$` <br />Optional: \{\} <br /> |
 
 
 #### api.v1beta1.EmbeddingResourceOverrides
@@ -1169,7 +1328,7 @@ _Appears in:_
 | `model` _string_ | Model is the HuggingFace embedding model to use (e.g., "sentence-transformers/all-MiniLM-L6-v2") | BAAI/bge-small-en-v1.5 | Optional: \{\} <br /> |
 | `hfTokenSecretRef` _[api.v1beta1.SecretKeyRef](#apiv1beta1secretkeyref)_ | HFTokenSecretRef is a reference to a Kubernetes Secret containing the huggingface token.<br />If provided, the secret value will be provided to the embedding server for authentication with huggingface. |  | Optional: \{\} <br /> |
 | `image` _string_ | Image is the container image for the embedding inference server.<br />Images must be from HuggingFace Text Embeddings Inference (https://github.com/huggingface/text-embeddings-inference). | ghcr.io/huggingface/text-embeddings-inference:cpu-latest | Optional: \{\} <br /> |
-| `imagePullPolicy` _string_ | ImagePullPolicy defines the pull policy for the container image | IfNotPresent | Enum: [Always Never IfNotPresent] <br />Optional: \{\} <br /> |
+| `imagePullPolicy` _[PullPolicy](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.27/#pullpolicy-v1-core)_ | ImagePullPolicy defines the pull policy for the container image | IfNotPresent | Enum: [Always Never IfNotPresent] <br />Optional: \{\} <br /> |
 | `port` _integer_ | Port is the port to expose the embedding service on | 8080 | Maximum: 65535 <br />Minimum: 1 <br /> |
 | `args` _string array_ | Args are additional arguments to pass to the embedding inference server |  | Optional: \{\} <br /> |
 | `env` _[api.v1beta1.EnvVar](#apiv1beta1envvar) array_ | Env are environment variables to set in the container |  | Optional: \{\} <br /> |
@@ -1278,6 +1437,7 @@ _Appears in:_
 | `embeddedAuthServer` | ExternalAuthTypeEmbeddedAuthServer is the type for embedded OAuth2/OIDC authorization server<br />This enables running an embedded auth server that delegates to upstream IDPs<br /> |
 | `awsSts` | ExternalAuthTypeAWSSts is the type for AWS STS authentication<br /> |
 | `upstreamInject` | ExternalAuthTypeUpstreamInject is the type for upstream token injection<br />This injects an upstream IDP access token as the Authorization: Bearer header<br /> |
+| `obo` | ExternalAuthTypeOBO is the type for on-behalf-of (OBO) flows.<br />This type requires a build with an OBO handler registered via<br />controllerutil.RegisterOBOHandler; an upstream-only build surfaces<br />status.conditions[Valid] = False with Reason: EnterpriseRequired<br />when an obo-typed MCPExternalAuthConfig is applied.<br /> |
 
 
 #### api.v1beta1.HeaderForwardConfig
@@ -1334,6 +1494,38 @@ _Appears in:_
 | `valueSecretRef` _[api.v1beta1.SecretKeyRef](#apiv1beta1secretkeyref)_ | ValueSecretRef references a Kubernetes Secret containing the header value |  | Required: \{\} <br /> |
 
 
+#### api.v1beta1.IdentityFromTokenConfig
+
+
+
+IdentityFromTokenConfig extracts user identity (subject, name, email) directly from the
+OAuth2 token-endpoint response body using gjson dot-notation paths. When configured on an
+OAuth2UpstreamConfig, the embedded auth server skips the userinfo HTTP call entirely and
+resolves identity from the token response.
+
+Paths use gjson dot-notation, where each segment is a JSON object key. For example,
+"username" extracts a top-level field, and "authed_user.id" extracts a nested field.
+
+Trust-model warning: Identity claims extracted via this block are not cryptographically
+verified — they are trusted only via the TLS connection to the token endpoint. Prefer
+OIDC + ID token validation when verifiable claims are required.
+
+Subject uniqueness is scoped to the upstream provider entry. To keep identity namespaces
+separate across multiple instances of the same provider (e.g., two Snowflake accounts),
+use distinct upstream provider entries.
+
+
+
+_Appears in:_
+- [api.v1beta1.OAuth2UpstreamConfig](#apiv1beta1oauth2upstreamconfig)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `subjectPath` _string_ | SubjectPath is the dot-notation path to the subject (user ID) field in the token response.<br />Warning: claims read from the token response are trusted only via TLS, not<br />cryptographically verified; prefer OIDC ID tokens when verifiable claims are required.<br />Example: "authed_user.id" for Slack (top-level token-response field). For providers<br />whose token response embeds the access token as a JWT (e.g. Snowflake), use the<br />"@upstreamjwt" modifier to decode the payload, e.g. "access_token\|@upstreamjwt\|sub".<br />The "@upstreamjwt" modifier performs no signature verification either. |  | MaxLength: 256 <br />MinLength: 1 <br />Required: \{\} <br /> |
+| `namePath` _string_ | NamePath is the dot-notation path to the display name field in the token response.<br />If not specified or if the path does not resolve to a string, the display name is omitted.<br />Omit the field entirely rather than setting it to an empty string. |  | MaxLength: 256 <br />MinLength: 1 <br />Optional: \{\} <br /> |
+| `emailPath` _string_ | EmailPath is the dot-notation path to the email address field in the token response.<br />If not specified or if the path does not resolve to a string, the email is omitted.<br />Omit the field entirely rather than setting it to an empty string. |  | MaxLength: 256 <br />MinLength: 1 <br />Optional: \{\} <br /> |
+
+
 #### api.v1beta1.IncomingAuthConfig
 
 
@@ -1356,7 +1548,11 @@ _Appears in:_
 
 
 
-InlineAuthzConfig contains direct authorization configuration
+InlineAuthzConfig contains direct authorization configuration.
+
+Source-agnostic Cedar JWT-claim mapping settings (GroupClaimName,
+RoleClaimName, GroupEntityType) live on the parent AuthzConfigRef so they
+work the same way for inline and configMap-sourced authz.
 
 
 
@@ -1366,8 +1562,8 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `policies` _string array_ | Policies is a list of Cedar policy strings |  | MinItems: 1 <br />Required: \{\} <br /> |
-| `entitiesJson` _string_ | EntitiesJSON is a JSON string representing Cedar entities | [] | Optional: \{\} <br /> |
-| `primaryUpstreamProvider` _string_ | PrimaryUpstreamProvider names the upstream IDP provider whose access<br />token should be used as the source of JWT claims for Cedar evaluation.<br />When empty, claims from the ToolHive-issued token are used.<br />Must match an upstream provider name configured in the embedded auth server<br />(e.g. "default", "github"). Only relevant when the embedded auth server is active. |  | Optional: \{\} <br /> |
+| `entitiesJson` _string_ | EntitiesJSON is a JSON string representing Cedar entities. Required when<br />transitive policies (e.g. `ClaimGroup → PlatformRole`) need a static<br />entity store; defaults to "[]". | [] | Optional: \{\} <br /> |
+| `primaryUpstreamProvider` _string_ | PrimaryUpstreamProvider names the upstream IDP whose access token's<br />claims Cedar should evaluate.<br />Deprecated: on VirtualMCPServer this field has moved to<br />spec.authServerConfig.primaryUpstreamProvider. The old location is<br />still read for one release for backward compatibility; the<br />VirtualMCPServer controller emits an AuthzPrimaryUpstreamProviderDeprecated<br />Warning event whenever it is consumed, and removal is planned for the<br />release after the deprecation cycle.<br />On MCPServer and MCPRemoteProxy this field has always been a structural<br />no-op (those CRDs do not run an embedded auth server). Setting it<br />continues to surface the AuthzPrimaryUpstreamProviderIgnored advisory<br />condition; the deprecation does not change that behaviour. |  | MaxLength: 63 <br />MinLength: 1 <br />Pattern: `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$` <br />Optional: \{\} <br /> |
 
 
 #### api.v1beta1.InlineOIDCSharedConfig
@@ -1505,6 +1701,7 @@ _Appears in:_
 | `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.27/#condition-v1-meta) array_ | Conditions represent the latest available observations of the MCPExternalAuthConfig's state |  | Optional: \{\} <br /> |
 | `observedGeneration` _integer_ | ObservedGeneration is the most recent generation observed for this MCPExternalAuthConfig.<br />It corresponds to the MCPExternalAuthConfig's generation, which is updated on mutation by the API Server. |  | Optional: \{\} <br /> |
 | `configHash` _string_ | ConfigHash is a hash of the current configuration for change detection |  | Optional: \{\} <br /> |
+| `referenceCount` _integer_ | ReferenceCount is the number of workloads referencing this config. |  | Optional: \{\} <br /> |
 | `referencingWorkloads` _[api.v1beta1.WorkloadReference](#apiv1beta1workloadreference) array_ | ReferencingWorkloads is a list of workload resources that reference this MCPExternalAuthConfig.<br />Each entry identifies the workload by kind and name. |  | Optional: \{\} <br /> |
 
 
@@ -1749,6 +1946,7 @@ _Appears in:_
 | `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.27/#condition-v1-meta) array_ | Conditions represent the latest available observations of the MCPOIDCConfig's state |  | Optional: \{\} <br /> |
 | `observedGeneration` _integer_ | ObservedGeneration is the most recent generation observed for this MCPOIDCConfig. |  | Optional: \{\} <br /> |
 | `configHash` _string_ | ConfigHash is a hash of the current configuration for change detection |  | Optional: \{\} <br /> |
+| `referenceCount` _integer_ | ReferenceCount is the number of workloads referencing this config. |  | Optional: \{\} <br /> |
 | `referencingWorkloads` _[api.v1beta1.WorkloadReference](#apiv1beta1workloadreference) array_ | ReferencingWorkloads is a list of workload resources that reference this MCPOIDCConfig.<br />Each entry identifies the workload by kind and name. |  | Optional: \{\} <br /> |
 
 
@@ -1833,6 +2031,7 @@ _Appears in:_
 | `pgpassSecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.27/#secretkeyselector-v1-core)_ | PGPassSecretRef references a Secret containing a pre-created pgpass file.<br />Why this is a dedicated field instead of a regular volume/volumeMount:<br />PostgreSQL's libpq rejects pgpass files that aren't mode 0600. Kubernetes<br />secret volumes mount files as root-owned, and the registry-api container<br />runs as non-root (UID 65532). A root-owned 0600 file is unreadable by<br />UID 65532, and using fsGroup changes permissions to 0640 which libpq also<br />rejects. The only solution is an init container that copies the file to an<br />emptyDir as the app user and runs chmod 0600. This cannot be expressed<br />through volumes/volumeMounts alone -- it requires an init container, two<br />extra volumes (secret + emptyDir), a subPath mount, and an environment<br />variable, all wired together correctly.<br />When specified, the operator generates all of that plumbing invisibly.<br />The user creates the Secret with pgpass-formatted content; the operator<br />handles only the Kubernetes permission mechanics.<br />Example Secret:<br />	apiVersion: v1<br />	kind: Secret<br />	metadata:<br />	  name: my-pgpass<br />	stringData:<br />	  .pgpass: \|<br />	    postgres:5432:registry:db_app:mypassword<br />	    postgres:5432:registry:db_migrator:otherpassword<br />Then reference it:<br />	pgpassSecretRef:<br />	  name: my-pgpass<br />	  key: .pgpass |  | Optional: \{\} <br /> |
 | `displayName` _string_ | DisplayName is a human-readable name for the registry. |  | Optional: \{\} <br /> |
 | `podTemplateSpec` _[RawExtension](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.27/#rawextension-runtime-pkg)_ | PodTemplateSpec defines the pod template to use for the registry API server.<br />This allows for customizing the pod configuration beyond what is provided by the other fields.<br />Note that to modify the specific container the registry API server runs in, you must specify<br />the `registry-api` container name in the PodTemplateSpec.<br />This field accepts a PodTemplateSpec object as JSON/YAML. |  | Type: object <br />Optional: \{\} <br /> |
+| `imagePullSecrets` _[LocalObjectReference](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.27/#localobjectreference-v1-core) array_ | ImagePullSecrets allows specifying image pull secrets for the registry API workload.<br />These are applied to both the registry-api Deployment's PodSpec.ImagePullSecrets<br />and to the operator-managed ServiceAccount the registry API runs as, so private<br />images are pullable through either path.<br />Use this field for new manifests.<br />Important: this is the ONLY way to attach image-pull credentials to the<br />operator-managed ServiceAccount. The legacy<br />spec.podTemplateSpec.spec.imagePullSecrets path populates the Deployment's pod<br />spec ONLY — it does NOT touch the ServiceAccount. On managed Kubernetes<br />platforms that rely on ServiceAccount-level credential injection (for example<br />GKE Workload Identity, OpenShift's per-SA dockercfg secrets, EKS IRSA), using<br />only the legacy PodTemplateSpec path can fail to pull private images even when<br />the secret exists in the namespace. Always set spec.imagePullSecrets when<br />SA-level credentials matter.<br />Precedence with PodTemplateSpec:<br />  - This field is applied first as the controller-generated default.<br />  - Values set under spec.podTemplateSpec.spec.imagePullSecrets are user overrides<br />    and win on overlap. If the user supplies imagePullSecrets via PodTemplateSpec,<br />    those replace the default list on the Deployment (the list is treated atomically).<br />  - The ServiceAccount is always populated from this field — PodTemplateSpec does not<br />    affect the ServiceAccount.<br />An omitted field and an explicitly empty list are equivalent: both leave the<br />ServiceAccount's existing ImagePullSecrets unchanged. This preserves<br />platform-managed pull secrets (for example OpenShift's per-SA dockercfg<br />entries) when overlays or patches emit an empty list. Truly clearing the<br />ServiceAccount's pull secrets requires recreating the resource. |  | Optional: \{\} <br /> |
 
 
 #### api.v1beta1.MCPRegistryStatus
@@ -2179,6 +2378,7 @@ _Appears in:_
 | `audit` _[api.v1beta1.AuditConfig](#apiv1beta1auditconfig)_ | Audit defines audit logging configuration for the MCP server |  | Optional: \{\} <br /> |
 | `toolConfigRef` _[api.v1beta1.ToolConfigRef](#apiv1beta1toolconfigref)_ | ToolConfigRef references a MCPToolConfig resource for tool filtering and renaming.<br />The referenced MCPToolConfig must exist in the same namespace as this MCPServer.<br />Cross-namespace references are not supported for security and isolation reasons. |  | Optional: \{\} <br /> |
 | `externalAuthConfigRef` _[api.v1beta1.ExternalAuthConfigRef](#apiv1beta1externalauthconfigref)_ | ExternalAuthConfigRef references a MCPExternalAuthConfig resource for external authentication.<br />The referenced MCPExternalAuthConfig must exist in the same namespace as this MCPServer. |  | Optional: \{\} <br /> |
+| `webhookConfigRef` _[api.v1beta1.WebhookConfigRef](#apiv1beta1webhookconfigref)_ | WebhookConfigRef references a MCPWebhookConfig resource for webhook middleware configuration.<br />The referenced MCPWebhookConfig must exist in the same namespace as this MCPServer. |  | Optional: \{\} <br /> |
 | `authServerRef` _[api.v1beta1.AuthServerRef](#apiv1beta1authserverref)_ | AuthServerRef optionally references a resource that configures an embedded<br />OAuth 2.0/OIDC authorization server to authenticate MCP clients.<br />Currently the only supported kind is MCPExternalAuthConfig (type: embeddedAuthServer). |  | Optional: \{\} <br /> |
 | `telemetryConfigRef` _[api.v1beta1.MCPTelemetryConfigReference](#apiv1beta1mcptelemetryconfigreference)_ | TelemetryConfigRef references an MCPTelemetryConfig resource for shared telemetry configuration.<br />The referenced MCPTelemetryConfig must exist in the same namespace as this MCPServer.<br />Cross-namespace references are not supported for security and isolation reasons. |  | Optional: \{\} <br /> |
 | `trustProxyHeaders` _boolean_ | TrustProxyHeaders indicates whether to trust X-Forwarded-* headers from reverse proxies<br />When enabled, the proxy will use X-Forwarded-Proto, X-Forwarded-Host, X-Forwarded-Port,<br />and X-Forwarded-Prefix headers to construct endpoint URLs | false | Optional: \{\} <br /> |
@@ -2188,7 +2388,7 @@ _Appears in:_
 | `replicas` _integer_ | Replicas is the desired number of proxy runner (thv run) pod replicas.<br />MCPServer creates two separate Deployments: one for the proxy runner and one<br />for the MCP server backend. This field controls the proxy runner Deployment.<br />When nil, the operator does not set Deployment.Spec.Replicas, leaving replica<br />management to an HPA or other external controller. |  | Minimum: 0 <br />Optional: \{\} <br /> |
 | `backendReplicas` _integer_ | BackendReplicas is the desired number of MCP server backend pod replicas.<br />This controls the backend Deployment (the MCP server container itself),<br />independent of the proxy runner controlled by Replicas.<br />When nil, the operator does not set Deployment.Spec.Replicas, leaving replica<br />management to an HPA or other external controller. |  | Minimum: 0 <br />Optional: \{\} <br /> |
 | `sessionStorage` _[api.v1beta1.SessionStorageConfig](#apiv1beta1sessionstorageconfig)_ | SessionStorage configures session storage for stateful horizontal scaling.<br />When nil, no session storage is configured. |  | Optional: \{\} <br /> |
-| `rateLimiting` _[api.v1beta1.RateLimitConfig](#apiv1beta1ratelimitconfig)_ | RateLimiting defines rate limiting configuration for the MCP server.<br />Requires Redis session storage to be configured for distributed rate limiting. |  | Optional: \{\} <br /> |
+| `rateLimiting` _[ratelimit.types.RateLimitConfig](#ratelimittypesratelimitconfig)_ | RateLimiting defines rate limiting configuration for the MCP server.<br />Requires Redis session storage to be configured for distributed rate limiting. |  | Optional: \{\} <br /> |
 
 
 #### api.v1beta1.MCPServerStatus
@@ -2211,6 +2411,7 @@ _Appears in:_
 | `authServerConfigHash` _string_ | AuthServerConfigHash is the hash of the referenced authServerRef spec,<br />used to detect configuration changes and trigger reconciliation. |  | Optional: \{\} <br /> |
 | `oidcConfigHash` _string_ | OIDCConfigHash is the hash of the referenced MCPOIDCConfig spec for change detection |  | Optional: \{\} <br /> |
 | `telemetryConfigHash` _string_ | TelemetryConfigHash is the hash of the referenced MCPTelemetryConfig spec for change detection |  | Optional: \{\} <br /> |
+| `webhookConfigHash` _string_ | WebhookConfigHash is the hash of the referenced MCPWebhookConfig spec |  | Optional: \{\} <br /> |
 | `url` _string_ | URL is the URL where the MCP server can be accessed |  | Optional: \{\} <br /> |
 | `phase` _[api.v1beta1.MCPServerPhase](#apiv1beta1mcpserverphase)_ | Phase is the current phase of the MCPServer |  | Enum: [Pending Ready Failed Terminating Stopped] <br />Optional: \{\} <br /> |
 | `message` _string_ | Message provides additional information about the current phase |  | Optional: \{\} <br /> |
@@ -2431,7 +2632,42 @@ _Appears in:_
 | `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.27/#condition-v1-meta) array_ | Conditions represent the latest available observations of the MCPToolConfig's state |  | Optional: \{\} <br /> |
 | `observedGeneration` _integer_ | ObservedGeneration is the most recent generation observed for this MCPToolConfig.<br />It corresponds to the MCPToolConfig's generation, which is updated on mutation by the API Server. |  | Optional: \{\} <br /> |
 | `configHash` _string_ | ConfigHash is a hash of the current configuration for change detection |  | Optional: \{\} <br /> |
+| `referenceCount` _integer_ | ReferenceCount is the number of workloads referencing this config. |  | Optional: \{\} <br /> |
 | `referencingWorkloads` _[api.v1beta1.WorkloadReference](#apiv1beta1workloadreference) array_ | ReferencingWorkloads is a list of workload resources that reference this MCPToolConfig.<br />Each entry identifies the workload by kind and name. |  | Optional: \{\} <br /> |
+
+
+#### api.v1beta1.MCPWebhookConfigSpec
+
+
+
+MCPWebhookConfigSpec defines the desired state of MCPWebhookConfig
+
+
+
+
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `validating` _[api.v1beta1.WebhookSpec](#apiv1beta1webhookspec) array_ | Validating webhooks are called to approve or deny MCP requests. |  | Optional: \{\} <br /> |
+| `mutating` _[api.v1beta1.WebhookSpec](#apiv1beta1webhookspec) array_ | Mutating webhooks are called to transform MCP requests before processing. |  | Optional: \{\} <br /> |
+
+
+#### api.v1beta1.MCPWebhookConfigStatus
+
+
+
+MCPWebhookConfigStatus defines the observed state of MCPWebhookConfig
+
+
+
+
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.27/#condition-v1-meta) array_ | Conditions represent the latest available observations |  | Optional: \{\} <br /> |
+| `observedGeneration` _integer_ | ObservedGeneration is the last observed generation corresponding to the current status |  | Optional: \{\} <br /> |
+| `configHash` _string_ | ConfigHash is a hash of the spec, used for detecting changes |  | Optional: \{\} <br /> |
+| `referencingWorkloads` _[api.v1beta1.WorkloadReference](#apiv1beta1workloadreference) array_ | ReferencingWorkloads is a list of workload resources that reference this MCPWebhookConfig.<br />Each entry identifies the workload by kind and name. |  | Optional: \{\} <br /> |
 
 
 #### api.v1beta1.ModelCacheConfig
@@ -2477,6 +2713,27 @@ _Appears in:_
 OAuth2UpstreamConfig contains configuration for pure OAuth 2.0 providers.
 OAuth 2.0 providers require explicit endpoint configuration.
 
+Exactly one of ClientID or DCRConfig must be set: ClientID is used when the
+client is pre-provisioned out of band, DCRConfig enables RFC 7591 Dynamic
+Client Registration at runtime.
+
+ClientSecretRef is mutually exclusive with DCRConfig: when DCRConfig is set,
+the client_secret is obtained from the registration response (RFC 7591
+§3.2.1) and any static ClientSecretRef would be either dead config or a
+competing source of truth. The XValidation rule below rejects the
+combination at admission; ValidateOAuth2DCRConfig is the matching
+reconcile-time backstop.
+
+Layered XOR behavior: the ClientID/DCRConfig rule treats `clientId: ""` as
+absent (size>0) but treats `dcrConfig: {}` as present (has() is true for an
+empty object). For input `{ clientId: "", dcrConfig: {} }` the outer rule
+passes and the inner DCRUpstreamConfig XOR fires with "exactly one of
+discoveryUrl or registrationEndpoint must be set". This is intentional —
+adding a non-empty subfield check (e.g.,
+`has(self.dcrConfig.discoveryUrl) || has(self.dcrConfig.registrationEndpoint)`)
+would inflate CEL cost on an already-budget-bound rule, and the inner
+message is still actionable.
+
 
 
 _Appears in:_
@@ -2486,13 +2743,15 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `authorizationEndpoint` _string_ | AuthorizationEndpoint is the URL for the OAuth authorization endpoint. |  | Pattern: `^https?://.*$` <br />Required: \{\} <br /> |
 | `tokenEndpoint` _string_ | TokenEndpoint is the URL for the OAuth token endpoint. |  | Pattern: `^https?://.*$` <br />Required: \{\} <br /> |
-| `userInfo` _[api.v1beta1.UserInfoConfig](#apiv1beta1userinfoconfig)_ | UserInfo contains configuration for fetching user information from the upstream provider.<br />Required for OAuth2 providers to resolve user identity. |  | Required: \{\} <br /> |
-| `clientId` _string_ | ClientID is the OAuth 2.0 client identifier registered with the upstream IDP. |  | Required: \{\} <br /> |
+| `userInfo` _[api.v1beta1.UserInfoConfig](#apiv1beta1userinfoconfig)_ | UserInfo contains configuration for fetching user information from the upstream provider.<br />When omitted and IdentityFromToken is also unset, the embedded auth server runs in<br />synthesis mode for this upstream: a non-PII subject derived from the access token, no<br />Name/Email. Use this shape for upstreams with no userinfo surface and no identity in<br />the token response (e.g., MCP authorization servers per the MCP spec). When<br />IdentityFromToken is set instead, identity is resolved from the token response body<br />(e.g., Snowflake's "username" field, Slack's "authed_user.id"); the userinfo HTTP call<br />is skipped entirely. |  | Optional: \{\} <br /> |
+| `clientId` _string_ | ClientID is the OAuth 2.0 client identifier registered with the upstream IDP.<br />Mutually exclusive with DCRConfig: when DCRConfig is set, ClientID is obtained<br />at runtime via RFC 7591 Dynamic Client Registration and must be left empty. |  | Optional: \{\} <br /> |
 | `clientSecretRef` _[api.v1beta1.SecretKeyRef](#apiv1beta1secretkeyref)_ | ClientSecretRef references a Kubernetes Secret containing the OAuth 2.0 client secret.<br />Optional for public clients using PKCE instead of client secret. |  | Optional: \{\} <br /> |
 | `redirectUri` _string_ | RedirectURI is the callback URL where the upstream IDP will redirect after authentication.<br />When not specified, defaults to `\{resourceUrl\}/oauth/callback` where `resourceUrl` is the<br />URL associated with the resource (e.g., MCPServer or vMCP) using this config. |  | Optional: \{\} <br /> |
 | `scopes` _string array_ | Scopes are the OAuth scopes to request from the upstream IDP. |  | Optional: \{\} <br /> |
-| `tokenResponseMapping` _[api.v1beta1.TokenResponseMapping](#apiv1beta1tokenresponsemapping)_ | TokenResponseMapping configures custom field extraction from non-standard token responses.<br />Some OAuth providers (e.g., GovSlack) nest token fields under non-standard paths<br />instead of returning them at the top level. When set, ToolHive performs the token<br />exchange HTTP call directly and extracts fields using the configured dot-notation paths.<br />If nil, standard OAuth 2.0 token response parsing is used. |  | Optional: \{\} <br /> |
+| `tokenResponseMapping` _[api.v1beta1.TokenResponseMapping](#apiv1beta1tokenresponsemapping)_ | TokenResponseMapping configures custom field extraction from non-standard token responses.<br />Some OAuth providers (e.g., GovSlack) nest token fields under non-standard paths<br />instead of returning them at the top level. When set, ToolHive performs the token<br />exchange HTTP call directly and extracts fields using the configured dot-notation paths.<br />If nil, standard OAuth 2.0 token response parsing is used.<br />For extracting user identity from the token response, see IdentityFromToken. |  | Optional: \{\} <br /> |
+| `identityFromToken` _[api.v1beta1.IdentityFromTokenConfig](#apiv1beta1identityfromtokenconfig)_ | IdentityFromToken extracts user identity (subject, name, email) directly<br />from the OAuth2 token-endpoint response body using gjson dot-notation paths.<br />When set, the embedded auth server skips the userinfo HTTP call entirely<br />and resolves identity from the token response. See IdentityFromTokenConfig<br />for trust-model and uniqueness considerations. |  | Optional: \{\} <br /> |
 | `additionalAuthorizationParams` _object (keys:string, values:string)_ | AdditionalAuthorizationParams are extra query parameters to include in<br />authorization requests sent to the upstream provider.<br />This is useful for providers that require custom parameters, such as<br />Google's access_type=offline for obtaining refresh tokens.<br />Framework-managed parameters (response_type, client_id, redirect_uri,<br />scope, state, code_challenge, code_challenge_method, nonce) are not allowed. |  | MaxProperties: 16 <br />Optional: \{\} <br /> |
+| `dcrConfig` _[api.v1beta1.DCRUpstreamConfig](#apiv1beta1dcrupstreamconfig)_ | DCRConfig enables RFC 7591 Dynamic Client Registration against the upstream<br />authorization server. When set, the client credentials are obtained at<br />runtime rather than being pre-provisioned, and ClientID must be left empty.<br />Mutually exclusive with ClientID. |  | Optional: \{\} <br /> |
 
 
 #### api.v1beta1.OIDCUpstreamConfig
@@ -2643,42 +2902,8 @@ _Appears in:_
 | `imagePullSecrets` _[LocalObjectReference](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.27/#localobjectreference-v1-core) array_ | ImagePullSecrets allows specifying image pull secrets for the proxy runner<br />These are applied to both the Deployment and the ServiceAccount |  | Optional: \{\} <br /> |
 
 
-#### api.v1beta1.RateLimitBucket
 
 
-
-RateLimitBucket defines a token bucket configuration with a maximum capacity
-and a refill period. Used by both shared (global) and per-user rate limits.
-
-
-
-_Appears in:_
-- [api.v1beta1.RateLimitConfig](#apiv1beta1ratelimitconfig)
-- [api.v1beta1.ToolRateLimitConfig](#apiv1beta1toolratelimitconfig)
-
-| Field | Description | Default | Validation |
-| --- | --- | --- | --- |
-| `maxTokens` _integer_ | MaxTokens is the maximum number of tokens (bucket capacity).<br />This is also the burst size: the maximum number of requests that can be served<br />instantaneously before the bucket is depleted. |  | Minimum: 1 <br />Required: \{\} <br /> |
-| `refillPeriod` _[Duration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.27/#duration-v1-meta)_ | RefillPeriod is the duration to fully refill the bucket from zero to maxTokens.<br />The effective refill rate is maxTokens / refillPeriod tokens per second.<br />Format: Go duration string (e.g., "1m0s", "30s", "1h0m0s"). |  | Required: \{\} <br /> |
-
-
-#### api.v1beta1.RateLimitConfig
-
-
-
-RateLimitConfig defines rate limiting configuration for an MCP server.
-At least one of shared, perUser, or tools must be configured.
-
-
-
-_Appears in:_
-- [api.v1beta1.MCPServerSpec](#apiv1beta1mcpserverspec)
-
-| Field | Description | Default | Validation |
-| --- | --- | --- | --- |
-| `shared` _[api.v1beta1.RateLimitBucket](#apiv1beta1ratelimitbucket)_ | Shared is a token bucket shared across all users for the entire server. |  | Optional: \{\} <br /> |
-| `perUser` _[api.v1beta1.RateLimitBucket](#apiv1beta1ratelimitbucket)_ | PerUser is a token bucket applied independently to each authenticated user<br />at the server level. Requires authentication to be enabled.<br />Each unique userID creates Redis keys that expire after 2x refillPeriod.<br />Memory formula: unique_users_per_TTL_window * (1 + num_tools_with_per_user_limits) keys. |  | Optional: \{\} <br /> |
-| `tools` _[api.v1beta1.ToolRateLimitConfig](#apiv1beta1toolratelimitconfig) array_ | Tools defines per-tool rate limit overrides.<br />Each entry applies additional rate limits to calls targeting a specific tool name.<br />A request must pass both the server-level limit and the per-tool limit. |  | Optional: \{\} <br /> |
 
 
 #### api.v1beta1.RedisACLUserConfig
@@ -2694,7 +2919,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `usernameSecretRef` _[api.v1beta1.SecretKeyRef](#apiv1beta1secretkeyref)_ | UsernameSecretRef references a Secret containing the Redis ACL username. |  | Required: \{\} <br /> |
+| `usernameSecretRef` _[api.v1beta1.SecretKeyRef](#apiv1beta1secretkeyref)_ | UsernameSecretRef references a Secret containing the Redis ACL username.<br />When omitted, connections use legacy password-only AUTH. Omit for managed<br />Redis tiers that do not support ACL users (e.g. GCP Memorystore Basic/Standard<br />HA, Azure Cache for Redis). Set for services that support ACL users (e.g. AWS<br />ElastiCache non-cluster with Redis 6+ RBAC). |  | Optional: \{\} <br /> |
 | `passwordSecretRef` _[api.v1beta1.SecretKeyRef](#apiv1beta1secretkeyref)_ | PasswordSecretRef references a Secret containing the Redis ACL password. |  | Required: \{\} <br /> |
 
 
@@ -2721,8 +2946,13 @@ _Appears in:_
 
 
 
-RedisStorageConfig configures Redis-compatible storage for auth server state.
-Use Address for a direct backend such as DragonflyDB, or SentinelConfig for HA Redis.
+RedisStorageConfig configures Redis connection for auth server storage.
+Exactly one of addr or sentinelConfig must be set. Set clusterMode to true when
+addr points to a Redis Cluster discovery endpoint (GCP Memorystore Cluster,
+AWS ElastiCache cluster mode enabled).
+
+DocPlanner fork: the pre-v0.27 field name `address` is still accepted as a
+deprecated alias of `addr` until every environment has migrated (PAIINFRA-228).
 
 
 
@@ -2731,14 +2961,16 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `address` _string_ | Address is the Redis-compatible server address for direct mode (host:port).<br />Mutually exclusive with SentinelConfig. |  | Optional: \{\} <br /> |
-| `sentinelConfig` _[api.v1beta1.RedisSentinelConfig](#apiv1beta1redissentinelconfig)_ | SentinelConfig holds Redis Sentinel configuration for HA mode.<br />Mutually exclusive with Address. |  | Optional: \{\} <br /> |
+| `addr` _string_ | Addr is the Redis server address (host:port). Required for standalone and cluster modes.<br />Use for managed Redis services that expose a single endpoint (GCP Memorystore basic tier,<br />AWS ElastiCache without cluster mode, or cluster-mode services when clusterMode is true).<br />Mutually exclusive with sentinelConfig. |  | Optional: \{\} <br /> |
+| `address` _string_ | Address is a deprecated alias of addr, kept by the DocPlanner fork for<br />configurations written before upstream renamed the field. Use addr instead.<br />Deprecated: use Addr. |  | Optional: \{\} <br /> |
+| `clusterMode` _boolean_ | ClusterMode enables the Redis Cluster protocol. Set to true when addr points to a<br />Redis Cluster discovery endpoint (e.g., GCP Memorystore Cluster, AWS ElastiCache<br />cluster mode enabled). Requires addr to be set. |  | Optional: \{\} <br /> |
+| `sentinelConfig` _[api.v1beta1.RedisSentinelConfig](#apiv1beta1redissentinelconfig)_ | SentinelConfig holds Redis Sentinel configuration.<br />Use for self-managed Redis with Sentinel-based HA. Mutually exclusive with addr. |  | Optional: \{\} <br /> |
 | `aclUserConfig` _[api.v1beta1.RedisACLUserConfig](#apiv1beta1redisacluserconfig)_ | ACLUserConfig configures Redis ACL user authentication. |  | Required: \{\} <br /> |
 | `dialTimeout` _string_ | DialTimeout is the timeout for establishing connections.<br />Format: Go duration string (e.g., "5s", "1m"). | 5s | Pattern: `^([0-9]+(\.[0-9]+)?(ns\|us\|µs\|ms\|s\|m\|h))+$` <br />Optional: \{\} <br /> |
 | `readTimeout` _string_ | ReadTimeout is the timeout for socket reads.<br />Format: Go duration string (e.g., "3s", "1m"). | 3s | Pattern: `^([0-9]+(\.[0-9]+)?(ns\|us\|µs\|ms\|s\|m\|h))+$` <br />Optional: \{\} <br /> |
 | `writeTimeout` _string_ | WriteTimeout is the timeout for socket writes.<br />Format: Go duration string (e.g., "3s", "1m"). | 3s | Pattern: `^([0-9]+(\.[0-9]+)?(ns\|us\|µs\|ms\|s\|m\|h))+$` <br />Optional: \{\} <br /> |
 | `tls` _[api.v1beta1.RedisTLSConfig](#apiv1beta1redistlsconfig)_ | TLS configures TLS for connections to the Redis/Valkey master.<br />Presence of this field enables TLS. Omit to use plaintext. |  | Optional: \{\} <br /> |
-| `sentinelTls` _[api.v1beta1.RedisTLSConfig](#apiv1beta1redistlsconfig)_ | SentinelTLS configures TLS for connections to Sentinel instances.<br />Presence of this field enables TLS. Omit to use plaintext.<br />When omitted, sentinel connections use plaintext (no fallback to TLS config). |  | Optional: \{\} <br /> |
+| `sentinelTls` _[api.v1beta1.RedisTLSConfig](#apiv1beta1redistlsconfig)_ | SentinelTLS configures TLS for connections to Sentinel instances.<br />Only applies when sentinelConfig is set. Presence of this field enables TLS. |  | Optional: \{\} <br /> |
 
 
 #### api.v1beta1.RedisTLSConfig
@@ -2865,6 +3097,7 @@ SecretKeyRef is a reference to a key within a Secret
 
 _Appears in:_
 - [api.v1beta1.BearerTokenConfig](#apiv1beta1bearertokenconfig)
+- [api.v1beta1.DCRUpstreamConfig](#apiv1beta1dcrupstreamconfig)
 - [api.v1beta1.EmbeddedAuthServerConfig](#apiv1beta1embeddedauthserverconfig)
 - [api.v1beta1.EmbeddingServerSpec](#apiv1beta1embeddingserverspec)
 - [api.v1beta1.HeaderFromSecret](#apiv1beta1headerfromsecret)
@@ -2877,6 +3110,8 @@ _Appears in:_
 - [api.v1beta1.SensitiveHeader](#apiv1beta1sensitiveheader)
 - [api.v1beta1.SessionStorageConfig](#apiv1beta1sessionstorageconfig)
 - [api.v1beta1.TokenExchangeConfig](#apiv1beta1tokenexchangeconfig)
+- [api.v1beta1.WebhookSpec](#apiv1beta1webhookspec)
+- [api.v1beta1.WebhookTLSConfig](#apiv1beta1webhooktlsconfig)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -2969,7 +3204,7 @@ _Appears in:_
 TokenExchangeConfig holds configuration for RFC-8693 OAuth 2.0 Token Exchange.
 This configuration is used to exchange incoming authentication tokens for tokens
 that can be used with external services.
-The structure matches the tokenexchange.Config from pkg/auth/tokenexchange/middleware.go
+The structure matches the tokenexchange.Config from pkg/oauthproto/tokenexchange/middleware.go
 
 
 
@@ -3013,6 +3248,8 @@ _Appears in:_
 TokenResponseMapping maps non-standard token response fields to standard OAuth 2.0 fields
 using dot-notation JSON paths. This supports upstream providers like GovSlack that nest
 the access token under paths like "authed_user.access_token".
+
+For extracting user identity from the token response, see IdentityFromToken.
 
 
 
@@ -3087,23 +3324,6 @@ _Appears in:_
 | `annotations` _[api.v1beta1.ToolAnnotationsOverride](#apiv1beta1toolannotationsoverride)_ | Annotations overrides specific tool annotation fields.<br />Only specified fields are overridden; others pass through from the backend. |  | Optional: \{\} <br /> |
 
 
-#### api.v1beta1.ToolRateLimitConfig
-
-
-
-ToolRateLimitConfig defines rate limits for a specific tool.
-At least one of shared or perUser must be configured.
-
-
-
-_Appears in:_
-- [api.v1beta1.RateLimitConfig](#apiv1beta1ratelimitconfig)
-
-| Field | Description | Default | Validation |
-| --- | --- | --- | --- |
-| `name` _string_ | Name is the MCP tool name this limit applies to. |  | MinLength: 1 <br />Required: \{\} <br /> |
-| `shared` _[api.v1beta1.RateLimitBucket](#apiv1beta1ratelimitbucket)_ | Shared token bucket for this specific tool. |  | Optional: \{\} <br /> |
-| `perUser` _[api.v1beta1.RateLimitBucket](#apiv1beta1ratelimitbucket)_ | PerUser token bucket configuration for this tool. |  | Optional: \{\} <br /> |
 
 
 #### api.v1beta1.UpstreamInjectSpec
@@ -3129,6 +3349,17 @@ _Appears in:_
 
 
 UpstreamProviderConfig defines configuration for an upstream Identity Provider.
+
+Exactly one of OIDCConfig or OAuth2Config must be set and must match the
+declared Type: oidc-typed providers set OIDCConfig, oauth2-typed providers
+set OAuth2Config. The CEL rule below enforces the pairing at admission; the
+matching Go-level check in validateUpstreamProvider provides defense-in-depth
+for stored objects.
+
+The rule is structured as a chain of equality checks ending in an explicit
+`false`, so adding a new UpstreamProviderType value without extending this
+rule fails admission instead of silently demanding the OAuth2 shape. When
+adding a new type, extend both this rule and validateUpstreamProvider.
 
 
 
@@ -3166,7 +3397,9 @@ _Appears in:_
 
 UserInfoConfig contains configuration for fetching user information from an upstream provider.
 This supports both standard OIDC UserInfo endpoints and custom provider-specific endpoints
-like GitHub's /user API.
+like GitHub's /user API. For providers that do not expose a usable userinfo endpoint but
+include identity in the OAuth2 token response, use IdentityFromToken on OAuth2UpstreamConfig
+instead.
 
 
 
@@ -3400,6 +3633,7 @@ _Appears in:_
 | `authServerConfig` _[api.v1beta1.EmbeddedAuthServerConfig](#apiv1beta1embeddedauthserverconfig)_ | AuthServerConfig configures an embedded OAuth authorization server.<br />When set, the vMCP server acts as an OIDC issuer, drives users through<br />upstream IDPs, and issues ToolHive JWTs. The embedded AS becomes the<br />IncomingAuth OIDC provider — its issuer must match IncomingAuth.OIDCConfigRef<br />so that tokens it issues are accepted by the vMCP's incoming auth middleware.<br />When nil, IncomingAuth uses an external IDP and behavior is unchanged. |  | Optional: \{\} <br /> |
 | `replicas` _integer_ | Replicas is the desired number of vMCP pod replicas.<br />VirtualMCPServer creates a single Deployment for the vMCP aggregator process,<br />so there is only one replicas field (unlike MCPServer which has separate<br />Replicas and BackendReplicas for its two Deployments).<br />When nil, the operator does not set Deployment.Spec.Replicas, leaving replica<br />management to an HPA or other external controller. |  | Minimum: 0 <br />Optional: \{\} <br /> |
 | `sessionStorage` _[api.v1beta1.SessionStorageConfig](#apiv1beta1sessionstorageconfig)_ | SessionStorage configures session storage for stateful horizontal scaling.<br />When nil, no session storage is configured. |  | Optional: \{\} <br /> |
+| `imagePullSecrets` _[LocalObjectReference](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.27/#localobjectreference-v1-core) array_ | ImagePullSecrets allows specifying image pull secrets for the vMCP workload.<br />These are applied to both the vMCP Deployment's PodSpec.ImagePullSecrets<br />and to the operator-managed ServiceAccount the vMCP server runs as, so private<br />images are pullable through either path.<br />Merge semantics with PodTemplateSpec:<br />The deployed PodSpec.ImagePullSecrets is the Kubernetes-native strategic-merge<br />union of this field and spec.podTemplateSpec.spec.imagePullSecrets, merged by<br />the patchStrategy:"merge" / patchMergeKey:"name" tags on corev1.PodSpec.<br />  - This field is rendered first as the controller-generated default.<br />  - spec.podTemplateSpec.spec.imagePullSecrets is then strategic-merge-patched<br />    on top, keyed by Name. Distinct names from the two sources are unioned in<br />    the resulting list; entries with the same Name are deduplicated and the<br />    PodTemplateSpec entry wins on overlap (user override).<br />  - Order in the resulting list is not guaranteed and should not be relied on:<br />    strategic merge by name is order-insensitive.<br />  - The operator-managed ServiceAccount's imagePullSecrets list is populated<br />    ONLY from this field. spec.podTemplateSpec.spec.imagePullSecrets does not<br />    reach the ServiceAccount because PodTemplateSpec has no notion of a<br />    ServiceAccount. To make a secret usable via the ServiceAccount path<br />    (e.g. for sidecars or init containers that pull images independently),<br />    list it here rather than under spec.podTemplateSpec.<br />Note on cross-CRD consistency:<br />MCPRegistry currently uses an atomic-replace strategy for its imagePullSecrets<br />(the user-provided value replaces the controller-generated list rather than<br />being merged on top). VirtualMCPServer follows the Kubernetes-native<br />strategic-merge-by-name behavior described above. Aligning the two is tracked<br />as a separate follow-up; until then, manifests that set imagePullSecrets on<br />both CRDs will see different override behavior between them. |  | Optional: \{\} <br /> |
 
 
 #### api.v1beta1.VirtualMCPServerStatus
@@ -3445,6 +3679,80 @@ _Appears in:_
 | `readOnly` _boolean_ | ReadOnly specifies whether the volume should be mounted read-only | false | Optional: \{\} <br /> |
 
 
+#### api.v1beta1.WebhookConfigRef
+
+
+
+WebhookConfigRef defines a reference to a MCPWebhookConfig resource.
+The referenced MCPWebhookConfig must be in the same namespace as the MCPServer.
+
+
+
+_Appears in:_
+- [api.v1beta1.MCPServerSpec](#apiv1beta1mcpserverspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `name` _string_ | Name is the name of the MCPWebhookConfig resource |  | Required: \{\} <br /> |
+
+
+#### api.v1beta1.WebhookFailurePolicy
+
+_Underlying type:_ _string_
+
+WebhookFailurePolicy defines how webhook errors are handled.
+
+
+
+_Appears in:_
+- [api.v1beta1.WebhookSpec](#apiv1beta1webhookspec)
+
+| Field | Description |
+| --- | --- |
+| `fail` | WebhookFailurePolicyFail denies the request on webhook error.<br /> |
+| `ignore` | WebhookFailurePolicyIgnore allows the request on webhook error.<br /> |
+
+
+#### api.v1beta1.WebhookSpec
+
+
+
+WebhookSpec defines the configuration for a single webhook middleware
+
+
+
+_Appears in:_
+- [api.v1beta1.MCPWebhookConfigSpec](#apiv1beta1mcpwebhookconfigspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `name` _string_ | Name is a unique identifier for this webhook |  | MaxLength: 63 <br />MinLength: 1 <br /> |
+| `url` _string_ | URL is the endpoint to call for this webhook. Must be an HTTP/HTTPS URL. |  | Format: uri <br /> |
+| `timeout` _[Duration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.27/#duration-v1-meta)_ | Timeout configures the maximum time to wait for the webhook to respond.<br />Defaults to 10s if not specified. Maximum is 30s. |  | Format: duration <br />Type: string <br />Optional: \{\} <br /> |
+| `failurePolicy` _[api.v1beta1.WebhookFailurePolicy](#apiv1beta1webhookfailurepolicy)_ | FailurePolicy defines how to handle errors when communicating with the webhook.<br />Supported values: "fail", "ignore". Defaults to "fail". | fail | Enum: [fail ignore] <br />Optional: \{\} <br /> |
+| `tlsConfig` _[api.v1beta1.WebhookTLSConfig](#apiv1beta1webhooktlsconfig)_ | TLSConfig contains optional TLS configuration for the webhook connection. |  | Optional: \{\} <br /> |
+| `hmacSecretRef` _[api.v1beta1.SecretKeyRef](#apiv1beta1secretkeyref)_ | HMACSecretRef references a Kubernetes Secret containing the HMAC signing key<br />used to sign the webhook payload. If set, the X-Toolhive-Signature header will be injected. |  | Optional: \{\} <br /> |
+
+
+#### api.v1beta1.WebhookTLSConfig
+
+
+
+WebhookTLSConfig contains TLS configuration for secure webhook connections
+
+
+
+_Appears in:_
+- [api.v1beta1.WebhookSpec](#apiv1beta1webhookspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `caSecretRef` _[api.v1beta1.SecretKeyRef](#apiv1beta1secretkeyref)_ | CASecretRef references a Secret containing the CA certificate bundle used to verify the webhook server's certificate.<br />Contains a bundle of PEM-encoded X.509 certificates. |  | Optional: \{\} <br /> |
+| `clientCertSecretRef` _[api.v1beta1.SecretKeyRef](#apiv1beta1secretkeyref)_ | ClientCertSecretRef references a Secret containing the client certificate for mTLS authentication.<br />The referenced key must contain a PEM-encoded client certificate.<br />Use ClientKeySecretRef to provide the corresponding private key. |  | Optional: \{\} <br /> |
+| `clientKeySecretRef` _[api.v1beta1.SecretKeyRef](#apiv1beta1secretkeyref)_ | ClientKeySecretRef references a Secret containing the private key for the client certificate.<br />Required when ClientCertSecretRef is set to enable mTLS. |  | Optional: \{\} <br /> |
+| `insecureSkipVerify` _boolean_ | InsecureSkipVerify disables server certificate verification.<br />WARNING: This should only be used for development/testing and not in production environments. |  | Optional: \{\} <br /> |
+
+
 #### api.v1beta1.WorkloadReference
 
 
@@ -3459,6 +3767,7 @@ _Appears in:_
 - [api.v1beta1.MCPOIDCConfigStatus](#apiv1beta1mcpoidcconfigstatus)
 - [api.v1beta1.MCPTelemetryConfigStatus](#apiv1beta1mcptelemetryconfigstatus)
 - [api.v1beta1.MCPToolConfigStatus](#apiv1beta1mcptoolconfigstatus)
+- [api.v1beta1.MCPWebhookConfigStatus](#apiv1beta1mcpwebhookconfigstatus)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |

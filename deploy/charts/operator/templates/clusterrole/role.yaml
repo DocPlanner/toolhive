@@ -23,13 +23,6 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - events
-  verbs:
-  - create
-  - patch
-- apiGroups:
-  - ""
-  resources:
   - pods
   verbs:
   - delete
@@ -75,6 +68,13 @@ rules:
   - update
   - watch
 - apiGroups:
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
   - gateway.networking.k8s.io
   resources:
   - gateways
@@ -107,6 +107,7 @@ rules:
   - mcpremoteproxies
   - mcpservers
   - mcptoolconfigs
+  - mcpwebhookconfigs
   - virtualmcpservers
   verbs:
   - create
@@ -127,6 +128,7 @@ rules:
   - mcpservers/finalizers
   - mcptelemetryconfigs/finalizers
   - mcptoolconfigs/finalizers
+  - mcpwebhookconfigs/finalizers
   verbs:
   - update
 - apiGroups:
@@ -142,6 +144,7 @@ rules:
   - mcpservers/status
   - mcptelemetryconfigs/status
   - mcptoolconfigs/status
+  - mcpwebhookconfigs/status
   - virtualmcpservers/status
   verbs:
   - get

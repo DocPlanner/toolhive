@@ -24,10 +24,12 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -286,6 +288,55 @@ func TestVirtualMCPServerEnsureRBACResources(t *testing.T) {
 	assert.Equal(t, vmcpServiceAccountName(vmcp.Name), rb.RoleRef.Name)
 	assert.Len(t, rb.Subjects, 1)
 	assert.Equal(t, vmcpServiceAccountName(vmcp.Name), rb.Subjects[0].Name)
+}
+
+// TestVirtualMCPServerEnsureRBACResources_ImagePullSecrets verifies that
+// spec.imagePullSecrets propagates to the operator-managed ServiceAccount.
+func TestVirtualMCPServerEnsureRBACResources_ImagePullSecrets(t *testing.T) {
+	t.Parallel()
+
+	vmcp := &mcpv1beta1.VirtualMCPServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      testVmcpName,
+			Namespace: "default",
+		},
+		Spec: mcpv1beta1.VirtualMCPServerSpec{
+			GroupRef: &mcpv1beta1.MCPGroupRef{Name: testGroupName},
+			ImagePullSecrets: []corev1.LocalObjectReference{
+				{Name: "vmcp-creds"},
+				{Name: "extra-creds"},
+			},
+		},
+	}
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, mcpv1beta1.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, rbacv1.AddToScheme(scheme))
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(vmcp).
+		Build()
+
+	r := &VirtualMCPServerReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	require.NoError(t, r.ensureRBACResources(t.Context(), vmcp))
+
+	sa := &corev1.ServiceAccount{}
+	require.NoError(t, fakeClient.Get(t.Context(), types.NamespacedName{
+		Name:      vmcpServiceAccountName(vmcp.Name),
+		Namespace: vmcp.Namespace,
+	}, sa))
+
+	expected := []corev1.LocalObjectReference{
+		{Name: "vmcp-creds"},
+		{Name: "extra-creds"},
+	}
+	assert.Equal(t, expected, sa.ImagePullSecrets)
 }
 
 func TestVirtualMCPServerEnsureRBACResources_Update(t *testing.T) {
@@ -3475,4 +3526,857 @@ func TestDiscoveredRBACRulesIncludeMCPServerEntries(t *testing.T) {
 		}
 	}
 	assert.True(t, foundMCPServerEntries, "vmcpDiscoveredRBACRules should include mcpserverentries")
+}
+
+// TestVirtualMCPServerValidateAuthzUpstreamAvailable verifies that the
+// validator fires only when the embedded AuthServer is configured without any
+// upstream providers alongside AuthzConfig. Direct-IdP flows (clients present
+// an already-validated IdP token) leave AuthServerConfig nil and are valid —
+// Cedar evaluates against the identity's claims via the default branch.
+//
+// The validator also emits an advisory AuthzUpstreamSelectionWarning condition
+// when multiple upstreams are declared, naming the auto-selected provider.
+func TestVirtualMCPServerValidateAuthzUpstreamAvailable(t *testing.T) {
+	t.Parallel()
+
+	// inlineAuthzRef is the baseline inline authz config used by tests that
+	// place the explicit primary on the canonical spec.authServerConfig
+	// location.
+	inlineAuthzRef := &mcpv1beta1.AuthzConfigRef{
+		Type: "inline",
+		Inline: &mcpv1beta1.InlineAuthzConfig{
+			Policies: []string{`permit(principal, action, resource);`},
+		},
+	}
+
+	// authzRefWithDeprecatedInlinePrimary builds an inline authz ref that
+	// sets PrimaryUpstreamProvider on the deprecated InlineAuthzConfig field.
+	// Used to exercise the backward-compatibility fallback path on
+	// ExplicitPrimaryUpstreamProvider.
+	authzRefWithDeprecatedInlinePrimary := func(primary string) *mcpv1beta1.AuthzConfigRef {
+		return &mcpv1beta1.AuthzConfigRef{
+			Type: "inline",
+			Inline: &mcpv1beta1.InlineAuthzConfig{
+				Policies:                []string{`permit(principal, action, resource);`},
+				PrimaryUpstreamProvider: primary,
+			},
+		}
+	}
+
+	// warningExpectation captures the expected state of the advisory
+	// AuthzUpstreamSelectionWarning condition after validation. When
+	// expectPresent is false the condition must not appear in status at
+	// all — the advisory only applies to the narrow multi-upstream slice.
+	type warningExpectation struct {
+		expectPresent bool
+		status        metav1.ConditionStatus
+		reason        string
+		messageSubstr string // empty when we don't care about the message
+	}
+
+	tests := []struct {
+		name             string
+		incomingAuth     *mcpv1beta1.IncomingAuthConfig
+		authServerConfig *mcpv1beta1.EmbeddedAuthServerConfig
+		expectError      bool
+		expectedReason   string
+		expectedWarning  warningExpectation
+	}{
+		{
+			name:            "no incoming auth is valid",
+			incomingAuth:    nil,
+			expectedWarning: warningExpectation{expectPresent: false},
+		},
+		{
+			name: "incoming auth without authz is valid",
+			incomingAuth: &mcpv1beta1.IncomingAuthConfig{
+				Type: "anonymous",
+			},
+			expectedWarning: warningExpectation{expectPresent: false},
+		},
+		{
+			name: "authz with nil auth server config is valid (direct IdP flow)",
+			incomingAuth: &mcpv1beta1.IncomingAuthConfig{
+				Type:        "oidc",
+				AuthzConfig: inlineAuthzRef,
+			},
+			authServerConfig: nil,
+			expectError:      false,
+			expectedWarning:  warningExpectation{expectPresent: false},
+		},
+		{
+			name: "authz with empty upstream providers is invalid",
+			incomingAuth: &mcpv1beta1.IncomingAuthConfig{
+				Type:        "oidc",
+				AuthzConfig: inlineAuthzRef,
+			},
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer:            "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{},
+			},
+			expectError:     true,
+			expectedReason:  mcpv1beta1.ConditionReasonAuthzRequiresUpstream,
+			expectedWarning: warningExpectation{expectPresent: false},
+		},
+		{
+			name: "authz with single upstream is valid",
+			incomingAuth: &mcpv1beta1.IncomingAuthConfig{
+				Type:        "oidc",
+				AuthzConfig: inlineAuthzRef,
+			},
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+			},
+			expectedWarning: warningExpectation{expectPresent: false},
+		},
+		{
+			name: "authz with multiple upstreams emits advisory warning",
+			incomingAuth: &mcpv1beta1.IncomingAuthConfig{
+				Type:        "oidc",
+				AuthzConfig: inlineAuthzRef,
+			},
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+					{Name: "entra", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+			},
+			expectedWarning: warningExpectation{
+				expectPresent: true,
+				status:        metav1.ConditionTrue,
+				reason:        mcpv1beta1.ConditionReasonAuthzUpstreamAutoSelected,
+				messageSubstr: `"okta"`,
+			},
+		},
+		{
+			// Explicit PrimaryUpstreamProvider matching one of the upstreams is
+			// valid and emits no advisory — the user has disambiguated the choice.
+			name: "explicit primary provider matching an upstream is valid",
+			incomingAuth: &mcpv1beta1.IncomingAuthConfig{
+				Type:        "oidc",
+				AuthzConfig: inlineAuthzRef,
+			},
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+					{Name: "entra", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+				PrimaryUpstreamProvider: "entra",
+			},
+			expectedWarning: warningExpectation{expectPresent: false},
+		},
+		{
+			// Explicit PrimaryUpstreamProvider with multiple upstreams suppresses
+			// the advisory warning — auto-selection is no longer happening.
+			name: "explicit primary provider suppresses multi-upstream advisory",
+			incomingAuth: &mcpv1beta1.IncomingAuthConfig{
+				Type:        "oidc",
+				AuthzConfig: inlineAuthzRef,
+			},
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+					{Name: "entra", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+					{Name: "google", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+				PrimaryUpstreamProvider: "okta",
+			},
+			expectedWarning: warningExpectation{expectPresent: false},
+		},
+		{
+			// Explicit PrimaryUpstreamProvider that does not match any declared
+			// upstream is rejected at admission. Cedar would otherwise deny every
+			// request at runtime; failing loudly is the right behavior.
+			name: "explicit primary provider not matching any upstream is invalid",
+			incomingAuth: &mcpv1beta1.IncomingAuthConfig{
+				Type:        "oidc",
+				AuthzConfig: inlineAuthzRef,
+			},
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+					{Name: "entra", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+				PrimaryUpstreamProvider: "ping",
+			},
+			expectError:     true,
+			expectedReason:  mcpv1beta1.ConditionReasonAuthzUpstreamUnknown,
+			expectedWarning: warningExpectation{expectPresent: false},
+		},
+		{
+			// Explicit PrimaryUpstreamProvider with no embedded auth server at
+			// all is rejected at admission. The field names an upstream IDP on
+			// the embedded AS — without an AS there is nothing for it to refer
+			// to, and the converter would otherwise forward an unresolvable
+			// name. Distinct condition reason from the upstream-mismatch case
+			// so tooling can route the two misconfigurations separately. With
+			// authServerConfig=nil the canonical location can't carry the
+			// field, so this case exercises the deprecated inline fallback.
+			name: "explicit primary provider without embedded auth server is invalid",
+			incomingAuth: &mcpv1beta1.IncomingAuthConfig{
+				Type:        "oidc",
+				AuthzConfig: authzRefWithDeprecatedInlinePrimary("okta"),
+			},
+			authServerConfig: nil,
+			expectError:      true,
+			expectedReason:   mcpv1beta1.ConditionReasonAuthzPrimaryProviderRequiresAuthServer,
+			expectedWarning:  warningExpectation{expectPresent: false},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			vmcp := &mcpv1beta1.VirtualMCPServer{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       testVmcpName,
+					Namespace:  "default",
+					Generation: 1,
+				},
+				Spec: mcpv1beta1.VirtualMCPServerSpec{
+					GroupRef:         &mcpv1beta1.MCPGroupRef{Name: testGroupName},
+					IncomingAuth:     tt.incomingAuth,
+					AuthServerConfig: tt.authServerConfig,
+				},
+			}
+
+			r := &VirtualMCPServerReconciler{}
+			statusManager := virtualmcpserverstatus.NewStatusManager(vmcp)
+			err := r.validateAuthzUpstreamAvailable(t.Context(), vmcp, statusManager)
+
+			if tt.expectError {
+				require.Error(t, err)
+				// Error path writes phase, message, and the AuthServerConfigValidated
+				// condition — UpdateStatus must report a change.
+				assert.True(t, statusManager.UpdateStatus(t.Context(), &vmcp.Status))
+				assert.Equal(t, mcpv1beta1.VirtualMCPServerPhaseFailed, vmcp.Status.Phase)
+				assert.NotEmpty(t, vmcp.Status.Message)
+
+				found := false
+				for _, cond := range vmcp.Status.Conditions {
+					if cond.Type == mcpv1beta1.ConditionTypeAuthServerConfigValidated {
+						found = true
+						assert.Equal(t, metav1.ConditionFalse, cond.Status)
+						assert.Equal(t, tt.expectedReason, cond.Reason)
+					}
+				}
+				assert.True(t, found, "AuthServerConfigValidated condition should be set to False")
+			} else {
+				require.NoError(t, err)
+				// Positive path: apply any pending status changes (only the
+				// multi-upstream case emits the advisory; other valid paths
+				// leave the collector unchanged).
+				_ = statusManager.UpdateStatus(t.Context(), &vmcp.Status)
+				assert.NotEqual(t, mcpv1beta1.VirtualMCPServerPhaseFailed, vmcp.Status.Phase)
+				for _, cond := range vmcp.Status.Conditions {
+					if cond.Type == mcpv1beta1.ConditionTypeAuthServerConfigValidated {
+						assert.NotEqual(t, mcpv1beta1.ConditionReasonAuthzRequiresUpstream, cond.Reason)
+					}
+				}
+			}
+
+			// The advisory AuthzUpstreamSelectionWarning condition should only
+			// appear on the narrow multi-upstream path. Every other path must
+			// leave it absent so kubectl describe stays clean.
+			var warning *metav1.Condition
+			for i := range vmcp.Status.Conditions {
+				if vmcp.Status.Conditions[i].Type == mcpv1beta1.ConditionTypeAuthzUpstreamSelectionWarning {
+					warning = &vmcp.Status.Conditions[i]
+					break
+				}
+			}
+			if !tt.expectedWarning.expectPresent {
+				assert.Nil(t, warning, "AuthzUpstreamSelectionWarning condition should not be present")
+				return
+			}
+			require.NotNil(t, warning, "AuthzUpstreamSelectionWarning condition should be present")
+			assert.Equal(t, tt.expectedWarning.status, warning.Status)
+			assert.Equal(t, tt.expectedWarning.reason, warning.Reason)
+			if tt.expectedWarning.messageSubstr != "" {
+				assert.Contains(t, warning.Message, tt.expectedWarning.messageSubstr)
+			}
+		})
+	}
+}
+
+// TestVirtualMCPServerValidateAuthzUpstreamAvailable_DeprecationEvent confirms
+// that when validateAuthzUpstreamAvailable resolves the primary upstream from
+// the deprecated spec.incomingAuth.authzConfig.inline.primaryUpstreamProvider
+// location, a Warning event is recorded with reason
+// AuthzPrimaryUpstreamProviderDeprecated. The canonical location does not emit
+// the event. The event is the only user-visible signal that the deprecated
+// field is being read, so its emission must remain test-locked.
+func TestVirtualMCPServerValidateAuthzUpstreamAvailable_DeprecationEvent(t *testing.T) {
+	t.Parallel()
+
+	inlineAuthzRefWithDeprecatedPrimary := &mcpv1beta1.AuthzConfigRef{
+		Type: "inline",
+		Inline: &mcpv1beta1.InlineAuthzConfig{
+			Policies:                []string{`permit(principal, action, resource);`},
+			PrimaryUpstreamProvider: "okta",
+		},
+	}
+	inlineAuthzRef := &mcpv1beta1.AuthzConfigRef{
+		Type: "inline",
+		Inline: &mcpv1beta1.InlineAuthzConfig{
+			Policies: []string{`permit(principal, action, resource);`},
+		},
+	}
+
+	tests := []struct {
+		name             string
+		incomingAuth     *mcpv1beta1.IncomingAuthConfig
+		authServerConfig *mcpv1beta1.EmbeddedAuthServerConfig
+		wantEvent        bool
+		wantError        bool
+	}{
+		{
+			name: "deprecated inline primary emits the deprecation event",
+			incomingAuth: &mcpv1beta1.IncomingAuthConfig{
+				Type:        "oidc",
+				AuthzConfig: inlineAuthzRefWithDeprecatedPrimary,
+			},
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+			},
+			wantEvent: true,
+		},
+		{
+			name: "canonical authServerConfig primary does not emit the event",
+			incomingAuth: &mcpv1beta1.IncomingAuthConfig{
+				Type:        "oidc",
+				AuthzConfig: inlineAuthzRef,
+			},
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+				PrimaryUpstreamProvider: "okta",
+			},
+			wantEvent: false,
+		},
+		{
+			name: "no explicit primary does not emit the event",
+			incomingAuth: &mcpv1beta1.IncomingAuthConfig{
+				Type:        "oidc",
+				AuthzConfig: inlineAuthzRef,
+			},
+			authServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+			},
+			wantEvent: false,
+		},
+		{
+			// Mid-migration: user removed AuthServerConfig (or hasn't added it
+			// yet) but still has the deprecated inline field set. The
+			// validator rejects (no auth server to anchor the provider
+			// against), but the deprecation hint must still fire so the user
+			// sees what to fix.
+			name: "deprecated inline primary in no-auth-server branch emits the event before reject",
+			incomingAuth: &mcpv1beta1.IncomingAuthConfig{
+				Type:        "oidc",
+				AuthzConfig: inlineAuthzRefWithDeprecatedPrimary,
+			},
+			authServerConfig: nil,
+			wantEvent:        true,
+			wantError:        true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			vmcp := &mcpv1beta1.VirtualMCPServer{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       testVmcpName,
+					Namespace:  "default",
+					Generation: 1,
+				},
+				Spec: mcpv1beta1.VirtualMCPServerSpec{
+					GroupRef:         &mcpv1beta1.MCPGroupRef{Name: testGroupName},
+					IncomingAuth:     tt.incomingAuth,
+					AuthServerConfig: tt.authServerConfig,
+				},
+			}
+
+			recorder := events.NewFakeRecorder(10)
+			r := &VirtualMCPServerReconciler{Recorder: recorder}
+			statusManager := virtualmcpserverstatus.NewStatusManager(vmcp)
+			err := r.validateAuthzUpstreamAvailable(t.Context(), vmcp, statusManager)
+			if tt.wantError {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+
+			select {
+			case event := <-recorder.Events:
+				if !tt.wantEvent {
+					t.Errorf("expected no event, got %q", event)
+					return
+				}
+				assert.Contains(t, event, "Warning")
+				assert.Contains(t, event, "AuthzPrimaryUpstreamProviderDeprecated")
+				assert.Contains(t, event,
+					"spec.incomingAuth.authzConfig.inline.primaryUpstreamProvider is deprecated")
+			case <-time.After(50 * time.Millisecond):
+				if tt.wantEvent {
+					t.Errorf("expected AuthzPrimaryUpstreamProviderDeprecated event, none recorded")
+				}
+			}
+		})
+	}
+}
+
+// TestVirtualMCPServerValidateAuthzUpstreamAvailable_ClearsStaleWarning verifies
+// the transition case: a VMCP that was previously multi-upstream (advisory True
+// on its status) is reconfigured to a single upstream, and the stale advisory
+// condition must be removed after the next validation pass.
+func TestVirtualMCPServerValidateAuthzUpstreamAvailable_ClearsStaleWarning(t *testing.T) {
+	t.Parallel()
+
+	inlineAuthzRef := &mcpv1beta1.AuthzConfigRef{
+		Type: "inline",
+		Inline: &mcpv1beta1.InlineAuthzConfig{
+			Policies: []string{`permit(principal, action, resource);`},
+		},
+	}
+
+	vmcp := &mcpv1beta1.VirtualMCPServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       testVmcpName,
+			Namespace:  "default",
+			Generation: 2,
+		},
+		Spec: mcpv1beta1.VirtualMCPServerSpec{
+			GroupRef: &mcpv1beta1.MCPGroupRef{Name: testGroupName},
+			IncomingAuth: &mcpv1beta1.IncomingAuthConfig{
+				Type:        "oidc",
+				AuthzConfig: inlineAuthzRef,
+			},
+			// Single upstream now — the advisory should be cleared.
+			AuthServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+			},
+		},
+		Status: mcpv1beta1.VirtualMCPServerStatus{
+			// Simulate a stale True advisory from a previous multi-upstream
+			// reconciliation.
+			Conditions: []metav1.Condition{
+				{
+					Type:    mcpv1beta1.ConditionTypeAuthzUpstreamSelectionWarning,
+					Status:  metav1.ConditionTrue,
+					Reason:  mcpv1beta1.ConditionReasonAuthzUpstreamAutoSelected,
+					Message: `multiple upstreamProviders configured; Cedar policies will evaluate claims from the first upstream ("okta").`,
+				},
+			},
+		},
+	}
+
+	r := &VirtualMCPServerReconciler{}
+	statusManager := virtualmcpserverstatus.NewStatusManager(vmcp)
+	require.NoError(t, r.validateAuthzUpstreamAvailable(t.Context(), vmcp, statusManager))
+
+	// Applying the status should remove the stale condition.
+	assert.True(t, statusManager.UpdateStatus(t.Context(), &vmcp.Status),
+		"UpdateStatus must report a change because a stale condition was removed")
+
+	for _, cond := range vmcp.Status.Conditions {
+		assert.NotEqual(t, mcpv1beta1.ConditionTypeAuthzUpstreamSelectionWarning, cond.Type,
+			"stale AuthzUpstreamSelectionWarning condition should have been removed")
+	}
+}
+
+// TestVirtualMCPServerValidateAuthzUpstreamAvailable_ConfigMapFallThrough
+// pins the documented fall-through contract for configMap-sourced authz: the
+// new admission rejections never fire because primaryUpstreamProvider lives on
+// InlineAuthzConfig only. ConfigMap users get auto-selection of the first
+// upstream and the multi-upstream advisory, identical to inline users with no
+// explicit override. Locks the inline-only contract until the configMap
+// loader (TODO #5208) is implemented.
+func TestVirtualMCPServerValidateAuthzUpstreamAvailable_ConfigMapFallThrough(t *testing.T) {
+	t.Parallel()
+
+	configMapAuthzRef := &mcpv1beta1.AuthzConfigRef{
+		Type: "configMap",
+		ConfigMap: &mcpv1beta1.ConfigMapAuthzRef{
+			Name: "authz-policies",
+			Key:  "authz.json",
+		},
+	}
+
+	vmcp := &mcpv1beta1.VirtualMCPServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       testVmcpName,
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: mcpv1beta1.VirtualMCPServerSpec{
+			GroupRef: &mcpv1beta1.MCPGroupRef{Name: testGroupName},
+			IncomingAuth: &mcpv1beta1.IncomingAuthConfig{
+				Type:        "oidc",
+				AuthzConfig: configMapAuthzRef,
+			},
+			AuthServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+					{Name: "entra", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+				},
+			},
+		},
+	}
+
+	r := &VirtualMCPServerReconciler{}
+	statusManager := virtualmcpserverstatus.NewStatusManager(vmcp)
+	require.NoError(t, r.validateAuthzUpstreamAvailable(t.Context(), vmcp, statusManager))
+	statusManager.UpdateStatus(t.Context(), &vmcp.Status)
+
+	advisoryFound := false
+	for _, cond := range vmcp.Status.Conditions {
+		if cond.Type == mcpv1beta1.ConditionTypeAuthzUpstreamSelectionWarning {
+			advisoryFound = true
+			assert.Equal(t, metav1.ConditionTrue, cond.Status)
+			assert.Equal(t, mcpv1beta1.ConditionReasonAuthzUpstreamAutoSelected, cond.Reason)
+		}
+		assert.NotEqual(t, mcpv1beta1.ConditionReasonAuthzPrimaryProviderRequiresAuthServer, cond.Reason,
+			"configMap-sourced authz should not trip the no-AS rejection")
+		assert.NotEqual(t, mcpv1beta1.ConditionReasonAuthzUpstreamUnknown, cond.Reason,
+			"configMap-sourced authz should not trip the upstream-mismatch rejection")
+	}
+	assert.True(t, advisoryFound, "multi-upstream advisory should be present for configMap authz")
+}
+
+// TestVirtualMCPServerValidateAuthzUpstreamAvailable_ClearsStaleAuthzUnknown
+// verifies the recovery path for the new failure reasons: a VMCP that was
+// previously rejected with AuthServerConfigValidated=False (either reason)
+// must transition back to a passing state after the spec is corrected.
+// Without this, a fix-then-reconcile cycle would leave the VMCP stuck in
+// Failed phase forever.
+//
+// AuthServerConfigValidated is co-owned by validateAuthServerConfig (sets True
+// on success) and validateAuthzUpstreamAvailable (sets False on authz
+// rejection). The True transition comes from validateAuthServerConfig running
+// first; this test asserts validateAuthzUpstreamAvailable does NOT re-emit a
+// False rejection on a corrected spec, so the True from the prior validator
+// survives through to status.
+func TestVirtualMCPServerValidateAuthzUpstreamAvailable_ClearsStaleAuthzUnknown(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		staleReason string
+	}{
+		{
+			name:        "recovers from AuthzUpstreamUnknown after fixing the explicit name",
+			staleReason: mcpv1beta1.ConditionReasonAuthzUpstreamUnknown,
+		},
+		{
+			name:        "recovers from AuthzPrimaryProviderRequiresAuthServer after configuring AS",
+			staleReason: mcpv1beta1.ConditionReasonAuthzPrimaryProviderRequiresAuthServer,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			authzRef := &mcpv1beta1.AuthzConfigRef{
+				Type: "inline",
+				Inline: &mcpv1beta1.InlineAuthzConfig{
+					Policies: []string{`permit(principal, action, resource);`},
+				},
+			}
+
+			vmcp := &mcpv1beta1.VirtualMCPServer{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       testVmcpName,
+					Namespace:  "default",
+					Generation: 2,
+				},
+				Spec: mcpv1beta1.VirtualMCPServerSpec{
+					GroupRef: &mcpv1beta1.MCPGroupRef{Name: testGroupName},
+					IncomingAuth: &mcpv1beta1.IncomingAuthConfig{
+						Type:        "oidc",
+						AuthzConfig: authzRef,
+					},
+					// Spec is now valid: explicit "okta" matches the single declared upstream.
+					AuthServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+						Issuer: "https://authserver.example.com",
+						UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+							{Name: "okta", Type: mcpv1beta1.UpstreamProviderTypeOIDC},
+						},
+						PrimaryUpstreamProvider: "okta",
+					},
+				},
+				Status: mcpv1beta1.VirtualMCPServerStatus{
+					Phase: mcpv1beta1.VirtualMCPServerPhaseFailed,
+					Conditions: []metav1.Condition{
+						{
+							Type:    mcpv1beta1.ConditionTypeAuthServerConfigValidated,
+							Status:  metav1.ConditionFalse,
+							Reason:  tt.staleReason,
+							Message: "previous rejection from before the spec was fixed",
+						},
+					},
+				},
+			}
+
+			r := &VirtualMCPServerReconciler{}
+			statusManager := virtualmcpserverstatus.NewStatusManager(vmcp)
+
+			// Mirror the production reconcile order: AuthServerConfig validates
+			// first (sets AuthServerConfigValidated=True on success, overwriting
+			// the stale False), then the authz validator runs.
+			require.NoError(t, r.validateAuthServerConfig(vmcp, statusManager))
+			require.NoError(t, r.validateAuthzUpstreamAvailable(t.Context(), vmcp, statusManager))
+			statusManager.UpdateStatus(t.Context(), &vmcp.Status)
+
+			cond := meta.FindStatusCondition(vmcp.Status.Conditions, mcpv1beta1.ConditionTypeAuthServerConfigValidated)
+			require.NotNil(t, cond, "AuthServerConfigValidated condition should be present after recovery")
+			assert.Equal(t, metav1.ConditionTrue, cond.Status,
+				"AuthServerConfigValidated must transition back to True after the spec is corrected")
+			assert.NotEqual(t, tt.staleReason, cond.Reason,
+				"stale rejection reason must not survive the recovery cycle")
+		})
+	}
+}
+
+// TestVirtualMCPServerValidateAuthServerConfig_IdentitySynthesizedCondition
+// is the parity test: same condition shape as MCPExternalAuthConfig emits
+// for the same upstreamProviders, on a VirtualMCPServer's inline AuthServerConfig.
+func TestVirtualMCPServerValidateAuthServerConfig_IdentitySynthesizedCondition(t *testing.T) {
+	t.Parallel()
+
+	oauth2Upstream := func(name string, withUserInfo bool) mcpv1beta1.UpstreamProviderConfig {
+		cfg := &mcpv1beta1.OAuth2UpstreamConfig{
+			AuthorizationEndpoint: "https://idp.example.com/authorize",
+			TokenEndpoint:         "https://idp.example.com/token",
+			ClientID:              "client",
+		}
+		if withUserInfo {
+			cfg.UserInfo = &mcpv1beta1.UserInfoConfig{EndpointURL: "https://idp.example.com/userinfo"}
+		}
+		return mcpv1beta1.UpstreamProviderConfig{
+			Name:         name,
+			Type:         mcpv1beta1.UpstreamProviderTypeOAuth2,
+			OAuth2Config: cfg,
+		}
+	}
+
+	tests := []struct {
+		name           string
+		upstreams      []mcpv1beta1.UpstreamProviderConfig
+		wantStatus     metav1.ConditionStatus
+		wantReason     string
+		wantNamesInMsg []string
+	}{
+		{
+			name:       "all OAuth2 upstreams have userInfo: condition False",
+			upstreams:  []mcpv1beta1.UpstreamProviderConfig{oauth2Upstream("primary", true)},
+			wantStatus: metav1.ConditionFalse,
+			wantReason: mcpv1beta1.ConditionReasonIdentitySynthesizedInactive,
+		},
+		{
+			name: "one OAuth2 upstream missing userInfo: condition True with name in message",
+			upstreams: []mcpv1beta1.UpstreamProviderConfig{
+				oauth2Upstream("primary", true),
+				oauth2Upstream("atlassian", false),
+			},
+			wantStatus:     metav1.ConditionTrue,
+			wantReason:     mcpv1beta1.ConditionReasonIdentitySynthesizedActive,
+			wantNamesInMsg: []string{"atlassian"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			vmcp := &mcpv1beta1.VirtualMCPServer{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       testVmcpName,
+					Namespace:  "default",
+					Generation: 1,
+				},
+				Spec: mcpv1beta1.VirtualMCPServerSpec{
+					GroupRef: &mcpv1beta1.MCPGroupRef{Name: testGroupName},
+					AuthServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+						Issuer:            "https://authserver.example.com",
+						UpstreamProviders: tt.upstreams,
+					},
+				},
+			}
+
+			r := &VirtualMCPServerReconciler{}
+			statusManager := virtualmcpserverstatus.NewStatusManager(vmcp)
+			// runAuthValidations runs the synthesis advisory before
+			// validateAuthServerConfig so the condition tracks the spec on both
+			// pass and fail paths. Mirror that ordering here.
+			r.applyAuthServerIdentitySynthesizedCondition(vmcp, statusManager)
+			require.NoError(t, r.validateAuthServerConfig(vmcp, statusManager))
+			statusManager.UpdateStatus(t.Context(), &vmcp.Status)
+
+			cond := findCondition(vmcp.Status.Conditions, mcpv1beta1.ConditionTypeIdentitySynthesized)
+			require.NotNil(t, cond, "IdentitySynthesized condition should be set on a valid AuthServerConfig")
+			assert.Equal(t, tt.wantStatus, cond.Status)
+			assert.Equal(t, tt.wantReason, cond.Reason)
+			for _, name := range tt.wantNamesInMsg {
+				assert.Contains(t, cond.Message, name,
+					"upstream %q should be named in the condition message", name)
+			}
+		})
+	}
+}
+
+// TestVirtualMCPServerReconciler_IdentitySynthesizedTransitionsOnValidationFailure
+// pins the contract that the IdentitySynthesized advisory is recomputed from
+// the current spec on every reconcile, including paths where
+// validateAuthServerConfig early-returns (Issuer == "", empty UpstreamProviders,
+// invalid AdditionalAuthorizationParams). Without this, breaking the spec
+// after a synthesizing upstream was reported leaves a stale True/upstream-name
+// dangling next to the new AuthServerConfigValidated=False.
+func TestVirtualMCPServerReconciler_IdentitySynthesizedTransitionsOnValidationFailure(t *testing.T) {
+	t.Parallel()
+
+	syntheticUpstream := mcpv1beta1.UpstreamProviderConfig{
+		Name: "atlassian",
+		Type: mcpv1beta1.UpstreamProviderTypeOAuth2,
+		OAuth2Config: &mcpv1beta1.OAuth2UpstreamConfig{
+			AuthorizationEndpoint: "https://idp.example.com/authorize",
+			TokenEndpoint:         "https://idp.example.com/token",
+			ClientID:              "client",
+			// UserInfo intentionally nil — synthesizes identity.
+		},
+	}
+
+	vmcp := &mcpv1beta1.VirtualMCPServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       testVmcpName,
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: mcpv1beta1.VirtualMCPServerSpec{
+			GroupRef: &mcpv1beta1.MCPGroupRef{Name: testGroupName},
+			AuthServerConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer:            "https://authserver.example.com",
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{syntheticUpstream},
+			},
+		},
+	}
+
+	r := &VirtualMCPServerReconciler{}
+
+	// Pass 1: valid spec with synthesizing upstream.
+	statusManager := virtualmcpserverstatus.NewStatusManager(vmcp)
+	r.applyAuthServerIdentitySynthesizedCondition(vmcp, statusManager)
+	require.NoError(t, r.validateAuthServerConfig(vmcp, statusManager))
+	statusManager.UpdateStatus(t.Context(), &vmcp.Status)
+
+	cond := findCondition(vmcp.Status.Conditions, mcpv1beta1.ConditionTypeIdentitySynthesized)
+	require.NotNil(t, cond, "synthesizing upstream should produce IdentitySynthesized condition")
+	assert.Equal(t, metav1.ConditionTrue, cond.Status)
+	assert.Equal(t, mcpv1beta1.ConditionReasonIdentitySynthesizedActive, cond.Reason)
+	assert.Contains(t, cond.Message, "atlassian", "initial message must name the synthesizing upstream")
+
+	// Pass 2: mutate the spec to break validation. Empty Issuer triggers the
+	// first early-return in validateAuthServerConfig and removes the
+	// synthesizing upstream that the prior message names.
+	vmcp.Spec.AuthServerConfig.Issuer = ""
+	vmcp.Spec.AuthServerConfig.UpstreamProviders = nil
+	vmcp.Generation = 2
+
+	statusManager = virtualmcpserverstatus.NewStatusManager(vmcp)
+	r.applyAuthServerIdentitySynthesizedCondition(vmcp, statusManager)
+	require.Error(t, r.validateAuthServerConfig(vmcp, statusManager),
+		"empty Issuer must fail validation")
+	statusManager.UpdateStatus(t.Context(), &vmcp.Status)
+
+	cond = findCondition(vmcp.Status.Conditions, mcpv1beta1.ConditionTypeIdentitySynthesized)
+	require.NotNil(t, cond, "advisory must be recomputed on the validation-failure path, not left stale")
+	assert.Equal(t, metav1.ConditionFalse, cond.Status,
+		"empty upstream list has no synthesizing providers; advisory must flip to False")
+	assert.Equal(t, mcpv1beta1.ConditionReasonIdentitySynthesizedInactive, cond.Reason)
+	assert.NotContains(t, cond.Message, "atlassian",
+		"stale message naming the now-removed upstream must not survive the broken edit")
+}
+
+func TestVirtualMCPServerReconciler_updateOIDCConfigReferencingWorkloads(t *testing.T) {
+	t.Parallel()
+
+	existingRef := mcpv1beta1.WorkloadReference{
+		Kind: mcpv1beta1.WorkloadKindVirtualMCPServer,
+		Name: "existing",
+	}
+	newRef := mcpv1beta1.WorkloadReference{
+		Kind: mcpv1beta1.WorkloadKindVirtualMCPServer,
+		Name: "new",
+	}
+
+	tests := []struct {
+		name          string
+		vmcpName      string
+		expectedRefs  []mcpv1beta1.WorkloadReference
+		expectedCount int32
+	}{
+		{
+			name:          "adds new virtual server reference",
+			vmcpName:      "new",
+			expectedRefs:  []mcpv1beta1.WorkloadReference{existingRef, newRef},
+			expectedCount: 2,
+		},
+		{
+			name:          "does not duplicate existing reference",
+			vmcpName:      "existing",
+			expectedRefs:  []mcpv1beta1.WorkloadReference{existingRef},
+			expectedCount: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := t.Context()
+			scheme := runtime.NewScheme()
+			require.NoError(t, mcpv1beta1.AddToScheme(scheme))
+
+			oidcConfig := &mcpv1beta1.MCPOIDCConfig{
+				ObjectMeta: metav1.ObjectMeta{Name: "cfg", Namespace: "default"},
+				Status: mcpv1beta1.MCPOIDCConfigStatus{
+					ReferencingWorkloads: []mcpv1beta1.WorkloadReference{existingRef},
+					ReferenceCount:       1,
+				},
+			}
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(oidcConfig).
+				WithStatusSubresource(&mcpv1beta1.MCPOIDCConfig{}).
+				Build()
+			reconciler := &VirtualMCPServerReconciler{Client: fakeClient, Scheme: scheme}
+
+			require.NoError(t, reconciler.updateOIDCConfigReferencingWorkloads(ctx, oidcConfig, tt.vmcpName))
+			assert.ElementsMatch(t, tt.expectedRefs, oidcConfig.Status.ReferencingWorkloads)
+			assert.Equal(t, tt.expectedCount, oidcConfig.Status.ReferenceCount)
+		})
+	}
 }

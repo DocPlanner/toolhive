@@ -4,9 +4,11 @@
 package networking
 
 import (
+	"net"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestIsURL(t *testing.T) {
@@ -297,6 +299,33 @@ func TestIsLocalhost(t *testing.T) {
 	}
 }
 
+func TestIsPrivateIP(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		ip   string
+		want bool
+	}{
+		{"CGN 100.64.0.1", "100.64.0.1", true},
+		{"CGN 100.127.255.255", "100.127.255.255", true},
+		{"documentation TEST-NET-1", "192.0.2.1", true},
+		{"documentation TEST-NET-2", "198.51.100.1", true},
+		{"documentation TEST-NET-3", "203.0.113.1", true},
+		{"public IPv4", "8.8.8.8", false},
+		{"public IPv6", "2001:db8::1", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ip := net.ParseIP(tt.ip)
+			require.NotNil(t, ip, "failed to parse test IP %s", tt.ip)
+			assert.Equal(t, tt.want, IsPrivateIP(ip))
+		})
+	}
+}
+
 func TestAddressReferencesPrivateIp(t *testing.T) {
 	t.Parallel()
 
@@ -486,6 +515,160 @@ func TestValidateEndpointURL(t *testing.T) {
 				assert.Error(t, err, "Expected error for endpoint: %s", tt.endpoint)
 			} else {
 				assert.NoError(t, err, "Expected no error for endpoint: %s", tt.endpoint)
+			}
+		})
+	}
+}
+
+func TestValidateHTTPSURL(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		url         string
+		expectError bool
+	}{
+		{
+			name:        "valid HTTPS URL",
+			url:         "https://llm.example.com",
+			expectError: false,
+		},
+		{
+			name:        "valid HTTPS URL with path",
+			url:         "https://llm.example.com/api/v1",
+			expectError: false,
+		},
+		{
+			name:        "valid HTTPS URL with port",
+			url:         "https://llm.example.com:8443",
+			expectError: false,
+		},
+		{
+			name:        "HTTP rejected even for localhost",
+			url:         "http://localhost:8080",
+			expectError: true,
+		},
+		{
+			name:        "HTTP rejected for remote host",
+			url:         "http://llm.example.com",
+			expectError: true,
+		},
+		{
+			name:        "missing host",
+			url:         "https://",
+			expectError: true,
+		},
+		{
+			name:        "unsupported scheme",
+			url:         "ftp://llm.example.com",
+			expectError: true,
+		},
+		{
+			name:        "invalid URL format",
+			url:         "not-a-url",
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := ValidateHTTPSURL(tt.url)
+			if tt.expectError {
+				assert.Error(t, err, "Expected error for URL: %s", tt.url)
+			} else {
+				assert.NoError(t, err, "Expected no error for URL: %s", tt.url)
+			}
+		})
+	}
+}
+
+func TestValidateIssuerURL(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		url         string
+		expectError bool
+	}{
+		{
+			name:        "valid HTTPS issuer",
+			url:         "https://auth.example.com",
+			expectError: false,
+		},
+		{
+			name:        "valid HTTPS issuer with path",
+			url:         "https://auth.example.com/realms/myrealm",
+			expectError: false,
+		},
+		{
+			name:        "localhost HTTP allowed for development",
+			url:         "http://localhost:8080",
+			expectError: false,
+		},
+		{
+			name:        "127.0.0.1 HTTP allowed for development",
+			url:         "http://127.0.0.1:9000",
+			expectError: false,
+		},
+		{
+			name:        "HTTP rejected for remote host",
+			url:         "http://auth.example.com",
+			expectError: true,
+		},
+		{
+			name:        "missing host",
+			url:         "https://",
+			expectError: true,
+		},
+		{
+			name:        "invalid URL format",
+			url:         "not-a-url",
+			expectError: true,
+		},
+		{
+			name:        "unsupported scheme",
+			url:         "ftp://auth.example.com",
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := ValidateIssuerURL(tt.url)
+			if tt.expectError {
+				assert.Error(t, err, "Expected error for URL: %s", tt.url)
+			} else {
+				assert.NoError(t, err, "Expected no error for URL: %s", tt.url)
+			}
+		})
+	}
+}
+
+func TestValidateLoopbackAddress(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		addr    string
+		wantErr bool
+	}{
+		{"127.0.0.1:14000", false},
+		{"[::1]:14000", false},
+		{"0.0.0.0:14000", true},
+		{"192.168.1.1:14000", true},
+		{"10.0.0.1:14000", true},
+		{"notanaddr", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.addr, func(t *testing.T) {
+			t.Parallel()
+			err := ValidateLoopbackAddress(tt.addr)
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
 			}
 		})
 	}
