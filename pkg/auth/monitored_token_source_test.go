@@ -437,15 +437,19 @@ func TestMonitoredTokenSource_MultipleCallsToToken(t *testing.T) {
 func TestTransientRefresher_SingleflightDeduplicatesConcurrentRetries(t *testing.T) {
 	t.Parallel()
 
-	const numCallers = 10
-
 	tokenSource := newMockTokenSource()
 	recoveredToken := &oauth2.Token{
 		AccessToken: "recovered-token",
 		Expiry:      time.Now().Add(time.Hour),
 	}
+
+	releaseLeader := make(chan struct{})
+	leaderEntered := make(chan struct{})
+	var leaderOnce sync.Once
 	tokenSource.setTokenFn(func() (*oauth2.Token, error) {
-		return recoveredToken, nil // retry always succeeds immediately
+		leaderOnce.Do(func() { close(leaderEntered) })
+		<-releaseLeader
+		return recoveredToken, nil
 	})
 
 	transientErr := &net.OpError{
@@ -453,94 +457,74 @@ func TestTransientRefresher_SingleflightDeduplicatesConcurrentRetries(t *testing
 		Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED},
 	}
 
-	// Two-phase synchronisation to guarantee deterministic singleflight deduplication:
-	//
-	// Phase 1 (beforeEntry): all numCallers goroutines arrive here before calling
-	// Refresh. A WaitGroup barrier ensures they are all released simultaneously,
-	// so they race to group.Do together.
-	//
-	// Phase 2 (afterEntry): the singleflight leader enters this hook from inside
-	// group.Do and waits until all numCallers goroutines have signalled they are
-	// about to call Refresh (i.e. finished Phase 1). At that point the leader is
-	// still running inside Do, so any follower that subsequently calls Do will be
-	// deduplicated rather than starting an independent retry loop.
-	//
-	// Without Phase 2 the leader could return before late goroutines reached Do,
-	// causing each to start its own singleflight group and hammer the token source.
-	allAtSingleflight := make(chan struct{})
-	var atSingleflight sync.WaitGroup
-	atSingleflight.Add(numCallers)
-	var closeOnce sync.Once
-
-	var beforeDo sync.WaitGroup
-	beforeDo.Add(numCallers)
-
 	ctx := context.Background()
 	refresher := &transientRefresher{
 		source:     tokenSource,
 		workload:   "test-workload",
 		newBackOff: fastBackOff,
-		beforeEntry: func() {
-			// Phase 1: barrier — release all goroutines simultaneously.
-			atSingleflight.Done()
-			closeOnce.Do(func() {
-				atSingleflight.Wait()
-				close(allAtSingleflight)
-			})
-			<-allAtSingleflight
-			// Signal: I am about to call group.Do.
-			beforeDo.Done()
-		},
-		afterEntry: func() {
-			// Phase 2: leader waits until all goroutines have signalled they are
-			// about to call group.Do, so the group is fully formed before retry returns.
-			beforeDo.Wait()
-		},
 	}
 
-	var wg sync.WaitGroup
-	tokens := make([]*oauth2.Token, numCallers)
-	errs := make([]error, numCallers)
-	for i := range numCallers {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			tokens[idx], errs[idx] = refresher.Refresh(ctx, transientErr)
-		}(i)
+	type result struct {
+		tok *oauth2.Token
+		err error
 	}
 
-	// Guard against a deadlock in the synchronisation barriers turning into a
-	// silent hang. Use the test deadline if available; otherwise fall back to a
-	// conservative fixed timeout.
-	done := make(chan struct{})
-	go func() { wg.Wait(); close(done) }()
-	timeout := 10 * time.Second
+	leaderResult := make(chan result, 1)
+	go func() {
+		tok, err := refresher.Refresh(ctx, transientErr)
+		leaderResult <- result{tok, err}
+	}()
+
+	select {
+	case <-leaderEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("leader did not enter Token() within 5s")
+	}
+
+	followerResult := make(chan result, 1)
+	go func() {
+		tok, err := refresher.Refresh(ctx, transientErr)
+		followerResult <- result{tok, err}
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	close(releaseLeader)
+
+	timeout := 5 * time.Second
 	if deadline, ok := t.Deadline(); ok {
 		timeout = time.Until(deadline) - 500*time.Millisecond
 	}
+
+	var leader, follower result
 	select {
-	case <-done:
+	case leader = <-leaderResult:
 	case <-time.After(timeout):
-		t.Fatal("test timed out — likely deadlock in synchronisation barriers")
+		t.Fatal("leader did not finish")
+	}
+	select {
+	case follower = <-followerResult:
+	case <-time.After(timeout):
+		t.Fatal("follower did not finish")
 	}
 
-	// All callers must succeed with the recovered token.
-	for i := range numCallers {
-		if errs[i] != nil {
-			t.Errorf("caller %d: unexpected error: %v", i, errs[i])
-		}
-		if tokens[i] == nil || tokens[i].AccessToken != "recovered-token" {
-			t.Errorf("caller %d: expected recovered-token, got %v", i, tokens[i])
-		}
+	if leader.err != nil {
+		t.Errorf("leader: unexpected error: %v", leader.err)
+	}
+	if follower.err != nil {
+		t.Errorf("follower: unexpected error: %v", follower.err)
+	}
+	if leader.tok == nil || leader.tok.AccessToken != "recovered-token" {
+		t.Errorf("leader: expected recovered-token, got %v", leader.tok)
+	}
+	if follower.tok == nil || follower.tok.AccessToken != "recovered-token" {
+		t.Errorf("follower: expected recovered-token, got %v", follower.tok)
 	}
 
-	// KEY ASSERTION: exactly 1 call via singleflight, not numCallers independent calls.
-	// Independent retry loops would produce up to numCallers calls.
 	tokenSource.mu.Lock()
 	calls := tokenSource.callCount
 	tokenSource.mu.Unlock()
 	if calls != 1 {
-		t.Errorf("expected 1 tokenSource.Token() call (singleflight deduplication), got %d", calls)
+		t.Errorf("expected exactly 1 tokenSource.Token() call (constant singleflight key), got %d", calls)
 	}
 }
 

@@ -86,11 +86,12 @@ const (
 	// Reference MCP test server providing ~16 diverse example tools.
 	EverythingMCPServerImage = everythingMCPServerImageURL + ":" + everythingMCPServerImageTag
 
-	idaProMCPServerImageURL = "ghcr.io/stacklok/dockyard/uvx/ida-pro-mcp"
-	idaProMCPServerImageTag = "1.4.0"
+	idaProMCPServerImageURL    = "ghcr.io/stacklok/dockyard/uvx/ida-pro-mcp"
+	idaProMCPServerImageTag    = "1.4.0"
+	idaProMCPServerImageDigest = "sha256:5a596d965fe05052d615a41152213f93ebc72bf46b07304718de948833d73c70"
 	// IDAProMCPServerImage is used for testing multi-backend optimizer scenarios.
 	// Provides ~47 IDA Pro reverse engineering tools (decompile, disassemble, rename, etc.).
-	IDAProMCPServerImage = idaProMCPServerImageURL + ":" + idaProMCPServerImageTag
+	IDAProMCPServerImage = idaProMCPServerImageURL + ":" + idaProMCPServerImageTag + "@" + idaProMCPServerImageDigest
 
 	pagerdutyMCPServerImageURL = "ghcr.io/stacklok/dockyard/uvx/pagerduty-mcp"
 	pagerdutyMCPServerImageTag = "0.12.0"

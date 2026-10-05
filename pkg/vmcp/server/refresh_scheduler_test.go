@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
+	"github.com/stacklok/toolhive/pkg/auth"
 	"github.com/stacklok/toolhive/pkg/vmcp"
 	"github.com/stacklok/toolhive/pkg/vmcp/health"
 	"github.com/stacklok/toolhive/pkg/vmcp/mocks"
@@ -128,7 +129,7 @@ type refreshTestManager struct {
 	sessions map[string]sessiontypes.MultiSession
 }
 
-func (m *refreshTestManager) GetMultiSession(sessionID string) (vmcpsession.MultiSession, bool) {
+func (m *refreshTestManager) GetMultiSession(_ context.Context, sessionID string) (vmcpsession.MultiSession, bool) {
 	sess, ok := m.sessions[sessionID]
 	return sess, ok
 }
@@ -258,4 +259,66 @@ func TestEligibleBackends_WithoutRegistry(t *testing.T) {
 	srv := newRefreshTestServer(map[string]sessiontypes.MultiSession{})
 	assert.Nil(t, srv.eligibleBackends(context.Background()))
 	assert.Empty(t, srv.reconcileSessionsLackingBackends(context.Background()))
+}
+
+const (
+	reconcileTestBackend            = "global"
+	reconcileTestCallerTokenBackend = "global_memory-mcp"
+)
+
+type boundRefreshTestSession struct {
+	sessiontypes.MultiSession
+	backendIDs string
+	tokenHash  string
+	identity   *auth.Identity
+}
+
+func (s *boundRefreshTestSession) GetMetadata() map[string]string {
+	return map[string]string{
+		vmcpsession.MetadataKeyBackendIDs: s.backendIDs,
+		sessiontypes.MetadataKeyTokenHash: s.tokenHash,
+	}
+}
+
+func (s *boundRefreshTestSession) CreatorIdentity() *auth.Identity {
+	return s.identity
+}
+
+func TestReconcileSessionsLackingBackends_SkipsBoundSessionsWithoutCallerToken(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	registry := mocks.NewMockBackendRegistry(ctrl)
+	registry.EXPECT().List(gomock.Any()).Return([]vmcp.Backend{
+		{ID: reconcileTestBackend, HealthStatus: vmcp.BackendHealthy},
+		{ID: reconcileTestCallerTokenBackend, HealthStatus: vmcp.BackendHealthy},
+	}).AnyTimes()
+
+	sessions := map[string]sessiontypes.MultiSession{
+		"restored": &boundRefreshTestSession{
+			backendIDs: reconcileTestBackend,
+			tokenHash:  "subject-hash",
+			identity:   &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: "user-123"}},
+		},
+		"live": &boundRefreshTestSession{
+			backendIDs: reconcileTestBackend,
+			tokenHash:  "subject-hash",
+			identity:   &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: "user-123"}, Token: "bearer"},
+		},
+		"anonymous": &boundRefreshTestSession{backendIDs: reconcileTestBackend},
+	}
+	srv := newRefreshTestServer(sessions, "restored", "live", "anonymous")
+	srv.backendRegistry = registry
+	t.Cleanup(func() {
+		if srv.refreshSched != nil {
+			srv.refreshSched.stop()
+		}
+	})
+
+	assert.ElementsMatch(t, []string{"live", "anonymous"},
+		targetIDs(srv.targetSessionsForRefresh(reconcileTestCallerTokenBackend, refreshSessionsLackingBackend)))
+
+	onlyRestored := newRefreshTestServer(map[string]sessiontypes.MultiSession{"restored": sessions["restored"]}, "restored")
+	onlyRestored.backendRegistry = registry
+	assert.Empty(t, onlyRestored.reconcileSessionsLackingBackends(context.Background()))
 }

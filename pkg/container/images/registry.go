@@ -6,6 +6,7 @@ package images
 import (
 	"archive/tar"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,6 +34,7 @@ type RegistryImageManager struct {
 	platform     *v1.Platform
 	dockerClient *client.Client // Used for building images from Dockerfiles
 	daemonClient daemon.Client  // Used for daemon.Image/daemon.Write (go-containerregistry)
+	mobyClient   *mobyclient.Client
 }
 
 // NewRegistryImageManager creates a new RegistryImageManager instance
@@ -54,6 +56,7 @@ func NewRegistryImageManager(dockerClient *client.Client) *RegistryImageManager 
 		platform:     getDefaultPlatform(),   // Use a default platform based on host architecture
 		dockerClient: dockerClient,           // Used solely for building images from Dockerfiles
 		daemonClient: mobyClient,             // Used for go-containerregistry daemon operations
+		mobyClient:   mobyClient,
 	}
 }
 
@@ -94,6 +97,15 @@ func (r *RegistryImageManager) PullImage(ctx context.Context, imageName string) 
 		return fmt.Errorf("failed to parse image reference %q: %w", imageName, err)
 	}
 
+	if _, ok := ref.(name.Digest); ok {
+		return r.pullDigestViaDockerDaemon(ctx, imageName, ref)
+	}
+
+	tag, ok := ref.(name.Tag)
+	if !ok {
+		return fmt.Errorf("unsupported image reference type %T", ref)
+	}
+
 	// Configure remote options
 	remoteOpts := []remote.Option{
 		remote.WithAuthFromKeychain(r.keychain),
@@ -110,16 +122,6 @@ func (r *RegistryImageManager) PullImage(ctx context.Context, imageName string) 
 		return fmt.Errorf("failed to pull image from registry: %w", err)
 	}
 
-	// Convert reference to tag for daemon.Write
-	tag, ok := ref.(name.Tag)
-	if !ok {
-		// If it's not a tag, try to convert to tag
-		tag, err = name.NewTag(ref.String())
-		if err != nil {
-			return fmt.Errorf("failed to convert reference to tag: %w", err)
-		}
-	}
-
 	// Save the image to the local daemon
 	response, err := daemon.Write(tag, img, daemon.WithClient(r.daemonClient))
 	if err != nil {
@@ -132,6 +134,36 @@ func (r *RegistryImageManager) PullImage(ctx context.Context, imageName string) 
 	}
 	//nolint:gosec // G706: image name and response from registry pull
 	slog.Debug("pull complete", "image", imageName, "response", response)
+
+	return nil
+}
+
+func (r *RegistryImageManager) pullDigestViaDockerDaemon(ctx context.Context, imageName string, ref name.Reference) error {
+	var registryAuth string
+	if auth, err := r.keychain.Resolve(ref.Context().Registry); err == nil && auth != authn.Anonymous {
+		if authCfg, err := auth.Authorization(); err == nil {
+			if authJSON, err := json.Marshal(authCfg); err == nil {
+				registryAuth = base64.URLEncoding.EncodeToString(authJSON)
+			}
+		}
+	}
+
+	if r.mobyClient == nil {
+		return fmt.Errorf("failed to pull image %q: docker daemon client unavailable", imageName)
+	}
+	resp, err := r.mobyClient.ImagePull(ctx, imageName, mobyclient.ImagePullOptions{
+		RegistryAuth: registryAuth,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to pull image: %w", err)
+	}
+	if err := resp.Wait(ctx); err != nil {
+		return fmt.Errorf("failed waiting for image pull: %w", err)
+	}
+
+	if _, err := fmt.Fprintf(os.Stdout, "Successfully pulled %s\n", imageName); err != nil {
+		slog.Debug("failed to write success message", "error", err)
+	}
 
 	return nil
 }

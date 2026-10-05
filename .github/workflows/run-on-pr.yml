@@ -17,6 +17,9 @@ jobs:
     uses: ./.github/workflows/license-headers.yml
   linting:
     name: Linting
+    permissions:
+      contents: read
+      pull-requests: read
     uses: ./.github/workflows/lint.yml
   security-scan:
     name: Security Scan

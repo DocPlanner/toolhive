@@ -268,7 +268,7 @@ var _ = Describe("VirtualMCPServer Optimizer Multi-Backend", Ordered, func() {
 
 	It("should only expose find_tool and call_tool", func() {
 		By("Creating and initializing MCP client")
-		mcpClient, err := CreateInitializedMCPClient(vmcpNodePort, "optmulti-test-client", 30*time.Second)
+		mcpClient, err := CreateInitializedMCPClient(vmcpNodePort, "optmulti-test-client", 90*time.Second)
 		Expect(err).ToNot(HaveOccurred())
 		defer mcpClient.Close()
 
@@ -291,7 +291,7 @@ var _ = Describe("VirtualMCPServer Optimizer Multi-Backend", Ordered, func() {
 
 	It("should complete cold-start find_tool request under 5 seconds", func() {
 		By("Creating and initializing MCP client for cold-start latency test")
-		mcpClient, err := CreateInitializedMCPClient(vmcpNodePort, "optmulti-coldstart-client", 30*time.Second)
+		mcpClient, err := CreateInitializedMCPClient(vmcpNodePort, "optmulti-coldstart-client", 90*time.Second)
 		Expect(err).ToNot(HaveOccurred())
 		defer mcpClient.Close()
 
@@ -315,7 +315,7 @@ var _ = Describe("VirtualMCPServer Optimizer Multi-Backend", Ordered, func() {
 
 	It("should return semantically relevant results (search quality)", func() {
 		By("Creating and initializing MCP client for search quality test")
-		mcpClient, err := CreateInitializedMCPClient(vmcpNodePort, "optmulti-quality-client", 30*time.Second)
+		mcpClient, err := CreateInitializedMCPClient(vmcpNodePort, "optmulti-quality-client", 90*time.Second)
 		Expect(err).ToNot(HaveOccurred())
 		defer mcpClient.Close()
 

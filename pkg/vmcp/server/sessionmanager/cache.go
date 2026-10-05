@@ -4,6 +4,7 @@
 package sessionmanager
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -42,13 +43,13 @@ type RestorableCache[K comparable, V any] struct {
 
 	// load is called on a cache miss. Return (value, nil) on success.
 	// A successful result is stored in the cache before being returned.
-	load func(key K) (V, error)
+	load func(ctx context.Context, key K) (V, error)
 
 	// check is called on every cache hit to confirm liveness. Returning nil
 	// means the entry is alive. Returning ErrExpired means it has definitively
 	// expired (the entry is evicted). Any other error is treated as a transient
 	// failure and the cached value is returned unchanged.
-	check func(key K) error
+	check func(ctx context.Context, key K) error
 
 	// onEvict is called after a confirmed-expired entry has been removed. The
 	// evicted value is passed to allow resource cleanup (e.g. closing
@@ -80,8 +81,8 @@ func (c *cacheTouch) lastTouch() time.Time {
 const minSweepInterval = time.Millisecond
 
 func newRestorableCache[K comparable, V any](
-	load func(K) (V, error),
-	check func(K) error,
+	load func(context.Context, K) (V, error),
+	check func(context.Context, K) error,
 	onEvict func(K, V),
 ) *RestorableCache[K, V] {
 	return &RestorableCache[K, V]{
@@ -110,14 +111,14 @@ func (c *RestorableCache[K, V]) recordTouch(key K, now time.Time) {
 //
 // On a cache miss, load is called under a singleflight group so at most one
 // restore runs concurrently per key.
-func (c *RestorableCache[K, V]) Get(key K) (V, bool) {
+func (c *RestorableCache[K, V]) Get(ctx context.Context, key K) (V, bool) {
 	if raw, ok := c.m.Load(key); ok {
 		v, isV := raw.(V)
 		if !isV {
 			var zero V
 			return zero, false
 		}
-		if err := c.check(key); err != nil {
+		if err := c.check(ctx, key); err != nil {
 			if errors.Is(err, ErrExpired) {
 				c.m.Delete(key)
 				c.touch.Delete(key)
@@ -146,7 +147,7 @@ func (c *RestorableCache[K, V]) Get(key K) (V, bool) {
 			// hard stop: do not call load() and do not overwrite the sentinel.
 			return nil, errSentinelFound
 		}
-		v, loadErr := c.load(key)
+		v, loadErr := c.load(ctx, key)
 		if loadErr != nil {
 			return nil, loadErr
 		}

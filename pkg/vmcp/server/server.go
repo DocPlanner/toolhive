@@ -122,6 +122,17 @@ const (
 
 var errSessionOwnerUnavailable = errors.New("session owner unavailable")
 
+const ownerForwardDialTimeout = 2 * time.Second
+
+func newOwnerForwardTransport() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{
+		Timeout:   ownerForwardDialTimeout,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	return transport
+}
+
 //go:generate mockgen -destination=mocks/mock_watcher.go -package=mocks -source=server.go Watcher
 
 // Watcher is the interface for Kubernetes backend watcher integration.
@@ -576,7 +587,7 @@ func New(
 		sessionManager:     sessionManager,
 		sessionDataStorage: sessionDataStorage,
 		sessionOwnerURL:    sessionOwnerURL,
-		ownerForwardClient: &http.Client{Transport: http.DefaultTransport},
+		ownerForwardClient: &http.Client{Transport: newOwnerForwardTransport()},
 		capabilityAdapter:  capabilityAdapter,
 		ready:              make(chan struct{}),
 		healthMonitor:      healthMon,
@@ -761,6 +772,8 @@ func (s *Server) Handler(_ context.Context) (http.Handler, error) {
 		mcpHandler = auditor.Middleware(mcpHandler)
 		slog.Info("audit middleware enabled for MCP endpoints")
 	}
+
+	mcpHandler = s.claimOrphanedSessionMiddleware(mcpHandler)
 
 	// Apply authentication middleware if configured (runs first in chain)
 	if s.config.AuthMiddleware != nil {
@@ -1528,7 +1541,7 @@ func (s *Server) waitForSessionRegistration(ctx context.Context, sessionID strin
 	if sessionID == "" {
 		return nil
 	}
-	if _, ok := s.vmcpSessionMgr.GetMultiSession(sessionID); ok {
+	if _, ok := s.vmcpSessionMgr.GetMultiSession(ctx, sessionID); ok {
 		return nil
 	}
 
@@ -1635,7 +1648,7 @@ func (s *Server) rehydrateSessionCapabilities(
 ) error {
 	sessionID := session.SessionID()
 
-	if _, ok := s.vmcpSessionMgr.GetMultiSession(sessionID); !ok {
+	if _, ok := s.vmcpSessionMgr.GetMultiSession(ctx, sessionID); !ok {
 		return fmt.Errorf("session %q not found", sessionID)
 	}
 
@@ -1671,7 +1684,7 @@ func (s *Server) ownerForwardingMiddleware(next http.Handler) http.Handler {
 		forwarded, err := s.tryForwardSessionRequest(w, r)
 		if err != nil {
 			if errors.Is(err, errSessionOwnerUnavailable) {
-				s.handleOwnerUnavailable(r)
+				r = r.WithContext(context.WithValue(r.Context(), sessionOwnerUnavailableKey{}, true))
 			}
 			slog.Warn("failed to forward live session request to owner",
 				"method", r.Method,
@@ -1689,6 +1702,17 @@ func (s *Server) ownerForwardingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+type sessionOwnerUnavailableKey struct{}
+
+func (s *Server) claimOrphanedSessionMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if unavailable, _ := r.Context().Value(sessionOwnerUnavailableKey{}).(bool); unavailable {
+			s.handleOwnerUnavailable(r)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // handleOwnerUnavailable restores an orphaned session and claims ownership
 // so subsequent requests route directly to this pod.
 func (s *Server) handleOwnerUnavailable(r *http.Request) {
@@ -1700,7 +1724,7 @@ func (s *Server) handleOwnerUnavailable(r *http.Request) {
 		return
 	}
 
-	ms, ok := s.vmcpSessionMgr.GetMultiSession(sessionID)
+	ms, ok := s.vmcpSessionMgr.GetMultiSession(r.Context(), sessionID)
 	if !ok || ms == nil {
 		return
 	}
@@ -1711,7 +1735,7 @@ func (s *Server) handleOwnerUnavailable(r *http.Request) {
 	}
 
 	if err := s.vmcpSessionMgr.SetSessionMetadataValue(
-		r.Context(), sessionID, ms,
+		context.WithoutCancel(r.Context()), sessionID, ms,
 		sessiontypes.MetadataKeyOwnerURL,
 		s.sessionOwnerURL,
 	); err != nil {
@@ -2160,7 +2184,7 @@ func (s *Server) targetSessionsForRefresh(
 		if !ok {
 			return true
 		}
-		multiSess, exists := s.vmcpSessionMgr.GetMultiSession(sessionID)
+		multiSess, exists := s.vmcpSessionMgr.GetMultiSession(context.Background(), sessionID)
 		if !exists || multiSess == nil {
 			s.activeClientSessions.Delete(key)
 			stale++
@@ -2169,7 +2193,7 @@ func (s *Server) targetSessionsForRefresh(
 		contains := sessionContainsBackend(multiSess, backendID)
 		switch mode {
 		case refreshSessionsLackingBackend:
-			if contains {
+			if contains || !canRebuildInBackground(multiSess) {
 				return true
 			}
 		case refreshSessionsContainingBackend:
@@ -2190,6 +2214,17 @@ func (s *Server) targetSessionsForRefresh(
 			"backend_id", backendID, "count", stale)
 	}
 	return targets
+}
+
+func canRebuildInBackground(sess sessiontypes.MultiSession) bool {
+	if sess.GetMetadata()[sessiontypes.MetadataKeyTokenHash] == "" {
+		return true
+	}
+	provider, ok := sess.(sessiontypes.CreatorIdentityProvider)
+	if !ok {
+		return false
+	}
+	return !sessiontypes.ShouldAllowAnonymous(provider.CreatorIdentity())
 }
 
 func sessionContainsBackend(sess sessiontypes.MultiSession, backendID string) bool {
@@ -2216,7 +2251,7 @@ func (s *Server) refreshSessionCapabilities(
 	sessionID string,
 	clientSession server.ClientSession,
 ) error {
-	previous, ok := s.vmcpSessionMgr.GetMultiSession(sessionID)
+	previous, ok := s.vmcpSessionMgr.GetMultiSession(ctx, sessionID)
 	if !ok {
 		return fmt.Errorf("session %q not found", sessionID)
 	}

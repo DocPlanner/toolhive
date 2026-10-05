@@ -27,6 +27,8 @@ func generateUniqueProxyStdioServerName(prefix string) string {
 	return fmt.Sprintf("%s-%d-%d-%d", prefix, os.Getpid(), time.Now().UnixNano(), GinkgoRandomSeed())
 }
 
+const timeMCPServerImage = "ghcr.io/stacklok/dockyard/uvx/mcp-server-time:2026.7.10@sha256:5cca77dec3fefbacad35e3008ab1660f8725ef246213afb24231504fc73c999d"
+
 var _ = Describe("Proxy Stdio E2E", Label("proxy", "stdio", "e2e"), Serial, func() {
 	var (
 		config        *e2e.TestConfig
@@ -183,7 +185,7 @@ var _ = Describe("Proxy Stdio E2E", Label("proxy", "stdio", "e2e"), Serial, func
 		BeforeEach(func() {
 			transportType = types.TransportTypeStdio
 			proxyMode = "sse"
-			mcpServerName = "time"
+			mcpServerName = timeMCPServerImage
 		})
 		It("should proxy MCP requests successfully", func() {
 			By("Getting time server URL")
@@ -234,7 +236,7 @@ var _ = Describe("Proxy Stdio E2E", Label("proxy", "stdio", "e2e"), Serial, func
 		BeforeEach(func() {
 			transportType = types.TransportTypeStdio
 			proxyMode = "streamable-http"
-			mcpServerName = "time"
+			mcpServerName = timeMCPServerImage
 		})
 		It("should proxy MCP requests successfully", func() {
 			By("Getting time server URL")

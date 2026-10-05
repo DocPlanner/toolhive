@@ -16,7 +16,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/stacklok/toolhive/pkg/auth"
 	transportsession "github.com/stacklok/toolhive/pkg/transport/session"
+	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
 	sessiontypes "github.com/stacklok/toolhive/pkg/vmcp/session/types"
 )
 
@@ -368,4 +370,54 @@ func TestOwnerForwardingMiddleware_ForwardsSessionScopedPOSTRequests(t *testing.
 			assert.JSONEq(t, tc.body, forwardedBody)
 		})
 	}
+}
+
+type claimRecordingManager struct {
+	SessionManager
+	identities []*auth.Identity
+}
+
+func (m *claimRecordingManager) GetMultiSession(ctx context.Context, _ string) (vmcpsession.MultiSession, bool) {
+	identity, _ := auth.IdentityFromContext(ctx)
+	m.identities = append(m.identities, identity)
+	return nil, false
+}
+
+func TestOwnerUnavailable_RestoresTheSessionAfterAuthentication(t *testing.T) {
+	t.Parallel()
+
+	manager := &claimRecordingManager{}
+	srv := &Server{
+		vmcpSessionMgr: manager,
+		sessionDataStorage: &forwardingTestStorage{
+			metadata: map[string]map[string]string{
+				"session-orphaned": {sessiontypes.MetadataKeyOwnerURL: "http://10.1.2.7:4483/mcp"},
+			},
+		},
+		sessionOwnerURL: "http://10.9.9.9:4483/mcp",
+		ownerForwardClient: &http.Client{
+			Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return nil, errors.New("dial tcp 10.1.2.7: connect: connection refused")
+			}),
+		},
+	}
+
+	caller := &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: "alice"}, Token: "live-token"}
+	authenticate := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			next.ServeHTTP(w, r.WithContext(auth.WithIdentity(r.Context(), caller)))
+		})
+	}
+	handler := srv.ownerForwardingMiddleware(authenticate(srv.claimOrphanedSessionMiddleware(
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusAccepted) }),
+	)))
+
+	req := httptest.NewRequest(http.MethodDelete, "/mcp", nil)
+	req.Header.Set(mcpserver.HeaderKeySessionID, "session-orphaned")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+
+	assert.Equal(t, http.StatusAccepted, recorder.Code)
+	require.Len(t, manager.identities, 1)
+	assert.Same(t, caller, manager.identities[0])
 }

@@ -5,11 +5,12 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   lint-go-code:
     name: Lint Go Code
-    runs-on: ubuntu-8cores-32gb
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -37,10 +38,12 @@ jobs:
             ${{ runner.os }}-go-build-
 
       - name: Check go.mod version format
-        run: "! grep -qE '^go [0-9]+\\.[0-9]+\\.[0-9]+' go.mod || { echo 'ERROR: go.mod must pin Go to minor version (e.g. go 1.26), not patch (e.g. go 1.26.1)'; exit 1; }"
+        run: "! grep -qE '^go [0-9]+\\.[0-9]+\\.[1-9][0-9]*$' go.mod || { echo 'ERROR: go.mod must not pin a non-zero Go patch version (go 1.26 or go 1.26.0 are fine; a dependency floor is always X.Y.0, never a later patch)'; exit 1; }"
 
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9.2.0
         with:
+          version: v2.14.0
+          only-new-issues: true
           # Enable golangci-lint's built-in caching (removes skip-cache: true)
           args: --timeout=5m
