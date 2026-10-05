@@ -41,6 +41,7 @@ import (
 	vmcpconfig "github.com/stacklok/toolhive/pkg/vmcp/config"
 	"github.com/stacklok/toolhive/pkg/vmcp/discovery"
 	"github.com/stacklok/toolhive/pkg/vmcp/health"
+	"github.com/stacklok/toolhive/pkg/vmcp/internal/backendtelemetry"
 	"github.com/stacklok/toolhive/pkg/vmcp/optimizer"
 	"github.com/stacklok/toolhive/pkg/vmcp/router"
 	"github.com/stacklok/toolhive/pkg/vmcp/server/adapter"
@@ -119,6 +120,12 @@ const (
 
 	sessionOwnerForwardedHeader = "X-ToolHive-Session-Forwarded"
 	sessionOwnerForwardedValue  = "1"
+	// Transport defaults shared by New and Serve (buildServeConfig) so the two
+	// entry points cannot drift while New is not yet routed through Serve.
+	defaultServerName    = "toolhive-vmcp"
+	defaultServerVersion = "0.1.0"
+	defaultHost          = "127.0.0.1"
+	defaultEndpointPath  = "/mcp"
 )
 
 var errSessionOwnerUnavailable = errors.New("session owner unavailable")
@@ -418,18 +425,18 @@ func New(
 ) (*Server, error) {
 	// Apply defaults
 	if cfg.Host == "" {
-		cfg.Host = "127.0.0.1"
+		cfg.Host = defaultHost
 	}
 	// Note: Port 0 means "let OS assign random port" - intentionally no default applied here.
 	// CLI provides default via flag (4483), so Port is only 0 in tests for dynamic port assignment.
 	if cfg.EndpointPath == "" {
-		cfg.EndpointPath = "/mcp"
+		cfg.EndpointPath = defaultEndpointPath
 	}
 	if cfg.Name == "" {
-		cfg.Name = "toolhive-vmcp"
+		cfg.Name = defaultServerName
 	}
 	if cfg.Version == "" {
-		cfg.Version = "0.1.0"
+		cfg.Version = defaultServerVersion
 	}
 	if cfg.SessionTTL == 0 {
 		cfg.SessionTTL = defaultSessionTTL
@@ -467,7 +474,7 @@ func New(
 		var err error
 		// Get initial backends list from registry for telemetry setup
 		initialBackends := backendRegistry.List(ctx)
-		backendClient, err = monitorBackends(
+		backendClient, err = backendtelemetry.MonitorBackends(
 			ctx,
 			cfg.TelemetryProvider.MeterProvider(),
 			cfg.TelemetryProvider.TracerProvider(),
@@ -2256,7 +2263,7 @@ func (s *Server) targetSessionsForRefresh(
 }
 
 func canRebuildInBackground(sess sessiontypes.MultiSession) bool {
-	if sess.GetMetadata()[sessiontypes.MetadataKeyTokenHash] == "" {
+	if !sessiontypes.HasBoundIdentity(sess.GetMetadata()) {
 		return true
 	}
 	provider, ok := sess.(sessiontypes.CreatorIdentityProvider)

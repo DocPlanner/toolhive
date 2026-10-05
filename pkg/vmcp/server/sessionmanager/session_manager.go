@@ -319,18 +319,11 @@ func (sm *Manager) CreateSession(
 	// Resolve the caller identity (may be nil for anonymous access).
 	identity, _ := auth.IdentityFromContext(ctx)
 
-	// Note: Token hash and salt are computed and stored by the session factory
-	// (MakeSessionWithID below). Token binding enforcement happens at the session
-	// level via validateCaller(), which uses HMAC-SHA256 with a per-session salt.
-
 	// List and filter the currently eligible backends.
 	backends := sm.currentEligibleBackends(ctx)
 
 	// Build the fully-formed MultiSession using the SDK-assigned session ID.
-	// Sessions created with an identity are bound to that identity (allowAnonymous=false).
-	// Sessions created without an identity allow anonymous access (allowAnonymous=true).
-	allowAnonymous := sessiontypes.ShouldAllowAnonymous(identity)
-	sess, err := sm.factory.MakeSessionWithID(ctx, sessionID, identity, allowAnonymous, backends)
+	sess, err := sm.factory.MakeSessionWithID(ctx, sessionID, identity, backends)
 	if err != nil {
 		sm.cleanupFailedPlaceholder(sessionID, placeholder)
 		return nil, fmt.Errorf("Manager.CreateSession: failed to create multi-session: %w", err)
@@ -438,7 +431,7 @@ func (sm *Manager) RefreshSession(
 	unlock()
 
 	backends := sm.currentEligibleBackends(ctx)
-	refreshed, err := sm.factory.MakeSessionWithID(ctx, sessionID, identity, allowAnonymous, backends)
+	refreshed, err := sm.factory.MakeSessionWithID(ctx, sessionID, identity, backends)
 	if err != nil {
 		return nil, fmt.Errorf("Manager.RefreshSession: failed to rebuild multi-session: %w", err)
 	}
@@ -570,36 +563,37 @@ func (sm *Manager) Terminate(sessionID string) (isNotAllowed bool, err error) {
 		return false, fmt.Errorf("Manager.Terminate: failed to load session %q: %w", sessionID, loadErr)
 	}
 
-	// Placeholder session (not yet upgraded to MultiSession).
-	//
-	// This handles the race condition where a client sends DELETE between
-	// Generate() (Phase 1) and CreateSession() (Phase 2). The two-phase
-	// pattern creates a window where the session exists as a placeholder:
-	//
-	//   1. Client sends initialize → Generate() creates placeholder
-	//   2. Client sends DELETE before OnRegisterSession hook fires
-	//   3. We mark the placeholder as terminated (don't delete it)
-	//   4. CreateSession() hook fires → sees terminated flag → fails fast
-	//
-	// Without this branch, CreateSession() would open backend HTTP connections
-	// for a session the client already terminated, silently resurrecting it.
-	//
-	// We mark (not delete) so Validate() can return isTerminated=true, which
-	// lets the SDK distinguish "actively terminated" from "never existed".
-	// TTL cleanup will remove the placeholder later.
+	if _, isFullSession := metadata[sessiontypes.MetadataKeyIdentityBinding]; isFullSession {
+		// Phase 2 (full MultiSession): delete from storage. The cache entry will be
+		// evicted lazily on the next Get when checkSession finds the session gone.
+		if deleteErr := sm.storage.Delete(ctx, sessionID); deleteErr != nil {
+			return false, fmt.Errorf("Manager.Terminate: failed to delete session from storage: %w", deleteErr)
+		}
+		slog.Info("Manager.Terminate: session terminated", "session_id", sessionID)
+		return false, nil
+	}
+
+	// Phase 1 (placeholder): mark terminated so CreateSession fast-fails and
+	// Validate returns isTerminated=true during the TTL window.
+	// Use Update (SET XX) rather than Upsert so we never resurrect a key that
+	// was concurrently deleted or expired between the Load above and this write.
+	// (false, nil) means already gone — treat as success.
 	metadata[MetadataKeyTerminated] = MetadataValTrue
-	if storeErr := sm.storage.Upsert(ctx, sessionID, metadata); storeErr != nil {
+	updated, storeErr := sm.storage.Update(ctx, sessionID, metadata)
+	if storeErr != nil {
 		slog.Warn("Manager.Terminate: failed to persist terminated flag for placeholder; attempting delete fallback",
 			"session_id", sessionID, "error", storeErr)
-		// Use a fresh context: if ctx expired (deadline exceeded), the same
-		// context would cause the fallback delete to fail immediately too.
 		deleteCtx, deleteCancel := context.WithTimeout(context.Background(), terminateTimeout)
-		defer deleteCancel()
 		if deleteErr := sm.storage.Delete(deleteCtx, sessionID); deleteErr != nil {
+			deleteCancel()
 			return false, fmt.Errorf(
 				"Manager.Terminate: failed to persist terminated flag and delete placeholder: storeErr=%v, deleteErr=%w",
 				storeErr, deleteErr)
 		}
+		deleteCancel()
+	} else if !updated {
+		// Session expired or was concurrently deleted between Load and Update — already gone.
+		slog.Debug("Manager.Terminate: placeholder already gone before terminated flag could be set", "session_id", sessionID)
 	}
 
 	slog.Info("Manager.Terminate: session terminated", "session_id", sessionID)
@@ -796,16 +790,17 @@ func (sm *Manager) loadSession(ctx context.Context, sessionID string) (vmcpsessi
 	}
 
 	// Don't restore placeholder sessions (Phase 2 never ran).
-	// PreventSessionHijacking always writes MetadataKeyTokenHash during Phase 2
-	// (empty sentinel for anonymous, non-empty hash for authenticated). Its
-	// absence means Generate() stored this record but CreateSession() never
-	// completed — treat it as "not found" rather than "corrupted".
+	// BindSession always writes MetadataKeyIdentityBinding during Phase 2
+	// (the unauthenticated sentinel for anonymous sessions, a bound (iss, sub)
+	// binding for authenticated ones). Its absence means Generate() stored
+	// this record but CreateSession() never completed — treat it as "not
+	// found" rather than "corrupted".
 	//
 	// Note: this is intentionally different from RestoreSession's fail-closed
 	// check (absent key → error). Here we know a placeholder's empty metadata
 	// is valid storage state produced by Generate(), so we return the
 	// SDK-standard ErrSessionNotFound instead of an error.
-	if _, hashPresent := metadata[sessiontypes.MetadataKeyTokenHash]; !hashPresent {
+	if _, bindingPresent := metadata[sessiontypes.MetadataKeyIdentityBinding]; !bindingPresent {
 		return nil, transportsession.ErrSessionNotFound
 	}
 
@@ -1027,7 +1022,7 @@ var errRefreshWithoutCallerToken = errors.New("bound session has no caller token
 const metadataKeyRestoredFromBackendIDs = "vmcp.session.restored_from_backend_ids"
 
 func isBoundSession(sess vmcpsession.MultiSession) bool {
-	return sess.GetMetadata()[sessiontypes.MetadataKeyTokenHash] != ""
+	return sessiontypes.HasBoundIdentity(sess.GetMetadata())
 }
 
 func keepStoredBackendIDs(restored vmcpsession.MultiSession, stored map[string]string) {

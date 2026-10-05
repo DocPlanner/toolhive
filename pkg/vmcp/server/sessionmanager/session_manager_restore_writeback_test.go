@@ -84,7 +84,7 @@ func TestSessionManager_LoadSessionPersistsRestoredMetadata(t *testing.T) {
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		sessionID := "restore-metadata-persist-session"
 		freshMeta := map[string]string{
-			sessiontypes.MetadataKeyTokenHash:                         "",
+			sessiontypes.MetadataKeyIdentityBinding:                   "unauthenticated",
 			vmcpsession.MetadataKeyBackendIDs:                         "backend-a",
 			vmcpsession.MetadataKeyBackendSessionPrefix + "backend-a": "fresh-session-id",
 		}
@@ -94,7 +94,7 @@ func TestSessionManager_LoadSessionPersistsRestoredMetadata(t *testing.T) {
 
 		sm, storage := newTestSessionManager(t, factory, newFakeRegistry())
 		_, err := storage.Create(context.Background(), sessionID, map[string]string{
-			sessiontypes.MetadataKeyTokenHash:                         "",
+			sessiontypes.MetadataKeyIdentityBinding:                   "unauthenticated",
 			vmcpsession.MetadataKeyBackendIDs:                         "backend-a",
 			vmcpsession.MetadataKeyBackendSessionPrefix + "backend-a": "stale-session-id",
 		})
@@ -115,7 +115,7 @@ func TestSessionManager_LoadSessionPersistsRestoredMetadata(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		sessionID := "restore-concurrent-delete-session"
-		restored := newRestoredMockSession(ctrl, sessionID, map[string]string{sessiontypes.MetadataKeyTokenHash: ""})
+		restored := newRestoredMockSession(ctrl, sessionID, map[string]string{sessiontypes.MetadataKeyIdentityBinding: "unauthenticated"})
 		restored.EXPECT().Close().Return(nil).Times(1)
 		factory.EXPECT().
 			RestoreSession(gomock.Any(), sessionID, gomock.Any(), gomock.Any()).
@@ -126,7 +126,7 @@ func TestSessionManager_LoadSessionPersistsRestoredMetadata(t *testing.T) {
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = cleanup(context.Background()) })
 
-		_, err = inner.Create(context.Background(), sessionID, map[string]string{sessiontypes.MetadataKeyTokenHash: ""})
+		_, err = inner.Create(context.Background(), sessionID, map[string]string{sessiontypes.MetadataKeyIdentityBinding: "unauthenticated"})
 		require.NoError(t, err)
 
 		multiSess, ok := sm.GetMultiSession(context.Background(), sessionID)
@@ -142,7 +142,7 @@ func TestSessionManager_LoadSessionPersistsRestoredMetadata(t *testing.T) {
 		sessionID := "restore-update-error-session"
 		factory.EXPECT().
 			RestoreSession(gomock.Any(), sessionID, gomock.Any(), gomock.Any()).
-			Return(newRestoredMockSession(ctrl, sessionID, map[string]string{sessiontypes.MetadataKeyTokenHash: ""}), nil).
+			Return(newRestoredMockSession(ctrl, sessionID, map[string]string{sessiontypes.MetadataKeyIdentityBinding: "unauthenticated"}), nil).
 			Times(1)
 
 		inner := newTestSessionDataStorage(t)
@@ -150,7 +150,7 @@ func TestSessionManager_LoadSessionPersistsRestoredMetadata(t *testing.T) {
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = cleanup(context.Background()) })
 
-		_, err = inner.Create(context.Background(), sessionID, map[string]string{sessiontypes.MetadataKeyTokenHash: ""})
+		_, err = inner.Create(context.Background(), sessionID, map[string]string{sessiontypes.MetadataKeyIdentityBinding: "unauthenticated"})
 		require.NoError(t, err)
 
 		multiSess, ok := sm.GetMultiSession(context.Background(), sessionID)
@@ -210,11 +210,13 @@ func newMetadataTestSession(
 const (
 	tokenlessRestoreSessionID = "550e8400-e29b-41d4-a716-446655440900"
 	tokenlessRestoreSubject   = "user-123"
+	// tokenlessRestoreBinding is binding.Format("https://idp.example", tokenlessRestoreSubject).
+	tokenlessRestoreBinding = "https://idp.example\x00" + tokenlessRestoreSubject
 )
 
 func fullStoredMetadata() map[string]string {
 	return map[string]string{
-		sessiontypes.MetadataKeyTokenHash:                                 "subject-hash",
+		sessiontypes.MetadataKeyIdentityBinding:                           tokenlessRestoreBinding,
 		vmcpsession.MetadataKeyBackendIDs:                                 "global,global_memory-mcp,p2",
 		vmcpsession.MetadataKeyBackendSessionPrefix + "global":            "global-session",
 		vmcpsession.MetadataKeyBackendSessionPrefix + "global_memory-mcp": "memory-session",
@@ -224,7 +226,7 @@ func fullStoredMetadata() map[string]string {
 
 func tokenlessRestoredMetadata() map[string]string {
 	return map[string]string{
-		sessiontypes.MetadataKeyTokenHash:                      "subject-hash",
+		sessiontypes.MetadataKeyIdentityBinding:                tokenlessRestoreBinding,
 		vmcpsession.MetadataKeyBackendIDs:                      "global,p2",
 		vmcpsession.MetadataKeyBackendSessionPrefix + "global": "global-session-restored",
 		vmcpsession.MetadataKeyBackendSessionPrefix + "p2":     "p2-session-restored",
@@ -326,7 +328,7 @@ func TestSessionManager_RefreshSessionNeverDowngradesBoundSession(t *testing.T) 
 
 		ctrl := gomock.NewController(t)
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
-		factory.EXPECT().MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+		factory.EXPECT().MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
 		sm, _ := newTestSessionManager(t, factory, &fakeBackendRegistry{backends: []vmcp.Backend{{ID: "global_memory-mcp"}}})
 
 		restored := newMetadataTestSession(ctrl, tokenlessRestoredMetadata(),
@@ -346,13 +348,13 @@ func TestSessionManager_RefreshSessionNeverDowngradesBoundSession(t *testing.T) 
 
 		ctrl := gomock.NewController(t)
 		anonymousMeta := map[string]string{
-			sessiontypes.MetadataKeyTokenHash: "",
-			vmcpsession.MetadataKeyBackendIDs: "global",
+			sessiontypes.MetadataKeyIdentityBinding: "unauthenticated",
+			vmcpsession.MetadataKeyBackendIDs:       "global",
 		}
 		rebuilt := newMetadataTestSession(ctrl, anonymousMeta, nil)
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), tokenlessRestoreSessionID, gomock.Nil(), true, gomock.Any()).
+			MakeSessionWithID(gomock.Any(), tokenlessRestoreSessionID, gomock.Nil(), gomock.Any()).
 			Return(rebuilt, nil).Times(1)
 		sm, _ := newTestSessionManager(t, factory, newFakeRegistry())
 

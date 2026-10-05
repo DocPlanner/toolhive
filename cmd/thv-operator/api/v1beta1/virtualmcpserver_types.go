@@ -338,12 +338,8 @@ const (
 	// ConditionReasonIncomingAuthInvalid indicates incoming auth is invalid
 	ConditionReasonIncomingAuthInvalid = "IncomingAuthInvalid"
 
-	// Note: ConditionReasonAuthzConfigMapNotFound is shared with MCPRemoteProxy and is
-	// declared in mcpremoteproxy_types.go.
-
-	// ConditionReasonAuthzConfigMapInvalid indicates the referenced authz ConfigMap was
-	// found but its payload is missing/empty/malformed or fails Cedar validation.
-	ConditionReasonAuthzConfigMapInvalid = "AuthzConfigMapInvalid"
+	// Note: ConditionReasonAuthzConfigMapNotFound and ConditionReasonAuthzConfigMapInvalid
+	// are shared with MCPRemoteProxy and are declared in mcpremoteproxy_types.go.
 
 	// ConditionReasonGroupRefValid indicates the GroupRef is valid
 	ConditionReasonVirtualMCPServerGroupRefValid = "GroupRefValid"
@@ -471,6 +467,7 @@ const (
 //+kubebuilder:object:root=true
 //+kubebuilder:storageversion
 //+kubebuilder:subresource:status
+//+kubebuilder:metadata:labels=toolhive.stacklok.dev/auto-migrate-storage-version=true
 //+kubebuilder:resource:shortName=vmcp;virtualmcp,categories=toolhive
 //+kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase",description="The phase of the VirtualMCPServer"
 //+kubebuilder:printcolumn:name="URL",type="string",JSONPath=".status.url",description="Virtual MCP server URL"

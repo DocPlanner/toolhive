@@ -51,7 +51,7 @@ func callerIdentity(subject, token string) *auth.Identity {
 func storedBoundSession(t *testing.T, factory MultiSessionFactory) map[string]string {
 	t.Helper()
 	original, err := factory.MakeSessionWithID(
-		t.Context(), uuid.New().String(), callerIdentity("alice", "token-at-create"), false, restoreTestBackends(),
+		t.Context(), uuid.New().String(), callerIdentity("alice", "token-at-create"), restoreTestBackends(),
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = original.Close() })

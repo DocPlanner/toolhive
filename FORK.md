@@ -43,6 +43,27 @@ renamed `address` to `addr`. Fork behaviour re-applied while resolving:
 | vMCP `--session-ttl` flag wins over the config-file `sessionTTL` | `pkg/vmcp/cli/serve_timeouts.go` (`sessionTTLFromConfig`) | `d104dfc9f` |
 | Per-workload backend request timeouts kept alongside upstream's header-forward secrets provider | `pkg/vmcp/session/internal/backend/mcp_session.go` | `3533730ce` |
 
+### Merge upstream v0.29.3
+
+Upstream replaced HMAC token/subject session binding with an `(iss, sub)` identity binding
+(#5306/#5378). The fork's subject binding (`e492cbfad`) is dropped; the binding is upstream's.
+Fork behaviour re-applied on top:
+
+| Behaviour | Where it lives now | Original commit |
+|---|---|---|
+| `CreatorIdentity` passthrough on the binding decorator | `pkg/vmcp/session/internal/security/security.go` | `560c1d023` |
+| Restore uses the owner's live identity when the restoring caller owns the stored binding (else the context identity is cleared) | `pkg/vmcp/session/factory.go` (`ownsStoredSession`) | `7a6c9a2f3` |
+| Session-owner URL kept across restore | `pkg/vmcp/session/factory.go` | `ee63a49a8` |
+| "Bound session" checks use the identity binding instead of the token hash | `pkg/vmcp/session/types/session.go` (`HasBoundIdentity`) | `517f94007`, `e755493fe` |
+| `Terminate` handles the locally cached session first, then upstream's full-session delete / placeholder `Update` path | `pkg/vmcp/server/sessionmanager/session_manager.go` | `c9ab3ccbc` |
+| Session-cardinality gauges live in the server package (upstream moved the old telemetry file into `internal/backendtelemetry`) | `pkg/vmcp/server/session_telemetry.go` | `560c1d023` |
+| Upstream's unused `server.Serve` registers the fork's session hooks instead of `lazyInjectSessionTools` | `pkg/vmcp/server/serve.go` | — |
+| DCR without `scope` defaults to the server's supported scopes | `pkg/authserver/server/registration/dcr.go` | `16c2fba5e` |
+| Digest-pinned image pulls go through the Docker daemon (upstream #5978, after v0.29.3) | `pkg/container/images/registry.go` | `09c117c56` |
+
+`VMCP_SESSION_HMAC_SECRET` is no longer used (upstream logs and ignores it). Sessions stored with the
+old token-hash key are invalidated on read, so clients re-initialize once after the upgrade.
+
 Drop the `address` aliases in M3 (PAIINFRA-228), after PAIINFRA-219 has moved stg and prod values to `addr`.
 
 ## Dropped patches
@@ -57,3 +78,4 @@ them on a replay.
 | `87be189f6` | Restore embedding config resolution | Upstream's `populateOptimizerEmbeddingService` resolves `embeddingServerRef` (with `Validate()` defaulting the optimizer). Upstream's version is used. |
 | `690846dd8` | `InlineAuthzConfig.primaryUpstreamProvider` on `VirtualMCPServer` | Upstream added it in v0.27.1 and moved it to `spec.authServerConfig.primaryUpstreamProvider`; the inline location is still read (deprecated). Dropped in the v0.28.3 merge. |
 | `4cca58224` | Prefer the caller's live identity on backend requests | Upstream #5335 (v0.28.0) does the same in `identityRoundTripper`. Dropped in the v0.28.3 merge. |
+| `e492cbfad` | Bind sessions to the `sub` claim instead of the bearer token | Upstream #5378 (v0.29.x) binds to `(iss, sub)`. Dropped in the v0.29.3 merge. |
