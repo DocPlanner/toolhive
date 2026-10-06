@@ -16,8 +16,6 @@ import (
 	"path/filepath"
 	"runtime"
 
-	"github.com/docker/docker/api/types/build"
-	"github.com/docker/docker/client"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -30,33 +28,20 @@ import (
 // for direct registry operations without requiring a Docker daemon.
 // However, for building images from Dockerfiles, it still uses the Docker client.
 type RegistryImageManager struct {
-	keychain     authn.Keychain
-	platform     *v1.Platform
-	dockerClient *client.Client // Used for building images from Dockerfiles
-	daemonClient daemon.Client  // Used for daemon.Image/daemon.Write (go-containerregistry)
-	mobyClient   *mobyclient.Client
+	keychain authn.Keychain
+	platform *v1.Platform
+	// dockerClient is used for building images from Dockerfiles and, because the
+	// moby/moby client already satisfies the go-containerregistry daemon.Client
+	// interface, for daemon.Image/daemon.Write operations as well.
+	dockerClient *mobyclient.Client
 }
 
 // NewRegistryImageManager creates a new RegistryImageManager instance
-func NewRegistryImageManager(dockerClient *client.Client) *RegistryImageManager {
-	// Create a moby/moby client that satisfies the daemon.Client interface
-	// required by go-containerregistry, using the same host and HTTP client
-	// as the docker client.
-	mobyClient, err := mobyclient.New(
-		mobyclient.WithHost(dockerClient.DaemonHost()),
-		mobyclient.WithHTTPClient(dockerClient.HTTPClient()),
-	)
-	if err != nil {
-		// Fall back: this should not happen since we already have a working docker client
-		slog.Warn("failed to create moby client for daemon operations, daemon image operations may fail", "error", err)
-	}
-
+func NewRegistryImageManager(dockerClient *mobyclient.Client) *RegistryImageManager {
 	return &RegistryImageManager{
 		keychain:     NewCompositeKeychain(), // Use composite keychain (env vars + default)
 		platform:     getDefaultPlatform(),   // Use a default platform based on host architecture
-		dockerClient: dockerClient,           // Used solely for building images from Dockerfiles
-		daemonClient: mobyClient,             // Used for go-containerregistry daemon operations
-		mobyClient:   mobyClient,
+		dockerClient: dockerClient,
 	}
 }
 
@@ -78,7 +63,7 @@ func (r *RegistryImageManager) ImageExists(_ context.Context, imageName string) 
 	}
 
 	// First check if image exists locally in daemon
-	if _, err := daemon.Image(ref, daemon.WithClient(r.daemonClient)); err != nil {
+	if _, err := daemon.Image(ref, daemon.WithClient(r.dockerClient)); err != nil {
 		// Image does not exist locally
 		return false, nil
 	}
@@ -123,7 +108,7 @@ func (r *RegistryImageManager) PullImage(ctx context.Context, imageName string) 
 	}
 
 	// Save the image to the local daemon
-	response, err := daemon.Write(tag, img, daemon.WithClient(r.daemonClient))
+	response, err := daemon.Write(tag, img, daemon.WithClient(r.dockerClient))
 	if err != nil {
 		return fmt.Errorf("failed to write image to daemon: %w", err)
 	}
@@ -148,10 +133,10 @@ func (r *RegistryImageManager) pullDigestViaDockerDaemon(ctx context.Context, im
 		}
 	}
 
-	if r.mobyClient == nil {
+	if r.dockerClient == nil {
 		return fmt.Errorf("failed to pull image %q: docker daemon client unavailable", imageName)
 	}
-	resp, err := r.mobyClient.ImagePull(ctx, imageName, mobyclient.ImagePullOptions{
+	resp, err := r.dockerClient.ImagePull(ctx, imageName, mobyclient.ImagePullOptions{
 		RegistryAuth: registryAuth,
 	})
 	if err != nil {
@@ -186,7 +171,7 @@ func (r *RegistryImageManager) WithPlatform(platform *v1.Platform) *RegistryImag
 }
 
 // buildDockerImage builds a Docker image using the Docker client API
-func buildDockerImage(ctx context.Context, dockerClient *client.Client, contextDir, imageName string) error {
+func buildDockerImage(ctx context.Context, dockerClient *mobyclient.Client, contextDir, imageName string) error {
 	//nolint:gosec // G706: image name and context dir from config
 	slog.Debug("building image", "image", imageName, "context_dir", contextDir)
 
@@ -224,7 +209,7 @@ func buildDockerImage(ctx context.Context, dockerClient *client.Client, contextD
 	}
 
 	// Build the image
-	buildOptions := build.ImageBuildOptions{
+	buildOptions := mobyclient.ImageBuildOptions{
 		Tags:       []string{imageName},
 		Dockerfile: "Dockerfile",
 		Remove:     true,

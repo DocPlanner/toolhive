@@ -69,6 +69,10 @@ type ServeConfig struct {
 	// the loaded config does not already define an audit section.
 	EnableAudit bool
 
+	// SessionTTL is the inactivity timeout for vMCP sessions.
+	// Zero uses the server default (30m). Negative values fail validation.
+	SessionTTL time.Duration
+
 	// Optimizer tier selection (Phase 4 — flag-driven).
 	// EnableOptimizer enables Tier 1 FTS5 keyword search (find_tool / call_tool).
 	EnableOptimizer bool
@@ -112,6 +116,9 @@ func (c ServeConfig) validateQuickModeHost() error {
 func Serve(ctx context.Context, cfg ServeConfig) error {
 	if err := cfg.validateQuickModeHost(); err != nil {
 		return err
+	}
+	if cfg.SessionTTL < 0 {
+		return fmt.Errorf("session-ttl must be non-negative, got %s", cfg.SessionTTL)
 	}
 
 	// Load and validate configuration — file path takes precedence over group quick mode.
@@ -245,6 +252,15 @@ func Serve(ctx context.Context, cfg ServeConfig) error {
 
 	slog.Info(fmt.Sprintf("Setting up incoming authentication (type: %s)", vmcpCfg.IncomingAuth.Type))
 
+	if vmcpCfg.IncomingAuth.Type == config.IncomingAuthTypeAnonymous {
+		slog.Warn(
+			"vMCP is configured with anonymous incoming auth; all anonymous sessions share a single sentinel binding, "+
+				"so possession of a session ID is sufficient to act as that session from any source. "+
+				"Anonymous mode is intended for development only.",
+			"incoming_auth_type", config.IncomingAuthTypeAnonymous,
+		)
+	}
+
 	// Configure health monitoring if enabled.
 	var healthMonitorConfig *health.MonitorConfig
 	if vmcpCfg.Operational != nil &&
@@ -329,16 +345,11 @@ func Serve(ctx context.Context, cfg ServeConfig) error {
 	}
 
 	envReader := &env.OSReader{}
-	sessionFactory, err := createSessionFactory(
-		envReader.Getenv("VMCP_SESSION_HMAC_SECRET"),
-		runtime.IsKubernetesRuntimeWithEnv(envReader),
-		outgoingRegistry,
-		agg,
-		backendTimeoutSessionOptions(vmcpCfg)...,
-	)
-	if err != nil {
-		return err
+	if hmacSecret := envReader.Getenv("VMCP_SESSION_HMAC_SECRET"); hmacSecret != "" {
+		slog.Debug("VMCP_SESSION_HMAC_SECRET is set but no longer used after #5306; ignoring",
+			"env_var", "VMCP_SESSION_HMAC_SECRET")
 	}
+	sessionFactory := createSessionFactory(outgoingRegistry, agg, backendTimeoutSessionOptions(vmcpCfg)...)
 
 	// When the optimizer is enabled, its meta-tools must pass through the authz
 	// response filter so they appear in tools/list.
@@ -361,7 +372,7 @@ func Serve(ctx context.Context, cfg ServeConfig) error {
 	}
 
 	authMiddleware, authzMiddleware, authInfoHandler, err :=
-		factory.NewIncomingAuthMiddleware(ctx, vmcpCfg.IncomingAuth, passThroughTools, upstreamReader, keyProvider)
+		factory.NewIncomingAuthMiddleware(ctx, vmcpCfg.IncomingAuth, vmcpCfg.Name, passThroughTools, upstreamReader, keyProvider)
 	if err != nil {
 		return fmt.Errorf("failed to create authentication middleware: %w", err)
 	}
@@ -374,6 +385,7 @@ func Serve(ctx context.Context, cfg ServeConfig) error {
 		GroupRef:                vmcpCfg.Group,
 		Host:                    cfg.Host,
 		Port:                    cfg.Port,
+		SessionTTL:              sessionTTLFromConfig(cfg.SessionTTL, vmcpCfg),
 		AuthMiddleware:          authMiddleware,
 		AuthzMiddleware:         authzMiddleware,
 		AuthInfoHandler:         authInfoHandler,
@@ -387,7 +399,6 @@ func Serve(ctx context.Context, cfg ServeConfig) error {
 		OptimizerConfig:         optCfg,
 		SessionFactory:          sessionFactory,
 		SessionStorage:          vmcpCfg.SessionStorage,
-		SessionTTL:              time.Duration(vmcpCfg.SessionTTL),
 		WriteTimeout:            serverWriteTimeoutFromConfig(vmcpCfg),
 		SessionOwnerAdvertiseURL: resolveSessionOwnerAdvertiseURL(
 			envReader.Getenv(envVMCPSessionOwnerURL),
@@ -574,10 +585,21 @@ func discoverBackends(
 	if len(cfg.Backends) > 0 {
 		// Static mode: use pre-configured backends from config.
 		slog.Info(fmt.Sprintf("Static mode: using %d pre-configured backends", len(cfg.Backends)))
+
+		// Reconstruct per-backend HeaderForwardConfig from env vars the
+		// operator emitted on this pod. Plaintext header values are inline
+		// in the JSON manifest; secret-backed headers carry only identifiers
+		// here and resolve later via secrets.EnvironmentProvider at request
+		// time. Map keys are the normalized entry segment from the env-var
+		// suffix; the discoverer normalizes Backend.Name through
+		// ctrlutil.NormalizeHeaderForEnvVar to look up the matching entry.
+		// Returns an empty map when no entry in the group declared
+		// headerForward — the common case.
 		discoverer = aggregator.NewUnifiedBackendDiscovererWithStaticBackends(
 			cfg.Backends,
 			cfg.OutgoingAuth,
 			cfg.Group,
+			readHeaderForwardFromEnv(os.Environ()),
 		)
 	} else {
 		// Dynamic mode: discover backends at runtime from the active workload manager (K8s or local).
@@ -634,53 +656,18 @@ func runDiscovery(
 	return backends, backendClient, outgoingRegistry, nil
 }
 
-// createSessionFactory creates a MultiSessionFactory with HMAC-SHA256 token binding.
-// The HMAC secret and Kubernetes detection are passed in as parameters (typically sourced
-// from the VMCP_SESSION_HMAC_SECRET environment variable and runtime environment detection
-// by the caller).
-//
-// Behavior:
-//   - If hmacSecret is non-empty: validates length and creates factory with the secret.
-//   - If running in Kubernetes without secret: returns error (production safety requirement).
-//   - Otherwise: logs warning and creates factory with default insecure secret.
+// createSessionFactory creates a MultiSessionFactory backed by the provided outgoing
+// auth registry and optional aggregator. When agg is non-nil, sessions gain access
+// to aggregated backend metadata; pass nil for single-backend deployments.
 func createSessionFactory(
-	hmacSecret string,
-	isKubernetes bool,
 	outgoingRegistry vmcpauth.OutgoingAuthRegistry,
 	agg aggregator.Aggregator,
 	extraOpts ...vmcpsession.MultiSessionFactoryOption,
-) (vmcpsession.MultiSessionFactory, error) {
-	const minRecommendedSecretLen = 32
-
-	opts := []vmcpsession.MultiSessionFactoryOption{}
+) vmcpsession.MultiSessionFactory {
+	var opts []vmcpsession.MultiSessionFactoryOption
 	if agg != nil {
 		opts = append(opts, vmcpsession.WithAggregator(agg))
 	}
 	opts = append(opts, extraOpts...)
-
-	if hmacSecret != "" {
-		if secretLen := len(hmacSecret); secretLen < minRecommendedSecretLen {
-			// G706: Safe - only logging integer length, not the secret itself.
-			slog.Warn( //nolint:gosec
-				"HMAC secret is shorter than recommended length - consider using a longer secret",
-				"actual_length", secretLen,
-				"recommended_length", minRecommendedSecretLen,
-			)
-		}
-		slog.Info("using provided HMAC secret for session token binding")
-		opts = append(opts, vmcpsession.WithHMACSecret([]byte(hmacSecret)))
-		return vmcpsession.NewSessionFactory(outgoingRegistry, opts...), nil
-	}
-
-	// No secret provided — fail fast in Kubernetes (production environment).
-	if isKubernetes {
-		return nil, fmt.Errorf(
-			"an HMAC secret is required when running in Kubernetes (set VMCP_SESSION_HMAC_SECRET). " +
-				"Generate a secure secret with: openssl rand -base64 32",
-		)
-	}
-
-	// Development mode: use default insecure secret with warning.
-	slog.Warn("no HMAC secret provided - using default insecure secret (NOT recommended for production)")
-	return vmcpsession.NewSessionFactory(outgoingRegistry, opts...), nil
+	return vmcpsession.NewSessionFactory(outgoingRegistry, opts...)
 }

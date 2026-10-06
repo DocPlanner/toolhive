@@ -17,6 +17,7 @@ import (
 
 	"golang.org/x/oauth2"
 
+	tcredis "github.com/stacklok/toolhive-core/redis"
 	"github.com/stacklok/toolhive/pkg/auth"
 	"github.com/stacklok/toolhive/pkg/auth/remote"
 	authsecrets "github.com/stacklok/toolhive/pkg/auth/secrets"
@@ -120,6 +121,7 @@ func NewRunner(runConfig *RunConfig, statusManager statuses.StatusManager) *Runn
 func newTransportSessionStorage(
 	ctx context.Context,
 	scalingConfig *ScalingConfig,
+	ttl time.Duration,
 ) (transportsession.Storage, error) {
 	if scalingConfig == nil || scalingConfig.SessionRedis == nil {
 		return nil, nil
@@ -130,15 +132,16 @@ func newTransportSessionStorage(
 		keyPrefix = defaultProxySessionKeyPrefix
 	}
 
-	redisCfg := transportsession.RedisConfig{
-		Addr:      scalingConfig.SessionRedis.Address,
-		Username:  os.Getenv(vmcpconfig.RedisUsernameEnvVar),
-		Password:  os.Getenv(vmcpconfig.RedisPasswordEnvVar),
-		DB:        int(scalingConfig.SessionRedis.DB),
-		KeyPrefix: keyPrefix,
+	// toolhive-core's client config has no username source of its own; the
+	// operator injects the ACL username from sessionStorage.usernameRef.
+	redisCfg := tcredis.Config{
+		Addr:     scalingConfig.SessionRedis.Address,
+		Username: os.Getenv(vmcpconfig.RedisUsernameEnvVar),
+		Password: os.Getenv(vmcpconfig.RedisPasswordEnvVar),
+		DB:       int(scalingConfig.SessionRedis.DB),
 	}
 
-	storage, err := transportsession.NewRedisStorage(ctx, redisCfg, transportsession.ResolveSessionTTLFromEnv())
+	storage, err := transportsession.NewRedisStorage(ctx, redisCfg, keyPrefix, ttl)
 	if err != nil {
 		return nil, fmt.Errorf("creating redis session storage: %w", err)
 	}
@@ -198,6 +201,31 @@ func (c *RunConfig) GetPort() int {
 //
 //nolint:gocyclo // This function is complex but manageable
 func (r *Runner) Run(ctx context.Context) error {
+	// Resolve session TTL once so both the transport proxy and Redis storage use
+	// the same effective value, rather than each applying their own zero-fallback
+	// independently. SessionTTL is stored as a Go duration string so the
+	// runconfig wire format does not depend on nanosecond integers.
+	// Proxy tuning knobs are declared as workload env vars (MCPServer spec.env)
+	// but are read by this process, so mirror them before the transport and the
+	// session store resolve their configuration.
+	applyProxyProcessEnv(r.Config.EnvVars)
+
+	// DocPlanner fork: without an explicit session_ttl, fall back to the
+	// TOOLHIVE_PROXY_SESSION_TTL env override before the upstream default.
+	effectiveSessionTTL := transportsession.ResolveSessionTTLFromEnv()
+	if r.Config.SessionTTL != "" {
+		parsed, err := time.ParseDuration(r.Config.SessionTTL)
+		if err != nil {
+			return fmt.Errorf("invalid session_ttl %q: %w", r.Config.SessionTTL, err)
+		}
+		if parsed < 0 {
+			return fmt.Errorf("session_ttl must be non-negative, got %s", parsed)
+		}
+		if parsed > 0 {
+			effectiveSessionTTL = parsed
+		}
+	}
+
 	// Create transport with runtime
 	transportConfig := types.Config{
 		Type:              r.Config.Transport,
@@ -209,6 +237,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		Debug:             r.Config.Debug,
 		TrustProxyHeaders: r.Config.TrustProxyHeaders,
 		EndpointPrefix:    r.Config.EndpointPrefix,
+		SessionTTL:        effectiveSessionTTL,
 	}
 
 	// Set proxy mode for stdio transport
@@ -373,6 +402,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			r.Config.TargetHost,
 			r.Config.Publish,
 			scalingConfig,
+			r.Config.MCPServerGeneration,
 		)
 		if err != nil {
 			return fmt.Errorf("failed to set up workload: %w", err)
@@ -386,15 +416,10 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}
 
-	// Proxy tuning knobs are declared as workload env vars (MCPServer spec.env)
-	// but are read by this process, so mirror them before the transport and the
-	// session store resolve their configuration.
-	applyProxyProcessEnv(r.Config.EnvVars)
-
 	// When Redis session storage is configured, create a Redis-backed session
 	// store so sessions are shared across proxy replicas instead of being pod-local.
 	if r.Config.ScalingConfig != nil && r.Config.ScalingConfig.SessionRedis != nil {
-		storage, err := newTransportSessionStorage(ctx, r.Config.ScalingConfig)
+		storage, err := newTransportSessionStorage(ctx, r.Config.ScalingConfig, effectiveSessionTTL)
 		if err != nil {
 			return fmt.Errorf("failed to create Redis session storage: %w", err)
 		}
@@ -423,7 +448,25 @@ func (r *Runner) Run(ctx context.Context) error {
 			r.monitoringCtx, r.monitoringCancel = context.WithCancel(ctx)
 			// Create adapter to bridge statuses.StatusManager to auth.StatusUpdater
 			adapter := &statusManagerAdapter{sm: r.statusManager}
-			r.authenticatedTokenSource = auth.NewMonitoredTokenSource(r.monitoringCtx, tokenSource, r.Config.BaseName, adapter)
+
+			// Capture the upstream issuer and resolved client_id so the DCR
+			// remediation warning emitted by isTransientNetworkError on a
+			// permanent 4xx (indicating a stale RFC 7591 registration)
+			// carries enough context for an operator to identify which
+			// upstream AS + client_id to re-register. Precedence (cached
+			// CIMD > cached DCR > static) lives next to
+			// resolveClientCredentials in pkg/auth/remote so both call
+			// sites stay in sync.
+			upstream, clientID := r.Config.RemoteAuthConfig.LogContext()
+
+			r.authenticatedTokenSource = auth.NewMonitoredTokenSource(
+				r.monitoringCtx,
+				tokenSource,
+				r.Config.BaseName,
+				upstream,
+				clientID,
+				adapter,
+			)
 			tokenSource = r.authenticatedTokenSource
 			r.authenticatedTokenSource.StartBackgroundMonitoring()
 		}

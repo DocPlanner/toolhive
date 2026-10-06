@@ -417,7 +417,7 @@ func TestCreateRunConfigFromMCPServer(t *testing.T) {
 
 				// Verify authorization config is set
 				assert.NotNil(t, config.AuthzConfig)
-				assert.Equal(t, "v1", config.AuthzConfig.Version)
+				assert.Equal(t, ctrlutil.AuthzConfigVersion, config.AuthzConfig.Version)
 				assert.Equal(t, authz.ConfigType(cedar.ConfigType), config.AuthzConfig.Type)
 
 				// Check Cedar-specific configuration
@@ -455,7 +455,7 @@ func TestCreateRunConfigFromMCPServer(t *testing.T) {
 
 				// For ConfigMap type, with new feature, authorization config is embedded in RunConfig
 				require.NotNil(t, config.AuthzConfig)
-				assert.Equal(t, "v1", config.AuthzConfig.Version)
+				assert.Equal(t, ctrlutil.AuthzConfigVersion, config.AuthzConfig.Version)
 				assert.Equal(t, authz.ConfigType(cedar.ConfigType), config.AuthzConfig.Type)
 
 				cedarCfg, err := cedar.ExtractConfig(config.AuthzConfig)
@@ -493,7 +493,7 @@ func TestCreateRunConfigFromMCPServer(t *testing.T) {
 							}
 							return ctrlutil.DefaultAuthzKey
 						}(): `{
-							"version": "v1",
+							"version": "1.0",
 							"type": "cedarv1",
 							"cedar": {
 								"policies": [
@@ -799,7 +799,7 @@ func TestEnsureRunConfigConfigMap(t *testing.T) {
 
 				// Verify authorization configuration is properly serialized
 				assert.NotNil(t, runConfig.AuthzConfig, "AuthzConfig should be present in runconfig.json")
-				assert.Equal(t, "v1", runConfig.AuthzConfig.Version)
+				assert.Equal(t, ctrlutil.AuthzConfigVersion, runConfig.AuthzConfig.Version)
 				assert.Equal(t, authz.ConfigType(cedar.ConfigType), runConfig.AuthzConfig.Type)
 
 				// Check Cedar-specific configuration
@@ -928,7 +928,7 @@ func TestEnsureRunConfigConfigMap(t *testing.T) {
 			},
 			Data: map[string]string{
 				"authz.json": `{
-					"version": "v1",
+					"version": "1.0",
 					"type": "cedarv1",
 					"cedar": {
 						"policies": [
@@ -966,7 +966,7 @@ func TestEnsureRunConfigConfigMap(t *testing.T) {
 		require.NoError(t, err)
 
 		require.NotNil(t, runConfig.AuthzConfig)
-		assert.Equal(t, "v1", runConfig.AuthzConfig.Version)
+		assert.Equal(t, ctrlutil.AuthzConfigVersion, runConfig.AuthzConfig.Version)
 		assert.Equal(t, authz.ConfigType(cedar.ConfigType), runConfig.AuthzConfig.Type)
 
 		cedarCfg, err := cedar.ExtractConfig(runConfig.AuthzConfig)
@@ -1782,4 +1782,35 @@ func TestCreateRunConfigFromMCPServer_RateLimiting(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCreateRunConfigFromMCPServer_SetsMCPServerGeneration(t *testing.T) {
+	t.Parallel()
+
+	m := &mcpv1beta1.MCPServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "generation-server",
+			Namespace:  "default",
+			Generation: 7,
+		},
+		Spec: mcpv1beta1.MCPServerSpec{
+			Image:     "ghcr.io/example/mcp:v1",
+			Transport: stdioTransport,
+			ProxyPort: 8080,
+		},
+	}
+
+	r := newTestMCPServerReconciler(
+		fake.NewClientBuilder().WithScheme(createRunConfigTestScheme()).WithObjects(m).Build(),
+		createRunConfigTestScheme(),
+		kubernetes.PlatformKubernetes,
+	)
+
+	rc, err := r.createRunConfigFromMCPServer(m)
+
+	require.NoError(t, err)
+	require.NotNil(t, rc)
+
+	assert.Equal(t, int64(7), rc.MCPServerGeneration,
+		"MCPServerGeneration should match MCPServer .metadata.generation")
 }

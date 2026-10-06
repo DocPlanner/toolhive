@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"time"
 
 	josev3 "github.com/go-jose/go-jose/v3"
 	"github.com/ory/fosite"
@@ -21,9 +22,22 @@ import (
 
 // server is the internal implementation of the Server interface.
 type server struct {
-	handler   http.Handler
-	storage   storage.Storage
+	handler http.Handler
+	// storage is the active storage backend, potentially wrapped by decorators
+	// such as CIMDStorageDecorator. Code that needs the concrete type must walk
+	// the Unwrap() chain rather than asserting directly.
+	storage storage.Storage
+	// dcrStore is the same storage.Storage value asserted to
+	// storage.DCRCredentialStore. The assertion runs once at construction
+	// (newServer) so DCRStore() is a field read rather than re-asserting on
+	// every call, and a backend that does not implement DCRCredentialStore
+	// is rejected at boot rather than at first DCR resolve.
+	dcrStore  storage.DCRCredentialStore
 	upstreams []handlers.NamedUpstream
+	// refreshTokenLifespan mirrors the validated Config.RefreshTokenLifespan.
+	// It is threaded into upstreamTokenRefresher so the refresh path can
+	// re-anchor SessionExpiresAt for legacy storage rows missing that field.
+	refreshTokenLifespan time.Duration
 }
 
 // upstreamProviderFactory creates an upstream OAuth2Provider from configuration.
@@ -88,6 +102,20 @@ func newServer(ctx context.Context, cfg Config, stor storage.Storage, opts ...se
 		return nil, fmt.Errorf("storage is required")
 	}
 
+	// Storage no longer embeds DCRCredentialStore (the embed widened secret
+	// reach to every Storage consumer); obtain the DCR-capable handle via an
+	// explicit assertion at the boundary. The per-backend
+	// `var _ DCRCredentialStore = (*MemoryStorage)(nil)` /
+	// `var _ DCRCredentialStore = (*RedisStorage)(nil)` checks make this
+	// provably safe for the production backends; surfacing a bad backend as
+	// a constructor error keeps misconfiguration fail-loud at boot rather
+	// than at first DCR resolve.
+	baseStore := unwrapStorage(stor)
+	dcrStore, ok := baseStore.(storage.DCRCredentialStore)
+	if !ok {
+		return nil, fmt.Errorf("storage backend %T does not implement storage.DCRCredentialStore", baseStore)
+	}
+
 	slog.Debug("creating OAuth2 configuration")
 
 	// Get signing key from KeyProvider
@@ -107,8 +135,10 @@ func newServer(ctx context.Context, cfg Config, stor storage.Storage, opts ...se
 		SigningKeyAlgorithm:          signingKey.Algorithm,
 		SigningKey:                   signingKey.Key,
 		ScopesSupported:              cfg.ScopesSupported,
+		BaselineClientScopes:         cfg.BaselineClientScopes,
 		AllowedAudiences:             cfg.AllowedAudiences,
 		AuthorizationEndpointBaseURL: cfg.AuthorizationEndpointBaseURL,
+		CIMDEnabled:                  cfg.CIMDEnabled,
 	}
 	authServerConfig, err := oauthserver.NewAuthorizationServerConfig(oauthParams)
 	if err != nil {
@@ -120,10 +150,6 @@ func newServer(ctx context.Context, cfg Config, stor storage.Storage, opts ...se
 		"refresh_token_lifespan", cfg.RefreshTokenLifespan,
 		"auth_code_lifespan", cfg.AuthCodeLifespan,
 	)
-
-	// Create fosite provider
-	slog.Debug("creating fosite OAuth2 provider")
-	fositeProvider := createProvider(authServerConfig, stor)
 
 	// Build ordered upstream provider list from all configured upstreams.
 	upstreams := make([]handlers.NamedUpstream, 0, len(cfg.Upstreams))
@@ -143,14 +169,35 @@ func newServer(ctx context.Context, cfg Config, stor storage.Storage, opts ...se
 
 	// Run one-shot bulk migration of legacy data before handler construction.
 	// TODO(migration): Remove once all deployments have upgraded past this version.
-	if rs, ok := stor.(*storage.RedisStorage); ok {
-		for i := range cfg.Upstreams {
-			upCfg := &cfg.Upstreams[i]
-			if err := rs.MigrateLegacyUpstreamData(ctx, upCfg.Name, string(upCfg.Type)); err != nil {
-				return nil, fmt.Errorf("legacy data migration failed for upstream %q: %w", upCfg.Name, err)
-			}
+	if err := runLegacyMigration(ctx, stor, cfg.Upstreams); err != nil {
+		return nil, err
+	}
+
+	// Wrap storage with the CIMD decorator before constructing the fosite provider
+	// so that GetClient calls for HTTPS client_id values are intercepted at the
+	// fosite level (not just the handler level).
+	if cfg.CIMDEnabled {
+		if len(cfg.BaselineClientScopes) > 0 {
+			slog.Warn("CIMD is enabled with baseline_client_scopes configured; "+
+				"any third-party client resolved via CIMD will also receive these scopes — "+
+				"ensure they are scopes you would grant by default to any unknown client",
+				"baseline_client_scopes", cfg.BaselineClientScopes)
+		}
+		stor, err = storage.NewCIMDStorageDecorator(stor, storage.CIMDDecoratorConfig{
+			Enabled:              true,
+			CacheMaxSize:         cfg.CIMDCacheMaxSize,
+			FallbackTTL:          cfg.CIMDCacheFallbackTTL,
+			ScopesSupported:      cfg.ScopesSupported,
+			BaselineClientScopes: cfg.BaselineClientScopes,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize CIMD storage decorator: %w", err)
 		}
 	}
+
+	// Create fosite provider with the (possibly decorated) storage.
+	slog.Debug("creating fosite OAuth2 provider")
+	fositeProvider := createProvider(authServerConfig, stor)
 
 	handlerInstance, err := handlers.NewHandler(fositeProvider, authServerConfig, stor, upstreams)
 	if err != nil {
@@ -165,9 +212,11 @@ func newServer(ctx context.Context, cfg Config, stor storage.Storage, opts ...se
 	)
 
 	return &server{
-		handler:   router,
-		storage:   stor,
-		upstreams: upstreams,
+		handler:              router,
+		storage:              stor,
+		dcrStore:             dcrStore,
+		upstreams:            upstreams,
+		refreshTokenLifespan: cfg.RefreshTokenLifespan,
 	}, nil
 }
 
@@ -179,6 +228,12 @@ func (s *server) Handler() http.Handler {
 // IDPTokenStorage returns the IDP token storage interface.
 func (s *server) IDPTokenStorage() storage.UpstreamTokenStorage {
 	return s.storage
+}
+
+// DCRStore returns the persistent DCR credential store the server is wired
+// against. See the Server interface doc for SECURITY and lifecycle notes.
+func (s *server) DCRStore() storage.DCRCredentialStore {
+	return s.dcrStore
 }
 
 // UpstreamTokenRefresher returns a refresher that wraps the upstream providers
@@ -193,8 +248,9 @@ func (s *server) UpstreamTokenRefresher() storage.UpstreamTokenRefresher {
 		providers[u.Name] = u.Provider
 	}
 	return &upstreamTokenRefresher{
-		providers: providers,
-		storage:   s.storage,
+		providers:            providers,
+		storage:              s.storage,
+		refreshTokenLifespan: s.refreshTokenLifespan,
 	}
 }
 
@@ -259,4 +315,32 @@ func createProvider(authServerConfig *oauthserver.AuthorizationServerConfig, sto
 		compose.OAuth2RefreshTokenGrantFactory, // Refresh token grant
 		compose.OAuth2PKCEFactory,              // PKCE for public clients
 	)
+}
+
+// unwrapStorage peels off one decorator layer if the storage implements
+// Unwrap(), returning the concrete backend. Both newServer (DCRCredentialStore
+// assertion) and runLegacyMigration (RedisStorage type assertion) need this.
+func unwrapStorage(stor storage.Storage) storage.Storage {
+	if unwrapper, ok := stor.(interface{ Unwrap() storage.Storage }); ok {
+		return unwrapper.Unwrap()
+	}
+	return stor
+}
+
+// runLegacyMigration runs one-shot Redis data migrations before handlers are
+// constructed. It is a no-op for non-Redis backends and passes through any
+// decorator wrapping so the concrete type can be reached.
+func runLegacyMigration(ctx context.Context, stor storage.Storage, upstreams []UpstreamConfig) error {
+	base := unwrapStorage(stor)
+	rs, ok := base.(*storage.RedisStorage)
+	if !ok {
+		return nil
+	}
+	for i := range upstreams {
+		upCfg := &upstreams[i]
+		if err := rs.MigrateLegacyUpstreamData(ctx, upCfg.Name, string(upCfg.Type)); err != nil {
+			return fmt.Errorf("legacy data migration failed for upstream %q: %w", upCfg.Name, err)
+		}
+	}
+	return nil
 }

@@ -64,7 +64,7 @@ func newMockFactory(t *testing.T, ctrl *gomock.Controller, sess vmcpsession.Mult
 	t.Helper()
 	factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 	factory.EXPECT().
-		MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 		Return(sess, nil).AnyTimes()
 	return factory
 }
@@ -74,7 +74,7 @@ func newMockFactoryWithError(t *testing.T, ctrl *gomock.Controller, err error) *
 	t.Helper()
 	factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 	factory.EXPECT().
-		MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 		Return(nil, err).AnyTimes()
 	return factory
 }
@@ -324,8 +324,8 @@ func TestSessionManager_CreateSession(t *testing.T) {
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		var createdSess *sessionmocks.MockMultiSession
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 				createdSess = newMockSession(t, ctrl, id, tools)
 				return createdSess, nil
 			}).AnyTimes()
@@ -391,8 +391,8 @@ func TestSessionManager_CreateSession(t *testing.T) {
 		factoryCalled := false
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 				factoryCalled = true
 				sess := newMockSession(t, ctrl, id, tools)
 				return sess, nil
@@ -426,8 +426,8 @@ func TestSessionManager_CreateSession(t *testing.T) {
 		factoryCalled := false
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 				factoryCalled = true
 				sess := newMockSession(t, ctrl, id, tools)
 				return sess, nil
@@ -464,8 +464,8 @@ func TestSessionManager_CreateSession(t *testing.T) {
 		var createdSess *sessionmocks.MockMultiSession
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 				// Sleep to simulate slow backend initialization, creating a window
 				// where the client can terminate the session after the first check passes.
 				time.Sleep(50 * time.Millisecond)
@@ -518,8 +518,8 @@ func TestSessionManager_CreateSession(t *testing.T) {
 
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, backends []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, backends []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 				require.Len(t, backends, 2)
 				assert.Equal(t, "healthy", backends[0].ID)
 				assert.Equal(t, "degraded", backends[1].ID)
@@ -680,15 +680,13 @@ func TestSessionManager_RefreshSession(t *testing.T) {
 
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), sessionID, gomock.Any(), false, gomock.Any()).
+			MakeSessionWithID(gomock.Any(), sessionID, gomock.Any(), gomock.Any()).
 			DoAndReturn(func(
 				_ context.Context,
 				id string,
 				gotIdentity *auth.Identity,
-				allowAnonymous bool,
 				backends []*vmcp.Backend,
 			) (vmcpsession.MultiSession, error) {
-				require.False(t, allowAnonymous)
 				require.NotNil(t, gotIdentity)
 				assert.Equal(t, identity.Subject, gotIdentity.Subject)
 				assert.Equal(t, identity.Token, gotIdentity.Token)
@@ -838,8 +836,8 @@ func TestSessionManager_Terminate(t *testing.T) {
 		var createdSess *sessionmocks.MockMultiSession
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 				createdSess = newMockSession(t, ctrl, id, tools)
 				// Close() will be called exactly once during Terminate
 				createdSess.EXPECT().Close().Return(nil).Times(1)
@@ -870,8 +868,8 @@ func TestSessionManager_Terminate(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 				sess := newMockSession(t, ctrl, id, nil)
 				sess.EXPECT().Close().Return(nil).Times(1)
 				return sess, nil
@@ -1043,8 +1041,8 @@ func TestSessionManager_GetMultiSession(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 				sess := newMockSession(t, ctrl, id, tools)
 				return sess, nil
 			}).Times(1)
@@ -1069,7 +1067,7 @@ func TestSessionManager_GetMultiSession(t *testing.T) {
 	// Cross-pod restore path: session is in storage but not in the in-memory
 	// cache (simulates pod restart or eviction). loadSession is called on Get.
 
-	t.Run("restore path: placeholder in storage (absent token hash) is treated as not found", func(t *testing.T) {
+	t.Run("restore path: placeholder in storage (absent identity binding) is treated as not found", func(t *testing.T) {
 		t.Parallel()
 
 		ctrl := gomock.NewController(t)
@@ -1081,23 +1079,23 @@ func TestSessionManager_GetMultiSession(t *testing.T) {
 
 		sessionID := "restore-placeholder-session"
 		// Write placeholder metadata directly to storage, bypassing the cache.
-		// Generate() stores an empty map with no token hash.
+		// Generate() stores an empty map with no identity binding.
 		require.NoError(t, sm.storage.Upsert(context.Background(), sessionID, map[string]string{}))
 
-		// loadSession detects absent MetadataKeyTokenHash → ErrSessionNotFound.
+		// loadSession detects absent MetadataKeyIdentityBinding → ErrSessionNotFound.
 		multiSess, ok := sm.GetMultiSession(context.Background(), sessionID)
 		assert.False(t, ok, "placeholder should not be restorable")
 		assert.Nil(t, multiSess)
 	})
 
-	t.Run("restore path: fully-initialized zero-backend session (has token hash) is restored", func(t *testing.T) {
+	t.Run("restore path: fully-initialized zero-backend session (has identity binding) is restored", func(t *testing.T) {
 		t.Parallel()
 
 		tools := []vmcp.Tool{{Name: "zero-backend-tool", Description: "tool with no backends"}}
 		ctrl := gomock.NewController(t)
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		// MakeSessionWithID is only for Phase 2; unused in the restore path.
-		factory.EXPECT().MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		factory.EXPECT().MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 			Times(0)
 
 		sessionID := "restore-zero-backend-session"
@@ -1109,12 +1107,13 @@ func TestSessionManager_GetMultiSession(t *testing.T) {
 
 		sm, _ := newTestSessionManager(t, factory, newFakeRegistry())
 
-		// Metadata matching what populateBackendMetadata now writes for a
-		// Phase-2-complete session with zero backends: MetadataKeyBackendIDs
-		// is always written (empty string for zero backends).
+		// Metadata matching what BindSession and populateBackendMetadata write
+		// for a Phase-2-complete anonymous session with zero backends:
+		// MetadataKeyIdentityBinding holds the unauthenticated sentinel;
+		// MetadataKeyBackendIDs is always written (empty string for zero backends).
 		initializedMeta := map[string]string{
-			sessiontypes.MetadataKeyTokenHash: "", // anonymous sentinel — present but empty
-			vmcpsession.MetadataKeyBackendIDs: "", // always written; empty = zero backends
+			sessiontypes.MetadataKeyIdentityBinding: "unauthenticated", // anonymous sentinel
+			vmcpsession.MetadataKeyBackendIDs:       "",                // always written; empty = zero backends
 		}
 		require.NoError(t, sm.storage.Upsert(context.Background(), sessionID, initializedMeta))
 
@@ -1135,7 +1134,7 @@ func TestSessionManager_GetMultiSession(t *testing.T) {
 		// RestoreSession. This test documents that backward-compat behaviour.
 		ctrl := gomock.NewController(t)
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
-		factory.EXPECT().MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		factory.EXPECT().MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 			Times(0)
 
 		sessionID := "restore-legacy-session"
@@ -1147,9 +1146,10 @@ func TestSessionManager_GetMultiSession(t *testing.T) {
 
 		sm, _ := newTestSessionManager(t, factory, newFakeRegistry())
 
-		// Legacy metadata: token hash present but MetadataKeyBackendIDs absent.
+		// Metadata with identity binding but MetadataKeyBackendIDs absent
+		// (sessions written before populateBackendMetadata always wrote the key).
 		legacyMeta := map[string]string{
-			sessiontypes.MetadataKeyTokenHash: "", // Phase 2 completion marker
+			sessiontypes.MetadataKeyIdentityBinding: "unauthenticated", // Phase 2 completion marker
 			// MetadataKeyBackendIDs intentionally absent (legacy record)
 		}
 		require.NoError(t, sm.storage.Upsert(context.Background(), sessionID, legacyMeta))
@@ -1157,6 +1157,140 @@ func TestSessionManager_GetMultiSession(t *testing.T) {
 		multiSess, ok := sm.GetMultiSession(context.Background(), sessionID)
 		require.True(t, ok, "legacy record without MetadataKeyBackendIDs must still be restorable")
 		require.NotNil(t, multiSess)
+		assert.Equal(t, sessionID, multiSess.ID())
+	})
+
+	t.Run("restore path: restored metadata is persisted back to storage", func(t *testing.T) {
+		t.Parallel()
+
+		// Simulate a backend that doesn't honor Mcp-Session-Id hints (e.g. SSE
+		// transport): RestoreSession assigns a fresh per-backend session ID.
+		// loadSession must write the restored session's metadata back to Redis so
+		// that stale per-backend session IDs do not persist indefinitely in storage.
+		ctrl := gomock.NewController(t)
+		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
+		factory.EXPECT().MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			Times(0)
+
+		sessionID := "restore-metadata-persist-session"
+
+		// The restored session returns fresh per-backend session metadata.
+		freshMeta := map[string]string{
+			sessiontypes.MetadataKeyIdentityBinding:                   "unauthenticated",
+			vmcpsession.MetadataKeyBackendIDs:                         "backend-a",
+			vmcpsession.MetadataKeyBackendSessionPrefix + "backend-a": "fresh-session-id",
+		}
+		restored := sessionmocks.NewMockMultiSession(ctrl)
+		restored.EXPECT().ID().Return(sessionID).AnyTimes()
+		restored.EXPECT().GetMetadata().Return(freshMeta).AnyTimes()
+
+		factory.EXPECT().
+			RestoreSession(gomock.Any(), sessionID, gomock.Any(), gomock.Any()).
+			Return(restored, nil).Times(1)
+
+		sm, storage := newTestSessionManager(t, factory, newFakeRegistry())
+
+		// Seed storage with stale per-backend session ID.
+		staleMeta := map[string]string{
+			sessiontypes.MetadataKeyIdentityBinding:                   "unauthenticated",
+			vmcpsession.MetadataKeyBackendIDs:                         "backend-a",
+			vmcpsession.MetadataKeyBackendSessionPrefix + "backend-a": "stale-session-id",
+		}
+		_, err := sm.storage.Create(context.Background(), sessionID, staleMeta)
+		require.NoError(t, err)
+
+		multiSess, ok := sm.GetMultiSession(context.Background(), sessionID)
+		require.True(t, ok, "session must be restored")
+		require.NotNil(t, multiSess)
+
+		// Verify storage now contains the fresh metadata written by loadSession.
+		storedMeta, loadErr := storage.Load(context.Background(), sessionID)
+		require.NoError(t, loadErr)
+		assert.Equal(t, freshMeta, storedMeta,
+			"loadSession must persist restored session metadata back to storage")
+	})
+
+	t.Run("restore path: concurrent delete between RestoreSession and Update returns ErrSessionNotFound", func(t *testing.T) {
+		t.Parallel()
+
+		// Simulate a Terminate / TTL expiry that races with loadSession's
+		// metadata write-back: deleteBeforeUpdateStorage deletes the key just
+		// before the first Update, so Update returns (false, nil).
+		// loadSession must treat this as ErrSessionNotFound and NOT cache the
+		// restored session.
+		ctrl := gomock.NewController(t)
+		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
+		factory.EXPECT().MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			Times(0)
+
+		sessionID := "restore-concurrent-delete-session"
+		restored := sessionmocks.NewMockMultiSession(ctrl)
+		restored.EXPECT().ID().Return(sessionID).AnyTimes()
+		restored.EXPECT().GetMetadata().Return(map[string]string{
+			sessiontypes.MetadataKeyIdentityBinding: "unauthenticated",
+		}).AnyTimes()
+
+		factory.EXPECT().
+			RestoreSession(gomock.Any(), sessionID, gomock.Any(), gomock.Any()).
+			Return(restored, nil).Times(1)
+		// loadSession calls Close on the restored session when a concurrent
+		// delete is detected (Update returns false, nil).
+		restored.EXPECT().Close().Return(nil).Times(1)
+
+		// Build Manager with the wrapping storage.
+		innerStorage := newTestSessionDataStorage(t)
+		racyStorage := &deleteBeforeUpdateStorage{DataStorage: innerStorage}
+		sm, cleanup, err := New(racyStorage, &FactoryConfig{Base: factory}, newFakeRegistry(), nil)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = cleanup(context.Background()) })
+
+		// Seed the inner storage with a valid session record.
+		_, err = innerStorage.Create(context.Background(), sessionID, map[string]string{
+			sessiontypes.MetadataKeyIdentityBinding: "unauthenticated",
+		})
+		require.NoError(t, err)
+
+		// GetMultiSession triggers loadSession; the racing delete causes
+		// Update to return (false, nil) → ErrSessionNotFound → (nil, false).
+		multiSess, ok := sm.GetMultiSession(context.Background(), sessionID)
+		assert.False(t, ok, "session deleted before metadata write-back must not be cached")
+		assert.Nil(t, multiSess)
+	})
+
+	t.Run("restore path: transient Update error is non-fatal, session is still returned", func(t *testing.T) {
+		t.Parallel()
+
+		// A transient Redis write failure during loadSession's metadata write-back
+		// must not prevent the restored session from being cached and served.
+		// The session is still usable on this pod; checkSession will detect any
+		// metadata drift on the next liveness check and evict if necessary.
+		ctrl := gomock.NewController(t)
+		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
+		factory.EXPECT().MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			Times(0)
+
+		sessionID := "restore-update-error-session"
+		restored := newMockSession(t, ctrl, sessionID, nil)
+
+		factory.EXPECT().
+			RestoreSession(gomock.Any(), sessionID, gomock.Any(), gomock.Any()).
+			Return(restored, nil).Times(1)
+
+		innerStorage := newTestSessionDataStorage(t)
+		faultyStorage := &errorOnUpdateStorage{DataStorage: innerStorage}
+		sm, cleanup, err := New(faultyStorage, &FactoryConfig{Base: factory}, newFakeRegistry(), nil)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = cleanup(context.Background()) })
+
+		_, err = innerStorage.Create(context.Background(), sessionID, map[string]string{
+			sessiontypes.MetadataKeyIdentityBinding: "unauthenticated",
+		})
+		require.NoError(t, err)
+
+		// Write failure must be non-fatal: session is still returned and cached.
+		multiSess, ok := sm.GetMultiSession(context.Background(), sessionID)
+		assert.True(t, ok, "transient Update error must not prevent session from being served")
+		assert.NotNil(t, multiSess)
 		assert.Equal(t, sessionID, multiSess.ID())
 	})
 }
@@ -1201,8 +1335,8 @@ func TestSessionManager_GetAdaptedTools(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 				return newMockSession(t, ctrl, id, tools), nil
 			}).Times(1)
 
@@ -1261,8 +1395,8 @@ func TestSessionManager_GetAdaptedTools(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 				return newMockSession(t, ctrl, id, tools), nil
 			}).Times(1)
 
@@ -1314,8 +1448,8 @@ func TestSessionManager_GetAdaptedTools(t *testing.T) {
 		}
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 				sess := newMockSession(t, ctrl, id, tools)
 				sess.EXPECT().CallTool(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 					Return(callToolResult, nil).Times(1)
@@ -1355,8 +1489,8 @@ func TestSessionManager_GetAdaptedTools(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 				sess := newMockSession(t, ctrl, id, tools)
 				sess.EXPECT().CallTool(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 					Return(nil, errors.New("backend exploded")).Times(1)
@@ -1394,8 +1528,8 @@ func TestSessionManager_GetAdaptedTools(t *testing.T) {
 
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 				callCount++
 				sess := newMockSession(t, ctrl, id, tools)
 				if callCount == 1 {
@@ -1449,8 +1583,8 @@ func TestSessionManager_GetAdaptedTools(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 				return newMockSession(t, ctrl, id, tools), nil
 			}).Times(1)
 
@@ -1485,8 +1619,8 @@ func TestSessionManager_GetAdaptedTools(t *testing.T) {
 		var capturedMeta map[string]any
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 				sess := newMockSession(t, ctrl, id, tools)
 				sess.EXPECT().CallTool(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 					DoAndReturn(func(_ context.Context, _ *auth.Identity, _ string, _ map[string]any, meta map[string]any) (*vmcp.ToolCallResult, error) {
@@ -1551,8 +1685,8 @@ func TestSessionManager_GetAdaptedTools(t *testing.T) {
 				authErr := tc.authError
 				factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 				factory.EXPECT().
-					MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-					DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+					MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+					DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 						sess := newMockSession(t, ctrl, id, tools)
 						sess.EXPECT().CallTool(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 							Return(nil, authErr).Times(1)
@@ -1699,8 +1833,8 @@ func TestSessionManager_GetAdaptedResources(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 				sess := newMockSession(t, ctrl, id, nil)
 				// Override default Resources() AnyTimes with a specific return
 				sess.EXPECT().Resources().Return(resources).AnyTimes()
@@ -1751,8 +1885,8 @@ func TestSessionManager_GetAdaptedResources(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 				sess := newMockSession(t, ctrl, id, nil)
 				sess.EXPECT().Resources().Return(resources).AnyTimes()
 				sess.EXPECT().ReadResource(gomock.Any(), gomock.Any(), "file:///data.txt").
@@ -1799,8 +1933,8 @@ func TestSessionManager_GetAdaptedResources(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 				sess := newMockSession(t, ctrl, id, nil)
 				sess.EXPECT().Resources().Return(resources).AnyTimes()
 				sess.EXPECT().ReadResource(gomock.Any(), gomock.Any(), "file:///broken.txt").
@@ -1846,8 +1980,8 @@ func TestSessionManager_GetAdaptedResources(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 				sess := newMockSession(t, ctrl, id, nil)
 				sess.EXPECT().Resources().Return(resources).AnyTimes()
 				sess.EXPECT().ReadResource(gomock.Any(), gomock.Any(), "file:///binary.bin").
@@ -1909,8 +2043,8 @@ func TestSessionManager_GetAdaptedResources(t *testing.T) {
 				ctrl := gomock.NewController(t)
 				factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 				factory.EXPECT().
-					MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-					DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+					MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+					DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 						sess := newMockSession(t, ctrl, id, nil)
 						sess.EXPECT().Resources().Return(resources).AnyTimes()
 						sess.EXPECT().ReadResource(gomock.Any(), gomock.Any(), "file:///protected.txt").
@@ -1989,8 +2123,8 @@ func TestSessionManager_GetAdaptedPrompts(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 				// Create mock directly (without newMockSession) so there is no
 				// pre-existing Prompts().Return(nil).AnyTimes() that would win
 				// the FIFO expectation race over our specific prompts list.
@@ -2050,8 +2184,8 @@ func TestSessionManager_GetAdaptedPrompts(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 				sess := sessionmocks.NewMockMultiSession(ctrl)
 				sess.EXPECT().ID().Return(id).AnyTimes()
 				sess.EXPECT().GetMetadata().Return(map[string]string{}).AnyTimes()
@@ -2092,8 +2226,8 @@ func TestSessionManager_GetAdaptedPrompts(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 				sess := sessionmocks.NewMockMultiSession(ctrl)
 				sess.EXPECT().ID().Return(id).AnyTimes()
 				sess.EXPECT().GetMetadata().Return(map[string]string{}).AnyTimes()
@@ -2143,8 +2277,8 @@ func TestSessionManager_GetAdaptedPrompts(t *testing.T) {
 				ctrl := gomock.NewController(t)
 				factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 				factory.EXPECT().
-					MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-					DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+					MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+					DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 						sess := sessionmocks.NewMockMultiSession(ctrl)
 						sess.EXPECT().ID().Return(id).AnyTimes()
 						sess.EXPECT().GetMetadata().Return(map[string]string{}).AnyTimes()
@@ -2197,8 +2331,8 @@ func TestSessionManager_DecorateSession(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
 				return newMockSession(t, ctrl, id, tools), nil
 			}).Times(1)
 
@@ -2260,10 +2394,17 @@ func TestSessionManager_DecorateSession(t *testing.T) {
 		// decorator fn, so the re-check that follows fn() sees it is gone.
 		ctrl := gomock.NewController(t)
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
+		// The mock session carries MetadataKeyIdentityBinding so that:
+		// 1. CreateSession stores it in storage (via sess.GetMetadata()), keeping
+		//    cache and storage in sync for checkSession's maps.Equal comparison.
+		// 2. Terminate sees the key and takes the Phase 2 path (storage.Delete).
+		bindingMeta := map[string]string{sessiontypes.MetadataKeyIdentityBinding: "unauthenticated"}
 		factory.EXPECT().
-			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ bool, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
-				sess := newMockSession(t, ctrl, id, nil)
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+				sess := sessionmocks.NewMockMultiSession(ctrl)
+				sess.EXPECT().ID().Return(id).AnyTimes()
+				sess.EXPECT().GetMetadata().Return(bindingMeta).AnyTimes()
 				sess.EXPECT().Close().Return(nil).AnyTimes()
 				return sess, nil
 			}).Times(1)
@@ -2302,7 +2443,7 @@ func TestSessionManager_CheckSession(t *testing.T) {
 		t.Helper()
 		ctrl := gomock.NewController(t)
 		f := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
-		f.EXPECT().MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		f.EXPECT().MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 			AnyTimes().Return(nil, nil)
 		f.EXPECT().RestoreSession(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 			AnyTimes().Return(nil, nil)
@@ -2559,6 +2700,13 @@ func TestNotifyBackendExpired(t *testing.T) {
 		_, err := sm.CreateSession(t.Context(), sessionID)
 		require.NoError(t, err)
 
+		// Seed MetadataKeyIdentityBinding into storage so Terminate recognises this
+		// as a Phase 2 (full MultiSession) and deletes rather than marks terminated.
+		_, err = storage.Update(context.Background(), sessionID, map[string]string{
+			sessiontypes.MetadataKeyIdentityBinding: "unauthenticated",
+		})
+		require.NoError(t, err)
+
 		_, err = sm.Terminate(sessionID)
 		require.NoError(t, err)
 
@@ -2671,6 +2819,179 @@ func TestNotifyBackendExpired(t *testing.T) {
 		assert.False(t, stillCached,
 			"session must be evicted from node-local cache after NotifyBackendExpired")
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Tests: Phase 2 marker migration (#5306)
+// ---------------------------------------------------------------------------
+
+// TestLoadSession_Phase2Marker_UsesIdentityBindingKey documents that the
+// Phase-2 detection key for the restore path is MetadataKeyIdentityBinding,
+// not the legacy MetadataKeyTokenHash. Sessions stored with only the legacy
+// key are treated as not found (ErrSessionNotFound) and the client must
+// re-initialize. Sessions stored with MetadataKeyIdentityBinding are restored
+// normally.
+func TestLoadSession_Phase2Marker_UsesIdentityBindingKey(t *testing.T) {
+	t.Parallel()
+
+	t.Run("legacy session (only MetadataKeyTokenHash) returns not found", func(t *testing.T) {
+		t.Parallel()
+
+		ctrl := gomock.NewController(t)
+		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
+		// RestoreSession must NOT be called for legacy sessions on the restore path.
+		factory.EXPECT().RestoreSession(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+
+		sm, _ := newTestSessionManager(t, factory, newFakeRegistry())
+
+		sessionID := "legacy-only-token-hash-session"
+		// Seed storage with only the legacy key — no MetadataKeyIdentityBinding.
+		_, err := sm.storage.Create(context.Background(), sessionID, map[string]string{
+			sessiontypes.MetadataKeyTokenHash: "",
+		})
+		require.NoError(t, err)
+
+		// loadSession must treat absent MetadataKeyIdentityBinding as a legacy session
+		// and return (nil, false) — not attempting RestoreSession.
+		multiSess, ok := sm.GetMultiSession(context.Background(), sessionID)
+		assert.False(t, ok, "legacy session with only MetadataKeyTokenHash must not be restored")
+		assert.Nil(t, multiSess)
+	})
+
+	t.Run("session with MetadataKeyIdentityBinding is restored normally", func(t *testing.T) {
+		t.Parallel()
+
+		tools := []vmcp.Tool{{Name: "restored-tool", Description: "a restored tool"}}
+		ctrl := gomock.NewController(t)
+		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
+		factory.EXPECT().MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			Times(0)
+
+		sessionID := "identity-binding-session"
+		restored := newMockSession(t, ctrl, sessionID, tools)
+
+		factory.EXPECT().
+			RestoreSession(gomock.Any(), sessionID, gomock.Any(), gomock.Any()).
+			Return(restored, nil).Times(1)
+
+		sm, _ := newTestSessionManager(t, factory, newFakeRegistry())
+
+		_, err := sm.storage.Create(context.Background(), sessionID, map[string]string{
+			sessiontypes.MetadataKeyIdentityBinding: "unauthenticated",
+			vmcpsession.MetadataKeyBackendIDs:       "",
+		})
+		require.NoError(t, err)
+
+		multiSess, ok := sm.GetMultiSession(context.Background(), sessionID)
+		require.True(t, ok, "session with MetadataKeyIdentityBinding must be restorable")
+		require.NotNil(t, multiSess)
+		assert.Equal(t, sessionID, multiSess.ID())
+	})
+}
+
+// TestTerminate_Phase2DetectionUsesIdentityBindingKey verifies that Terminate
+// uses MetadataKeyIdentityBinding (not the legacy MetadataKeyTokenHash) to
+// distinguish Phase 2 sessions (full MultiSession → Delete) from Phase 1
+// placeholders (→ mark terminated).
+func TestTerminate_Phase2DetectionUsesIdentityBindingKey(t *testing.T) {
+	t.Parallel()
+
+	t.Run("session with MetadataKeyIdentityBinding takes delete path", func(t *testing.T) {
+		t.Parallel()
+
+		ctrl := gomock.NewController(t)
+		sess := newMockSession(t, ctrl, "s", nil)
+		sess.EXPECT().Close().Return(nil).AnyTimes()
+		factory := newMockFactory(t, ctrl, sess)
+		registry := newFakeRegistry()
+		sm, storage := newTestSessionManager(t, factory, registry)
+
+		sessionID := sm.Generate()
+		require.NotEmpty(t, sessionID)
+
+		// Write MetadataKeyIdentityBinding into storage to simulate a Phase 2 session.
+		_, err := storage.Update(context.Background(), sessionID, map[string]string{
+			sessiontypes.MetadataKeyIdentityBinding: "unauthenticated",
+		})
+		require.NoError(t, err)
+
+		// Terminate must take the Phase 2 path: storage.Delete (not marked terminated).
+		isNotAllowed, err := sm.Terminate(sessionID)
+		require.NoError(t, err)
+		assert.False(t, isNotAllowed)
+
+		// Session must be deleted from storage, not just marked terminated.
+		_, loadErr := storage.Load(context.Background(), sessionID)
+		assert.ErrorIs(t, loadErr, transportsession.ErrSessionNotFound,
+			"Phase 2 Terminate must delete the session from storage")
+	})
+
+	t.Run("placeholder without MetadataKeyIdentityBinding takes mark-terminated path", func(t *testing.T) {
+		t.Parallel()
+
+		ctrl := gomock.NewController(t)
+		sess := newMockSession(t, ctrl, "", nil)
+		factory := newMockFactory(t, ctrl, sess)
+		registry := newFakeRegistry()
+		sm, storage := newTestSessionManager(t, factory, registry)
+
+		sessionID := sm.Generate()
+		require.NotEmpty(t, sessionID)
+
+		// No MetadataKeyIdentityBinding in storage — this is a Phase 1 placeholder.
+		isNotAllowed, err := sm.Terminate(sessionID)
+		require.NoError(t, err)
+		assert.False(t, isNotAllowed)
+
+		// Session must remain in storage but marked as terminated (not deleted).
+		metadata, loadErr := storage.Load(context.Background(), sessionID)
+		require.NoError(t, loadErr, "placeholder must remain in storage (TTL will clean it)")
+		assert.Equal(t, MetadataValTrue, metadata[MetadataKeyTerminated],
+			"Phase 1 Terminate must mark the session terminated, not delete it")
+	})
+}
+
+// TestTerminate_LegacyFormatSession_TakesPlaceholderPath is a B5 documentation
+// test. It verifies that a legacy session stored in Redis with only the old
+// MetadataKeyTokenHash key (no MetadataKeyIdentityBinding) causes Terminate to
+// take the placeholder (mark-terminated) path rather than deleting the session.
+//
+// This is intentional: without the identity binding key, the Manager cannot
+// tell whether the record is a real Phase-2 session or a corrupted/partial
+// record. Treating it as a placeholder (soft termination) is safe — the TTL
+// will eventually clean it up. The comment at session_manager.go line 485
+// references this test.
+func TestTerminate_LegacyFormatSession_TakesPlaceholderPath(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	sess := newMockSession(t, ctrl, "", nil)
+	factory := newMockFactory(t, ctrl, sess)
+	registry := newFakeRegistry()
+	sm, storage := newTestSessionManager(t, factory, registry)
+
+	sessionID := sm.Generate()
+	require.NotEmpty(t, sessionID)
+
+	// Seed storage with only the legacy key — simulates a pre-#5306 session in Redis.
+	// MetadataKeyIdentityBinding is absent.
+	_, err := storage.Update(context.Background(), sessionID, map[string]string{
+		sessiontypes.MetadataKeyTokenHash: "",
+	})
+	require.NoError(t, err)
+
+	// Terminate must take the placeholder path: mark as terminated, NOT delete.
+	isNotAllowed, err := sm.Terminate(sessionID)
+	require.NoError(t, err)
+	assert.False(t, isNotAllowed)
+
+	// Session must still exist in storage — marked terminated, not deleted.
+	// (Storage cleanup happens via TTL or the next GET → checkSession → eviction.)
+	metadata, loadErr := storage.Load(context.Background(), sessionID)
+	require.NoError(t, loadErr,
+		"legacy session must remain in storage after Terminate (not deleted)")
+	assert.Equal(t, MetadataValTrue, metadata[MetadataKeyTerminated],
+		"legacy session Terminate must set MetadataKeyTerminated rather than deleting")
 }
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-{{- if .Values.crds.install.server }}
+{{- if .Values.crds.install }}
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -7,6 +7,8 @@ metadata:
     helm.sh/resource-policy: keep
     {{- end }}
     controller-gen.kubebuilder.io/version: v0.17.3
+  labels:
+    toolhive.stacklok.dev/auto-migrate-storage-version: "true"
   name: mcpservers.toolhive.stacklok.dev
 spec:
   group: toolhive.stacklok.dev
@@ -124,6 +126,28 @@ spec:
                     required:
                     - name
                     type: object
+                  groupClaimName:
+                    description: |-
+                      GroupClaimName is the JWT claim key that contains group membership for the
+                      principal. When set, takes priority over the well-known defaults
+                      ("groups", "roles", "cognito:groups"). Use this for IDPs that place
+                      groups under a URI-style claim (e.g. "https://example.com/groups"). When
+                      Type is "configMap", a group_claim_name entry in the referenced ConfigMap
+                      is overridden by this field if both are set.
+                    maxLength: 253
+                    type: string
+                  groupEntityType:
+                    description: |-
+                      GroupEntityType is the Cedar entity type name used for principal parent
+                      UIDs synthesised from JWT group/role claims. Defaults to "THVGroup" when
+                      empty. Must match the entity type used in the static entity store for
+                      transitive `in` checks (e.g. `ClaimGroup → PlatformRole`) to resolve.
+                      Namespaced names (`Foo::Bar`) are not yet supported. When Type is
+                      "configMap", a group_entity_type entry in the referenced ConfigMap is
+                      overridden by this field if both are set.
+                    maxLength: 63
+                    pattern: ^[A-Za-z_][A-Za-z0-9_]*$
+                    type: string
                   inline:
                     description: |-
                       Inline contains direct authorization configuration
@@ -131,8 +155,10 @@ spec:
                     properties:
                       entitiesJson:
                         default: '[]'
-                        description: EntitiesJSON is a JSON string representing Cedar
-                          entities
+                        description: |-
+                          EntitiesJSON is a JSON string representing Cedar entities. Required when
+                          transitive policies (e.g. `ClaimGroup → PlatformRole`) need a static
+                          entity store; defaults to "[]".
                         type: string
                       policies:
                         description: Policies is a list of Cedar policy strings
@@ -143,15 +169,36 @@ spec:
                         x-kubernetes-list-type: atomic
                       primaryUpstreamProvider:
                         description: |-
-                          PrimaryUpstreamProvider names the upstream IDP provider whose access
-                          token should be used as the source of JWT claims for Cedar evaluation.
-                          When empty, claims from the ToolHive-issued token are used.
-                          Must match an upstream provider name configured in the embedded auth server
-                          (e.g. "default", "github"). Only relevant when the embedded auth server is active.
+                          PrimaryUpstreamProvider names the upstream IDP whose access token's
+                          claims Cedar should evaluate.
+
+                          Deprecated: on VirtualMCPServer this field has moved to
+                          spec.authServerConfig.primaryUpstreamProvider. The old location is
+                          still read for one release for backward compatibility; the
+                          VirtualMCPServer controller emits an AuthzPrimaryUpstreamProviderDeprecated
+                          Warning event whenever it is consumed, and removal is planned for the
+                          release after the deprecation cycle.
+
+                          On MCPServer and MCPRemoteProxy this field has always been a structural
+                          no-op (those CRDs do not run an embedded auth server). Setting it
+                          continues to surface the AuthzPrimaryUpstreamProviderIgnored advisory
+                          condition; the deprecation does not change that behaviour.
+                        maxLength: 63
+                        minLength: 1
+                        pattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$
                         type: string
                     required:
                     - policies
                     type: object
+                  roleClaimName:
+                    description: |-
+                      RoleClaimName is the JWT claim key that contains role membership for the
+                      principal. When set, the claim is extracted separately from GroupClaimName
+                      and both are mapped to the configured GroupEntityType. When Type is
+                      "configMap", a role_claim_name entry in the referenced ConfigMap is
+                      overridden by this field if both are set.
+                    maxLength: 253
+                    type: string
                   type:
                     default: configMap
                     description: Type is the type of authorization configuration
@@ -244,6 +291,11 @@ spec:
                   The referenced MCPOIDCConfig must exist in the same namespace as this MCPServer.
                   Per-server overrides (audience, scopes) are specified here; shared provider config
                   lives in the MCPOIDCConfig resource.
+
+                  SECURITY: if this field is omitted and no other authentication source is configured,
+                  the proxy runs UNAUTHENTICATED. It accepts every request that can reach its port and
+                  forwards it to the MCP server under a synthetic local-user identity, with no token or
+                  credential check. Set this field to enforce identity-based access control per request.
                 properties:
                   audience:
                     description: |-
@@ -769,6 +821,17 @@ spec:
                 x-kubernetes-list-map-keys:
                 - name
                 x-kubernetes-list-type: map
+              webhookConfigRef:
+                description: |-
+                  WebhookConfigRef references a MCPWebhookConfig resource for webhook middleware configuration.
+                  The referenced MCPWebhookConfig must exist in the same namespace as this MCPServer.
+                properties:
+                  name:
+                    description: Name is the name of the MCPWebhookConfig resource
+                    type: string
+                required:
+                - name
+                type: object
             required:
             - image
             type: object
@@ -893,6 +956,10 @@ spec:
                 type: string
               url:
                 description: URL is the URL where the MCP server can be accessed
+                type: string
+              webhookConfigHash:
+                description: WebhookConfigHash is the hash of the referenced MCPWebhookConfig
+                  spec
                 type: string
             type: object
         type: object
@@ -999,6 +1066,28 @@ spec:
                     required:
                     - name
                     type: object
+                  groupClaimName:
+                    description: |-
+                      GroupClaimName is the JWT claim key that contains group membership for the
+                      principal. When set, takes priority over the well-known defaults
+                      ("groups", "roles", "cognito:groups"). Use this for IDPs that place
+                      groups under a URI-style claim (e.g. "https://example.com/groups"). When
+                      Type is "configMap", a group_claim_name entry in the referenced ConfigMap
+                      is overridden by this field if both are set.
+                    maxLength: 253
+                    type: string
+                  groupEntityType:
+                    description: |-
+                      GroupEntityType is the Cedar entity type name used for principal parent
+                      UIDs synthesised from JWT group/role claims. Defaults to "THVGroup" when
+                      empty. Must match the entity type used in the static entity store for
+                      transitive `in` checks (e.g. `ClaimGroup → PlatformRole`) to resolve.
+                      Namespaced names (`Foo::Bar`) are not yet supported. When Type is
+                      "configMap", a group_entity_type entry in the referenced ConfigMap is
+                      overridden by this field if both are set.
+                    maxLength: 63
+                    pattern: ^[A-Za-z_][A-Za-z0-9_]*$
+                    type: string
                   inline:
                     description: |-
                       Inline contains direct authorization configuration
@@ -1006,8 +1095,10 @@ spec:
                     properties:
                       entitiesJson:
                         default: '[]'
-                        description: EntitiesJSON is a JSON string representing Cedar
-                          entities
+                        description: |-
+                          EntitiesJSON is a JSON string representing Cedar entities. Required when
+                          transitive policies (e.g. `ClaimGroup → PlatformRole`) need a static
+                          entity store; defaults to "[]".
                         type: string
                       policies:
                         description: Policies is a list of Cedar policy strings
@@ -1018,15 +1109,36 @@ spec:
                         x-kubernetes-list-type: atomic
                       primaryUpstreamProvider:
                         description: |-
-                          PrimaryUpstreamProvider names the upstream IDP provider whose access
-                          token should be used as the source of JWT claims for Cedar evaluation.
-                          When empty, claims from the ToolHive-issued token are used.
-                          Must match an upstream provider name configured in the embedded auth server
-                          (e.g. "default", "github"). Only relevant when the embedded auth server is active.
+                          PrimaryUpstreamProvider names the upstream IDP whose access token's
+                          claims Cedar should evaluate.
+
+                          Deprecated: on VirtualMCPServer this field has moved to
+                          spec.authServerConfig.primaryUpstreamProvider. The old location is
+                          still read for one release for backward compatibility; the
+                          VirtualMCPServer controller emits an AuthzPrimaryUpstreamProviderDeprecated
+                          Warning event whenever it is consumed, and removal is planned for the
+                          release after the deprecation cycle.
+
+                          On MCPServer and MCPRemoteProxy this field has always been a structural
+                          no-op (those CRDs do not run an embedded auth server). Setting it
+                          continues to surface the AuthzPrimaryUpstreamProviderIgnored advisory
+                          condition; the deprecation does not change that behaviour.
+                        maxLength: 63
+                        minLength: 1
+                        pattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$
                         type: string
                     required:
                     - policies
                     type: object
+                  roleClaimName:
+                    description: |-
+                      RoleClaimName is the JWT claim key that contains role membership for the
+                      principal. When set, the claim is extracted separately from GroupClaimName
+                      and both are mapped to the configured GroupEntityType. When Type is
+                      "configMap", a role_claim_name entry in the referenced ConfigMap is
+                      overridden by this field if both are set.
+                    maxLength: 253
+                    type: string
                   type:
                     default: configMap
                     description: Type is the type of authorization configuration
@@ -1119,6 +1231,11 @@ spec:
                   The referenced MCPOIDCConfig must exist in the same namespace as this MCPServer.
                   Per-server overrides (audience, scopes) are specified here; shared provider config
                   lives in the MCPOIDCConfig resource.
+
+                  SECURITY: if this field is omitted and no other authentication source is configured,
+                  the proxy runs UNAUTHENTICATED. It accepts every request that can reach its port and
+                  forwards it to the MCP server under a synthetic local-user identity, with no token or
+                  credential check. Set this field to enforce identity-based access control per request.
                 properties:
                   audience:
                     description: |-
@@ -1644,6 +1761,17 @@ spec:
                 x-kubernetes-list-map-keys:
                 - name
                 x-kubernetes-list-type: map
+              webhookConfigRef:
+                description: |-
+                  WebhookConfigRef references a MCPWebhookConfig resource for webhook middleware configuration.
+                  The referenced MCPWebhookConfig must exist in the same namespace as this MCPServer.
+                properties:
+                  name:
+                    description: Name is the name of the MCPWebhookConfig resource
+                    type: string
+                required:
+                - name
+                type: object
             required:
             - image
             type: object
@@ -1768,6 +1896,10 @@ spec:
                 type: string
               url:
                 description: URL is the URL where the MCP server can be accessed
+                type: string
+              webhookConfigHash:
+                description: WebhookConfigHash is the hash of the referenced MCPWebhookConfig
+                  spec
                 type: string
             type: object
         type: object

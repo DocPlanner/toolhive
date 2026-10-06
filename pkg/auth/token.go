@@ -24,11 +24,10 @@ import (
 	"github.com/lestrrat-go/jwx/v3/jwk"
 
 	"github.com/stacklok/toolhive-core/env"
-	"github.com/stacklok/toolhive/pkg/auth/oauth"
 	"github.com/stacklok/toolhive/pkg/auth/upstreamtoken"
 	"github.com/stacklok/toolhive/pkg/authserver/server/keys"
 	"github.com/stacklok/toolhive/pkg/networking"
-	oauthproto "github.com/stacklok/toolhive/pkg/oauth"
+	"github.com/stacklok/toolhive/pkg/oauthproto"
 )
 
 // TokenIntrospector defines the interface for token introspection providers
@@ -124,7 +123,7 @@ func (g *GoogleProvider) IntrospectToken(ctx context.Context, token string) (jwt
 	}
 
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", oauth.UserAgent)
+	req.Header.Set("User-Agent", oauthproto.UserAgent)
 
 	// Make the request
 	resp, err := g.client.Do(req) // #nosec G704 -- URL is the configured OIDC introspection endpoint
@@ -301,7 +300,7 @@ func (r *RFC7662Provider) IntrospectToken(ctx context.Context, token string) (jw
 
 	// Set headers
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", oauth.UserAgent)
+	req.Header.Set("User-Agent", oauthproto.UserAgent)
 	req.Header.Set("Accept", "application/json")
 
 	// Add client authentication if configured
@@ -465,7 +464,7 @@ func discoverOIDCConfiguration(
 	}
 
 	// Set User-Agent header
-	req.Header.Set("User-Agent", oauth.UserAgent)
+	req.Header.Set("User-Agent", oauthproto.UserAgent)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := client.Do(req) // #nosec G704 -- URL is the configured OIDC issuer discovery endpoint
@@ -495,22 +494,6 @@ func discoverOIDCConfiguration(
 	}
 
 	return &doc, nil
-}
-
-// NewTokenValidatorConfig creates a new TokenValidatorConfig with the provided parameters
-func NewTokenValidatorConfig(issuer, audience, jwksURL, clientID string, clientSecret string) *TokenValidatorConfig {
-	// Only create a config if at least one parameter is provided
-	if issuer == "" && audience == "" && jwksURL == "" && clientID == "" && clientSecret == "" {
-		return nil
-	}
-
-	return &TokenValidatorConfig{
-		Issuer:       issuer,
-		Audience:     audience,
-		JWKSURL:      jwksURL,
-		ClientID:     clientID,
-		ClientSecret: clientSecret,
-	}
 }
 
 // registerIntrospectionProviders creates and configures the provider registry

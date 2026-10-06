@@ -350,7 +350,7 @@ func TestNewTransportSessionStorage(t *testing.T) {
 	t.Run("returns nil when scaling config is absent", func(t *testing.T) {
 		t.Parallel()
 
-		storage, err := newTransportSessionStorage(context.Background(), nil)
+		storage, err := newTransportSessionStorage(context.Background(), nil, transportsession.DefaultSessionTTL)
 		require.NoError(t, err)
 		assert.Nil(t, storage)
 	})
@@ -358,7 +358,7 @@ func TestNewTransportSessionStorage(t *testing.T) {
 	t.Run("returns nil when redis session storage is not configured", func(t *testing.T) {
 		t.Parallel()
 
-		storage, err := newTransportSessionStorage(context.Background(), &ScalingConfig{})
+		storage, err := newTransportSessionStorage(context.Background(), &ScalingConfig{}, transportsession.DefaultSessionTTL)
 		require.NoError(t, err)
 		assert.Nil(t, storage)
 	})
@@ -372,7 +372,7 @@ func TestNewTransportSessionStorage(t *testing.T) {
 			SessionRedis: &SessionRedisConfig{
 				Address: mr.Addr(),
 			},
-		})
+		}, transportsession.DefaultSessionTTL)
 		require.NoError(t, err)
 		t.Cleanup(func() {
 			_ = storage.Close()
@@ -390,7 +390,7 @@ func TestNewTransportSessionStorage(t *testing.T) {
 				Address:   "localhost:6379",
 				KeyPrefix: "missing-trailing-colon",
 			},
-		})
+		}, transportsession.DefaultSessionTTL)
 		require.Error(t, err)
 		assert.Nil(t, storage)
 		assert.Contains(t, err.Error(), "creating redis session storage")
@@ -409,7 +409,7 @@ func TestNewTransportSessionStorage_UsesRedisCredentials(t *testing.T) {
 			Address:   mr.Addr(),
 			KeyPrefix: "test:mcp:",
 		},
-	})
+	}, transportsession.DefaultSessionTTL)
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		_ = storage.Close()

@@ -91,18 +91,26 @@ type testStorageState struct {
 	authCodeSessions   map[string]fosite.Requester          // authorize code sessions for token exchange
 	pkceSessions       map[string]fosite.Requester          // PKCE sessions for token exchange
 	idpTokenCount      int
+	renewedClients     []string // client IDs passed to RenewClientTTL
 }
 
 // baseTestSetupOption configures optional behavior overrides for baseTestSetup.
 type baseTestSetupOption func(*baseTestSetupConfig)
 
 type baseTestSetupConfig struct {
-	storePendingErr error // if non-nil, StorePendingAuthorization always returns this error
+	storePendingErr            error // if non-nil, StorePendingAuthorization always returns this error
+	getLatestUpstreamTokensErr error // if non-nil, GetLatestUpstreamTokensForUser always returns this error
 }
 
 func withStorePendingError(err error) baseTestSetupOption {
 	return func(c *baseTestSetupConfig) {
 		c.storePendingErr = err
+	}
+}
+
+func withGetLatestUpstreamTokensError(err error) baseTestSetupOption {
+	return func(c *baseTestSetupConfig) {
+		c.getLatestUpstreamTokensErr = err
 	}
 }
 
@@ -177,6 +185,14 @@ func baseTestSetup(t *testing.T, opts ...baseTestSetupOption) (fosite.OAuth2Prov
 		return nil, fosite.ErrNotFound
 	}).AnyTimes()
 	stor.EXPECT().GetClient(gomock.Any(), gomock.Not(testAuthClientID)).Return(nil, fosite.ErrNotFound).AnyTimes()
+
+	// Token issuance renews the public client's registration TTL (best-effort).
+	// Record the calls so tests can assert the renewal fired on success.
+	stor.EXPECT().RenewClientTTL(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, c fosite.Client) error {
+			storState.renewedClients = append(storState.renewedClients, c.GetID())
+			return nil
+		}).AnyTimes()
 
 	// Setup mock expectations for pending authorization storage
 	if setupCfg.storePendingErr != nil {
@@ -346,6 +362,28 @@ func baseTestSetup(t *testing.T, opts ...baseTestSetupOption) (fosite.OAuth2Prov
 			return result, nil
 		}).AnyTimes()
 
+	stor.EXPECT().
+		GetLatestUpstreamTokensForUser(gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, userID, providerID string) (*storage.UpstreamTokens, error) {
+			if setupCfg.getLatestUpstreamTokensErr != nil {
+				return nil, setupCfg.getLatestUpstreamTokensErr
+			}
+			var winner *storage.UpstreamTokens
+			for _, t := range storState.upstreamTokens {
+				if t == nil || t.UserID != userID || t.ProviderID != providerID {
+					continue
+				}
+				if winner == nil || t.ExpiresAt.After(winner.ExpiresAt) {
+					winner = t
+				}
+			}
+			if winner == nil {
+				return nil, storage.ErrNotFound
+			}
+			return winner, nil
+		}).
+		AnyTimes()
+
 	// Create fosite provider with authorization code support
 	jwtStrategy := compose.NewOAuth2JWTStrategy(
 		func(_ context.Context) (any, error) {
@@ -368,10 +406,11 @@ func baseTestSetup(t *testing.T, opts ...baseTestSetupOption) (fosite.OAuth2Prov
 }
 
 // handlerTestSetup creates a test setup with all dependencies including an upstream provider.
-func handlerTestSetup(t *testing.T) (*Handler, *testStorageState, *mockIDPProvider) {
+// Any baseTestSetupOption values are forwarded to baseTestSetup.
+func handlerTestSetup(t *testing.T, opts ...baseTestSetupOption) (*Handler, *testStorageState, *mockIDPProvider) {
 	t.Helper()
 
-	provider, oauth2Config, stor, storState := baseTestSetup(t)
+	provider, oauth2Config, stor, storState := baseTestSetup(t, opts...)
 
 	mockUpstream := &mockIDPProvider{
 		providerType:     upstream.ProviderTypeOAuth2,

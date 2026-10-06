@@ -269,14 +269,14 @@ const (
 type boundRefreshTestSession struct {
 	sessiontypes.MultiSession
 	backendIDs string
-	tokenHash  string
+	binding    string
 	identity   *auth.Identity
 }
 
 func (s *boundRefreshTestSession) GetMetadata() map[string]string {
 	return map[string]string{
-		vmcpsession.MetadataKeyBackendIDs: s.backendIDs,
-		sessiontypes.MetadataKeyTokenHash: s.tokenHash,
+		vmcpsession.MetadataKeyBackendIDs:       s.backendIDs,
+		sessiontypes.MetadataKeyIdentityBinding: s.binding,
 	}
 }
 
@@ -297,12 +297,12 @@ func TestReconcileSessionsLackingBackends_SkipsBoundSessionsWithoutCallerToken(t
 	sessions := map[string]sessiontypes.MultiSession{
 		"restored": &boundRefreshTestSession{
 			backendIDs: reconcileTestBackend,
-			tokenHash:  "subject-hash",
+			binding:    "https://idp.example\x00user-123",
 			identity:   &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: "user-123"}},
 		},
 		"live": &boundRefreshTestSession{
 			backendIDs: reconcileTestBackend,
-			tokenHash:  "subject-hash",
+			binding:    "https://idp.example\x00user-123",
 			identity:   &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: "user-123"}, Token: "bearer"},
 		},
 		"anonymous": &boundRefreshTestSession{backendIDs: reconcileTestBackend},

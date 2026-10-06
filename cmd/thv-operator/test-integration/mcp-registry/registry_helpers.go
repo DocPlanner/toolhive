@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
@@ -47,7 +46,6 @@ const (
 // registryBuilderConfig holds the configuration data used to generate configYAML
 type registryBuilderConfig struct {
 	SourceName   string
-	Format       string
 	SourceType   string
 	FilePath     string // for file sources: path inside the mounted volume
 	GitRepo      string
@@ -83,7 +81,6 @@ func (h *MCPRegistryTestHelper) NewRegistryBuilder(name string) *RegistryBuilder
 		},
 		config: registryBuilderConfig{
 			SourceName: "default",
-			Format:     "toolhive",
 		},
 	}
 }
@@ -114,22 +111,6 @@ func (rb *RegistryBuilder) WithAPISource(endpoint string) *RegistryBuilder {
 	return rb
 }
 
-// WithRegistryName sets the name for the source config
-func (rb *RegistryBuilder) WithRegistryName(name string) *RegistryBuilder {
-	rb.config.SourceName = name
-	// Recalculate file path if this is a file source
-	if rb.config.SourceType == sourceTypeFile {
-		rb.config.FilePath = fmt.Sprintf("/config/registry/%s/registry.json", name)
-	}
-	return rb
-}
-
-// WithUpstreamFormat configures the source to use upstream MCP format
-func (rb *RegistryBuilder) WithUpstreamFormat() *RegistryBuilder {
-	rb.config.Format = "upstream"
-	return rb
-}
-
 // WithSyncPolicy configures the sync policy interval for the source
 func (rb *RegistryBuilder) WithSyncPolicy(interval string) *RegistryBuilder {
 	rb.config.SyncInterval = interval
@@ -151,30 +132,6 @@ func (rb *RegistryBuilder) WithLabel(key, value string) *RegistryBuilder {
 		rb.labels = make(map[string]string)
 	}
 	rb.labels[key] = value
-	return rb
-}
-
-// WithNameIncludeFilter sets name include patterns for filtering on the source
-func (rb *RegistryBuilder) WithNameIncludeFilter(patterns []string) *RegistryBuilder {
-	rb.config.NameInclude = patterns
-	return rb
-}
-
-// WithNameExcludeFilter sets name exclude patterns for filtering on the source
-func (rb *RegistryBuilder) WithNameExcludeFilter(patterns []string) *RegistryBuilder {
-	rb.config.NameExclude = patterns
-	return rb
-}
-
-// WithTagIncludeFilter sets tag include patterns for filtering on the source
-func (rb *RegistryBuilder) WithTagIncludeFilter(tags []string) *RegistryBuilder {
-	rb.config.TagInclude = tags
-	return rb
-}
-
-// WithTagExcludeFilter sets tag exclude patterns for filtering on the source
-func (rb *RegistryBuilder) WithTagExcludeFilter(tags []string) *RegistryBuilder {
-	rb.config.TagExclude = tags
 	return rb
 }
 
@@ -244,7 +201,6 @@ func (rb *RegistryBuilder) buildConfigYAML() string {
 	// Sources section
 	b.WriteString("sources:\n")
 	fmt.Fprintf(&b, "  - name: %s\n", rb.config.SourceName)
-	fmt.Fprintf(&b, "    format: %s\n", rb.config.Format)
 
 	// Source type specific fields
 	switch rb.config.SourceType {
@@ -324,30 +280,6 @@ func writeStringList(b *strings.Builder, label string, items []string) {
 	}
 }
 
-// CreateBasicConfigMapRegistry creates a simple MCPRegistry with ConfigMap source
-func (h *MCPRegistryTestHelper) CreateBasicConfigMapRegistry(name, configMapName string) *mcpv1beta1.MCPRegistry {
-	return h.NewRegistryBuilder(name).
-		WithConfigMapSource(configMapName, "registry.json").
-		WithSyncPolicy("1h").
-		Create(h)
-}
-
-// CreateManualSyncRegistry creates an MCPRegistry with manual sync only
-func (h *MCPRegistryTestHelper) CreateManualSyncRegistry(name, configMapName string) *mcpv1beta1.MCPRegistry {
-	return h.NewRegistryBuilder(name).
-		WithConfigMapSource(configMapName, "registry.json").
-		Create(h)
-}
-
-// CreateUpstreamFormatRegistry creates an MCPRegistry with upstream format
-func (h *MCPRegistryTestHelper) CreateUpstreamFormatRegistry(name, configMapName string) *mcpv1beta1.MCPRegistry {
-	return h.NewRegistryBuilder(name).
-		WithConfigMapSource(configMapName, "registry.json").
-		WithUpstreamFormat().
-		WithSyncPolicy("30m").
-		Create(h)
-}
-
 // GetRegistry retrieves an MCPRegistry by name
 func (h *MCPRegistryTestHelper) GetRegistry(name string) (*mcpv1beta1.MCPRegistry, error) {
 	registry := &mcpv1beta1.MCPRegistry{}
@@ -363,14 +295,6 @@ func (h *MCPRegistryTestHelper) UpdateRegistry(registry *mcpv1beta1.MCPRegistry)
 	return h.Client.Update(h.Context, registry)
 }
 
-// PatchRegistry patches an MCPRegistry with the given patch
-func (h *MCPRegistryTestHelper) PatchRegistry(name string, patch client.Patch) error {
-	registry := &mcpv1beta1.MCPRegistry{}
-	registry.Name = name
-	registry.Namespace = h.Namespace
-	return h.Client.Patch(h.Context, registry, patch)
-}
-
 // DeleteRegistry deletes an MCPRegistry by name
 func (h *MCPRegistryTestHelper) DeleteRegistry(name string) error {
 	registry := &mcpv1beta1.MCPRegistry{
@@ -380,54 +304,6 @@ func (h *MCPRegistryTestHelper) DeleteRegistry(name string) error {
 		},
 	}
 	return h.Client.Delete(h.Context, registry)
-}
-
-// TriggerManualSync adds the manual sync annotation to trigger a sync
-func (h *MCPRegistryTestHelper) TriggerManualSync(name string) error {
-	registry, err := h.GetRegistry(name)
-	if err != nil {
-		return err
-	}
-
-	if registry.Annotations == nil {
-		registry.Annotations = make(map[string]string)
-	}
-	registry.Annotations["toolhive.stacklok.dev/manual-sync"] = fmt.Sprintf("%d", time.Now().Unix())
-
-	return h.UpdateRegistry(registry)
-}
-
-// GetRegistryStatus returns the current status of an MCPRegistry
-func (h *MCPRegistryTestHelper) GetRegistryStatus(name string) (*mcpv1beta1.MCPRegistryStatus, error) {
-	registry, err := h.GetRegistry(name)
-	if err != nil {
-		return nil, err
-	}
-	return &registry.Status, nil
-}
-
-// GetRegistryPhase returns the current phase of an MCPRegistry
-func (h *MCPRegistryTestHelper) GetRegistryPhase(name string) (mcpv1beta1.MCPRegistryPhase, error) {
-	status, err := h.GetRegistryStatus(name)
-	if err != nil {
-		return "", err
-	}
-	return status.Phase, nil
-}
-
-// GetRegistryCondition returns a specific condition from the registry status
-func (h *MCPRegistryTestHelper) GetRegistryCondition(name, conditionType string) (*metav1.Condition, error) {
-	status, err := h.GetRegistryStatus(name)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, condition := range status.Conditions {
-		if condition.Type == conditionType {
-			return &condition, nil
-		}
-	}
-	return nil, fmt.Errorf("condition %s not found", conditionType)
 }
 
 // ListRegistries returns all MCPRegistries in the namespace
@@ -494,18 +370,13 @@ func containsFinalizer(finalizers []string, _ string) bool {
 }
 
 // buildConfigYAMLForMultipleSources generates a configYAML string for multiple sources.
-// Each source is specified as a map with keys: name, format, sourceType, and type-specific fields.
+// Each source is specified as a map with keys: name, sourceType, and type-specific fields.
 func buildConfigYAMLForMultipleSources(sources []map[string]string) string {
 	var b strings.Builder
 
 	b.WriteString("sources:\n")
 	for _, src := range sources {
 		fmt.Fprintf(&b, "  - name: %s\n", src["name"])
-		format := src["format"]
-		if format == "" {
-			format = "toolhive"
-		}
-		fmt.Fprintf(&b, "    format: %s\n", format)
 
 		switch src["sourceType"] {
 		case sourceTypeFile:

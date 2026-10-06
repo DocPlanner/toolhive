@@ -109,6 +109,41 @@ type MCPRegistrySpec struct {
 	// +kubebuilder:pruning:PreserveUnknownFields
 	// +kubebuilder:validation:Type=object
 	PodTemplateSpec *runtime.RawExtension `json:"podTemplateSpec,omitempty"`
+
+	// ImagePullSecrets allows specifying image pull secrets for the registry API workload.
+	// These are applied to both the registry-api Deployment's PodSpec.ImagePullSecrets
+	// and to the operator-managed ServiceAccount the registry API runs as, so private
+	// images are pullable through either path.
+	//
+	// Use this field for new manifests.
+	//
+	// Important: this is the ONLY way to attach image-pull credentials to the
+	// operator-managed ServiceAccount. The legacy
+	// spec.podTemplateSpec.spec.imagePullSecrets path populates the Deployment's pod
+	// spec ONLY — it does NOT touch the ServiceAccount. On managed Kubernetes
+	// platforms that rely on ServiceAccount-level credential injection (for example
+	// GKE Workload Identity, OpenShift's per-SA dockercfg secrets, EKS IRSA), using
+	// only the legacy PodTemplateSpec path can fail to pull private images even when
+	// the secret exists in the namespace. Always set spec.imagePullSecrets when
+	// SA-level credentials matter.
+	//
+	// Precedence with PodTemplateSpec:
+	//   - This field is applied first as the controller-generated default.
+	//   - Values set under spec.podTemplateSpec.spec.imagePullSecrets are user overrides
+	//     and win on overlap. If the user supplies imagePullSecrets via PodTemplateSpec,
+	//     those replace the default list on the Deployment (the list is treated atomically).
+	//   - The ServiceAccount is always populated from this field — PodTemplateSpec does not
+	//     affect the ServiceAccount.
+	//
+	// An omitted field and an explicitly empty list are equivalent: both leave the
+	// ServiceAccount's existing ImagePullSecrets unchanged. This preserves
+	// platform-managed pull secrets (for example OpenShift's per-SA dockercfg
+	// entries) when overlays or patches emit an empty list. Truly clearing the
+	// ServiceAccount's pull secrets requires recreating the resource.
+	//
+	// +listType=atomic
+	// +optional
+	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
 }
 
 // MCPRegistryStatus defines the observed state of MCPRegistry
@@ -167,17 +202,31 @@ const (
 	ConditionReasonRegistryNotReady = "NotReady"
 )
 
-//+kubebuilder:object:root=true
-//+kubebuilder:storageversion
-//+kubebuilder:subresource:status
-//+kubebuilder:printcolumn:name="Status",type="string",JSONPath=".status.phase"
-//+kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status"
-//+kubebuilder:printcolumn:name="Replicas",type="integer",JSONPath=".status.readyReplicas"
-//+kubebuilder:printcolumn:name="URL",type="string",JSONPath=".status.url"
-//+kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
-//+kubebuilder:resource:shortName=mcpreg;registry,scope=Namespaced,categories=toolhive
+// Developer note: the MCPRegistry deprecation is expressed as prose in the type
+// doc comment below, NOT via the Go "Deprecated:" convention. The operator still
+// reconciles this type, so the staticcheck SA1019 analyzer must not flag the
+// operator's own internal uses. The kubectl-visible deprecation comes from the
+// +kubebuilder:deprecatedversion:warning marker below.
 
-// MCPRegistry is the Schema for the mcpregistries API
+// MCPRegistry is the Schema for the mcpregistries API.
+//
+// The MCPRegistry CRD is deprecated and will be removed in a future release.
+// Install the ToolHive registry server via the toolhive-registry-server Helm chart
+// instead: https://github.com/stacklok/toolhive-registry-server
+//
+// +kubebuilder:object:root=true
+// +kubebuilder:storageversion
+// +kubebuilder:deprecatedversion:warning="MCPRegistry is deprecated and will be removed in a future release; install the ToolHive registry server via the toolhive-registry-server Helm chart (https://github.com/stacklok/toolhive-registry-server) instead"
+// +kubebuilder:subresource:status
+// +kubebuilder:metadata:labels=toolhive.stacklok.dev/auto-migrate-storage-version=true
+// +kubebuilder:printcolumn:name="Status",type="string",JSONPath=".status.phase"
+// +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status"
+// +kubebuilder:printcolumn:name="Replicas",type="integer",JSONPath=".status.readyReplicas"
+// +kubebuilder:printcolumn:name="URL",type="string",JSONPath=".status.url"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
+// +kubebuilder:resource:shortName=mcpreg;registry,scope=Namespaced,categories=toolhive
+//
+//nolint:lll // kubebuilder deprecatedversion marker cannot be line-wrapped
 type MCPRegistry struct {
 	metav1.TypeMeta   `json:",inline"` // nolint:revive
 	metav1.ObjectMeta `json:"metadata,omitempty"`

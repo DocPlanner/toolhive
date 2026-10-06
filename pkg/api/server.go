@@ -61,6 +61,7 @@ import (
 const (
 	middlewareTimeout  = 60 * time.Second
 	readHeaderTimeout  = 10 * time.Second
+	idleTimeout        = 120 * time.Second
 	shutdownTimeout    = 30 * time.Second
 	nonceBytes         = 16
 	socketPermissions  = 0660    // Socket file permissions (owner/group read-write)
@@ -141,47 +142,32 @@ func (b *ServerBuilder) WithOtelEnabled(enabled bool) *ServerBuilder {
 	return b
 }
 
-// WithMiddleware adds middleware to the server
+// WithMiddleware appends HTTP middleware that runs after the default middleware
+// stack (request-ID, body-size limit, headers, update-check, auth) and before
+// route handlers. Part of the ApplyServerExtensions extension point — used by
+// downstream consumers to inject custom authentication or request-scoping
+// middleware into the API server.
+//
+// Public extension API. Do not remove based on deadcode analysis alone:
+// callers may live in repositories that are not visible to this module's
+// analyzer. The test in server_test.go intentionally exercises this method
+// to keep it reachable.
 func (b *ServerBuilder) WithMiddleware(mw ...func(http.Handler) http.Handler) *ServerBuilder {
 	b.middlewares = append(b.middlewares, mw...)
 	return b
 }
 
-// WithRoute adds a custom route to the server
+// WithRoute mounts a sub-router at the given prefix. The caller is responsible
+// for any per-route timeout middleware. Part of the ApplyServerExtensions
+// extension point — used by downstream consumers to add API surface alongside
+// the built-in routes.
+//
+// Public extension API. Do not remove based on deadcode analysis alone:
+// callers may live in repositories that are not visible to this module's
+// analyzer. The test in server_test.go intentionally exercises this method
+// to keep it reachable.
 func (b *ServerBuilder) WithRoute(prefix string, handler http.Handler) *ServerBuilder {
 	b.customRoutes[prefix] = handler
-	return b
-}
-
-// WithContainerRuntime sets the container runtime
-func (b *ServerBuilder) WithContainerRuntime(containerRuntime runtime.Runtime) *ServerBuilder {
-	b.containerRuntime = containerRuntime
-	return b
-}
-
-// WithClientManager sets the client manager
-func (b *ServerBuilder) WithClientManager(manager client.Manager) *ServerBuilder {
-	b.clientManager = manager
-	return b
-}
-
-// WithWorkloadManager sets the workload manager
-func (b *ServerBuilder) WithWorkloadManager(manager workloads.Manager) *ServerBuilder {
-	b.workloadManager = manager
-	return b
-}
-
-// WithGroupManager sets the group manager
-func (b *ServerBuilder) WithGroupManager(manager groups.Manager) *ServerBuilder {
-	b.groupManager = manager
-	return b
-}
-
-// WithSkillManager sets the skill service manager.
-// The caller is responsible for closing any underlying resources
-// when providing an external skill service.
-func (b *ServerBuilder) WithSkillManager(manager skills.SkillService) *ServerBuilder {
-	b.skillManager = manager
 	return b
 }
 
@@ -366,41 +352,25 @@ func (b *ServerBuilder) setupDefaultRoutes(r *chi.Mux) {
 	}
 }
 
+// namedPipePrefix is the Windows named-pipe namespace prefix. The canonical
+// definition lives in pkg/server/discovery so the listener and dialer cannot
+// drift; pkg/api re-aliases it here so per-platform socket files do not need
+// to import discovery directly.
+const namedPipePrefix = discovery.NamedPipePrefix
+
+// isNamedPipeAddress reports whether address is a Windows named-pipe path.
+// The check is platform-agnostic so callers on non-Windows can fail fast with
+// a clear error before reaching the listener code. The comparison is
+// case-insensitive because the Windows pipe namespace is case-insensitive at
+// the kernel layer; without EqualFold an address like \\.\Pipe\foo would
+// silently fall through to AF_UNIX and then fail to bind.
+func isNamedPipeAddress(address string) bool {
+	return len(address) >= len(namedPipePrefix) &&
+		strings.EqualFold(address[:len(namedPipePrefix)], namedPipePrefix)
+}
+
 func setupTCPListener(address string) (net.Listener, error) {
 	return net.Listen("tcp", address)
-}
-
-func setupUnixSocket(address string) (net.Listener, error) {
-	// Remove the socket file if it already exists
-	if _, err := os.Stat(address); err == nil {
-		if err := os.Remove(address); err != nil {
-			return nil, fmt.Errorf("failed to remove existing socket: %w", err)
-		}
-	}
-
-	// Create the directory for the socket file if it doesn't exist
-	if err := os.MkdirAll(filepath.Dir(address), 0750); err != nil {
-		return nil, fmt.Errorf("failed to create socket directory: %w", err)
-	}
-
-	// Create UNIX socket listener
-	listener, err := net.Listen("unix", address)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create UNIX socket listener: %w", err)
-	}
-
-	// Set file permissions on the socket to allow other local processes to connect
-	if err := os.Chmod(address, socketPermissions); err != nil {
-		return nil, fmt.Errorf("failed to set socket permissions: %w", err)
-	}
-
-	return listener, nil
-}
-
-func cleanupUnixSocket(address string) {
-	if err := os.Remove(address); err != nil && !os.IsNotExist(err) {
-		slog.Warn("failed to remove socket file", "error", err)
-	}
 }
 
 func headersMiddleware(next http.Handler) http.Handler {
@@ -408,6 +378,8 @@ func headersMiddleware(next http.Handler) http.Handler {
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			w.Header().Set("Content-Type", "application/json")
 		}
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -575,6 +547,12 @@ func NewServer(ctx context.Context, builder *ServerBuilder) (*Server, error) {
 		Addr:              builder.address,
 		Handler:           handler,
 		ReadHeaderTimeout: readHeaderTimeout,
+		// IdleTimeout caps how long a keep-alive connection can sit idle.
+		// On Windows named pipes winio.MaxInstances defaults to 255, so a
+		// slow client cannot hold an instance forever and starve new
+		// connections; on POSIX it bounds keep-alive resource use the same
+		// way the http stdlib defaults would for a tcp listener.
+		IdleTimeout: idleTimeout,
 	}
 
 	return &Server{
@@ -592,7 +570,7 @@ func NewServer(ctx context.Context, builder *ServerBuilder) (*Server, error) {
 // bound address from the listener (important when binding to port 0).
 func (s *Server) ListenURL() string {
 	if s.isUnixSocket {
-		return fmt.Sprintf("unix://%s", s.address)
+		return socketURL(s.address)
 	}
 	return fmt.Sprintf("http://%s", s.listener.Addr().String())
 }
@@ -715,24 +693,30 @@ func (s *Server) cleanup() {
 	}
 }
 
-// createListener creates the appropriate listener based on the configuration
+// createListener creates the appropriate listener based on the configuration.
+// Named-pipe addresses are only supported on Windows; other platforms reject
+// them up front rather than creating a literal-backslash file via AF_UNIX.
 func createListener(address string, isUnixSocket bool) (net.Listener, string, error) {
-	var listener net.Listener
-	var addrType string
-	var err error
-
-	if isUnixSocket {
-		listener, err = setupUnixSocket(address)
-		addrType = "UNIX socket"
-	} else {
-		listener, err = setupTCPListener(address)
-		addrType = "HTTP"
+	if !isUnixSocket {
+		listener, err := setupTCPListener(address)
+		if err != nil {
+			return nil, "", err
+		}
+		return listener, "HTTP", nil
 	}
 
+	addrType := "UNIX socket"
+	if isNamedPipeAddress(address) {
+		if !supportsNamedPipe() {
+			return nil, "", fmt.Errorf("named pipe addresses are only supported on Windows: %s", address)
+		}
+		addrType = "Windows named pipe"
+	}
+
+	listener, err := setupUnixSocket(address)
 	if err != nil {
 		return nil, "", err
 	}
-
 	return listener, addrType, nil
 }
 
@@ -824,42 +808,4 @@ func GenerateNonce() (string, error) {
 		return "", fmt.Errorf("failed to generate server nonce: %w", err)
 	}
 	return hex.EncodeToString(b), nil
-}
-
-// Serve starts the server on the given address and serves the API.
-// It is assumed that the caller sets up appropriate signal handling.
-// If isUnixSocket is true, address is treated as a UNIX socket path.
-// If oidcConfig is provided, OIDC authentication will be enabled for all API endpoints.
-// Serve is a convenience wrapper that builds and starts the API server.
-// For callers that need to configure OTEL or other builder options not exposed
-// here, use NewServerBuilder and NewServer directly.
-func Serve(
-	ctx context.Context,
-	address string,
-	isUnixSocket bool,
-	debugMode bool,
-	enableDocs bool,
-	oidcConfig *auth.TokenValidatorConfig,
-	middlewares ...func(http.Handler) http.Handler,
-) error {
-	nonce, err := GenerateNonce()
-	if err != nil {
-		return err
-	}
-
-	builder := NewServerBuilder().
-		WithAddress(address).
-		WithUnixSocket(isUnixSocket).
-		WithDebugMode(debugMode).
-		WithDocs(enableDocs).
-		WithNonce(nonce).
-		WithOIDCConfig(oidcConfig).
-		WithMiddleware(middlewares...)
-
-	server, err := NewServer(ctx, builder)
-	if err != nil {
-		return err
-	}
-
-	return server.Start(ctx)
 }
