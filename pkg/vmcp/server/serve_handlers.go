@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -17,9 +18,24 @@ import (
 	"github.com/stacklok/toolhive/pkg/auth"
 	"github.com/stacklok/toolhive/pkg/vmcp"
 	"github.com/stacklok/toolhive/pkg/vmcp/conversion"
+	"github.com/stacklok/toolhive/pkg/vmcp/server/sessionmanager"
 	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
 	sessiontypes "github.com/stacklok/toolhive/pkg/vmcp/session/types"
 )
+
+const (
+	// sessionRegistrationWaitTimeout bounds how long a call waits for the
+	// session's registration (OnRegisterSession) to write the identity binding.
+	sessionRegistrationWaitTimeout = 10 * time.Second
+
+	// sessionRegistrationPollInterval is the step between two reads of the
+	// session record while waiting for the registration.
+	sessionRegistrationPollInterval = 25 * time.Millisecond
+)
+
+// errSessionNotRegistered is returned when a call gives up waiting for the
+// session's registration. The session is not terminated for it.
+var errSessionNotRegistered = errors.New("session registration not finished")
 
 // This file holds the Serve-path (s.core != nil) capability wiring. On the Serve
 // path the core VMCP is the single authoritative aggregation: session
@@ -251,19 +267,66 @@ func (s *Server) coreResourceHandler(
 // ErrSessionOwnerUnknown. Unlike the legacy GetAdaptedTools handler, which terminates
 // only on ErrUnauthorizedCaller/ErrNilCaller, terminateOnBindingFailure terminates on
 // any rejection here — intentional fail-closed behavior, not a bug.
+//
+// A call that arrives while the session is still being registered (the client
+// got the session ID from initialize, but OnRegisterSession has not yet written
+// the binding) waits for the registration instead of failing; see
+// waitForRegisteredSession. If the wait ends first, errSessionNotRegistered is
+// returned and the session is kept.
 func (s *Server) enforceSessionBinding(ctx context.Context, sessionID string, caller *auth.Identity) error {
-	sess, ok := s.vmcpSessionMgr.GetMultiSession(ctx, sessionID)
-	if !ok {
-		return sessiontypes.ErrUnauthorizedCaller
+	sess, err := s.waitForRegisteredSession(ctx, sessionID)
+	if err != nil {
+		return err
 	}
 	// Single-key read: avoid GetMetadata()'s per-call full-map copy on this hot path.
 	storedBinding, _ := sess.GetMetadataValue(vmcpsession.MetadataKeyIdentityBinding)
 	return vmcpsession.ValidateCaller(storedBinding, caller)
 }
 
+// waitForRegisteredSession returns the session's MultiSession. While the stored
+// record exists, is not terminated and has no identity binding yet (Generate wrote
+// the placeholder, CreateSession has not finished on any pod), it polls every
+// sessionRegistrationPollInterval for up to sessionRegistrationWaitTimeout.
+func (s *Server) waitForRegisteredSession(ctx context.Context, sessionID string) (vmcpsession.MultiSession, error) {
+	deadline := time.Now().Add(sessionRegistrationWaitTimeout)
+	for {
+		if sess, ok := s.vmcpSessionMgr.GetMultiSession(ctx, sessionID); ok {
+			return sess, nil
+		}
+		if !s.registrationPending(ctx, sessionID) {
+			return nil, sessiontypes.ErrUnauthorizedCaller
+		}
+		if time.Now().After(deadline) {
+			return nil, errSessionNotRegistered
+		}
+		select {
+		case <-ctx.Done():
+			return nil, errSessionNotRegistered
+		case <-time.After(sessionRegistrationPollInterval):
+		}
+	}
+}
+
+// registrationPending reports whether the stored session record is a live
+// placeholder: present, not terminated, and without an identity binding.
+func (s *Server) registrationPending(ctx context.Context, sessionID string) bool {
+	metadata, err := s.sessionDataStorage.Load(ctx, sessionID)
+	if err != nil || metadata[sessionmanager.MetadataKeyTerminated] == sessionmanager.MetadataValTrue {
+		return false
+	}
+	_, bound := metadata[vmcpsession.MetadataKeyIdentityBinding]
+	return !bound
+}
+
 // terminateOnBindingFailure logs the hijack-prevention event and terminates the
 // session, mirroring GetAdaptedTools' handling of ErrUnauthorizedCaller/ErrNilCaller.
+// A session whose registration has not finished yet is not terminated.
 func (s *Server) terminateOnBindingFailure(sessionID, capability string, err error) {
+	if errors.Is(err, errSessionNotRegistered) {
+		slog.Warn("session registration did not finish in time",
+			"session_id", sessionID, "capability", capability)
+		return
+	}
 	slog.Warn("caller authorization failed, terminating session",
 		"session_id", sessionID, "capability", capability, "error", err)
 	if _, termErr := s.vmcpSessionMgr.Terminate(sessionID); termErr != nil {

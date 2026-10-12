@@ -1148,10 +1148,9 @@ func (s *Server) handleSessionRegistrationImpl(ctx context.Context, session serv
 	// is no way to retract the session ID after it has been sent.
 	//
 	// NOTE: there is a brief race window between the client receiving the session
-	// ID and this hook completing. A client that pipelines a tools/call immediately
-	// after initialize may receive a "tool not found" error before AddSessionTools
-	// completes. Conforming MCP clients call tools/list before tools/call, so this
-	// window is expected to be harmless in practice.
+	// ID and this hook completing. A tools/call that arrives in it gets its tools
+	// from lazyInjectSessionTools, and enforceSessionBinding waits until
+	// CreateSession below has written the identity binding.
 	if _, retErr = s.vmcpSessionMgr.CreateSession(ctx, sessionID); retErr != nil {
 		slog.Error("failed to create session-scoped backends",
 			"session_id", sessionID,
