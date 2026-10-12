@@ -306,6 +306,9 @@ func TestBuildServeConfigMapsSharedFields(t *testing.T) {
 		"SessionFactory":      {}, // session manager built in Serve from ServerConfig.SessionManagerConfig
 		"OptimizerFactory":    {}, // optimizer wiring carried on ServerConfig.SessionManagerConfig (FactoryConfig)
 		"OptimizerConfig":     {}, // optimizer wiring carried on ServerConfig.SessionManagerConfig (FactoryConfig)
+		// DocPlanner fork fields: the fork's CLI uses server.New, not Serve.
+		"WriteTimeout":             {},
+		"SessionOwnerAdvertiseURL": {},
 	}
 
 	// Every field set to a non-zero value so a dropped mapping surfaces as a zero

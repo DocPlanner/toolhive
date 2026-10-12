@@ -44,8 +44,16 @@ func restoreTestBackends() []*vmcp.Backend {
 	return []*vmcp.Backend{{ID: "memory"}}
 }
 
+// callerIdentity carries the iss and sub claims that the (iss, sub) session
+// binding is derived from.
 func callerIdentity(subject, token string) *auth.Identity {
-	return &auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: subject}, Token: token}
+	return &auth.Identity{
+		PrincipalInfo: auth.PrincipalInfo{
+			Subject: subject,
+			Claims:  map[string]any{"iss": "https://issuer.example.com", "sub": subject},
+		},
+		Token: token,
+	}
 }
 
 func storedBoundSession(t *testing.T, factory MultiSessionFactory) map[string]string {

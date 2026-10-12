@@ -334,7 +334,7 @@ func TestValidatingMiddleware_RequestBodySizeLimit(t *testing.T) {
 
 		body := makeJSONBodyOfSize(t, webhook.MaxRequestSize+1)
 		req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
-		ctx := context.WithValue(req.Context(), mcp.MCPRequestContextKey, &mcp.ParsedMCPRequest{Method: "tools/call", ID: 1})
+		ctx := context.WithValue(req.Context(), mcp.MCPRequestContextKey, &mcp.ParsedMCPRequest{Method: "tools/call", ID: 1, IsRequest: true})
 		req = req.WithContext(ctx)
 
 		var nextCalled bool
@@ -374,7 +374,7 @@ func TestValidatingMiddleware_RequestBodySizeLimit(t *testing.T) {
 
 		body := makeJSONBodyOfSize(t, webhook.MaxRequestSize)
 		req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
-		ctx := context.WithValue(req.Context(), mcp.MCPRequestContextKey, &mcp.ParsedMCPRequest{Method: "tools/call", ID: 1})
+		ctx := context.WithValue(req.Context(), mcp.MCPRequestContextKey, &mcp.ParsedMCPRequest{Method: "tools/call", ID: 1, IsRequest: true})
 		req = req.WithContext(ctx)
 
 		var nextCalled bool
@@ -541,8 +541,9 @@ func TestCreateMiddleware_ResolvesHMACSecret(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader([]byte(`{"jsonrpc":"2.0","method":"tools/call","id":1}`)))
 	req = req.WithContext(context.WithValue(req.Context(), mcp.MCPRequestContextKey, &mcp.ParsedMCPRequest{
-		Method: "tools/call",
-		ID:     1,
+		Method:    "tools/call",
+		ID:        1,
+		IsRequest: true,
 	}))
 
 	rr := httptest.NewRecorder()

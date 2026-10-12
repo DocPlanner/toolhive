@@ -117,7 +117,7 @@ func (s *refreshableTestSession) CreatorIdentity() *auth.Identity {
 type configurableFailDataStorage struct {
 	transportsession.DataStorage
 	storeCallCount int
-	failStoreAfter int // fail Upsert/Create after this many successful calls (0 = never fail, -1 = always fail)
+	failStoreAfter int // fail Upsert/Create/Update after this many successful calls (0 = never fail, -1 = always fail)
 	failDelete     bool
 }
 
@@ -138,6 +138,13 @@ func (s *configurableFailDataStorage) Create(ctx context.Context, id string, met
 		return false, errors.New("injected Create failure")
 	}
 	return s.DataStorage.Create(ctx, id, metadata)
+}
+
+func (s *configurableFailDataStorage) Update(ctx context.Context, id string, metadata map[string]string) (bool, error) {
+	if s.shouldFail() {
+		return false, errors.New("injected Update failure")
+	}
+	return s.DataStorage.Update(ctx, id, metadata)
 }
 
 func (s *configurableFailDataStorage) Delete(ctx context.Context, id string) error {

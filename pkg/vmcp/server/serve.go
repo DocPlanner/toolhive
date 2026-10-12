@@ -294,6 +294,9 @@ func Serve(ctx context.Context, v core.VMCP, cfg *ServerConfig) (*Server, error)
 //     built directly in Serve from ServerConfig.SessionManagerConfig (a pre-built
 //     *sessionmanager.FactoryConfig that carries the session factory and optimizer
 //     wiring), not via Config→New, so these Config fields are unused on the Serve path.
+//   - WriteTimeout, SessionOwnerAdvertiseURL: DocPlanner fork fields. The fork's vMCP
+//     CLI builds the server through server.New with a full Config, never through
+//     Serve, so ServerConfig does not carry them.
 func buildServeConfig(cfg *ServerConfig) *Config {
 	return &Config{
 		Name:                    cmp.Or(cfg.Name, defaultServerName),

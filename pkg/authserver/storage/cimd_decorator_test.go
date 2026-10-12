@@ -580,10 +580,12 @@ func TestFetch_ScopeResolution(t *testing.T) {
 			wantScopes:      registration.DefaultScopes,
 		},
 		{
-			name:            "omitted scope with restrictive ScopesSupported requires explicit scope",
+			// DocPlanner fork (16c2fba5e): an omitted scope defaults to the
+			// advertised ScopesSupported set, the same as DCR.
+			name:            "omitted scope with restrictive ScopesSupported uses ScopesSupported",
 			docScope:        "",
 			scopesSupported: []string{"openid"},
-			wantErr:         true,
+			wantScopes:      []string{"openid"},
 		},
 		{
 			name:            "baseline unioned into scope set",
