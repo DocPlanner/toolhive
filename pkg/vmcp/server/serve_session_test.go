@@ -118,6 +118,10 @@ type fakeCore struct {
 	lastCallToolName   atomic.Value // string
 	lastReadURI        atomic.Value // string
 
+	// healthMarkedCalls counts CallTool/ReadResource calls whose context carries
+	// the health-check marker (which switches outgoing auth to service credentials).
+	healthMarkedCalls atomic.Int32
+
 	callErr error // when set, CallTool returns it (e.g. vmcp.ErrAuthorizationFailed)
 	readErr error // when set, ReadResource returns it
 }
@@ -130,9 +134,12 @@ func (f *fakeCore) ListTools(context.Context, *auth.Identity) ([]vmcp.Tool, erro
 }
 
 func (f *fakeCore) CallTool(
-	_ context.Context, _ *auth.Identity, name string, _ map[string]any, _ map[string]any,
+	ctx context.Context, _ *auth.Identity, name string, _ map[string]any, _ map[string]any,
 ) (*vmcp.ToolCallResult, error) {
 	f.callToolCalls.Add(1)
+	if health.IsHealthCheck(ctx) {
+		f.healthMarkedCalls.Add(1)
+	}
 	f.lastCallToolName.Store(name)
 	if f.callErr != nil {
 		return nil, f.callErr
@@ -145,8 +152,11 @@ func (f *fakeCore) ListResources(context.Context, *auth.Identity) ([]vmcp.Resour
 	return f.resources, nil
 }
 
-func (f *fakeCore) ReadResource(_ context.Context, _ *auth.Identity, uri string) (*vmcp.ResourceReadResult, error) {
+func (f *fakeCore) ReadResource(ctx context.Context, _ *auth.Identity, uri string) (*vmcp.ResourceReadResult, error) {
 	f.readResourceCalls.Add(1)
+	if health.IsHealthCheck(ctx) {
+		f.healthMarkedCalls.Add(1)
+	}
 	f.lastReadURI.Store(uri)
 	if f.readErr != nil {
 		return nil, f.readErr

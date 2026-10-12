@@ -614,10 +614,10 @@ func (s *Server) Handler(_ context.Context) (http.Handler, error) {
 		slog.Info("audit middleware enabled for MCP endpoints")
 	}
 
-	// Restore the health-probe marker that a peer vMCP's health checker sets on
-	// the wire (healthProbePropagatingRoundTripper), so session registration and
-	// lazy injection skip the probe. Runs after authentication.
-	mcpHandler = healthProbeContextMiddleware(mcpHandler)
+	// Mark health probes from a peer vMCP (peer_probe.go), so session registration
+	// and lazy injection skip them, and refuse any probe request beyond the
+	// handshake and capability lists. Runs after authentication.
+	mcpHandler = peerProbeMiddleware(mcpHandler)
 	mcpHandler = listenStreamContextMiddleware(mcpHandler)
 
 	mcpHandler = s.applyRateLimiting(mcpHandler)
@@ -1059,7 +1059,7 @@ func setSessionToolsDirect(session server.ClientSession, tools []server.ServerTo
 // Health probes from a peer vMCP are skipped: they get no tools.
 func (s *Server) lazyInjectSessionTools(ctx context.Context) {
 	sess := server.ClientSessionFromContext(ctx)
-	if sess == nil || health.IsHealthCheck(ctx) {
+	if sess == nil || isPeerProbe(ctx) {
 		return
 	}
 	sessionWithTools, ok := sess.(server.SessionWithTools)
@@ -1100,7 +1100,7 @@ func (s *Server) lazyInjectSessionTools(ctx context.Context) {
 // identity. The call-time binding check in coreResourceHandler stays the backstop.
 func (s *Server) lazyInjectSessionResources(ctx context.Context) {
 	sess := server.ClientSessionFromContext(ctx)
-	if sess == nil || health.IsHealthCheck(ctx) {
+	if sess == nil || isPeerProbe(ctx) {
 		return
 	}
 	sessionWithResources, ok := sess.(server.SessionWithResources)
@@ -1129,7 +1129,7 @@ func (s *Server) handleSessionRegistration(
 	ctx context.Context,
 	session server.ClientSession,
 ) {
-	if health.IsHealthCheck(ctx) {
+	if isPeerProbe(ctx) {
 		return
 	}
 	// Error is logged and handled within handleSessionRegistrationImpl.
@@ -1375,17 +1375,6 @@ var notAcceptableBody = []byte(
 	`{"jsonrpc":"2.0","id":"server-error","error":` +
 		`{"code":-32600,"message":"Not Acceptable: Client must accept text/event-stream"}}`,
 )
-
-// healthProbeContextMiddleware marks the request context as a health check when
-// the request carries the inter-vMCP probe header (health.ProbeHeader).
-func healthProbeContextMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if health.HasProbeHeader(r) {
-			r = r.WithContext(health.WithHealthCheckMarker(r.Context()))
-		}
-		next.ServeHTTP(w, r)
-	})
-}
 
 // listenStreamKey marks the context of a GET request (the Streamable HTTP listen
 // stream) for handleSessionRegistrationImpl.

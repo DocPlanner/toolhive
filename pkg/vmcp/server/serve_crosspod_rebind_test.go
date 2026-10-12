@@ -93,6 +93,7 @@ func headerIdentityMiddleware(next http.Handler) http.Handler {
 type crossPod struct {
 	handler http.Handler
 	factory *countingFactory
+	core    *fakeCore
 }
 
 // startCrossPod builds one Serve-path vMCP replica whose vMCP session manager uses
@@ -133,7 +134,7 @@ func startCrossPod(t *testing.T, shared transportsession.DataStorage, gate chan 
 
 	handler, err := srv.Handler(context.Background())
 	require.NoError(t, err)
-	return &crossPod{handler: handler, factory: factory}
+	return &crossPod{handler: handler, factory: factory, core: fc}
 }
 
 // storedBinding reads the identity binding for sessionID straight from the shared store.

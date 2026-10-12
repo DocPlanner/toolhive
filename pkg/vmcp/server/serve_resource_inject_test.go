@@ -15,7 +15,6 @@ import (
 	"go.uber.org/mock/gomock"
 
 	"github.com/stacklok/toolhive/pkg/vmcp"
-	"github.com/stacklok/toolhive/pkg/vmcp/health"
 	"github.com/stacklok/toolhive/pkg/vmcp/server/sessionmanager"
 )
 
@@ -62,7 +61,7 @@ func TestServeLazyInjectsResourcesForRehydratedSession(t *testing.T) {
 	}{
 		{"empty store is filled from the core", context.Background(), map[string]server.ServerResource{}, true},
 		{"populated store is left unchanged", context.Background(), preexisting, false},
-		{"health probe gets no resources", health.WithHealthCheckMarker(context.Background()), map[string]server.ServerResource{}, false},
+		{"health probe gets no resources", context.WithValue(context.Background(), peerProbeKey{}, true), map[string]server.ServerResource{}, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
