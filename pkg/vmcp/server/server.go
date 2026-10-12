@@ -319,7 +319,8 @@ type Server struct {
 	shutdownFuncs []func(context.Context) error
 
 	// activeClientSessions holds the SDK sessions registered on this replica
-	// (session ID -> struct{}); it feeds the session cardinality gauges.
+	// (session ID -> server.ClientSession); it feeds the session cardinality
+	// gauges and selects the sessions a capability refresh clears (serve_refresh.go).
 	activeClientSessions sync.Map
 
 	// inFlightRegistrations counts session registrations currently running the
@@ -760,6 +761,9 @@ func (s *Server) Start(ctx context.Context) error {
 		})
 	}
 
+	// Refresh session capabilities when the set of exposed backends changes.
+	s.shutdownFuncs = append(s.shutdownFuncs, s.startCapabilityRefresh())
+
 	// Wait for either context cancellation or server error
 	select {
 	case <-ctx.Done():
@@ -1132,7 +1136,7 @@ func (s *Server) handleSessionRegistration(
 	if err := s.handleSessionRegistrationImpl(ctx, session); err != nil {
 		return
 	}
-	s.activeClientSessions.Store(session.SessionID(), struct{}{})
+	s.activeClientSessions.Store(session.SessionID(), session)
 }
 
 // handleSessionRegistrationImpl handles session registration.

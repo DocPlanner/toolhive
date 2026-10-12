@@ -219,12 +219,13 @@ func Serve(ctx context.Context, v core.VMCP, cfg *ServerConfig) (*Server, error)
 	hooks := &server.Hooks{}
 
 	// Build the mcp-go server (mirrors server.New): tools and resources are
-	// registered dynamically, so capabilities start disabled.
+	// registered per session. listChanged is advertised because a backend change
+	// sends list_changed to the sessions (serve_refresh.go).
 	mcpServer := server.NewMCPServer(
 		serveCfg.Name,
 		serveCfg.Version,
-		server.WithToolCapabilities(false),
-		server.WithResourceCapabilities(false, false),
+		server.WithToolCapabilities(true),
+		server.WithResourceCapabilities(false, true),
 		server.WithLogging(),
 		server.WithHooks(hooks),
 	)

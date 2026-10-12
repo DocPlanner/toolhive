@@ -70,6 +70,8 @@ type Reporter interface {
 	UpdateBackends(newBackends []vmcp.Backend)
 	// BuildStatus assembles the aggregate vMCP status from current backend health.
 	BuildStatus() *vmcp.Status
+	// AddOnStatusChange registers a callback invoked when a backend's status changes.
+	AddOnStatusChange(hook func(StatusChangeEvent))
 }
 
 var _ Reporter = (*Monitor)(nil)
