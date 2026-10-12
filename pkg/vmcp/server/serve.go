@@ -6,6 +6,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -274,6 +275,14 @@ func Serve(ctx context.Context, v core.VMCP, cfg *ServerConfig) (*Server, error)
 		statusReporter:   cfg.StatusReporter,
 	}
 
+	if cfg.TelemetryProvider != nil {
+		// Gauges are diagnostics only: a registration failure must not stop the
+		// server (and an error return here would leak the components built above).
+		if err := monitorSessionCardinality(cfg.TelemetryProvider.MeterProvider(), srv); err != nil {
+			slog.Warn("failed to register session cardinality gauges", "error", err)
+		}
+	}
+
 	if optimizerCleanup != nil {
 		srv.shutdownFuncs = append(srv.shutdownFuncs, optimizerCleanup)
 	}
@@ -291,6 +300,9 @@ func Serve(ctx context.Context, v core.VMCP, cfg *ServerConfig) (*Server, error)
 	// OnBeforeCallTool); the *Server receiver methods are unchanged.
 	hooks.AddOnRegisterSession(func(hookCtx context.Context, session server.ClientSession) {
 		srv.handleSessionRegistration(hookCtx, session)
+	})
+	hooks.AddOnUnregisterSession(func(_ context.Context, session server.ClientSession) {
+		srv.activeClientSessions.Delete(session.SessionID())
 	})
 	hooks.AddBeforeListTools(func(hookCtx context.Context, _ any, _ *mcp.ListToolsRequest) {
 		srv.lazyInjectSessionTools(hookCtx)

@@ -19,6 +19,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mark3labs/mcp-go/server"
@@ -92,6 +93,11 @@ const (
 	// per tool call; a short TTL collapses bursts of calls into ~one sweep while keeping
 	// staleness tighter than the legacy once-per-session refresh.
 	capabilityCacheTTL = 30 * time.Second
+
+	// defaultSessionRegistrationTimeout bounds the post-initialize session
+	// registration (opening backend connections and injecting capabilities),
+	// which runs detached from the initialize request's cancellation.
+	defaultSessionRegistrationTimeout = 45 * time.Second
 )
 
 //go:generate mockgen -destination=mocks/mock_watcher.go -package=mocks -source=server.go Watcher
@@ -311,6 +317,14 @@ type Server struct {
 	// Populated during Start() initialization before blocking; no mutex needed
 	// since Stop() is only called after Start()'s select returns.
 	shutdownFuncs []func(context.Context) error
+
+	// activeClientSessions holds the SDK sessions registered on this replica
+	// (session ID -> struct{}); it feeds the session cardinality gauges.
+	activeClientSessions sync.Map
+
+	// inFlightRegistrations counts session registrations currently running the
+	// post-initialize hook; it feeds the session cardinality gauges.
+	inFlightRegistrations atomic.Int64
 }
 
 // buildSessionDataStorage constructs the DataStorage backend from cfg.
@@ -1071,7 +1085,10 @@ func (s *Server) handleSessionRegistration(
 ) {
 	// Error is logged and handled within handleSessionRegistrationImpl.
 	// The session is terminated on failure; no further action needed here.
-	_ = s.handleSessionRegistrationImpl(ctx, session)
+	if err := s.handleSessionRegistrationImpl(ctx, session); err != nil {
+		return
+	}
+	s.activeClientSessions.Store(session.SessionID(), struct{}{})
 }
 
 // handleSessionRegistrationImpl handles session registration.
@@ -1093,6 +1110,16 @@ func (s *Server) handleSessionRegistration(
 //
 //   - Prompts: not supported until the SDK adds AddSessionPrompts.
 func (s *Server) handleSessionRegistrationImpl(ctx context.Context, session server.ClientSession) (retErr error) {
+	// The SDK runs this hook with the initialize request's context, whose response
+	// is already written. A client that closes the connection fast would cancel
+	// backend initialization half-way. Keep the request values (identity, session),
+	// drop the cancellation, and bound the work with a server-side timeout.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultSessionRegistrationTimeout)
+	defer cancel()
+
+	s.inFlightRegistrations.Add(1)
+	defer s.inFlightRegistrations.Add(-1)
+
 	sessionID := session.SessionID()
 	slog.Debug("creating session-scoped backends", "session_id", sessionID)
 
