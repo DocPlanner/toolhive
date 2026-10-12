@@ -618,6 +618,7 @@ func (s *Server) Handler(_ context.Context) (http.Handler, error) {
 	// the wire (healthProbePropagatingRoundTripper), so session registration and
 	// lazy injection skip the probe. Runs after authentication.
 	mcpHandler = healthProbeContextMiddleware(mcpHandler)
+	mcpHandler = listenStreamContextMiddleware(mcpHandler)
 
 	mcpHandler = s.applyRateLimiting(mcpHandler)
 
@@ -1158,6 +1159,20 @@ func (s *Server) handleSessionRegistration(
 //
 //   - Prompts: not supported until the SDK adds AddSessionPrompts.
 func (s *Server) handleSessionRegistrationImpl(ctx context.Context, session server.ClientSession) (retErr error) {
+	s.inFlightRegistrations.Add(1)
+	defer s.inFlightRegistrations.Add(-1)
+
+	// Only the session's own initialize may create it. mcp-go v0.55 registers a
+	// session from the initialize POST and from a GET listen stream (or SSE
+	// reconnect) on a pod that does not hold the session in memory; the latter
+	// attaches to the bound session or is rejected, and never calls CreateSession.
+	// It keeps the GET's own context, so its wait for the binding ends when the
+	// client goes away. Checked before the cleanup defer below: rejecting a
+	// re-registration must not terminate the owner's session.
+	if isListenStreamRegistration(ctx) {
+		return s.attachToBoundSession(ctx, session)
+	}
+
 	// The SDK runs this hook with the initialize request's context, whose response
 	// is already written. A client that closes the connection fast would cancel
 	// backend initialization half-way. Keep the request values (identity, session),
@@ -1165,16 +1180,7 @@ func (s *Server) handleSessionRegistrationImpl(ctx context.Context, session serv
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultSessionRegistrationTimeout)
 	defer cancel()
 
-	s.inFlightRegistrations.Add(1)
-	defer s.inFlightRegistrations.Add(-1)
-
 	sessionID := session.SessionID()
-
-	// Checked before the cleanup defer below: rejecting a re-registration must not
-	// terminate the owner's session.
-	if handled, err := s.attachToBoundSession(ctx, session); handled {
-		return err
-	}
 
 	slog.Debug("creating session-scoped backends", "session_id", sessionID)
 
@@ -1216,37 +1222,50 @@ func (s *Server) handleSessionRegistrationImpl(ctx context.Context, session serv
 	return s.injectCoreSessionCapabilities(ctx, session)
 }
 
-// attachToBoundSession handles a registration for a session whose stored record
-// already has an identity binding. mcp-go registers a session again when a GET
-// listen stream (or an SSE reconnect) reaches a pod that does not hold it in
-// memory, and CreateSession would then build a new session with the caller's
-// identity and overwrite the stored binding. Instead, a caller that matches the
-// binding gets the session's capabilities, and a different caller is rejected and
-// unregistered from this pod; the stored session is not changed in either case.
-// It reports false when the record is missing, terminated or not bound yet, so
-// the caller goes on with CreateSession.
+// attachToBoundSession handles a registration that does not come from the
+// session's own initialize. mcp-go registers a session again when a GET listen
+// stream (or an SSE reconnect) reaches a pod that does not hold it in memory, and
+// CreateSession would then build a new session with the caller's identity and
+// overwrite the stored binding. Instead, this never creates a session: it waits
+// while the creating pod's registration is still pending (see
+// waitWhileRegistrationPending), then gives a caller that matches the binding the
+// session's capabilities. A different caller, or a session that is missing,
+// terminated or still not bound, is rejected and unregistered from this pod; the
+// stored session is not changed in any case.
 //
 // Upstream stops the re-bind only from v0.40.0, as a side effect of #5729. Drop
-// this guard once the fork is on v0.40 or later and TestCrossPodSessionRebind
-// passes without it.
-func (s *Server) attachToBoundSession(ctx context.Context, session server.ClientSession) (bool, error) {
+// this guard once the fork is on v0.40 or later and TestCrossPodSessionRebind and
+// TestCrossPodGETDuringRegistration pass without it.
+func (s *Server) attachToBoundSession(ctx context.Context, session server.ClientSession) error {
 	sessionID := session.SessionID()
+	s.waitWhileRegistrationPending(ctx, sessionID)
+	binding, err := s.storedBinding(ctx, sessionID)
+	if err == nil {
+		caller, _ := auth.IdentityFromContext(ctx)
+		err = vmcpsession.ValidateCaller(binding, caller)
+	}
+	if err != nil {
+		slog.Warn("rejected re-registration of a session", "session_id", sessionID, "error", err)
+		s.mcpServer.UnregisterSession(ctx, sessionID)
+		return err
+	}
+	return s.injectCoreSessionCapabilities(ctx, session)
+}
+
+// storedBinding returns the identity binding of a live stored session record.
+func (s *Server) storedBinding(ctx context.Context, sessionID string) (string, error) {
 	metadata, err := s.sessionDataStorage.Load(ctx, sessionID)
-	if err != nil || metadata[sessionmanager.MetadataKeyTerminated] == sessionmanager.MetadataValTrue {
-		return false, nil
+	if err != nil {
+		return "", fmt.Errorf("load session %s: %w", sessionID, err)
+	}
+	if metadata[sessionmanager.MetadataKeyTerminated] == sessionmanager.MetadataValTrue {
+		return "", fmt.Errorf("session %s is terminated", sessionID)
 	}
 	binding, bound := metadata[vmcpsession.MetadataKeyIdentityBinding]
 	if !bound {
-		return false, nil
+		return "", errSessionNotRegistered
 	}
-	caller, _ := auth.IdentityFromContext(ctx)
-	if err := vmcpsession.ValidateCaller(binding, caller); err != nil {
-		slog.Warn("rejected re-registration of a bound session by another caller",
-			"session_id", sessionID, "error", err)
-		s.mcpServer.UnregisterSession(ctx, sessionID)
-		return true, err
-	}
-	return true, s.injectCoreSessionCapabilities(ctx, session)
+	return binding, nil
 }
 
 // backendHealth returns the core-owned backend health reporter, or nil when health
@@ -1368,6 +1387,28 @@ func healthProbeContextMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// listenStreamKey marks the context of a GET request (the Streamable HTTP listen
+// stream) for handleSessionRegistrationImpl.
+type listenStreamKey struct{}
+
+// listenStreamContextMiddleware marks GET requests, so a session registration that
+// mcp-go runs for a GET never creates the session (see
+// handleSessionRegistrationImpl).
+func listenStreamContextMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			r = r.WithContext(context.WithValue(r.Context(), listenStreamKey{}, true))
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// isListenStreamRegistration reports whether ctx belongs to a GET request.
+func isListenStreamRegistration(ctx context.Context) bool {
+	marked, _ := ctx.Value(listenStreamKey{}).(bool)
+	return marked
 }
 
 func headerValidatingMiddleware(next http.Handler) http.Handler {

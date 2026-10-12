@@ -46,9 +46,12 @@ const (
 )
 
 // countingFactory wraps a MultiSessionFactory and counts phase-2 creations
-// (MakeSessionWithID) and cross-pod restores (RestoreSession).
+// (MakeSessionWithID) and cross-pod restores (RestoreSession). When gate is set,
+// MakeSessionWithID blocks until it is closed, which holds the session record as an
+// unbound placeholder.
 type countingFactory struct {
 	base     vmcpsession.MultiSessionFactory
+	gate     chan struct{}
 	makes    atomic.Int32
 	restores atomic.Int32
 }
@@ -57,6 +60,9 @@ func (f *countingFactory) MakeSessionWithID(
 	ctx context.Context, id string, identity *auth.Identity, backends []*vmcp.Backend,
 ) (vmcpsession.MultiSession, error) {
 	f.makes.Add(1)
+	if f.gate != nil {
+		<-f.gate
+	}
 	return f.base.MakeSessionWithID(ctx, id, identity, backends)
 }
 
@@ -90,11 +96,12 @@ type crossPod struct {
 
 // startCrossPod builds one Serve-path vMCP replica whose vMCP session manager uses
 // the shared store, and returns the full shared Handler (auth middleware included).
-func startCrossPod(t *testing.T, shared transportsession.DataStorage) *crossPod {
+// A non-nil gate blocks the replica's phase-2 creation until it is closed.
+func startCrossPod(t *testing.T, shared transportsession.DataStorage, gate chan struct{}) *crossPod {
 	t.Helper()
 	authReg := vmcpauth.NewDefaultOutgoingAuthRegistry()
 	require.NoError(t, authReg.RegisterStrategy(authtypes.StrategyTypeUnauthenticated, strategies.NewUnauthenticatedStrategy()))
-	factory := &countingFactory{base: vmcpsession.NewSessionFactory(authReg)}
+	factory := &countingFactory{base: vmcpsession.NewSessionFactory(authReg), gate: gate}
 	registry := vmcp.NewImmutableRegistry([]vmcp.Backend{})
 	fc := &fakeCore{tools: []vmcp.Tool{{Name: "echo", Description: "echo"}}}
 
@@ -258,8 +265,8 @@ func TestCrossPodSessionRebind(t *testing.T) {
 			shared, err := transportsession.NewLocalSessionDataStorage(time.Hour)
 			require.NoError(t, err)
 			t.Cleanup(func() { _ = shared.Close() })
-			podA := startCrossPod(t, shared)
-			podB := startCrossPod(t, shared)
+			podA := startCrossPod(t, shared, nil)
+			podB := startCrossPod(t, shared, nil)
 
 			sessionID := initSession(t, shared, podA, "alice")
 			aliceBinding := storedBinding(t, shared, sessionID)
@@ -307,4 +314,81 @@ func TestCrossPodSessionRebind(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCrossPodGETDuringRegistration covers the window before the session has a
+// binding: alice's initialize on pod A is still registering (phase-2 creation is
+// blocked) when eve sends a GET with the session ID to pod B. Only the session's own
+// initialize may create the session, so pod B must not run phase-2 creation for
+// eve's GET; it waits for alice's binding and then rejects eve.
+func TestCrossPodGETDuringRegistration(t *testing.T) {
+	t.Parallel()
+
+	shared, err := transportsession.NewLocalSessionDataStorage(time.Hour)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = shared.Close() })
+	gate := make(chan struct{})
+	podA := startCrossPod(t, shared, gate)
+	podB := startCrossPod(t, shared, nil)
+
+	// alice's initialize on pod A. mcp-go writes the response headers (with the
+	// session ID) before it runs the registration hook, which then blocks in the gate.
+	initW := newSSEWriter()
+	initDone := make(chan struct{})
+	go func() {
+		defer close(initDone)
+		podA.handler.ServeHTTP(initW, newCrossPodRequest(context.Background(), http.MethodPost, "alice", "",
+			`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18",`+
+				`"capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`))
+	}()
+	select {
+	case <-initW.headerWritten:
+	case <-time.After(5 * time.Second):
+		t.Fatal("initialize did not write response headers")
+	}
+	sessionID := initW.Header().Get("Mcp-Session-Id")
+	require.NotEmpty(t, sessionID)
+	require.Eventually(t, func() bool { return podA.factory.makes.Load() == 1 },
+		2*time.Second, 5*time.Millisecond, "alice's registration must be blocked in phase-2 creation")
+	require.Empty(t, storedBinding(t, shared, sessionID), "the session must not be bound yet")
+
+	// eve's GET on pod B while alice's registration is pending.
+	getCtx, cancelGET := context.WithCancel(context.Background())
+	getW := newSSEWriter()
+	getDone := make(chan struct{})
+	go func() {
+		defer close(getDone)
+		podB.handler.ServeHTTP(getW, newCrossPodRequest(getCtx, http.MethodGet, "eve", sessionID, ""))
+	}()
+
+	// Give eve's GET time to reach the registration hook, then let alice's
+	// registration finish.
+	time.Sleep(200 * time.Millisecond)
+	close(gate)
+	select {
+	case <-initDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("alice's registration did not finish")
+	}
+	select {
+	case <-getW.headerWritten:
+	case <-getDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("GET did not write response headers")
+	}
+	cancelGET()
+	<-getDone
+
+	assert.Equal(t, int32(0), podB.factory.makes.Load(),
+		"a GET on pod B must not call CreateSession/MakeSessionWithID")
+	binding := storedBinding(t, shared, sessionID)
+	alice := &auth.Identity{PrincipalInfo: auth.PrincipalInfo{
+		Subject: "alice", Claims: map[string]any{"iss": crossPodIssuer, "sub": "alice"},
+	}}
+	assert.NoError(t, vmcpsession.ValidateCaller(binding, alice), "the session must be bound to alice")
+
+	body := callEcho(t, podB, "alice", sessionID)
+	assert.Contains(t, body, `"ok"`, "alice must own her session after eve's GET")
+	body = callEcho(t, podB, "eve", sessionID)
+	assert.Contains(t, body, "Unauthorized", "eve must not be able to use alice's session")
 }

@@ -307,6 +307,20 @@ func (s *Server) waitForRegisteredSession(ctx context.Context, sessionID string)
 	}
 }
 
+// waitWhileRegistrationPending polls every sessionRegistrationPollInterval, for
+// up to sessionRegistrationWaitTimeout, while the stored session record is a live
+// placeholder whose registration has not written the identity binding yet.
+func (s *Server) waitWhileRegistrationPending(ctx context.Context, sessionID string) {
+	deadline := time.Now().Add(sessionRegistrationWaitTimeout)
+	for s.registrationPending(ctx, sessionID) && time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(sessionRegistrationPollInterval):
+		}
+	}
+}
+
 // registrationPending reports whether the stored session record is a live
 // placeholder: present, not terminated, and without an identity binding.
 func (s *Server) registrationPending(ctx context.Context, sessionID string) bool {
