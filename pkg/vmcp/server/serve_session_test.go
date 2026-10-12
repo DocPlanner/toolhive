@@ -944,3 +944,35 @@ func postServeMCP(t *testing.T, baseURL string, body map[string]any, sessionID s
 	require.NoError(t, err)
 	return resp
 }
+
+// recordingSessionIDManager records Terminate calls.
+type recordingSessionIDManager struct {
+	terminated []string
+}
+
+func (*recordingSessionIDManager) Generate() string              { return "generated" }
+func (*recordingSessionIDManager) Validate(string) (bool, error) { return false, nil }
+func (m *recordingSessionIDManager) Terminate(id string) (bool, error) {
+	m.terminated = append(m.terminated, id)
+	return false, nil
+}
+
+// TestSessionIDManagerResolver verifies that a request (DELETE included) reaches
+// the vMCP session manager, while mcp-go's idle sweeper (nil request) gets a
+// manager whose Terminate leaves the shared session record alone.
+func TestSessionIDManagerResolver(t *testing.T) {
+	t.Parallel()
+
+	mgr := &recordingSessionIDManager{}
+	resolver := sessionIDManagerResolver{manager: mgr}
+
+	_, err := resolver.ResolveSessionIdManager(nil).Terminate("swept")
+	require.NoError(t, err)
+	assert.Empty(t, mgr.terminated, "the idle sweeper must not terminate the shared session")
+	assert.Equal(t, "generated", resolver.ResolveSessionIdManager(nil).Generate())
+
+	req := httptest.NewRequest(http.MethodDelete, "/mcp", nil)
+	_, err = resolver.ResolveSessionIdManager(req).Terminate("deleted")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"deleted"}, mgr.terminated, "a client DELETE must terminate the session")
+}

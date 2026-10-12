@@ -102,6 +102,12 @@ type crossPod struct {
 // A non-nil gate blocks the replica's phase-2 creation until it is closed.
 func startCrossPod(t *testing.T, shared transportsession.DataStorage, gate chan struct{}) *crossPod {
 	t.Helper()
+	return startCrossPodWithTTL(t, shared, gate, time.Hour)
+}
+
+// startCrossPodWithTTL is startCrossPod with the given session TTL.
+func startCrossPodWithTTL(t *testing.T, shared transportsession.DataStorage, gate chan struct{}, ttl time.Duration) *crossPod {
+	t.Helper()
 	authReg := vmcpauth.NewDefaultOutgoingAuthRegistry()
 	require.NoError(t, authReg.RegisterStrategy(authtypes.StrategyTypeUnauthenticated, strategies.NewUnauthenticatedStrategy()))
 	factory := &countingFactory{base: vmcpsession.NewSessionFactory(authReg), gate: gate}
@@ -112,7 +118,7 @@ func startCrossPod(t *testing.T, shared transportsession.DataStorage, gate chan 
 	}
 
 	srv, err := Serve(context.Background(), fc, &ServerConfig{
-		SessionTTL:           time.Hour,
+		SessionTTL:           ttl,
 		SessionManagerConfig: &sessionmanager.FactoryConfig{Base: factory},
 		BackendRegistry:      registry,
 		AuthMiddleware:       headerIdentityMiddleware,
@@ -530,4 +536,35 @@ func TestListenStreamGuard(t *testing.T) {
 		_, podA, _ := newPods(t)
 		assert.Equal(t, http.StatusNotFound, openSSE(t, podA, "alice", "unknown-session"))
 	})
+}
+
+// TestCrossPodIdleSweepKeepsSessionInUse covers mcp-go's idle sweep of the SDK's
+// per-session state. A session used once on pod B and then only on pod A goes
+// idle on pod B; pod B's sweep must clear only its own SDK state, and must not
+// terminate the shared session that alice keeps using on pod A.
+func TestCrossPodIdleSweepKeepsSessionInUse(t *testing.T) {
+	t.Parallel()
+
+	const ttl = time.Second
+	shared, err := transportsession.NewLocalSessionDataStorage(time.Hour)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = shared.Close() })
+	podA := startCrossPodWithTTL(t, shared, nil, ttl)
+	podB := startCrossPodWithTTL(t, shared, nil, ttl)
+
+	sessionID := initSession(t, shared, podA, "alice")
+	require.Contains(t, callEcho(t, podB, "alice", sessionID), `"ok"`)
+
+	// Keep the session busy on pod A, and idle on pod B, for well over pod B's
+	// idle TTL plus one sweep interval (max(ttl/2, 1s)).
+	deadline := time.Now().Add(3 * ttl)
+	for time.Now().Before(deadline) {
+		require.Contains(t, callEcho(t, podA, "alice", sessionID), `"ok"`, "alice must keep her session on pod A")
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	_, err = shared.Load(context.Background(), sessionID)
+	require.NoError(t, err, "pod B's idle sweep must not delete the shared session record")
+	assert.Contains(t, callEcho(t, podB, "alice", sessionID), `"ok"`,
+		"pod B must serve the session again after its own idle sweep")
 }

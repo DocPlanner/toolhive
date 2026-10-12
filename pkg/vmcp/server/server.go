@@ -314,8 +314,9 @@ type Server struct {
 	statusReporter vmcpstatus.Reporter
 
 	// shutdownFuncs contains cleanup functions to run during Stop().
-	// Populated during Start() initialization before blocking; no mutex needed
-	// since Stop() is only called after Start()'s select returns.
+	// Populated by Serve, by Handler and during Start() initialization before
+	// blocking; no mutex needed since Stop() is only called after Start()'s select
+	// returns (or, for an embedded Handler, after the caller stops serving it).
 	shutdownFuncs []func(context.Context) error
 
 	// activeClientSessions holds the SDK sessions registered on this replica
@@ -523,12 +524,17 @@ func (s *Server) Handler(_ context.Context) (http.Handler, error) {
 	streamableServer := server.NewStreamableHTTPServer(
 		s.mcpServer,
 		server.WithEndpointPath(s.config.EndpointPath),
-		server.WithSessionIdManager(s.vmcpSessionMgr),
+		server.WithSessionIdManagerResolver(sessionIDManagerResolver{manager: s.vmcpSessionMgr}),
 		server.WithHeartbeatInterval(defaultHeartbeatInterval),
 		// Sweep the SDK's per-session tool/resource stores for sessions that go idle
-		// without a DELETE, using the same TTL as the session storage.
+		// on this replica without a DELETE, using the same TTL as the session
+		// storage. The sweep clears only this replica's state (see
+		// sessionIDManagerResolver); the storage TTL expires the shared record.
 		server.WithSessionIdleTTL(s.config.SessionTTL),
 	)
+	// Stop the idle sweeper's goroutine on Stop. Shutdown only cancels the sweeper
+	// here: the StreamableHTTPServer is used as a handler and owns no listener.
+	s.shutdownFuncs = append(s.shutdownFuncs, streamableServer.Shutdown)
 
 	// Create HTTP mux with separated authenticated and unauthenticated routes
 	mux := http.NewServeMux()
@@ -1389,6 +1395,39 @@ var notAcceptableBody = []byte(
 	`{"jsonrpc":"2.0","id":"server-error","error":` +
 		`{"code":-32600,"message":"Not Acceptable: Client must accept text/event-stream"}}`,
 )
+
+// sessionIDManagerResolver gives mcp-go the vMCP session manager for every
+// request. mcp-go's idle sweeper (WithSessionIdleTTL) resolves the manager with a
+// nil request and calls Terminate for each session that is idle on this replica;
+// the vMCP manager's Terminate would delete the shared session record for every
+// replica, including one where the session is still in use. For the sweeper the
+// resolver returns localSweepSessionIDManager, whose Terminate keeps the shared
+// record; mcp-go then clears only this replica's SDK state. The node-local
+// MultiSession is closed by the session manager's own idle sweep
+// (sessionmanager.FactoryConfig.IdleTTL), and the storage TTL expires the shared
+// record once no replica uses the session.
+type sessionIDManagerResolver struct {
+	manager server.SessionIdManager
+}
+
+// ResolveSessionIdManager implements server.SessionIdManagerResolver.
+func (r sessionIDManagerResolver) ResolveSessionIdManager(req *http.Request) server.SessionIdManager {
+	if req == nil {
+		return localSweepSessionIDManager{SessionIdManager: r.manager}
+	}
+	return r.manager
+}
+
+// localSweepSessionIDManager is the session ID manager mcp-go's idle sweeper
+// uses: Terminate is a no-op, so the sweep never touches the shared session record.
+type localSweepSessionIDManager struct {
+	server.SessionIdManager
+}
+
+// Terminate keeps the shared session record; see sessionIDManagerResolver.
+func (localSweepSessionIDManager) Terminate(string) (bool, error) {
+	return false, nil
+}
 
 // listenStreamKey marks the context of a GET request (the Streamable HTTP listen
 // stream) that passed listenStreamGuardMiddleware, for handleSessionRegistrationImpl.
