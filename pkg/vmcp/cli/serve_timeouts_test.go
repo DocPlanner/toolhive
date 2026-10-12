@@ -95,9 +95,25 @@ func TestServerWriteTimeoutFromConfig(t *testing.T) {
 		want time.Duration
 	}{
 		{
-			name: "returns zero without timeout configuration",
+			name: "covers the backend client's fallback without timeout configuration",
 			cfg:  nil,
-			want: 0,
+			want: 95 * time.Second,
+		},
+		{
+			name: "covers the fallback when only short per-workload timeouts are set",
+			cfg: &config.Config{Operational: &config.OperationalConfig{
+				Timeouts: &config.TimeoutConfig{
+					PerWorkload: map[string]config.Duration{"fast-mcp": config.Duration(10 * time.Second)},
+				},
+			}},
+			want: 95 * time.Second,
+		},
+		{
+			name: "a short default lowers the deadline below the fallback",
+			cfg: &config.Config{Operational: &config.OperationalConfig{
+				Timeouts: &config.TimeoutConfig{Default: config.Duration(20 * time.Second)},
+			}},
+			want: 25 * time.Second,
 		},
 		{
 			name: "adds response margin to default timeout",

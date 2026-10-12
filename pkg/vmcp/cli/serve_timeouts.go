@@ -6,6 +6,7 @@ package cli
 import (
 	"time"
 
+	vmcpclient "github.com/stacklok/toolhive/pkg/vmcp/client"
 	"github.com/stacklok/toolhive/pkg/vmcp/config"
 )
 
@@ -41,16 +42,20 @@ func backendRequestTimeoutsFromConfig(cfg *config.Config) (time.Duration, map[st
 	return time.Duration(timeouts.Default), perWorkload
 }
 
+// serverWriteTimeoutFromConfig returns the HTTP write timeout that lets the
+// longest backend call finish and leaves backendResponseMargin to write the MCP
+// response. It mirrors the backend client's choice of timeout per call: the
+// per-workload value, else timeouts.default, else
+// vmcpclient.DefaultBackendRequestTimeout. The server raises values below its own
+// default write timeout.
 func serverWriteTimeoutFromConfig(cfg *config.Config) time.Duration {
 	defaultTimeout, perWorkload := backendRequestTimeoutsFromConfig(cfg)
+	if defaultTimeout <= 0 {
+		defaultTimeout = vmcpclient.DefaultBackendRequestTimeout
+	}
 	maxTimeout := defaultTimeout
 	for _, timeout := range perWorkload {
-		if timeout > maxTimeout {
-			maxTimeout = timeout
-		}
-	}
-	if maxTimeout <= 0 {
-		return 0
+		maxTimeout = max(maxTimeout, timeout)
 	}
 	return maxTimeout + backendResponseMargin
 }

@@ -27,7 +27,7 @@ func TestRequestTimeout(t *testing.T) {
 		workload    string
 		wantTimeout time.Duration
 	}{
-		{name: "no option uses 90 s", workload: "a", wantTimeout: defaultBackendRequestTimeout},
+		{name: "no option uses 90 s", workload: "a", wantTimeout: DefaultBackendRequestTimeout},
 		{
 			name:        "default applies to unlisted workload",
 			opts:        []Option{WithRequestTimeouts(2*time.Minute, map[string]time.Duration{"b": time.Minute})},
@@ -44,7 +44,7 @@ func TestRequestTimeout(t *testing.T) {
 			name:        "non-positive values fall back to 90 s",
 			opts:        []Option{WithRequestTimeouts(0, map[string]time.Duration{"a": -time.Second})},
 			workload:    "a",
-			wantTimeout: defaultBackendRequestTimeout,
+			wantTimeout: DefaultBackendRequestTimeout,
 		},
 	}
 	for _, tt := range tests {

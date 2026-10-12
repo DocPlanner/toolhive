@@ -102,9 +102,10 @@ func WithDialControl(control func(network, address string, c syscall.RawConn) er
 	}
 }
 
-// defaultBackendRequestTimeout bounds each streamable-HTTP backend request when
-// WithRequestTimeouts sets no value for the backend.
-const defaultBackendRequestTimeout = 90 * time.Second
+// DefaultBackendRequestTimeout bounds each streamable-HTTP backend request when
+// WithRequestTimeouts sets no value for the backend. The vMCP's HTTP write
+// timeout must cover it (see serverWriteTimeoutFromConfig in pkg/vmcp/cli).
+const DefaultBackendRequestTimeout = 90 * time.Second
 
 // WithRequestTimeouts sets the timeout of each streamable-HTTP backend request.
 // An entry in perWorkload (keyed by BackendTarget.WorkloadID) wins over
@@ -611,7 +612,7 @@ func (h *httpBackendClient) requestTimeout(workloadID string) time.Duration {
 	if h.defaultRequestTimeout > 0 {
 		return h.defaultRequestTimeout
 	}
-	return defaultBackendRequestTimeout
+	return DefaultBackendRequestTimeout
 }
 
 // isAuthorizationRequired reports whether err is one of the mcp-go authorization-required
