@@ -45,6 +45,13 @@ type ValidatingCache[K comparable, V any] struct {
 	// lastUsed records when each entry was last read or written (K -> time.Time).
 	// EvictIdle reads it; the LRU eviction callback removes an entry's record.
 	lastUsed sync.Map
+	// detachMu guards detached.
+	detachMu sync.Mutex
+	// detached holds the entries that Remove and EvictIdle take out of the LRU
+	// while holding mu. The LRU eviction callback skips onEvict for them; the
+	// caller calls onEvict after releasing mu, so a slow onEvict (a session Close
+	// doing backend I/O) never blocks Set or a concurrent eviction.
+	detached map[K]V
 }
 
 // New creates a ValidatingCache with the given capacity and callbacks.
@@ -76,13 +83,14 @@ func New[K comparable, V any](
 	}
 
 	vc := &ValidatingCache[K, V]{
-		load:    load,
-		check:   check,
-		onEvict: onEvict,
+		load:     load,
+		check:    check,
+		onEvict:  onEvict,
+		detached: make(map[K]V),
 	}
 	c, err := lru.NewWithEvict(capacity, func(key K, val V) {
 		vc.lastUsed.Delete(key)
-		if onEvict != nil {
+		if onEvict != nil && !vc.takeDetached(key, val) {
 			onEvict(key, val)
 		}
 	})
@@ -196,17 +204,21 @@ func (c *ValidatingCache[K, V]) Set(key K, value V) {
 	c.lastUsed.Store(key, time.Now())
 }
 
-// Remove evicts key, calling onEvict for its value. It is a no-op when key is
-// not cached.
+// Remove evicts key, calling onEvict for its value after the cache lock is
+// released. It is a no-op when key is not cached.
 func (c *ValidatingCache[K, V]) Remove(key K) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.lruCache.Remove(key)
+	val, removed := c.removeDetached(key)
+	c.mu.Unlock()
+	if removed && c.onEvict != nil {
+		c.onEvict(key, val)
+	}
 }
 
 // EvictIdle evicts every entry that no Get or Set has used for longer than
-// maxAge, calling onEvict for each. It calls neither check nor load, so it never
-// touches the backing store (for example, it does not refresh a Redis TTL).
+// maxAge, calling onEvict for each after the cache lock is released. It calls
+// neither check nor load, so it never touches the backing store (for example, it
+// does not refresh a Redis TTL).
 //
 // An entry that a concurrent Get returns just before EvictIdle removes it is
 // still handed to that caller after onEvict has run.
@@ -219,11 +231,18 @@ func (c *ValidatingCache[K, V]) EvictIdle(maxAge time.Duration) {
 			return true
 		}
 		c.mu.Lock()
-		defer c.mu.Unlock()
 		// CompareAndDelete skips an entry that a Get or Set touched after Range
 		// read it; Set holds mu, so it cannot re-add the key in between.
+		var (
+			val     V
+			removed bool
+		)
 		if c.lastUsed.CompareAndDelete(rawKey, rawUsed) {
-			c.lruCache.Remove(key)
+			val, removed = c.removeDetached(key)
+		}
+		c.mu.Unlock()
+		if removed && c.onEvict != nil {
+			c.onEvict(key, val)
 		}
 		return true
 	})
@@ -232,6 +251,43 @@ func (c *ValidatingCache[K, V]) EvictIdle(maxAge time.Duration) {
 // Len returns the number of entries currently in the cache.
 func (c *ValidatingCache[K, V]) Len() int {
 	return c.lruCache.Len()
+}
+
+// removeDetached removes key from the LRU without running onEvict, and returns
+// the removed value for the caller to release after it unlocks mu. The caller
+// must hold mu. The LRU capacity eviction in Get does not hold mu, so it can
+// evict the same entry concurrently; exactly one of the two calls onEvict for
+// it. Peek and the detach mark happen under detachMu, which the eviction
+// callback also takes: an eviction whose callback runs after the mark skips
+// onEvict, and one that removed the entry before Peek leaves nothing to detach.
+func (c *ValidatingCache[K, V]) removeDetached(key K) (V, bool) {
+	c.detachMu.Lock()
+	val, ok := c.lruCache.Peek(key)
+	if ok {
+		c.detached[key] = val
+	}
+	c.detachMu.Unlock()
+	if !ok {
+		var zero V
+		return zero, false
+	}
+	c.lruCache.Remove(key)
+	// Drop the mark if no callback took it: a concurrent eviction removed val
+	// and a newer value for key took its place before Remove.
+	c.takeDetached(key, val)
+	return val, true
+}
+
+// takeDetached reports whether (key, val) is marked as detached, and clears the mark.
+func (c *ValidatingCache[K, V]) takeDetached(key K, val V) bool {
+	c.detachMu.Lock()
+	defer c.detachMu.Unlock()
+	marked, ok := c.detached[key]
+	if !ok || !sameEntry(marked, val) {
+		return false
+	}
+	delete(c.detached, key)
+	return true
 }
 
 // sameEntry reports whether a and b are the same cache entry.

@@ -643,3 +643,63 @@ func TestValidatingCache_EvictIdle(t *testing.T) {
 	_, tracked := c.lastUsed.Load("busy")
 	assert.False(t, tracked)
 }
+
+// TestValidatingCache_SlowEvictDoesNotBlockSet verifies that Remove and EvictIdle
+// call onEvict (for example a session Close doing backend I/O) without holding the
+// lock that Set takes.
+func TestValidatingCache_SlowEvictDoesNotBlockSet(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		evict func(c *ValidatingCache[string, string])
+	}{
+		{name: "Remove", evict: func(c *ValidatingCache[string, string]) { c.Remove("slow") }},
+		{name: "EvictIdle", evict: func(c *ValidatingCache[string, string]) { c.EvictIdle(0) }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			var evicted atomic.Int32
+			c := newStringCache(
+				func(_ context.Context, _ string) (string, error) { return "", errors.New("unused") },
+				alwaysAliveCheck,
+				func(key, _ string) {
+					if key == "slow" {
+						close(entered)
+						<-release
+					}
+					evicted.Add(1)
+				},
+			)
+			c.Set("slow", "v")
+
+			evictDone := make(chan struct{})
+			go func() {
+				defer close(evictDone)
+				tc.evict(c)
+			}()
+			<-entered
+
+			setDone := make(chan struct{})
+			go func() {
+				defer close(setDone)
+				c.Set("other", "v")
+			}()
+			select {
+			case <-setDone:
+			case <-time.After(time.Second):
+				t.Error("Set blocked while onEvict was running")
+			}
+
+			close(release)
+			<-evictDone
+			<-setDone
+			assert.Equal(t, int32(1), evicted.Load(), "onEvict must run exactly once")
+			_, ok := c.lruCache.Peek("slow")
+			assert.False(t, ok)
+		})
+	}
+}
