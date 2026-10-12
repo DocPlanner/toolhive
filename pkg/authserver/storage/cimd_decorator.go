@@ -159,10 +159,9 @@ func (d *CIMDStorageDecorator) fetch(ctx context.Context, id string) (fosite.Cli
 	// When ScopesSupported is configured:
 	//   - Declared scopes are validated via registration.ValidateScopes (same
 	//     function as the DCR handler).
-	//   - Omitted scope uses ValidateScopes(nil, scopesSupported) which returns
-	//     DefaultScopes when DefaultScopes ⊆ ScopesSupported, matching DCR.
-	//     If DefaultScopes ⊄ ScopesSupported the document must declare scope
-	//     explicitly to avoid ambiguous privilege grant.
+	//   - Omitted scope uses ValidateScopes(nil, scopesSupported), matching DCR.
+	//     In the DocPlanner fork (16c2fba5e) that returns the advertised
+	//     ScopesSupported set as the default grant, so it does not fail.
 	// When ScopesSupported is not configured: no AS-level validation; declared
 	// scopes are used directly, or nil to let buildFositeClient apply DefaultScopes.
 	// In both cases BaselineClientScopes is unioned in after validation,
@@ -177,7 +176,7 @@ func (d *CIMDStorageDecorator) fetch(ctx context.Context, id string) (fosite.Cli
 			}
 			resolvedScopes = computed
 		} else {
-			// Omitted scope: match DCR — give DefaultScopes when they fit, else require explicit scope.
+			// Omitted scope: match DCR, which grants the advertised ScopesSupported set.
 			computed, dcrErr := registration.ValidateScopes(nil, d.scopesSupported)
 			if dcrErr != nil {
 				return nil, fmt.Errorf("%w: CIMD document at %s omits scope but "+
