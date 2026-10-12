@@ -613,6 +613,11 @@ func (s *Server) Handler(_ context.Context) (http.Handler, error) {
 		slog.Info("audit middleware enabled for MCP endpoints")
 	}
 
+	// Restore the health-probe marker that a peer vMCP's health checker sets on
+	// the wire (healthProbePropagatingRoundTripper), so session registration and
+	// lazy injection skip the probe. Runs after authentication.
+	mcpHandler = healthProbeContextMiddleware(mcpHandler)
+
 	mcpHandler = s.applyRateLimiting(mcpHandler)
 
 	// Apply authentication middleware if configured (runs first in chain)
@@ -1045,9 +1050,11 @@ func setSessionToolsDirect(session server.ClientSession, tools []server.ServerTo
 //
 // For sessions initialized on this pod (normal case), tools are already in the store
 // (set by setSessionToolsDirect during OnRegisterSession); this method is a no-op.
+//
+// Health probes from a peer vMCP are skipped: they get no tools.
 func (s *Server) lazyInjectSessionTools(ctx context.Context) {
 	sess := server.ClientSessionFromContext(ctx)
-	if sess == nil {
+	if sess == nil || health.IsHealthCheck(ctx) {
 		return
 	}
 	sessionWithTools, ok := sess.(server.SessionWithTools)
@@ -1084,10 +1091,17 @@ func (s *Server) lazyInjectSessionTools(ctx context.Context) {
 
 // handleSessionRegistration processes a new MCP session registration.
 // It fires AFTER the session is registered in the SDK.
+//
+// A health probe from a peer vMCP only checks that the MCP handshake works, so
+// it neither opens backend connections nor lists capabilities, and it is not
+// counted as an active session.
 func (s *Server) handleSessionRegistration(
 	ctx context.Context,
 	session server.ClientSession,
 ) {
+	if health.IsHealthCheck(ctx) {
+		return
+	}
 	// Error is logged and handled within handleSessionRegistrationImpl.
 	// The session is terminated on failure; no further action needed here.
 	if err := s.handleSessionRegistrationImpl(ctx, session); err != nil {
@@ -1276,6 +1290,17 @@ var notAcceptableBody = []byte(
 
 // headerValidatingMiddleware rejects GET requests that do not include
 // Accept: text/event-stream, as required by the MCP Streamable HTTP transport spec.
+// healthProbeContextMiddleware marks the request context as a health check when
+// the request carries the inter-vMCP probe header (health.ProbeHeader).
+func healthProbeContextMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if health.HasProbeHeader(r) {
+			r = r.WithContext(health.WithHealthCheckMarker(r.Context()))
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func headerValidatingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet &&
