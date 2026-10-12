@@ -5,6 +5,7 @@ package server
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"go.uber.org/mock/gomock"
 
 	"github.com/stacklok/toolhive/pkg/auth"
+	transportsession "github.com/stacklok/toolhive/pkg/transport/session"
 	"github.com/stacklok/toolhive/pkg/vmcp"
 	"github.com/stacklok/toolhive/pkg/vmcp/server/sessionmanager"
 	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
@@ -134,4 +136,54 @@ func TestEnforceSessionBindingWaitsForRegistration(t *testing.T) {
 		require.ErrorIs(t, err, sessiontypes.ErrUnauthorizedCaller)
 		assert.Less(t, time.Since(start), time.Second)
 	})
+}
+
+// countingStorage counts Load calls on a DataStorage.
+type countingStorage struct {
+	transportsession.DataStorage
+	loads atomic.Int32
+}
+
+func (c *countingStorage) Load(ctx context.Context, id string) (map[string]string, error) {
+	c.loads.Add(1)
+	return c.DataStorage.Load(ctx, id)
+}
+
+// TestRegistrationWaitBacksOff verifies that a call waiting for a registration
+// reads the session store once per step, with a growing step, instead of a full
+// session lookup plus a placeholder check every 25 ms.
+func TestRegistrationWaitBacksOff(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	tools := []vmcp.Tool{{Name: "t"}}
+	base, _ := newToolSessionFactory(t, ctrl, tools)
+	srv, err := Serve(context.Background(), &fakeCore{tools: tools}, &ServerConfig{
+		SessionTTL:           time.Minute,
+		SessionManagerConfig: &sessionmanager.FactoryConfig{Base: base},
+		BackendRegistry:      vmcp.NewImmutableRegistry([]vmcp.Backend{}),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = srv.Stop(context.Background()) })
+
+	local, err := transportsession.NewLocalSessionDataStorage(time.Minute)
+	require.NoError(t, err)
+	storage := &countingStorage{DataStorage: local}
+	mgr, cleanup, err := sessionmanager.New(storage, &sessionmanager.FactoryConfig{Base: base},
+		vmcp.NewImmutableRegistry([]vmcp.Backend{}))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cleanup(context.Background()) })
+	srv.vmcpSessionMgr = mgr
+	_ = srv.sessionDataStorage.Close()
+	srv.sessionDataStorage = storage
+
+	// A placeholder whose registration never runs stays pending.
+	sessionID := mgr.Generate()
+	storage.loads.Store(0)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err = srv.enforceSessionBinding(ctx, sessionID, nil)
+	require.ErrorIs(t, err, errSessionNotRegistered)
+	assert.Less(t, storage.loads.Load(), int32(15), "a one-second wait must read the store only a few times")
 }

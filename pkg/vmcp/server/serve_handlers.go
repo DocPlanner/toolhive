@@ -28,9 +28,13 @@ const (
 	// session's registration (OnRegisterSession) to write the identity binding.
 	sessionRegistrationWaitTimeout = 10 * time.Second
 
-	// sessionRegistrationPollInterval is the step between two reads of the
-	// session record while waiting for the registration.
+	// sessionRegistrationPollInterval is the first step between two reads of the
+	// session record while waiting for the registration. Each step doubles, up
+	// to sessionRegistrationMaxPollInterval.
 	sessionRegistrationPollInterval = 25 * time.Millisecond
+
+	// sessionRegistrationMaxPollInterval caps the step between two reads.
+	sessionRegistrationMaxPollInterval = 500 * time.Millisecond
 )
 
 // errSessionNotRegistered is returned when a call gives up waiting for the
@@ -283,42 +287,49 @@ func (s *Server) enforceSessionBinding(ctx context.Context, sessionID string, ca
 	return vmcpsession.ValidateCaller(storedBinding, caller)
 }
 
-// waitForRegisteredSession returns the session's MultiSession. While the stored
-// record exists, is not terminated and has no identity binding yet (Generate wrote
-// the placeholder, CreateSession has not finished on any pod), it polls every
-// sessionRegistrationPollInterval for up to sessionRegistrationWaitTimeout.
+// waitForRegisteredSession returns the session's MultiSession. When the session
+// is not available and its stored record is a live placeholder (Generate wrote
+// it, CreateSession has not finished on any pod), it waits for the registration
+// (see waitWhileRegistrationPending) and then looks the session up once more.
 func (s *Server) waitForRegisteredSession(ctx context.Context, sessionID string) (vmcpsession.MultiSession, error) {
-	deadline := time.Now().Add(sessionRegistrationWaitTimeout)
-	for {
-		if sess, ok := s.vmcpSessionMgr.GetMultiSession(ctx, sessionID); ok {
-			return sess, nil
-		}
-		if !s.registrationPending(ctx, sessionID) {
-			return nil, sessiontypes.ErrUnauthorizedCaller
-		}
-		if time.Now().After(deadline) {
-			return nil, errSessionNotRegistered
-		}
-		select {
-		case <-ctx.Done():
-			return nil, errSessionNotRegistered
-		case <-time.After(sessionRegistrationPollInterval):
-		}
+	if sess, ok := s.vmcpSessionMgr.GetMultiSession(ctx, sessionID); ok {
+		return sess, nil
 	}
+	if !s.registrationPending(ctx, sessionID) {
+		return nil, sessiontypes.ErrUnauthorizedCaller
+	}
+	if s.waitWhileRegistrationPending(ctx, sessionID) {
+		return nil, errSessionNotRegistered
+	}
+	if sess, ok := s.vmcpSessionMgr.GetMultiSession(ctx, sessionID); ok {
+		return sess, nil
+	}
+	return nil, sessiontypes.ErrUnauthorizedCaller
 }
 
-// waitWhileRegistrationPending polls every sessionRegistrationPollInterval, for
-// up to sessionRegistrationWaitTimeout, while the stored session record is a live
-// placeholder whose registration has not written the identity binding yet.
-func (s *Server) waitWhileRegistrationPending(ctx context.Context, sessionID string) {
+// waitWhileRegistrationPending waits, for up to sessionRegistrationWaitTimeout,
+// while the stored session record is a live placeholder whose registration has
+// not written the identity binding yet. Each step reads the record once; the
+// step starts at sessionRegistrationPollInterval and doubles up to
+// sessionRegistrationMaxPollInterval. It reports whether the registration was
+// still pending when it gave up (timeout or ctx done).
+func (s *Server) waitWhileRegistrationPending(ctx context.Context, sessionID string) (stillPending bool) {
 	deadline := time.Now().Add(sessionRegistrationWaitTimeout)
-	for s.registrationPending(ctx, sessionID) && time.Now().Before(deadline) {
+	step := sessionRegistrationPollInterval
+	for s.registrationPending(ctx, sessionID) {
+		if !time.Now().Before(deadline) {
+			return true
+		}
+		timer := time.NewTimer(min(step, time.Until(deadline)))
 		select {
 		case <-ctx.Done():
-			return
-		case <-time.After(sessionRegistrationPollInterval):
+			timer.Stop()
+			return true
+		case <-timer.C:
 		}
+		step = min(2*step, sessionRegistrationMaxPollInterval)
 	}
+	return false
 }
 
 // registrationPending reports whether the stored session record is a live
