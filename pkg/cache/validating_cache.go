@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"golang.org/x/sync/singleflight"
@@ -37,10 +38,13 @@ type ValidatingCache[K comparable, V any] struct {
 	load     func(ctx context.Context, key K) (V, error)
 	check    func(ctx context.Context, key K, val V) error
 	onEvict  func(K, V)
-	// mu serializes Set against the conditional eviction in getHit.
-	// check() runs outside the lock to avoid holding it during I/O; the lock
-	// is only held for the short Peek+Remove sequence.
+	// mu serializes Set against the conditional eviction in getHit and in
+	// EvictIdle. check() runs outside the lock to avoid holding it during I/O;
+	// the lock is only held for the short Peek+Remove sequence.
 	mu sync.Mutex
+	// lastUsed records when each entry was last read or written (K -> time.Time).
+	// EvictIdle reads it; the LRU eviction callback removes an entry's record.
+	lastUsed sync.Map
 }
 
 // New creates a ValidatingCache with the given capacity and callbacks.
@@ -71,18 +75,23 @@ func New[K comparable, V any](
 		panic("cache.New: check must not be nil")
 	}
 
-	c, err := lru.NewWithEvict(capacity, onEvict)
+	vc := &ValidatingCache[K, V]{
+		load:    load,
+		check:   check,
+		onEvict: onEvict,
+	}
+	c, err := lru.NewWithEvict(capacity, func(key K, val V) {
+		vc.lastUsed.Delete(key)
+		if onEvict != nil {
+			onEvict(key, val)
+		}
+	})
 	if err != nil {
 		// Only possible if size < 0, which we have already ruled out above.
 		panic(fmt.Sprintf("cache.New: lru.NewWithEvict: %v", err))
 	}
-
-	return &ValidatingCache[K, V]{
-		lruCache: c,
-		load:     load,
-		check:    check,
-		onEvict:  onEvict,
-	}
+	vc.lruCache = c
+	return vc
 }
 
 // getHit validates a known-present cache entry and returns its value.
@@ -137,6 +146,7 @@ func (c *ValidatingCache[K, V]) Get(ctx context.Context, key K) (V, bool) {
 		if val, ok := c.lruCache.Get(key); ok {
 			v, alive := c.getHit(ctx, key, val)
 			if alive {
+				c.lastUsed.Store(key, time.Now())
 				return result{v: v}, nil
 			}
 			// Entry expired and evicted; fall through to load.
@@ -157,6 +167,7 @@ func (c *ValidatingCache[K, V]) Get(ctx context.Context, key K) (V, bool) {
 				if c.onEvict != nil {
 					c.onEvict(key, v)
 				}
+				c.lastUsed.Store(key, time.Now())
 				return result{v: winner}, nil
 			}
 			// The concurrent winner was itself evicted by LRU pressure between
@@ -164,6 +175,7 @@ func (c *ValidatingCache[K, V]) Get(ctx context.Context, key K) (V, bool) {
 			// since v has not been released and is still valid.
 			c.lruCache.Add(key, v)
 		}
+		c.lastUsed.Store(key, time.Now())
 		return result{v: v}, nil
 	})
 	if err != nil {
@@ -181,6 +193,40 @@ func (c *ValidatingCache[K, V]) Set(key K, value V) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.lruCache.Add(key, value)
+	c.lastUsed.Store(key, time.Now())
+}
+
+// Remove evicts key, calling onEvict for its value. It is a no-op when key is
+// not cached.
+func (c *ValidatingCache[K, V]) Remove(key K) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lruCache.Remove(key)
+}
+
+// EvictIdle evicts every entry that no Get or Set has used for longer than
+// maxAge, calling onEvict for each. It calls neither check nor load, so it never
+// touches the backing store (for example, it does not refresh a Redis TTL).
+//
+// An entry that a concurrent Get returns just before EvictIdle removes it is
+// still handed to that caller after onEvict has run.
+func (c *ValidatingCache[K, V]) EvictIdle(maxAge time.Duration) {
+	cutoff := time.Now().Add(-maxAge)
+	c.lastUsed.Range(func(rawKey, rawUsed any) bool {
+		key, okKey := rawKey.(K)
+		used, okUsed := rawUsed.(time.Time)
+		if !okKey || !okUsed || used.After(cutoff) {
+			return true
+		}
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		// CompareAndDelete skips an entry that a Get or Set touched after Range
+		// read it; Set holds mu, so it cannot re-add the key in between.
+		if c.lastUsed.CompareAndDelete(rawKey, rawUsed) {
+			c.lruCache.Remove(key)
+		}
+		return true
+	})
 }
 
 // Len returns the number of entries currently in the cache.

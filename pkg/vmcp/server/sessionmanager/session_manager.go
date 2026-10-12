@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -159,10 +160,35 @@ func New(
 
 	sm.factory = buildDecoratingFactory(cfg, optimizerFactory, sm.Terminate)
 
+	stopSweep := sm.startIdleSweep(cfg.IdleTTL)
 	cleanup := func(ctx context.Context) error {
+		stopSweep()
 		return optimizerCleanup(ctx)
 	}
 	return sm, cleanup, nil
+}
+
+// startIdleSweep closes cached sessions that have been idle on this replica for
+// longer than idleTTL. It works on the node-local cache only and never refreshes
+// the storage TTL. The returned function stops the sweep; it is idempotent.
+func (sm *Manager) startIdleSweep(idleTTL time.Duration) func() {
+	if idleTTL <= 0 {
+		return func() {}
+	}
+	stop := make(chan struct{})
+	ticker := time.NewTicker(max(idleTTL/2, time.Millisecond))
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				sm.sessions.EvictIdle(idleTTL)
+			case <-stop:
+				return
+			}
+		}
+	}()
+	return sync.OnceFunc(func() { close(stop) })
 }
 
 // OptimizerFactory returns the resolved (telemetry-wrapped) optimizer factory, or
@@ -459,9 +485,10 @@ func (sm *Manager) Validate(sessionID string) (isTerminated bool, err error) {
 // where client termination during the Phase 1→Phase 2 window could resurrect
 // sessions with open backend connections:
 //
-//   - MultiSession (Phase 2): the storage key is deleted. The node-local cache
-//     self-heals on the next Get: checkSession detects ErrSessionNotFound,
-//     evicts the entry, and onEvict closes backend connections. After deletion
+//   - MultiSession (Phase 2): the storage key is deleted, then the node-local
+//     cache entry is removed and onEvict closes its backend connections. Caches
+//     on other replicas self-heal on their next Get (checkSession detects
+//     ErrSessionNotFound) or through the idle sweep. After deletion
 //     Validate() returns (false, error) — the same response as "never existed".
 //
 //   - Placeholder (Phase 1): the session is marked terminated=true and left
@@ -484,7 +511,9 @@ func (sm *Manager) Terminate(sessionID string) (isNotAllowed bool, err error) {
 	// Load current metadata to determine session phase.
 	metadata, loadErr := sm.storage.Load(ctx, sessionID)
 	if errors.Is(loadErr, transportsession.ErrSessionNotFound) {
-		// Already gone (concurrent termination or TTL expiry).
+		// Already gone (concurrent termination or TTL expiry). Still close a
+		// cached copy so its backend connections do not outlive the session.
+		sm.sessions.Remove(sessionID)
 		slog.Debug("Manager.Terminate: session not found (already expired?)", "session_id", sessionID)
 		return false, nil
 	}
@@ -493,11 +522,15 @@ func (sm *Manager) Terminate(sessionID string) (isNotAllowed bool, err error) {
 	}
 
 	if _, isFullSession := metadata[sessiontypes.MetadataKeyIdentityBinding]; isFullSession {
-		// Phase 2 (full MultiSession): delete from storage. The cache entry will be
-		// evicted lazily on the next Get when checkSession finds the session gone.
+		// Phase 2 (full MultiSession): delete from storage, then close the cached
+		// session on this replica right away. Waiting for the next Get to evict it
+		// would keep its backend connections open, possibly forever, because no
+		// request uses a terminated session again. Other replicas close their
+		// copies through checkSession or the idle sweep.
 		if deleteErr := sm.storage.Delete(ctx, sessionID); deleteErr != nil {
 			return false, fmt.Errorf("Manager.Terminate: failed to delete session from storage: %w", deleteErr)
 		}
+		sm.sessions.Remove(sessionID)
 		slog.Info("Manager.Terminate: session terminated", "session_id", sessionID)
 		return false, nil
 	}

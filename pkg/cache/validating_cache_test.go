@@ -582,3 +582,64 @@ func TestValidatingCache_Singleflight_DeduplicatesConcurrentMisses(t *testing.T)
 		assert.Equal(t, "v", results[i])
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Remove / EvictIdle
+// ---------------------------------------------------------------------------
+
+func TestValidatingCache_Remove_EvictsAndCallsOnEvict(t *testing.T) {
+	t.Parallel()
+
+	var evicted []string
+	c := newStringCache(
+		func(_ context.Context, _ string) (string, error) { return "", errors.New("not found") },
+		alwaysAliveCheck,
+		func(key, _ string) { evicted = append(evicted, key) },
+	)
+	c.Set("k", "v")
+
+	c.Remove("k")
+	c.Remove("absent") // no-op
+
+	assert.Equal(t, []string{"k"}, evicted)
+	assert.Equal(t, 0, c.Len())
+}
+
+func TestValidatingCache_EvictIdle(t *testing.T) {
+	t.Parallel()
+
+	var checks atomic.Int32
+	var evicted []string
+	var mu sync.Mutex
+	c := newStringCache(
+		func(_ context.Context, key string) (string, error) { return "v-" + key, nil },
+		func(_ context.Context, _ string, _ string) error {
+			checks.Add(1)
+			return nil
+		},
+		func(key, _ string) {
+			mu.Lock()
+			evicted = append(evicted, key)
+			mu.Unlock()
+		},
+	)
+	c.Set("idle", "v")
+	c.Get(t.Context(), "busy") // loaded via load
+	time.Sleep(30 * time.Millisecond)
+	c.Get(t.Context(), "busy") // a hit refreshes the last use
+	checksBefore := checks.Load()
+
+	c.EvictIdle(20 * time.Millisecond)
+
+	mu.Lock()
+	assert.Equal(t, []string{"idle"}, evicted, "only the entry unused for maxAge is evicted")
+	mu.Unlock()
+	assert.Equal(t, checksBefore, checks.Load(), "EvictIdle must not call check")
+	assert.Equal(t, 1, c.Len())
+
+	// Every eviction drops the entry's last-use record, so the records stay
+	// bounded by the cache capacity even when EvictIdle never runs.
+	c.Remove("busy")
+	_, tracked := c.lastUsed.Load("busy")
+	assert.False(t, tracked)
+}

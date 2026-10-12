@@ -8,6 +8,7 @@ import (
 	"errors"
 	"maps"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -638,9 +639,9 @@ func TestSessionManager_Terminate(t *testing.T) {
 	t.Run("closes MultiSession backend connections", func(t *testing.T) {
 		t.Parallel()
 
-		// After Terminate deletes the session from storage, the next GetMultiSession
-		// call triggers checkSession → ErrExpired → onEvict → Close(). This verifies
-		// that backend connections are eventually closed via lazy eviction.
+		// Terminate deletes the session from storage and removes the cached copy
+		// right away, so onEvict closes the backend connections before any further
+		// GetMultiSession call.
 		tools := []vmcp.Tool{{Name: "t1", Description: "tool 1"}}
 		ctrl := gomock.NewController(t)
 
@@ -649,6 +650,7 @@ func TestSessionManager_Terminate(t *testing.T) {
 		bindingMeta := map[string]string{sessiontypes.MetadataKeyIdentityBinding: "unauthenticated"}
 
 		var createdSess *sessionmocks.MockMultiSession
+		var closed atomic.Bool
 		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 		factory.EXPECT().
 			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
@@ -666,9 +668,11 @@ func TestSessionManager_Terminate(t *testing.T) {
 				createdSess.EXPECT().BackendSessions().Return(nil).AnyTimes()
 				createdSess.EXPECT().GetRoutingTable().Return(nil).AnyTimes()
 				createdSess.EXPECT().Prompts().Return(nil).AnyTimes()
-				// Close() is called by onEvict when checkSession detects the session
-				// is gone from storage on the next GetMultiSession call.
-				createdSess.EXPECT().Close().Return(nil).Times(1)
+				// Close() is called by onEvict when Terminate removes the cache entry.
+				createdSess.EXPECT().Close().DoAndReturn(func() error {
+					closed.Store(true)
+					return nil
+				}).Times(1)
 				return createdSess, nil
 			}).Times(1)
 
@@ -686,14 +690,11 @@ func TestSessionManager_Terminate(t *testing.T) {
 		// so Terminate will take the Phase 2 path (storage.Delete) without
 		// any additional seeding.
 
-		// Terminate deletes from storage; the cache entry is evicted lazily on
-		// the next GetMultiSession call when checkSession detects ErrSessionNotFound.
 		isNotAllowed, err := sm.Terminate(sessionID)
 		require.NoError(t, err)
 		assert.False(t, isNotAllowed)
+		assert.True(t, closed.Load(), "Terminate must close the cached session at once")
 
-		// The next GetMultiSession triggers checkSession: storage returns
-		// ErrSessionNotFound → ErrExpired → onEvict → Close().
 		_, ok := sm.GetMultiSession(t.Context(), sessionID)
 		assert.False(t, ok, "terminated session must not be returned")
 		// gomock verifies Close() was called exactly once via Times(1)

@@ -87,6 +87,12 @@ type FactoryConfig struct {
 	// it reports as unhealthy, unknown or unauthenticated are skipped, the same rule
 	// the core applies to the advertised set. Nil falls back to the registry status.
 	HealthStatusProvider health.StatusProvider
+
+	// IdleTTL closes a cached MultiSession (and its backend connections) when no
+	// request on this replica has used it for this long. It bounds what a replica
+	// keeps after a DELETE that another replica served, or after the session
+	// expired in storage. Zero disables the sweep.
+	IdleTTL time.Duration
 }
 
 // resolveOptimizer wires the optimizer factory from cfg, applying telemetry

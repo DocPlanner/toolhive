@@ -490,6 +490,8 @@ func New(
 		// New sessions connect only to the backends the core's health monitor
 		// reports as eligible (nil when health monitoring is disabled).
 		HealthStatusProvider: coreVMCP.BackendHealth(),
+		// Close cached sessions idle on this replica for a full session TTL.
+		IdleTTL: resolved.SessionTTL,
 	}
 
 	srv, err := Serve(ctx, coreVMCP, deriveServerConfig(resolved, backendRegistry, sessMgrCfg))
