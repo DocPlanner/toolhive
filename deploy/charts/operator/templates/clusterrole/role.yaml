@@ -123,6 +123,7 @@ rules:
   - toolhive.stacklok.dev
   resources:
   - embeddingservers
+  - mcpauthzconfigs
   - mcpexternalauthconfigs
   - mcpgroups
   - mcpoidcconfigs
@@ -144,6 +145,7 @@ rules:
   - toolhive.stacklok.dev
   resources:
   - embeddingservers/finalizers
+  - mcpauthzconfigs/finalizers
   - mcpexternalauthconfigs/finalizers
   - mcpgroups/finalizers
   - mcpoidcconfigs/finalizers
@@ -158,6 +160,7 @@ rules:
   - toolhive.stacklok.dev
   resources:
   - embeddingservers/status
+  - mcpauthzconfigs/status
   - mcpexternalauthconfigs/status
   - mcpgroups/status
   - mcpoidcconfigs/status

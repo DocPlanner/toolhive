@@ -62,21 +62,6 @@ func (s *RedisSessionDataStorage) key(id string) string {
 	return s.keyPrefix + id
 }
 
-// Upsert serializes metadata as JSON and writes it to Redis with a sliding TTL.
-func (s *RedisSessionDataStorage) Upsert(ctx context.Context, id string, metadata map[string]string) error {
-	if id == "" {
-		return fmt.Errorf("cannot write session data with empty ID")
-	}
-	if metadata == nil {
-		metadata = make(map[string]string)
-	}
-	data, err := json.Marshal(metadata)
-	if err != nil {
-		return fmt.Errorf("failed to serialize session metadata: %w", err)
-	}
-	return s.client.Set(ctx, s.key(id), data, s.ttl).Err()
-}
-
 // Load retrieves metadata from Redis and refreshes the key's TTL via GETEX.
 // Returns ErrSessionNotFound if the key does not exist.
 func (s *RedisSessionDataStorage) Load(ctx context.Context, id string) (map[string]string, error) {

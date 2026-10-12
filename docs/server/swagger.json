@@ -422,6 +422,10 @@
                         "description": "AdditionalAuthorizationParams are extra query parameters to include in\nauthorization requests. Useful for provider-specific parameters like\nGoogle's access_type=offline.",
                         "type": "object"
                     },
+                    "allow_private_ips": {
+                        "description": "AllowPrivateIPs permits the upstream provider's HTTP client to connect to\nprivate IP ranges (RFC-1918, link-local). Use only when the upstream is\nhosted inside the same cluster and has no public endpoint. HTTP-scheme\nrestrictions are unchanged — HTTPS is still required for non-localhost hosts.\nDefaults to false.",
+                        "type": "boolean"
+                    },
                     "authorization_endpoint": {
                         "description": "AuthorizationEndpoint is the URL for the OAuth authorization endpoint.",
                         "type": "string"
@@ -479,6 +483,10 @@
                         "description": "AdditionalAuthorizationParams are extra query parameters to include in\nauthorization requests. Useful for provider-specific parameters like\nGoogle's access_type=offline.",
                         "type": "object"
                     },
+                    "allow_private_ips": {
+                        "description": "AllowPrivateIPs permits the OIDC discovery and token HTTP clients to\nconnect to private IP ranges (RFC-1918, link-local). Use only when the\nupstream is hosted inside the same cluster and has no public endpoint.\nHTTP-scheme restrictions are unchanged — HTTPS is still required for\nnon-localhost hosts. Defaults to false.",
+                        "type": "boolean"
+                    },
                     "client_id": {
                         "description": "ClientID is the OAuth 2.0 client identifier registered with the upstream IDP.",
                         "type": "string"
@@ -506,6 +514,10 @@
                         },
                         "type": "array",
                         "uniqueItems": false
+                    },
+                    "subject_claim": {
+                        "description": "SubjectClaim names the validated ID-token claim to use as the upstream\nsubject. Defaults to \"sub\" when empty. Set for IdPs where \"sub\" isn't\nstable per user (e.g. Entra/Azure AD's \"oid\"). See upstream.OIDCConfig.",
+                        "type": "string"
                     },
                     "userinfo_override": {
                         "$ref": "#/components/schemas/github_com_stacklok_toolhive_pkg_authserver.UserInfoRunConfig"
@@ -539,6 +551,10 @@
                     "cimd": {
                         "$ref": "#/components/schemas/github_com_stacklok_toolhive_pkg_authserver.CIMDRunConfig"
                     },
+                    "disable_upstream_token_injection": {
+                        "description": "DisableUpstreamTokenInjection prevents the upstream swap middleware from being added.\nWhen true, the embedded auth server handles OAuth flows for clients, but instead of\ninjecting upstream IdP tokens the proxy strips the client's credential headers\n(Authorization, Cookie, Proxy-Authorization) after the JWT is validated — the\nbackend receives an unauthenticated request. Incompatible with token exchange\nand AWS STS, which would re-add credentials after the strip.",
+                        "type": "boolean"
+                    },
                     "hmac_secret_files": {
                         "description": "HMACSecretFiles contains file paths to HMAC secrets for signing authorization codes\nand refresh tokens (opaque tokens).\nFirst file is the current secret (must be at least 32 bytes), subsequent files\nare for rotation/verification of existing tokens.\nIf empty, an ephemeral secret will be auto-generated (development only).",
                         "items": {
@@ -546,6 +562,10 @@
                         },
                         "type": "array",
                         "uniqueItems": false
+                    },
+                    "insecure_allow_http": {
+                        "description": "InsecureAllowHTTP permits an http:// issuer URL for non-localhost hosts.\nOnly set this for in-cluster Kubernetes deployments on a trusted network.\nProduction deployments reachable outside the cluster MUST use https://.",
+                        "type": "boolean"
                     },
                     "issuer": {
                         "description": "Issuer is the issuer identifier for this authorization server.\nThis will be included in the \"iss\" claim of issued tokens.\nMust be a valid HTTPS URL (or HTTP for localhost) without query, fragment, or trailing slash.",
@@ -751,10 +771,6 @@
                     },
                     "addr": {
                         "description": "Addr is the Redis server address (host:port). Required for standalone and cluster modes.\nMutually exclusive with SentinelConfig.",
-                        "type": "string"
-                    },
-                    "address": {
-                        "description": "LegacyAddress is the pre-v0.27 serialized name of Addr. DocPlanner fork:\nstill read so an image can start from a RunConfig written by an older\noperator. Never written by the current operator. Remove with PAIINFRA-228.\n\nDeprecated: use Addr.",
                         "type": "string"
                     },
                     "auth_type": {
@@ -967,6 +983,7 @@
                     "removing",
                     "unknown",
                     "unauthenticated",
+                    "auth_retrying",
                     "policy_stopped",
                     "running",
                     "stopped",
@@ -977,6 +994,7 @@
                     "removing",
                     "unknown",
                     "unauthenticated",
+                    "auth_retrying",
                     "policy_stopped",
                     "running",
                     "stopped",
@@ -987,6 +1005,7 @@
                     "removing",
                     "unknown",
                     "unauthenticated",
+                    "auth_retrying",
                     "policy_stopped"
                 ],
                 "type": "string",
@@ -1000,6 +1019,7 @@
                     "WorkloadStatusRemoving",
                     "WorkloadStatusUnknown",
                     "WorkloadStatusUnauthenticated",
+                    "WorkloadStatusAuthRetrying",
                     "WorkloadStatusPolicyStopped"
                 ]
             },
@@ -1237,9 +1257,25 @@
             },
             "github_com_stacklok_toolhive_pkg_runner.RunConfig": {
                 "properties": {
+                    "additional_middleware_configs": {
+                        "description": "AdditionalMiddlewareConfigs carries pre-built middleware configs injected by\nexternal-auth handlers (reached via *[]RunConfigBuilderOption) rather than\nderived from typed RunConfig fields. PopulateMiddlewareConfigs splices these\ninto the chain in the backend-egress group — after auth and before recovery —\ninstead of discarding them. Upstream carries these configs verbatim and never\ninspects their parameters; the middleware type identity (e.g. an enterprise\nauth type) is supplied by the caller via types.MiddlewareConfig.Type.\n\nEach entry's Type is expected to be a NEW egress middleware type (e.g. OBO),\nnot one already produced from a typed RunConfig field (auth, authz, audit,\ntokenExchange, awssts, …). Dispatch in the proxyrunner is purely by Type\nstring, so an injected Type that shadows a typed-field type would add a\nsecond instance of that middleware to the chain; the seam does not validate\nagainst this.",
+                        "items": {
+                            "$ref": "#/components/schemas/github_com_stacklok_toolhive_pkg_transport_types.MiddlewareConfig"
+                        },
+                        "type": "array",
+                        "uniqueItems": false
+                    },
                     "allow_docker_gateway": {
                         "description": "AllowDockerGateway permits outbound connections to Docker gateway addresses\n(host.docker.internal, gateway.docker.internal, 172.17.0.1). These are\nblocked by default in the egress proxy even when InsecureAllowAll is set.\nOnly applicable to Docker deployments with network isolation enabled.",
                         "type": "boolean"
+                    },
+                    "allowed_origins": {
+                        "description": "AllowedOrigins is the allowlist of values accepted on the HTTP Origin header,\nused for DNS-rebinding protection per MCP 2025-11-25 §\"Security Warning\".\nWhen empty and Host is loopback (127.0.0.1 / localhost / [::1]), a default\nloopback-only allowlist is derived at middleware-wiring time.\nWhen empty and Host is non-loopback, the middleware is disabled — operators\nexposing the proxy publicly must configure an explicit allowlist.",
+                        "items": {
+                            "type": "string"
+                        },
+                        "type": "array",
+                        "uniqueItems": false
                     },
                     "audit_config": {
                         "$ref": "#/components/schemas/github_com_stacklok_toolhive_pkg_audit.Config"
@@ -2735,7 +2771,7 @@
                         "type": "string"
                     },
                     "network_isolation": {
-                        "description": "Whether network isolation is turned on. This applies the rules in the permission profile.",
+                        "description": "Whether network isolation is turned on. This applies the rules in the permission profile.\nPointer so that omitting the field defaults to network isolation ENABLED (matching the\n`thv run` CLI default); set it explicitly to false to disable network isolation.\nThis also applies on update: a request that omits this field enables isolation, so\nclients that build update requests from scratch should send it explicitly to avoid\nunintentionally turning isolation on for a workload that had it off.",
                         "type": "boolean"
                     },
                     "oauth_config": {
@@ -3417,7 +3453,7 @@
                         "type": "string"
                     },
                     "network_isolation": {
-                        "description": "Whether network isolation is turned on. This applies the rules in the permission profile.",
+                        "description": "Whether network isolation is turned on. This applies the rules in the permission profile.\nPointer so that omitting the field defaults to network isolation ENABLED (matching the\n`thv run` CLI default); set it explicitly to false to disable network isolation.\nThis also applies on update: a request that omits this field enables isolation, so\nclients that build update requests from scratch should send it explicitly to avoid\nunintentionally turning isolation on for a workload that had it off.",
                         "type": "boolean"
                     },
                     "oauth_config": {

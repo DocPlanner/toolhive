@@ -472,7 +472,7 @@ func TestBuildPureOAuth2Config(t *testing.T) {
 			OAuth2Config: nil,
 		}
 
-		_, err := buildPureOAuth2Config(rc)
+		_, err := buildPureOAuth2Config(rc, false)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "oauth2_config required")
 	})
@@ -499,7 +499,7 @@ func TestBuildPureOAuth2Config(t *testing.T) {
 			},
 		}
 
-		cfg, err := buildPureOAuth2Config(rc)
+		cfg, err := buildPureOAuth2Config(rc, false)
 		require.NoError(t, err)
 		require.NotNil(t, cfg)
 
@@ -529,7 +529,7 @@ func TestBuildPureOAuth2Config(t *testing.T) {
 			},
 		}
 
-		cfg, err := buildPureOAuth2Config(rc)
+		cfg, err := buildPureOAuth2Config(rc, false)
 		require.NoError(t, err)
 		require.NotNil(t, cfg)
 
@@ -549,7 +549,7 @@ func TestBuildPureOAuth2Config(t *testing.T) {
 			},
 		}
 
-		_, err := buildPureOAuth2Config(rc)
+		_, err := buildPureOAuth2Config(rc, false)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "client_id or dcr_config is required")
 	})
@@ -570,7 +570,7 @@ func TestBuildPureOAuth2Config(t *testing.T) {
 			},
 		}
 
-		_, err := buildPureOAuth2Config(rc)
+		_, err := buildPureOAuth2Config(rc, false)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "mutually exclusive")
 	})
@@ -590,10 +590,31 @@ func TestBuildPureOAuth2Config(t *testing.T) {
 			},
 		}
 
-		cfg, err := buildPureOAuth2Config(rc)
+		cfg, err := buildPureOAuth2Config(rc, false)
 		require.NoError(t, err)
 		require.NotNil(t, cfg)
 		assert.Empty(t, cfg.ClientID)
+	})
+
+	t.Run("propagates AllowPrivateIPs", func(t *testing.T) {
+		t.Parallel()
+
+		rc := &authserver.UpstreamRunConfig{
+			Type: authserver.UpstreamProviderTypeOAuth2,
+			OAuth2Config: &authserver.OAuth2UpstreamRunConfig{
+				AuthorizationEndpoint: "https://example.com/authorize",
+				TokenEndpoint:         "https://example.com/token",
+				ClientID:              "my-client-id",
+				RedirectURI:           "https://my-app.com/callback",
+				AllowPrivateIPs:       true,
+			},
+		}
+
+		cfg, err := buildPureOAuth2Config(rc, false)
+		require.NoError(t, err)
+		require.NotNil(t, cfg)
+
+		assert.True(t, cfg.AllowPrivateIPs)
 	})
 }
 
@@ -615,7 +636,7 @@ func TestBuildPureOAuth2ConfigWithEnvVar(t *testing.T) {
 			},
 		}
 
-		cfg, err := buildPureOAuth2Config(rc)
+		cfg, err := buildPureOAuth2Config(rc, false)
 		require.NoError(t, err)
 		require.NotNil(t, cfg)
 
@@ -644,7 +665,7 @@ func TestBuildPureOAuth2ConfigIdentityFromToken(t *testing.T) {
 		rc := baseRC()
 		// IdentityFromToken is not set
 
-		cfg, err := buildPureOAuth2Config(rc)
+		cfg, err := buildPureOAuth2Config(rc, false)
 		require.NoError(t, err)
 		require.NotNil(t, cfg)
 
@@ -661,7 +682,7 @@ func TestBuildPureOAuth2ConfigIdentityFromToken(t *testing.T) {
 			EmailPath:   "email",
 		}
 
-		cfg, err := buildPureOAuth2Config(rc)
+		cfg, err := buildPureOAuth2Config(rc, false)
 		require.NoError(t, err)
 		require.NotNil(t, cfg)
 
@@ -679,7 +700,7 @@ func TestBuildPureOAuth2ConfigIdentityFromToken(t *testing.T) {
 			SubjectPath: "authed_user.id",
 		}
 
-		cfg, err := buildPureOAuth2Config(rc)
+		cfg, err := buildPureOAuth2Config(rc, false)
 		require.NoError(t, err)
 		require.NotNil(t, cfg)
 
@@ -869,7 +890,7 @@ func TestBuildUpstreamConfig(t *testing.T) {
 			},
 		}
 
-		cfg, err := buildUpstreamConfig(rc)
+		cfg, err := buildUpstreamConfig(rc, false)
 		require.NoError(t, err)
 		require.NotNil(t, cfg)
 
@@ -896,7 +917,7 @@ func TestBuildUpstreamConfig(t *testing.T) {
 			},
 		}
 
-		cfg, err := buildUpstreamConfig(rc)
+		cfg, err := buildUpstreamConfig(rc, false)
 		require.NoError(t, err)
 		require.NotNil(t, cfg)
 
@@ -916,7 +937,7 @@ func TestBuildUpstreamConfig(t *testing.T) {
 			Type: authserver.UpstreamProviderType("saml"),
 		}
 
-		_, err := buildUpstreamConfig(rc)
+		_, err := buildUpstreamConfig(rc, false)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "unsupported upstream type")
 		assert.Contains(t, err.Error(), "saml")
@@ -931,7 +952,7 @@ func TestBuildUpstreamConfig(t *testing.T) {
 			OIDCConfig: nil,
 		}
 
-		_, err := buildUpstreamConfig(rc)
+		_, err := buildUpstreamConfig(rc, false)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "oidc_config required")
 	})
@@ -945,7 +966,7 @@ func TestBuildUpstreamConfig(t *testing.T) {
 			OAuth2Config: nil,
 		}
 
-		_, err := buildUpstreamConfig(rc)
+		_, err := buildUpstreamConfig(rc, false)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "oauth2_config required")
 	})
@@ -962,7 +983,7 @@ func TestBuildOIDCConfig(t *testing.T) {
 			OIDCConfig: nil,
 		}
 
-		_, err := buildOIDCConfig(rc)
+		_, err := buildOIDCConfig(rc, false)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "oidc_config required")
 	})
@@ -980,7 +1001,7 @@ func TestBuildOIDCConfig(t *testing.T) {
 			},
 		}
 
-		cfg, err := buildOIDCConfig(rc)
+		cfg, err := buildOIDCConfig(rc, false)
 		require.NoError(t, err)
 		require.NotNil(t, cfg)
 
@@ -1006,7 +1027,7 @@ func TestBuildOIDCConfig(t *testing.T) {
 			},
 		}
 
-		cfg, err := buildOIDCConfig(rc)
+		cfg, err := buildOIDCConfig(rc, false)
 		require.NoError(t, err)
 		require.NotNil(t, cfg)
 
@@ -1032,7 +1053,7 @@ func TestBuildOIDCConfig(t *testing.T) {
 			},
 		}
 
-		cfg, err := buildOIDCConfig(rc)
+		cfg, err := buildOIDCConfig(rc, false)
 		require.NoError(t, err)
 		require.NotNil(t, cfg)
 
@@ -1052,7 +1073,7 @@ func TestBuildOIDCConfig(t *testing.T) {
 			},
 		}
 
-		_, err := buildOIDCConfig(rc)
+		_, err := buildOIDCConfig(rc, false)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to resolve OIDC client secret")
 	})
@@ -1076,7 +1097,7 @@ func TestBuildOIDCConfig(t *testing.T) {
 			},
 		}
 
-		cfg, err := buildOIDCConfig(rc)
+		cfg, err := buildOIDCConfig(rc, false)
 		require.NoError(t, err)
 		require.NotNil(t, cfg)
 
@@ -1100,12 +1121,52 @@ func TestBuildOIDCConfig(t *testing.T) {
 			},
 		}
 
-		cfg, err := buildOIDCConfig(rc)
+		cfg, err := buildOIDCConfig(rc, false)
 		require.NoError(t, err)
 		require.NotNil(t, cfg)
 
 		assert.Equal(t, map[string]string{"access_type": "offline"},
 			cfg.AdditionalAuthorizationParams)
+	})
+
+	t.Run("propagates SubjectClaim", func(t *testing.T) {
+		t.Parallel()
+
+		rc := &authserver.UpstreamRunConfig{
+			Type: authserver.UpstreamProviderTypeOIDC,
+			OIDCConfig: &authserver.OIDCUpstreamRunConfig{
+				IssuerURL:    "https://example.com",
+				ClientID:     "test-client-id",
+				RedirectURI:  "http://localhost:8080/callback",
+				SubjectClaim: "oid",
+			},
+		}
+
+		cfg, err := buildOIDCConfig(rc, false)
+		require.NoError(t, err)
+		require.NotNil(t, cfg)
+
+		assert.Equal(t, "oid", cfg.SubjectClaim)
+	})
+
+	t.Run("propagates AllowPrivateIPs", func(t *testing.T) {
+		t.Parallel()
+
+		rc := &authserver.UpstreamRunConfig{
+			Type: authserver.UpstreamProviderTypeOIDC,
+			OIDCConfig: &authserver.OIDCUpstreamRunConfig{
+				IssuerURL:       "https://idp.example.com",
+				ClientID:        "my-client-id",
+				RedirectURI:     "http://localhost:8080/callback",
+				AllowPrivateIPs: true,
+			},
+		}
+
+		cfg, err := buildOIDCConfig(rc, false)
+		require.NoError(t, err)
+		require.NotNil(t, cfg)
+
+		assert.True(t, cfg.AllowPrivateIPs)
 	})
 }
 
@@ -1369,19 +1430,6 @@ func TestConvertRedisRunConfig_WithEnvVars(t *testing.T) {
 		assert.Equal(t, "clusterpass", cfg.Password)
 	})
 
-	t.Run("legacy serialized address is used when addr is empty", func(t *testing.T) {
-		t.Setenv("TEST_REDIS_PASS_LEGACY_ADDR", "mypass")
-
-		cfg, err := convertRedisRunConfig(&storage.RedisRunConfig{
-			LegacyAddress: "dragonfly.default.svc.cluster.local:6379", //nolint:staticcheck // exercises the deprecated fallback
-			KeyPrefix:     "thv:auth:ns:name:",
-			ACLUserConfig: &storage.ACLUserRunConfig{
-				PasswordEnvVar: "TEST_REDIS_PASS_LEGACY_ADDR",
-			},
-		})
-		require.NoError(t, err)
-		assert.Equal(t, "dragonfly.default.svc.cluster.local:6379", cfg.Addr)
-	})
 }
 
 // stubServer is a minimal authserver.Server implementation for testing RegisterHandlers.
@@ -1607,7 +1655,7 @@ func TestBuildUpstreamConfigs_DCR(t *testing.T) {
 		}
 
 		store := newMemoryDCRStore(t)
-		got, err := buildUpstreamConfigs(context.Background(), cfg.Upstreams, cfg.Issuer, store)
+		got, err := buildUpstreamConfigs(context.Background(), cfg.Upstreams, cfg.Issuer, store, false)
 		require.NoError(t, err)
 		require.Len(t, got, 1)
 
@@ -1671,7 +1719,7 @@ func TestBuildUpstreamConfigs_DCR(t *testing.T) {
 		store := newMemoryDCRStore(t)
 
 		// First call: populates the store.
-		_, err := buildUpstreamConfigs(context.Background(), cfg.Upstreams, cfg.Issuer, store)
+		_, err := buildUpstreamConfigs(context.Background(), cfg.Upstreams, cfg.Issuer, store, false)
 		require.NoError(t, err)
 		firstCallRequests := atomic.LoadInt32(requestCount)
 		require.Greater(t, firstCallRequests, int32(0),
@@ -1679,7 +1727,7 @@ func TestBuildUpstreamConfigs_DCR(t *testing.T) {
 
 		// Second call: must short-circuit on the cache and issue zero
 		// additional HTTP requests against the mock AS.
-		got, err := buildUpstreamConfigs(context.Background(), cfg.Upstreams, cfg.Issuer, store)
+		got, err := buildUpstreamConfigs(context.Background(), cfg.Upstreams, cfg.Issuer, store, false)
 		require.NoError(t, err)
 		require.Len(t, got, 1)
 		assert.Equal(t, "dcr-client-id", got[0].OAuth2Config.ClientID)
@@ -1811,7 +1859,7 @@ func (s *closeTrackingStorage) Close() error {
 // crash-looping pod would leak one connection pool / goroutine per
 // restart.
 //
-// The test calls newEmbeddedAuthServerWithStorage (the test seam that
+// The test calls NewEmbeddedAuthServerWithStorage (the test seam that
 // production NewEmbeddedAuthServer dispatches into) so the storage
 // instance is observable: a closeTrackingStorage wrapper records every
 // Close call. The assertion is then a direct count rather than a
@@ -1851,7 +1899,7 @@ func TestNewEmbeddedAuthServer_ClosesStorageOnError(t *testing.T) {
 		AllowedAudiences: []string{"https://mcp.example.com"},
 	}
 
-	embed, err := newEmbeddedAuthServerWithStorage(context.Background(), cfg, tracker)
+	embed, err := NewEmbeddedAuthServerWithStorage(context.Background(), cfg, tracker)
 	require.Error(t, err,
 		"discovery returns 500, so DCR resolution must fail and the constructor must return an error")
 	assert.Nil(t, embed,
@@ -1981,7 +2029,7 @@ func (s *urlErrorOnCloseStorage) Close() error {
 
 // TestNewEmbeddedAuthServer_DeferredCleanupSanitizesLog pins the post-#5196
 // invariant that the deferred-cleanup slog.Warn at the top of
-// newEmbeddedAuthServerWithStorage routes both closeErr and retErr through
+// NewEmbeddedAuthServerWithStorage routes both closeErr and retErr through
 // dcr.SanitizeErrorForLog, so a future regression that drops the call (or that
 // changes the error chain to inline an upstream response body containing a
 // userinfo/query/fragment) cannot silently leak secrets to operator logs.
@@ -2056,7 +2104,7 @@ func TestNewEmbeddedAuthServer_DeferredCleanupSanitizesLog(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
-	embed, err := newEmbeddedAuthServerWithStorage(context.Background(), cfg, tracker)
+	embed, err := NewEmbeddedAuthServerWithStorage(context.Background(), cfg, tracker)
 	require.Error(t, err)
 	assert.Nil(t, embed)
 

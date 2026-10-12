@@ -48,9 +48,17 @@ type coreVMCP struct {
 	backendRegistry vmcp.BackendRegistry
 	backendClient   vmcp.BackendClient
 
-	// health is the injected read-only backend health view. Nil means no health
-	// filtering (all backends included), matching today's no-monitor behavior.
+	// health is the read-only backend health view used for capability filtering. It is the
+	// healthMonitor below as a StatusProvider, or a true nil interface when monitoring is
+	// disabled/failed (so filterHealthyBackends includes all backends rather than calling
+	// through a typed-nil).
 	health health.StatusProvider
+
+	// healthMonitor is the backend health monitor the core owns: built and started in New,
+	// stopped in Close, and exposed for reporting via BackendHealth. Nil when health
+	// monitoring is disabled or failed to start. (#5443 reversal: the monitor's lifecycle
+	// moved here from server.New/Serve so it has a single owner.)
+	healthMonitor *health.Monitor
 
 	// admission enforces the authorization decision for List* (filter) and
 	// Call/Read/Get (deny) from one source. Never nil: New installs an allow-all
@@ -150,17 +158,30 @@ func New(cfg *Config) (VMCP, error) {
 			"type", fmt.Sprintf("%T", stateStore))
 	}
 
+	// Build workflow telemetry instruments once here so they are reused across all
+	// per-call composer factories. Nil when TelemetryProvider is absent (disabled).
+	// Uses the same metric names as the session-factory composite-tool decorator in
+	// pkg/vmcp/server/sessionmanager so both execution paths emit into the same
+	// Prometheus counters and histograms.
+	instruments, err := newWorkflowInstruments(cfg.TelemetryProvider)
+	if err != nil {
+		stopStore()
+		return nil, fmt.Errorf("failed to create workflow telemetry instruments: %w", err)
+	}
+
 	// composerFactory builds a composite-tool engine bound to a specific routing
-	// table, generalizing server.New's sessionComposerFactory (server.go:393-398).
-	// Workflow-level telemetry (toolhive_vmcp_workflow_*) is intentionally NOT wired
-	// here: that instrumentation lives in the session/Serve layer
-	// (sessionmanager/factory.go:174-176) and is added when the core is wired into
-	// Serve (#5439). This mirrors server.go:393-398, which is also uninstrumented.
+	// table. When telemetry is configured, it wraps the engine with OTEL metrics so
+	// workflow executions are instrumented the same way as the session-factory path
+	// (sessionmanager/factory.go). The telemetryComposer is in core_telemetry.go.
 	composerFactory := func(sessionRT *vmcp.RoutingTable, sessionTools []vmcp.Tool) composer.Composer {
-		return composer.NewWorkflowEngine(
+		engine := composer.NewWorkflowEngine(
 			router.NewSessionRouter(sessionRT), backendClient, elicitationHandler,
 			stateStore, workflowAuditor, sessionTools,
 		)
+		if instruments != nil {
+			return &telemetryComposer{base: engine, instruments: instruments}
+		}
+		return engine
 	}
 
 	// Validate workflows fail-fast (server.go:400-405). The validation engine uses
@@ -175,16 +196,70 @@ func New(cfg *Config) (VMCP, error) {
 		return nil, fmt.Errorf("workflow validation failed: %w", err)
 	}
 
+	// Build and start the backend health monitor (#5443 reversal: the core owns its
+	// lifecycle). The core filters capabilities with it and stops it in Close. It is started
+	// with context.Background() and torn down via Close — like the state store — since New has
+	// no request-scoped context. The monitor uses the undecorated backend client so health
+	// checks do not emit backend-call telemetry. Built last so few error paths must stop it.
+	healthMonitor, healthProvider, err := buildHealthMonitor(cfg)
+	if err != nil {
+		stopStore()
+		return nil, err
+	}
+
 	return &coreVMCP{
 		aggregator:      cfg.Aggregator,
 		backendRegistry: cfg.BackendRegistry,
 		backendClient:   backendClient,
-		health:          cfg.HealthStatusProvider,
+		health:          healthProvider,
+		healthMonitor:   healthMonitor,
 		admission:       admission,
 		workflowDefs:    workflowDefs,
 		composerFactory: composerFactory,
 		stopStore:       stopStore,
 	}, nil
+}
+
+// buildHealthMonitor builds and starts the backend health monitor from cfg, returning the
+// monitor (for Close/reporting) and its StatusProvider view (for capability filtering).
+// Returns (nil, nil, nil) when health monitoring is not configured. A monitor that fails to
+// start is logged and disabled — not fatal — preserving the legacy lenient behavior, so the
+// returned monitor is nil in that case too. The StatusProvider is returned as a true nil
+// interface when disabled so filterHealthyBackends does not call through a typed-nil.
+func buildHealthMonitor(cfg *Config) (*health.Monitor, health.StatusProvider, error) {
+	if cfg.HealthMonitorConfig == nil {
+		slog.Info("health monitoring disabled")
+		return nil, nil, nil
+	}
+
+	// Use the undecorated client so health checks do not emit backend-call telemetry.
+	monitor, err := health.NewMonitor(
+		cfg.BackendClient, cfg.BackendRegistry.List(context.Background()), *cfg.HealthMonitorConfig)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create health monitor: %w", err)
+	}
+
+	if err := monitor.Start(context.Background()); err != nil {
+		slog.Warn("failed to start health monitor, disabling health monitoring", "error", err)
+		return nil, nil, nil
+	}
+
+	slog.Info("health monitoring enabled",
+		"check_interval", cfg.HealthMonitorConfig.CheckInterval,
+		"unhealthy_threshold", cfg.HealthMonitorConfig.UnhealthyThreshold,
+		"timeout", cfg.HealthMonitorConfig.Timeout,
+		"degraded_threshold", cfg.HealthMonitorConfig.DegradedThreshold)
+	return monitor, monitor, nil
+}
+
+// BackendHealth returns the core's backend health reporter, or nil when health monitoring is
+// disabled. The core owns the monitor's lifecycle (build/start in New, stop in Close); the
+// transport layer uses this only to report on or sync backend health.
+func (c *coreVMCP) BackendHealth() health.Reporter {
+	if c.healthMonitor == nil {
+		return nil
+	}
+	return c.healthMonitor
 }
 
 // ListTools health-filters the registry, aggregates backend capabilities on
@@ -280,7 +355,14 @@ func (c *coreVMCP) LookupPrompt(ctx context.Context, identity *auth.Identity, na
 // the underlying Stop closes a channel that cannot be closed twice, so the work
 // is guarded by sync.Once and subsequent calls return nil.
 func (c *coreVMCP) Close() error {
-	c.closeOnce.Do(c.stopStore)
+	c.closeOnce.Do(func() {
+		c.stopStore()
+		if c.healthMonitor != nil {
+			if err := c.healthMonitor.Stop(); err != nil {
+				slog.Warn("failed to stop health monitor", "error", err)
+			}
+		}
+	})
 	return nil
 }
 
@@ -436,10 +518,9 @@ func workflowsRequireElicitation(defs map[string]*composer.WorkflowDefinition) b
 // health monitor is used (respects circuit breaker state). When nil, falls back
 // to the initial health status from the backend registry.
 //
-// This is an intentional, temporary duplication of discovery.filterHealthyBackends
-// (discovery/middleware.go:157, rules at 185-188): the discovery middleware keeps
-// its own copy on the legacy server.New path until that path is removed in Phase 3
-// (#5442/#5445). Keep the include/exclude rules identical across both copies.
+// This filtering previously had a second copy in the discovery middleware on the
+// legacy server.New path. That path and its copy were removed in Phase 3 (#5445),
+// so this is now the single source of truth for backend health filtering.
 func filterHealthyBackends(backends []vmcp.Backend, healthStatusProvider health.StatusProvider) []vmcp.Backend {
 	if len(backends) == 0 {
 		return backends

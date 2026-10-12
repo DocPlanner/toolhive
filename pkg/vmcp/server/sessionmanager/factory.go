@@ -21,9 +21,7 @@ import (
 	"github.com/stacklok/toolhive/pkg/auth"
 	"github.com/stacklok/toolhive/pkg/telemetry"
 	"github.com/stacklok/toolhive/pkg/vmcp"
-	"github.com/stacklok/toolhive/pkg/vmcp/composer"
 	"github.com/stacklok/toolhive/pkg/vmcp/conversion"
-	"github.com/stacklok/toolhive/pkg/vmcp/internal/compositetools"
 	"github.com/stacklok/toolhive/pkg/vmcp/optimizer"
 	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
 	"github.com/stacklok/toolhive/pkg/vmcp/session/optimizerdec"
@@ -32,6 +30,11 @@ import (
 
 const instrumentationName = "github.com/stacklok/toolhive/pkg/vmcp"
 
+// defaultCacheCapacity is the fallback used when FactoryConfig.CacheCapacity is
+// zero (the Go zero value). This ensures the cache is always bounded; omitting
+// CacheCapacity from a config does not silently enable unbounded growth.
+const defaultCacheCapacity = 1000
+
 // FactoryConfig holds the session factory construction parameters that the
 // session manager needs to build its decorating factory. It is separate from
 // server.Config to avoid a circular import between the server and sessionmanager
@@ -39,18 +42,6 @@ const instrumentationName = "github.com/stacklok/toolhive/pkg/vmcp"
 type FactoryConfig struct {
 	// Base is the underlying session factory. Required.
 	Base vmcpsession.MultiSessionFactory
-
-	// SessionTTL bounds how long a node-local cached MultiSession may remain
-	// idle before the cache evicts and closes it.
-	SessionTTL time.Duration
-
-	// WorkflowDefs are the composite tool workflow definitions.
-	// If empty, composite tool decoration is skipped.
-	WorkflowDefs map[string]*composer.WorkflowDefinition
-
-	// ComposerFactory builds a per-session composer bound to the session's
-	// routing table and tool list.
-	ComposerFactory func(rt *vmcp.RoutingTable, tools []vmcp.Tool) composer.Composer
 
 	// OptimizerConfig is optional optimizer configuration.
 	// When non-nil and OptimizerFactory is nil, New() creates the optimizer
@@ -66,6 +57,30 @@ type FactoryConfig struct {
 	// If non-nil, the optimizer factory (whether derived from OptimizerConfig or
 	// supplied via OptimizerFactory) and workflow executors are wrapped with telemetry.
 	TelemetryProvider *telemetry.Provider
+
+	// CacheCapacity is the maximum number of live MultiSession entries held in
+	// the node-local ValidatingCache. When the cache is full the least-recently-used
+	// session is evicted (its backend connections are closed via onEvict). A value of
+	// 0 uses defaultCacheCapacity (1000). Negative values are rejected by
+	// sessionmanager.New.
+	CacheCapacity int
+
+	// AdvertiseFromCore signals that the advertised capability set is sourced from
+	// the core (the Serve path), not from this factory's per-session aggregation.
+	//
+	// It is the single switch that selects WHICH layer indexes the shared FTS5 store,
+	// so the two can never both do it (the AC6 double-index):
+	//   - true:  New does NOT install the optimizer decorator on the session factory,
+	//            and exposes the resolved factory via Manager.OptimizerFactory so the
+	//            Serve layer builds a per-session optimizer over the core's tools.
+	//   - false: New installs the optimizer decorator (legacy behavior) and
+	//            Manager.OptimizerFactory returns nil, so a Serve composition root that
+	//            enables the optimizer but forgets this flag gets no Serve-layer
+	//            optimizer rather than a second, divergent upsert into the store.
+	// Either way New resolves the optimizer factory and owns its store/cleanup. Has no
+	// effect when the optimizer is disabled. The legacy server.New path leaves this
+	// false, so its optimizer decorator is unchanged.
+	AdvertiseFromCore bool
 }
 
 // resolveOptimizer wires the optimizer factory from cfg, applying telemetry
@@ -125,52 +140,19 @@ func resolveOptimizer(cfg *FactoryConfig) (
 func buildDecoratingFactory(
 	cfg *FactoryConfig,
 	optimizerFactory func(context.Context, []mcpserver.ServerTool) (optimizer.Optimizer, error),
-	instruments *workflowExecutorInstruments,
 	terminateSession func(string) (bool, error),
 ) vmcpsession.MultiSessionFactory {
 	var decorators []vmcpsession.Decorator
 
-	if len(cfg.WorkflowDefs) > 0 {
-		decorators = append(decorators, compositeToolsDecorator(cfg.WorkflowDefs, cfg.ComposerFactory, instruments))
-	}
-	if optimizerFactory != nil {
+	// On the Serve path (AdvertiseFromCore) the optimizer is built by the Serve layer
+	// over the core's advertised set, so the factory's optimizer decorator is skipped
+	// to avoid double-indexing the shared store (see FactoryConfig.AdvertiseFromCore).
+	// Composite tools and their telemetry are owned by the core, not the factory.
+	if optimizerFactory != nil && !cfg.AdvertiseFromCore {
 		decorators = append(decorators, optimizerDecoratorFn(optimizerFactory, terminateSession))
 	}
 
 	return vmcpsession.NewDecoratingFactory(cfg.Base, decorators...)
-}
-
-// compositeToolsDecorator returns a Decorator that applies the composite tools
-// wrapper to newly created sessions.
-func compositeToolsDecorator(
-	workflowDefs map[string]*composer.WorkflowDefinition,
-	composerFactory func(rt *vmcp.RoutingTable, tools []vmcp.Tool) composer.Composer,
-	instruments *workflowExecutorInstruments,
-) vmcpsession.Decorator {
-	return func(_ context.Context, sess vmcpsession.MultiSession) (vmcpsession.MultiSession, error) {
-		sessionDefs := compositetools.FilterWorkflowDefsForSession(workflowDefs, sess.GetRoutingTable())
-		if len(sessionDefs) == 0 {
-			return sess, nil
-		}
-
-		compositeToolsMeta := compositetools.ConvertWorkflowDefsToTools(sessionDefs)
-		if err := compositetools.ValidateNoToolConflicts(sess.AllTools(), compositeToolsMeta); err != nil {
-			slog.Warn("composite tool name conflict detected; skipping composite tools", "session_id", sess.ID(), "error", err)
-			return sess, nil
-		}
-
-		sessionComposer := composerFactory(sess.GetRoutingTable(), sess.AllTools())
-		sessionExecutors := make(map[string]compositetools.WorkflowExecutor, len(sessionDefs))
-		for _, def := range sessionDefs {
-			ex := newComposerWorkflowExecutor(sessionComposer, def)
-			if instruments != nil {
-				ex = instruments.wrapExecutor(def.Name, ex)
-			}
-			sessionExecutors[def.Name] = ex
-		}
-
-		return compositetools.NewDecorator(sess, compositeToolsMeta, sessionExecutors), nil
-	}
 }
 
 // optimizerDecoratorFn returns a Decorator that indexes all session tools into
@@ -270,131 +252,6 @@ func adaptToolsForFactory(
 	}
 
 	return sdkTools, nil
-}
-
-// composerWorkflowExecutor adapts a composer.Composer + WorkflowDefinition
-// to the compositetools.WorkflowExecutor interface.
-type composerWorkflowExecutor struct {
-	composer composer.Composer
-	def      *composer.WorkflowDefinition
-}
-
-func newComposerWorkflowExecutor(c composer.Composer, def *composer.WorkflowDefinition) compositetools.WorkflowExecutor {
-	return &composerWorkflowExecutor{composer: c, def: def}
-}
-
-func (e *composerWorkflowExecutor) ExecuteWorkflow(
-	ctx context.Context, params map[string]any,
-) (*compositetools.WorkflowResult, error) {
-	result, err := e.composer.ExecuteWorkflow(ctx, e.def, params)
-	if err != nil {
-		return nil, err
-	}
-	return &compositetools.WorkflowResult{
-		Output: result.Output,
-		Error:  result.Error,
-	}, nil
-}
-
-// workflowExecutorInstruments holds pre-created OTEL instruments for workflow
-// telemetry. Created once at startup and reused across all session registrations.
-type workflowExecutorInstruments struct {
-	tracer            trace.Tracer
-	executionsTotal   metric.Int64Counter
-	errorsTotal       metric.Int64Counter
-	executionDuration metric.Float64Histogram
-}
-
-func newWorkflowExecutorInstruments(
-	meterProvider metric.MeterProvider,
-	tracerProvider trace.TracerProvider,
-) (*workflowExecutorInstruments, error) {
-	meter := meterProvider.Meter(instrumentationName)
-
-	executionsTotal, err := meter.Int64Counter(
-		"toolhive_vmcp_workflow_executions",
-		metric.WithDescription("Total number of workflow executions"),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create workflow executions counter: %w", err)
-	}
-
-	errorsTotal, err := meter.Int64Counter(
-		"toolhive_vmcp_workflow_errors",
-		metric.WithDescription("Total number of workflow execution errors"),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create workflow errors counter: %w", err)
-	}
-
-	executionDuration, err := meter.Float64Histogram(
-		"toolhive_vmcp_workflow_duration",
-		metric.WithDescription("Duration of workflow executions in seconds"),
-		metric.WithUnit("s"),
-		metric.WithExplicitBucketBoundaries(telemetry.MCPHistogramBuckets...),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create workflow duration histogram: %w", err)
-	}
-
-	return &workflowExecutorInstruments{
-		tracer:            tracerProvider.Tracer(instrumentationName),
-		executionsTotal:   executionsTotal,
-		errorsTotal:       errorsTotal,
-		executionDuration: executionDuration,
-	}, nil
-}
-
-func (i *workflowExecutorInstruments) wrapExecutor(
-	name string, ex compositetools.WorkflowExecutor,
-) compositetools.WorkflowExecutor {
-	return &telemetryWorkflowExecutor{
-		name:              name,
-		executor:          ex,
-		tracer:            i.tracer,
-		executionsTotal:   i.executionsTotal,
-		errorsTotal:       i.errorsTotal,
-		executionDuration: i.executionDuration,
-	}
-}
-
-type telemetryWorkflowExecutor struct {
-	name              string
-	executor          compositetools.WorkflowExecutor
-	tracer            trace.Tracer
-	executionsTotal   metric.Int64Counter
-	errorsTotal       metric.Int64Counter
-	executionDuration metric.Float64Histogram
-}
-
-var _ compositetools.WorkflowExecutor = (*telemetryWorkflowExecutor)(nil)
-
-func (t *telemetryWorkflowExecutor) ExecuteWorkflow(
-	ctx context.Context, params map[string]any,
-) (*compositetools.WorkflowResult, error) {
-	commonAttrs := []attribute.KeyValue{attribute.String("workflow.name", t.name)}
-
-	ctx, span := t.tracer.Start(ctx, "telemetryWorkflowExecutor.ExecuteWorkflow",
-		trace.WithAttributes(commonAttrs...),
-	)
-	defer span.End()
-
-	metricAttrs := metric.WithAttributes(commonAttrs...)
-	start := time.Now()
-	t.executionsTotal.Add(ctx, 1, metricAttrs)
-
-	result, err := t.executor.ExecuteWorkflow(ctx, params)
-
-	duration := time.Since(start)
-	t.executionDuration.Record(ctx, duration.Seconds(), metricAttrs)
-
-	if err != nil {
-		t.errorsTotal.Add(ctx, 1, metricAttrs)
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-	}
-
-	return result, err
 }
 
 // monitorOptimizer wraps an optimizer factory so that every Optimizer instance

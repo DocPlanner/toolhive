@@ -582,6 +582,13 @@ func BuildAuthServerRunConfig(
 	}
 	config.Storage = storageCfg
 
+	// Wire through upstream token injection flag
+	config.DisableUpstreamTokenInjection = authConfig.DisableUpstreamTokenInjection
+
+	// Wire through the insecure HTTP issuer flag from the CRD field.
+	// This replaces any auto-inference and moves control to the deployer.
+	config.InsecureAllowHTTP = authConfig.InsecureAllowHTTP
+
 	// Build CIMD configuration. CacheFallbackTTL is passed as-is (string);
 	// resolveCIMDConfig in the runner parses it to time.Duration at startup.
 	if authConfig.CIMD != nil && authConfig.CIMD.Enabled {
@@ -615,11 +622,10 @@ func buildStorageRunConfig(
 		return nil, fmt.Errorf("redis config is required when storage type is redis")
 	}
 
-	redisAddr := redisConfig.EffectiveAddr()
-	if redisAddr != "" && redisConfig.SentinelConfig != nil {
+	if redisConfig.Addr != "" && redisConfig.SentinelConfig != nil {
 		return nil, fmt.Errorf("addr and sentinelConfig are mutually exclusive for Redis storage")
 	}
-	if redisAddr == "" && redisConfig.SentinelConfig == nil {
+	if redisConfig.Addr == "" && redisConfig.SentinelConfig == nil {
 		return nil, fmt.Errorf("one of addr (standalone or cluster) or sentinelConfig (Sentinel) is required for Redis storage")
 	}
 
@@ -639,7 +645,7 @@ func buildStorageRunConfig(
 	}
 
 	rc := &storage.RedisRunConfig{
-		Addr:          redisAddr,
+		Addr:          redisConfig.Addr,
 		ClusterMode:   redisConfig.ClusterMode,
 		AuthType:      storage.AuthTypeACLUser,
 		ACLUserConfig: aclRunConfig,
@@ -787,6 +793,7 @@ func buildOIDCUpstreamRunConfig(
 		RedirectURI:                   redirectURI,
 		Scopes:                        cfg.Scopes,
 		AdditionalAuthorizationParams: cfg.AdditionalAuthorizationParams,
+		SubjectClaim:                  cfg.SubjectClaim,
 	}
 	if cfg.ClientSecretRef != nil {
 		runConfig.ClientSecretEnvVar = clientSecretEnvVar

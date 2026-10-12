@@ -36,13 +36,14 @@ import (
 	"github.com/stacklok/toolhive/pkg/vmcp"
 	"github.com/stacklok/toolhive/pkg/vmcp/aggregator"
 	vmcpauth "github.com/stacklok/toolhive/pkg/vmcp/auth"
-	"github.com/stacklok/toolhive/pkg/vmcp/auth/factory"
+	authfactory "github.com/stacklok/toolhive/pkg/vmcp/auth/factory"
 	vmcpclient "github.com/stacklok/toolhive/pkg/vmcp/client"
+	"github.com/stacklok/toolhive/pkg/vmcp/codemode"
 	"github.com/stacklok/toolhive/pkg/vmcp/config"
-	"github.com/stacklok/toolhive/pkg/vmcp/discovery"
 	"github.com/stacklok/toolhive/pkg/vmcp/health"
 	"github.com/stacklok/toolhive/pkg/vmcp/k8s"
 	"github.com/stacklok/toolhive/pkg/vmcp/optimizer"
+	ratelimitfactory "github.com/stacklok/toolhive/pkg/vmcp/ratelimit/factory"
 	vmcprouter "github.com/stacklok/toolhive/pkg/vmcp/router"
 	vmcpserver "github.com/stacklok/toolhive/pkg/vmcp/server"
 	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
@@ -208,11 +209,6 @@ func Serve(ctx context.Context, cfg ServeConfig) error {
 	// DynamicRegistry tracks backends for dynamic discovery in Kubernetes mode.
 	dynamicRegistry := vmcp.NewDynamicRegistry(backends)
 	backendRegistry := vmcp.BackendRegistry(dynamicRegistry)
-
-	discoveryMgr, err := discovery.NewManager(agg)
-	if err != nil {
-		return fmt.Errorf("failed to create discovery manager: %w", err)
-	}
 	slog.Info("dynamic backend registry enabled for Kubernetes environment")
 
 	// Backend watcher for dynamic backend discovery.
@@ -247,8 +243,9 @@ func Serve(ctx context.Context, cfg ServeConfig) error {
 		slog.Info("kubernetes backend watcher started for dynamic backend discovery")
 	}
 
-	// Create router.
-	rtr := vmcprouter.NewDefaultRouter()
+	// Workflow validation in core.New needs a non-nil Router, but the core routes per-call
+	// via NewSessionRouter and validation does not route — so an empty session router suffices.
+	rtr := vmcprouter.NewSessionRouter(&vmcp.RoutingTable{})
 
 	slog.Info(fmt.Sprintf("Setting up incoming authentication (type: %s)", vmcpCfg.IncomingAuth.Type))
 
@@ -349,7 +346,9 @@ func Serve(ctx context.Context, cfg ServeConfig) error {
 		slog.Debug("VMCP_SESSION_HMAC_SECRET is set but no longer used after #5306; ignoring",
 			"env_var", "VMCP_SESSION_HMAC_SECRET")
 	}
-	sessionFactory := createSessionFactory(outgoingRegistry, agg, backendTimeoutSessionOptions(vmcpCfg)...)
+	// The factory never aggregates — the core is the single source of capability
+	// aggregation (agg feeds it via Config.Aggregator below).
+	sessionFactory := vmcpsession.NewSessionFactory(outgoingRegistry)
 
 	// When the optimizer is enabled, its meta-tools must pass through the authz
 	// response filter so they appear in tools/list.
@@ -372,14 +371,47 @@ func Serve(ctx context.Context, cfg ServeConfig) error {
 	}
 
 	authMiddleware, authzMiddleware, authInfoHandler, err :=
-		factory.NewIncomingAuthMiddleware(ctx, vmcpCfg.IncomingAuth, vmcpCfg.Name, passThroughTools, upstreamReader, keyProvider)
+		authfactory.NewIncomingAuthMiddleware(ctx, vmcpCfg.IncomingAuth, vmcpCfg.Name, passThroughTools, upstreamReader, keyProvider)
 	if err != nil {
 		return fmt.Errorf("failed to create authentication middleware: %w", err)
 	}
 
+	// Build the authorizer-agnostic authz config the core admission seam consumes. It is
+	// the same config the HTTP authz middleware above is built from; server.New routes
+	// through Serve, which ignores the (vestigial) AuthzMiddleware and enforces authz in
+	// the core from this config instead. Nil when no Cedar policies are configured
+	// (allow-all parity).
+	authzConfig, err := authfactory.BuildAuthzConfig(vmcpCfg.IncomingAuth.Authz)
+	if err != nil {
+		return fmt.Errorf("failed to build authorization config: %w", err)
+	}
+
 	slog.Info(fmt.Sprintf("Incoming authentication configured: %s", vmcpCfg.IncomingAuth.Type))
 
-	serverCfg := &vmcpserver.Config{
+	namespace := vmcpNamespace()
+	rateLimitMiddleware, rateLimitCleanup, err := ratelimitfactory.NewMiddleware(ctx, ratelimitfactory.Config{
+		Namespace:      namespace,
+		ServerName:     vmcpCfg.Name,
+		RateLimiting:   vmcpCfg.RateLimiting,
+		SessionStorage: vmcpCfg.SessionStorage,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create rate limit middleware: %w", err)
+	}
+	if rateLimitCleanup != nil {
+		defer func() {
+			if closeErr := rateLimitCleanup(context.Background()); closeErr != nil {
+				slog.Error(fmt.Sprintf("failed to close rate limit middleware: %v", closeErr))
+			}
+		}()
+	}
+
+	// Resolve transport defaults once here at the composition root: the
+	// vMCP config edge is the single place flags/CRD/YAML become a fully-resolved
+	// Config, so server.New, Serve, and the derive* helpers downstream are pure
+	// pass-through. WithDefaults fills any unset Host/EndpointPath/SessionTTL/Name/
+	// Version (EndpointPath in particular is never set by the CLI).
+	serverCfg := vmcpserver.WithDefaults(&vmcpserver.Config{
 		Name:                    vmcpCfg.Name,
 		Version:                 versions.Version,
 		GroupRef:                vmcpCfg.Group,
@@ -389,6 +421,8 @@ func Serve(ctx context.Context, cfg ServeConfig) error {
 		AuthMiddleware:          authMiddleware,
 		AuthzMiddleware:         authzMiddleware,
 		AuthInfoHandler:         authInfoHandler,
+		PassthroughHeaders:      vmcpCfg.PassthroughHeaders,
+		RateLimitMiddleware:     rateLimitMiddleware,
 		AuthServer:              embeddedAuthServer,
 		TelemetryProvider:       telemetryProvider,
 		AuditConfig:             vmcpCfg.Audit,
@@ -397,15 +431,15 @@ func Serve(ctx context.Context, cfg ServeConfig) error {
 		Watcher:                 nil, // set below if backendWatcher is non-nil
 		StatusReporter:          statusReporter,
 		OptimizerConfig:         optCfg,
+		CodeModeConfig:          codemode.FromConfig(vmcpCfg.CodeMode),
 		SessionFactory:          sessionFactory,
 		SessionStorage:          vmcpCfg.SessionStorage,
-		WriteTimeout:            serverWriteTimeoutFromConfig(vmcpCfg),
-		SessionOwnerAdvertiseURL: resolveSessionOwnerAdvertiseURL(
-			envReader.Getenv(envVMCPSessionOwnerURL),
-			envReader.Getenv(envPodIP),
-			cfg.Port,
-		),
-	}
+		// Core collaborators: server.New routes through core.New + Serve, so the core
+		// is the single aggregator and authorizer. The aggregator is the same instance
+		// that backs discovery; Authz feeds the core admission seam (nil = allow-all).
+		Aggregator: agg,
+		Authz:      authzConfig,
+	})
 
 	// Assign Watcher only when backendWatcher is non-nil. A typed nil
 	// *k8s.BackendWatcher assigned to the Watcher interface produces a
@@ -423,8 +457,8 @@ func Serve(ctx context.Context, cfg ServeConfig) error {
 		slog.Info(fmt.Sprintf("Loaded %d composite tool workflow definitions", len(workflowDefs)))
 	}
 
-	// Create server with discovery manager, backend registry, and workflow definitions.
-	srv, err := vmcpserver.New(ctx, serverCfg, rtr, backendClient, discoveryMgr, backendRegistry, workflowDefs)
+	// Create server with the backend registry and workflow definitions.
+	srv, err := vmcpserver.New(ctx, serverCfg, rtr, backendClient, backendRegistry, workflowDefs)
 	if err != nil {
 		return fmt.Errorf("failed to create Virtual MCP Server: %w", err)
 	}
@@ -540,6 +574,14 @@ func generateQuickModeConfig(groupRef string) (*config.Config, error) {
 	return cfg, nil
 }
 
+func vmcpNamespace() string {
+	namespace := os.Getenv("VMCP_NAMESPACE")
+	if namespace == "" {
+		return "local"
+	}
+	return namespace
+}
+
 // loadAuthServerConfig loads the auth server RunConfig from a sibling file
 // alongside the main config. The operator serializes authserver.RunConfig as a
 // separate ConfigMap key (authserver-config.yaml).
@@ -571,7 +613,7 @@ func discoverBackends(
 ) ([]vmcp.Backend, vmcp.BackendClient, vmcpauth.OutgoingAuthRegistry, error) {
 	slog.Info("initializing outgoing authentication")
 	envReader := &env.OSReader{}
-	outgoingRegistry, err := factory.NewOutgoingAuthRegistry(ctx, envReader)
+	outgoingRegistry, err := authfactory.NewOutgoingAuthRegistry(ctx, envReader)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to create outgoing authentication registry: %w", err)
 	}
@@ -654,20 +696,4 @@ func runDiscovery(
 
 	slog.Info(fmt.Sprintf("Discovered %d backends", len(backends)))
 	return backends, backendClient, outgoingRegistry, nil
-}
-
-// createSessionFactory creates a MultiSessionFactory backed by the provided outgoing
-// auth registry and optional aggregator. When agg is non-nil, sessions gain access
-// to aggregated backend metadata; pass nil for single-backend deployments.
-func createSessionFactory(
-	outgoingRegistry vmcpauth.OutgoingAuthRegistry,
-	agg aggregator.Aggregator,
-	extraOpts ...vmcpsession.MultiSessionFactoryOption,
-) vmcpsession.MultiSessionFactory {
-	var opts []vmcpsession.MultiSessionFactoryOption
-	if agg != nil {
-		opts = append(opts, vmcpsession.WithAggregator(agg))
-	}
-	opts = append(opts, extraOpts...)
-	return vmcpsession.NewSessionFactory(outgoingRegistry, opts...)
 }

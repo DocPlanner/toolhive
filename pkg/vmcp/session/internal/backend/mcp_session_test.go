@@ -5,12 +5,8 @@ package backend
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"testing"
-	"time"
 
-	mcptransport "github.com/mark3labs/mcp-go/client/transport"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -31,6 +27,10 @@ func newTestRegistry(t *testing.T) vmcpauth.OutgoingAuthRegistry {
 	return reg
 }
 
+// mergeForwardedHeaders is now a one-line delegation to
+// headerforward.MergeForwardedHeaders; full coverage lives in
+// pkg/vmcp/headerforward/transport_test.go (TestMergeForwardedHeaders).
+
 func TestCreateMCPClient_UnsupportedTransport(t *testing.T) {
 	t.Parallel()
 
@@ -46,60 +46,10 @@ func TestCreateMCPClient_UnsupportedTransport(t *testing.T) {
 				TransportType: transport,
 			}
 
-			_, err := createMCPClient(context.Background(), target, nil, newTestRegistry(t), time.Second, secrets.NewEnvironmentProvider())
+			_, err := createMCPClient(context.Background(), target, nil, newTestRegistry(t), "", secrets.NewEnvironmentProvider())
 			require.Error(t, err)
 			assert.ErrorIs(t, err, vmcp.ErrUnsupportedTransport,
 				"transport %q should return ErrUnsupportedTransport", transport)
-		})
-	}
-}
-
-func TestRequestTimeoutForWorkload(t *testing.T) {
-	t.Parallel()
-
-	perWorkload := map[string]time.Duration{
-		"slow-backend": 125 * time.Second,
-	}
-
-	assert.Equal(
-		t,
-		125*time.Second,
-		requestTimeoutForWorkload("slow-backend", 60*time.Second, perWorkload),
-	)
-	assert.Equal(
-		t,
-		60*time.Second,
-		requestTimeoutForWorkload("other-backend", 60*time.Second, perWorkload),
-	)
-	assert.Equal(
-		t,
-		defaultBackendRequestTimeout,
-		requestTimeoutForWorkload("other-backend", 0, nil),
-	)
-}
-
-func TestIsBackendSessionLostError(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{name: "nil", err: nil, want: false},
-		{name: "mcp-go session terminated", err: fmt.Errorf("failed to send request: %w", mcptransport.ErrSessionTerminated), want: true},
-		{name: "transport dropped session id", err: errBackendSessionIDLost, want: true},
-		{name: "typescript sdk sessionless 400", err: errors.New("request failed with status 400: Bad Request: Not an initialization request and no valid session ID provided."), want: true},
-		{name: "go-sdk sessionless jsonrpc error", err: errors.New(`method "tools/call" is invalid during session initialization`), want: true},
-		{name: "mcp-go server invalid session", err: errors.New("request failed with status 400: Invalid session ID"), want: true},
-		{name: "mcp-for-argocd expired session", err: errors.New("request failed with status 400: Invalid or expired session ID: 6cce26fd-e2e2-417e-b8c2-5fded9e0b6d5"), want: true},
-		{name: "ambiguous 5xx", err: errors.New("request failed with status 502: Bad Gateway"), want: false},
-		{name: "network error", err: errors.New("dial tcp: connection refused"), want: false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			assert.Equal(t, tt.want, isBackendSessionLostError(tt.err))
 		})
 	}
 }

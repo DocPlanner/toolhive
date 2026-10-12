@@ -37,6 +37,10 @@ type HeaderFromSecret struct {
 }
 
 // MCPRemoteProxySpec defines the desired state of MCPRemoteProxy
+//
+// +kubebuilder:validation:XValidation:rule="!(has(self.authzConfig) && has(self.authzConfigRef))",message="authzConfig and authzConfigRef are mutually exclusive; use authzConfigRef to reference a shared MCPAuthzConfig"
+//
+//nolint:lll // CEL validation rules exceed line length limit
 type MCPRemoteProxySpec struct {
 	// RemoteURL is the URL of the remote MCP server to proxy
 	// +kubebuilder:validation:Required
@@ -84,9 +88,16 @@ type MCPRemoteProxySpec struct {
 	// +optional
 	HeaderForward *HeaderForwardConfig `json:"headerForward,omitempty"`
 
-	// AuthzConfig defines authorization policy configuration for the proxy
+	// AuthzConfig defines authorization policy configuration for the proxy.
+	// AuthzConfig and AuthzConfigRef are mutually exclusive.
 	// +optional
 	AuthzConfig *AuthzConfigRef `json:"authzConfig,omitempty"`
+
+	// AuthzConfigRef references a shared MCPAuthzConfig resource for authorization.
+	// The referenced MCPAuthzConfig must exist in the same namespace as this MCPRemoteProxy.
+	// Mutually exclusive with authzConfig.
+	// +optional
+	AuthzConfigRef *MCPAuthzConfigReference `json:"authzConfigRef,omitempty"`
 
 	// Audit defines audit logging configuration for the proxy
 	// +optional
@@ -127,12 +138,6 @@ type MCPRemoteProxySpec struct {
 	// +optional
 	EndpointPrefix string `json:"endpointPrefix,omitempty"`
 
-	// Replicas is the number of proxy deployment replicas.
-	// When nil, defaults to 1. Set to nil when using an external HPA.
-	// +kubebuilder:validation:Minimum=1
-	// +optional
-	Replicas *int32 `json:"replicas,omitempty"`
-
 	// PodTemplateSpec allows customizing the pod template for the proxy deployment.
 	// Scheduling fields (nodeSelector, tolerations, affinity) are applied to the proxy pods.
 	// +optional
@@ -150,10 +155,49 @@ type MCPRemoteProxySpec struct {
 	// SessionAffinity controls whether the Service routes repeated client connections to the same pod.
 	// MCP protocols (SSE, streamable-http) are stateful, so ClientIP is the default.
 	// Set to "None" for stateless servers or when using an external load balancer with its own affinity.
+	//
+	// Interaction with sessionStorage: when running multiple replicas with
+	// sessionStorage.provider "redis", set this to "None" so requests are
+	// distributed across replicas and sessions resolve via the shared store.
+	// Conversely, "None" without Redis-backed sessionStorage breaks session
+	// continuity — any request landing on a different pod fails with
+	// "Session not found".
 	// +kubebuilder:validation:Enum=ClientIP;None
 	// +kubebuilder:default=ClientIP
 	// +optional
 	SessionAffinity string `json:"sessionAffinity,omitempty"`
+
+	// Replicas is the desired number of proxy pod replicas.
+	// MCPRemoteProxy creates a single Deployment for the proxy process, so there
+	// is only one replicas field (mirrors VirtualMCPServer.spec.replicas).
+	// When nil, the operator does not set Deployment.Spec.Replicas, leaving replica
+	// management to an HPA or other external controller.
+	// When set above 1, also configure sessionStorage with the redis provider and
+	// sessionAffinity: "None" so sessions resolve across replicas; otherwise a
+	// SessionStorageWarning condition is surfaced on the resource status.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	Replicas *int32 `json:"replicas,omitempty"`
+
+	// SessionStorage configures session storage for stateful horizontal scaling.
+	// When nil, no session storage is configured and the proxy falls back to
+	// pod-local in-memory session state — incompatible with multi-replica
+	// deployments behind load balancers that don't preserve client-IP affinity
+	// (e.g. AWS ALB across multiple AZs).
+	//
+	// The transparent proxy validates `Mcp-Session-Id` against this store on
+	// every non-initialize request (see pkg/transport/proxy/transparent/
+	// transparent_proxy.go) and rewrites client-facing session IDs to backend
+	// session IDs using session metadata. Both lookups require shared state
+	// across replicas.
+	//
+	// When using the Redis provider, also set sessionAffinity to "None" so the
+	// Service routes requests round-robin and all replicas rely on the shared
+	// session store rather than pod-local state.
+	//
+	// Mirrors MCPServer.spec.sessionStorage and VirtualMCPServer.spec.sessionStorage.
+	// +optional
+	SessionStorage *SessionStorageConfig `json:"sessionStorage,omitempty"`
 }
 
 // MCPRemoteProxyStatus defines the observed state of MCPRemoteProxy
@@ -196,6 +240,10 @@ type MCPRemoteProxyStatus struct {
 	// used to detect configuration changes and trigger reconciliation.
 	// +optional
 	AuthServerConfigHash string `json:"authServerConfigHash,omitempty"`
+
+	// AuthzConfigHash is the hash of the referenced MCPAuthzConfig spec for change detection
+	// +optional
+	AuthzConfigHash string `json:"authzConfigHash,omitempty"`
 
 	// OIDCConfigHash is the hash of the referenced MCPOIDCConfig spec for change detection
 	// +optional
@@ -249,6 +297,9 @@ const (
 
 	// ConditionTypeMCPRemoteProxyAuthServerRefValidated indicates whether the AuthServerRef is valid
 	ConditionTypeMCPRemoteProxyAuthServerRefValidated = "AuthServerRefValidated"
+
+	// ConditionTypeMCPRemoteProxyCABundleRefValidated indicates whether the OIDC CA bundle reference is valid
+	ConditionTypeMCPRemoteProxyCABundleRefValidated = "CABundleRefValidated"
 
 	// ConditionTypeConfigurationValid indicates whether the proxy spec has passed all pre-deployment validation checks
 	ConditionTypeConfigurationValid = "ConfigurationValid"
@@ -337,6 +388,15 @@ const (
 
 	// ConditionReasonMCPRemoteProxyAuthServerRefMultiUpstream indicates multi-upstream is not supported
 	ConditionReasonMCPRemoteProxyAuthServerRefMultiUpstream = "MultiUpstreamNotSupported"
+
+	// ConditionReasonMCPRemoteProxyCABundleRefValid indicates the CA bundle ref is valid and the ConfigMap exists
+	ConditionReasonMCPRemoteProxyCABundleRefValid = "CABundleRefValid"
+
+	// ConditionReasonMCPRemoteProxyCABundleRefNotFound indicates the referenced CA bundle ConfigMap was not found
+	ConditionReasonMCPRemoteProxyCABundleRefNotFound = "CABundleRefNotFound"
+
+	// ConditionReasonMCPRemoteProxyCABundleRefInvalid indicates the CA bundle ref configuration is invalid
+	ConditionReasonMCPRemoteProxyCABundleRefInvalid = "CABundleRefInvalid"
 
 	// ConditionReasonConfigurationValid indicates all configuration validations passed
 	ConditionReasonConfigurationValid = "ConfigurationValid"

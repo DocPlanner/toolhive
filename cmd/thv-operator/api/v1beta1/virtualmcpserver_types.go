@@ -19,6 +19,7 @@ import (
 // +kubebuilder:validation:XValidation:rule="!has(self.config) || !has(self.config.rateLimiting) || (has(self.sessionStorage) && self.sessionStorage.provider == 'redis')",message="config.rateLimiting requires sessionStorage with provider 'redis'"
 // +kubebuilder:validation:XValidation:rule="!(has(self.config) && has(self.config.rateLimiting) && has(self.config.rateLimiting.perUser)) || (has(self.incomingAuth) && self.incomingAuth.type == 'oidc')",message="config.rateLimiting.perUser requires incomingAuth.type oidc"
 // +kubebuilder:validation:XValidation:rule="!has(self.config) || !has(self.config.rateLimiting) || !has(self.config.rateLimiting.tools) || self.config.rateLimiting.tools.all(t, !has(t.perUser)) || (has(self.incomingAuth) && self.incomingAuth.type == 'oidc')",message="per-tool perUser rate limiting requires incomingAuth.type oidc"
+// +kubebuilder:validation:XValidation:rule="!(has(self.embeddingServerRef) && has(self.config) && has(self.config.optimizer) && has(self.config.optimizer.embeddingProvider) && self.config.optimizer.embeddingProvider == 'openai')",message="embeddingServerRef provisions a managed TEI server and cannot be combined with optimizer.embeddingProvider 'openai'; openai mode uses embeddingService directly"
 //
 //nolint:lll // CEL validation rules exceed line length limit
 type VirtualMCPServerSpec struct {
@@ -36,6 +37,15 @@ type VirtualMCPServerSpec struct {
 	// dynamic discovery of credentials, rather than requiring secrets to be embedded in config.
 	// +optional
 	OutgoingAuth *OutgoingAuthConfig `json:"outgoingAuth,omitempty"`
+
+	// PassthroughHeaders is an allowlist of incoming client request header names
+	// forwarded verbatim to all backends (e.g. an API key the backend resolves to
+	// a user). Takes precedence over config.PassthroughHeaders. Names must not be
+	// restricted headers (Host, hop-by-hop, X-Forwarded-*). Forwarded headers are
+	// attacker-influenceable unless a trusted upstream sets them.
+	// +optional
+	// +listType=atomic
+	PassthroughHeaders []string `json:"passthroughHeaders,omitempty"`
 
 	// ServiceType specifies the Kubernetes service type for the Virtual MCP server
 	// +kubebuilder:validation:Enum=ClusterIP;NodePort;LoadBalancer
@@ -160,6 +170,7 @@ type EmbeddingServerRef struct {
 // IncomingAuthConfig configures authentication for clients connecting to the Virtual MCP server
 //
 // +kubebuilder:validation:XValidation:rule="self.type == 'oidc' ? has(self.oidcConfigRef) : true",message="spec.incomingAuth.oidcConfigRef is required when type is oidc"
+// +kubebuilder:validation:XValidation:rule="!(has(self.authzConfig) && has(self.authzConfigRef))",message="authzConfig and authzConfigRef are mutually exclusive; use authzConfigRef to reference a shared MCPAuthzConfig"
 //
 //nolint:lll // CEL validation rules exceed line length limit
 type IncomingAuthConfig struct {
@@ -176,10 +187,21 @@ type IncomingAuthConfig struct {
 	// +optional
 	OIDCConfigRef *MCPOIDCConfigReference `json:"oidcConfigRef,omitempty"`
 
-	// AuthzConfig defines authorization policy configuration
-	// Reuses MCPServer authz patterns
+	// AuthzConfig defines authorization policy configuration.
+	// Reuses MCPServer authz patterns.
+	// AuthzConfig and AuthzConfigRef are mutually exclusive.
 	// +optional
 	AuthzConfig *AuthzConfigRef `json:"authzConfig,omitempty"`
+
+	// AuthzConfigRef references a shared MCPAuthzConfig resource for authorization.
+	// The referenced MCPAuthzConfig must exist in the same namespace as this VirtualMCPServer.
+	// Mutually exclusive with authzConfig.
+	//
+	// Only cedarv1 MCPAuthzConfig resources are supported for VirtualMCPServer
+	// today; referencing a non-Cedar config fails reconciliation with a clear
+	// error because the vMCP runtime authz middleware is Cedar-only.
+	// +optional
+	AuthzConfigRef *MCPAuthzConfigReference `json:"authzConfigRef,omitempty"`
 }
 
 // OutgoingAuthConfig configures authentication from Virtual MCP to backend MCPServers
@@ -267,6 +289,11 @@ type VirtualMCPServerStatus struct {
 	// Excludes unavailable, degraded, and unknown backends.
 	// +optional
 	BackendCount int32 `json:"backendCount,omitempty"`
+
+	// AuthzConfigHash is the hash of the referenced MCPAuthzConfig spec for change detection.
+	// Only populated when IncomingAuth.AuthzConfigRef is set.
+	// +optional
+	AuthzConfigHash string `json:"authzConfigHash,omitempty"`
 
 	// OIDCConfigHash is the hash of the referenced MCPOIDCConfig spec for change detection.
 	// Only populated when IncomingAuth.OIDCConfigRef is set.

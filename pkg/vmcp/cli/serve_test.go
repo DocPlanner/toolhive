@@ -17,7 +17,6 @@ import (
 	authserverconfig "github.com/stacklok/toolhive/pkg/authserver"
 	"github.com/stacklok/toolhive/pkg/groups"
 	"github.com/stacklok/toolhive/pkg/vmcp"
-	"github.com/stacklok/toolhive/pkg/vmcp/aggregator"
 	aggregatormocks "github.com/stacklok/toolhive/pkg/vmcp/aggregator/mocks"
 	clientmocks "github.com/stacklok/toolhive/pkg/vmcp/client/mocks"
 	"github.com/stacklok/toolhive/pkg/vmcp/config"
@@ -160,35 +159,6 @@ backends:
 	assert.Len(t, backends, 1)
 }
 
-func newSessionFactoryMocks(t *testing.T) (*clientmocks.MockOutgoingAuthRegistry, *aggregatormocks.MockAggregator) {
-	t.Helper()
-	ctrl := gomock.NewController(t)
-	return clientmocks.NewMockOutgoingAuthRegistry(ctrl), aggregatormocks.NewMockAggregator(ctrl)
-}
-
-func TestCreateSessionFactory(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name   string
-		useAgg bool
-	}{
-		{name: "with aggregator", useAgg: true},
-		{name: "without aggregator", useAgg: false},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			registry, agg := newSessionFactoryMocks(t)
-			var aggArg aggregator.Aggregator
-			if tc.useAgg {
-				aggArg = agg
-			}
-			factory := createSessionFactory(registry, aggArg)
-			require.NotNil(t, factory)
-		})
-	}
-}
-
 // TestRunDiscovery_KubernetesGroupNotFound exercises the Kubernetes-specific branch
 // in runDiscovery where ErrGroupNotFound is treated as a non-fatal condition.
 // vMCP should start with zero backends and return nil error so it can begin
@@ -318,6 +288,20 @@ func TestValidateQuickModeHost(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestVMCPNamespace(t *testing.T) {
+	t.Run("defaults to local", func(t *testing.T) {
+		t.Setenv("VMCP_NAMESPACE", "")
+
+		assert.Equal(t, "local", vmcpNamespace())
+	})
+
+	t.Run("uses environment value", func(t *testing.T) {
+		t.Setenv("VMCP_NAMESPACE", "toolhive-system")
+
+		assert.Equal(t, "toolhive-system", vmcpNamespace())
+	})
 }
 
 // TestRunDiscovery_ZeroBackends exercises the branch in runDiscovery where the

@@ -4,34 +4,12 @@
 package cli
 
 import (
-	"fmt"
-	"net"
-	"strings"
 	"time"
 
 	"github.com/stacklok/toolhive/pkg/vmcp/config"
-	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
 )
 
-const (
-	envVMCPSessionOwnerURL = "THV_VMCP_SESSION_OWNER_URL"
-	envPodIP               = "POD_IP"
-	backendResponseMargin  = 5 * time.Second
-)
-
-// backendTimeoutSessionOptions translates the operational timeout settings into
-// session factory options so backend init and request deadlines follow config.
-func backendTimeoutSessionOptions(cfg *config.Config) []vmcpsession.MultiSessionFactoryOption {
-	var opts []vmcpsession.MultiSessionFactoryOption
-	if initTimeout := backendInitTimeoutFromConfig(cfg); initTimeout > 0 {
-		opts = append(opts, vmcpsession.WithBackendInitTimeout(initTimeout))
-	}
-	requestTimeout, perWorkload := backendRequestTimeoutsFromConfig(cfg)
-	if requestTimeout > 0 || len(perWorkload) > 0 {
-		opts = append(opts, vmcpsession.WithBackendRequestTimeouts(requestTimeout, perWorkload))
-	}
-	return opts
-}
+const backendResponseMargin = 5 * time.Second
 
 func backendInitTimeoutFromConfig(cfg *config.Config) time.Duration {
 	if cfg == nil || cfg.Operational == nil {
@@ -75,16 +53,6 @@ func serverWriteTimeoutFromConfig(cfg *config.Config) time.Duration {
 		return 0
 	}
 	return maxTimeout + backendResponseMargin
-}
-
-func resolveSessionOwnerAdvertiseURL(explicit, podIP string, port int) string {
-	if explicit = strings.TrimSpace(explicit); explicit != "" {
-		return explicit
-	}
-	if podIP == "" || port <= 0 {
-		return ""
-	}
-	return fmt.Sprintf("http://%s/mcp", net.JoinHostPort(podIP, fmt.Sprintf("%d", port)))
 }
 
 // sessionTTLFromConfig returns the vMCP session TTL. The --session-ttl flag

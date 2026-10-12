@@ -10,8 +10,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"strings"
-	"sync"
 	"time"
 
 	mcpclient "github.com/mark3labs/mcp-go/client"
@@ -102,175 +100,24 @@ var _ Session = (*mcpSession)(nil)
 
 // mcpSession wraps a persistent mark3labs MCP client for one backend.
 // It is created once per backend during MakeSession and closed when the session ends.
+//
+// Phase 1 limitation — no reconnection: if the underlying transport drops
+// (network error, server restart, SSE stream EOF), all subsequent operations
+// on this backend will fail with the transport error. The session must be
+// closed and a new one created to reconnect. This affects SSE backends more
+// visibly because SSE uses a single long-lived HTTP stream; streamable-HTTP
+// backends open a new connection per request and are therefore more resilient.
 type mcpSession struct {
-	mu               sync.RWMutex
 	client           *mcpclient.Client
 	target           *vmcp.BackendTarget // bound at creation; used for capability name translation
 	backendSessionID string              // backend-assigned session ID (may be empty)
-	generation       uint64
-	closed           bool
-	reconnect        func(context.Context) (*mcpclient.Client, string, error)
 }
 
 // SessionID returns the backend-assigned session ID.
-func (c *mcpSession) SessionID() string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.backendSessionID
-}
+func (c *mcpSession) SessionID() string { return c.backendSessionID }
 
 // Close closes the underlying MCP client transport.
-func (c *mcpSession) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed {
-		return nil
-	}
-	c.closed = true
-	return c.client.Close()
-}
-
-// backendSessionLostMarkers are lower-cased substrings of backend replies that
-// mean the backend no longer knows our session even though the transport did not
-// surface a plain 404:
-//   - "no valid session id": HTTP 400 from TypeScript SDK servers when a request
-//     arrives without Mcp-Session-Id;
-//   - "expired session id": HTTP 400 "Invalid or expired session ID" from
-//     mcp-for-argocd (src/server/transport.ts) once the server forgot the
-//     session, e.g. after a restart. Being a 400 rather than a 404, mcp-go
-//     keeps the stale ID and every later call fails the same way;
-//   - "invalid during session initialization": go-sdk servers open a fresh
-//     session for a sessionless request and reject any non-initialize method;
-//   - "invalid session id" / "session not found" / "session terminated": mcp-go
-//     and ToolHive proxies describing a session they no longer hold.
-//
-// All of these are returned before the backend executes the operation, so a
-// single reinitialize-and-retry is safe.
-var backendSessionLostMarkers = []string{
-	"no valid session id",
-	"expired session id",
-	"invalid during session initialization",
-	"invalid session id",
-	"session not found",
-	"session terminated",
-}
-
-// errBackendSessionIDLost is returned before a request is sent when the
-// streamable-HTTP transport has dropped the session ID the backend issued.
-// mark3labs/mcp-go clears the ID after any 404, so the next request would go out
-// without Mcp-Session-Id and be rejected as a non-initialize call. It wraps
-// ErrSessionTerminated so the recovery path treats it as a definitive loss.
-var errBackendSessionIDLost = fmt.Errorf(
-	"backend session ID dropped by transport: %w", mcptransport.ErrSessionTerminated)
-
-// isBackendSessionLostError reports whether err means the backend session is
-// definitively gone and the operation was not executed.
-func isBackendSessionLostError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, mcptransport.ErrSessionTerminated) {
-		return true
-	}
-	msg := strings.ToLower(err.Error())
-	for _, marker := range backendSessionLostMarkers {
-		if strings.Contains(msg, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-// callWithSessionRecovery retries an operation only after a definitive MCP
-// session-lost response (see isBackendSessionLostError). Such responses are
-// returned before the backend executes the operation, unlike ambiguous network
-// or 5xx errors, which are never retried.
-func callWithSessionRecovery[T any](
-	ctx context.Context,
-	c *mcpSession,
-	operation func(*mcpclient.Client) (T, error),
-) (T, error) {
-	result, generation, err := callSession(ctx, c, operation)
-	if err == nil || c.reconnect == nil || !isBackendSessionLostError(err) {
-		return result, err
-	}
-
-	slog.Info("backend session lost; reinitializing before retry",
-		"backendID", c.target.WorkloadID, "error", err)
-
-	if reconnectErr := c.reconnectIfCurrent(ctx, generation); reconnectErr != nil {
-		var zero T
-		return zero, fmt.Errorf("backend session expired and reinitialization failed: %w", reconnectErr)
-	}
-
-	result, _, err = callSession(ctx, c, operation)
-	return result, err
-}
-
-func callSession[T any](
-	ctx context.Context,
-	c *mcpSession,
-	operation func(*mcpclient.Client) (T, error),
-) (T, uint64, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if c.closed {
-		var zero T
-		return zero, c.generation, fmt.Errorf("backend session is closed")
-	}
-	if c.transportLostSessionID() {
-		var zero T
-		return zero, c.generation, errBackendSessionIDLost
-	}
-	result, err := operation(c.client)
-	return result, c.generation, err
-}
-
-// transportLostSessionID reports whether the streamable-HTTP transport no longer
-// carries the session ID the backend issued at initialize. Callers must hold
-// c.mu. Sending in that state is pointless: the backend would reject the
-// sessionless request, so the caller reinitializes first instead.
-func (c *mcpSession) transportLostSessionID() bool {
-	if c.backendSessionID == "" || c.reconnect == nil || c.client == nil {
-		return false
-	}
-	sh, ok := c.client.GetTransport().(*mcptransport.StreamableHTTP)
-	if !ok {
-		return false
-	}
-	return sh.GetSessionId() == ""
-}
-
-// reconnectIfCurrent serializes reinitialization. Concurrent callers that
-// observed the same expired generation reuse the first caller's new client.
-func (c *mcpSession) reconnectIfCurrent(ctx context.Context, observedGeneration uint64) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.closed {
-		return fmt.Errorf("backend session is closed")
-	}
-	if c.generation != observedGeneration {
-		return nil
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	newClient, sessionID, err := c.reconnect(ctx)
-	if err != nil {
-		return err
-	}
-	oldClient := c.client
-	c.client = newClient
-	c.backendSessionID = sessionID
-	c.generation++
-	if closeErr := oldClient.Close(); closeErr != nil {
-		slog.Warn("failed to close expired backend session", "backendID", c.target.WorkloadID, "error", closeErr)
-	}
-	slog.Info("reinitialized expired backend session", "backendID", c.target.WorkloadID)
-	return nil
-}
+func (c *mcpSession) Close() error { return c.client.Close() }
 
 // CallTool invokes a named tool on this backend.
 func (c *mcpSession) CallTool(
@@ -284,14 +131,12 @@ func (c *mcpSession) CallTool(
 		slog.Debug("Translating tool name", "clientName", toolName, "backendName", backendName)
 	}
 
-	result, err := callWithSessionRecovery(ctx, c, func(client *mcpclient.Client) (*mcp.CallToolResult, error) {
-		return client.CallTool(ctx, mcp.CallToolRequest{
-			Params: mcp.CallToolParams{
-				Name:      backendName,
-				Arguments: arguments,
-				Meta:      conversion.ToMCPMeta(meta),
-			},
-		})
+	result, err := c.client.CallTool(ctx, mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name:      backendName,
+			Arguments: arguments,
+			Meta:      conversion.ToMCPMeta(meta),
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("tool %q call failed on backend %s: %w", toolName, c.target.WorkloadID, err)
@@ -323,10 +168,8 @@ func (c *mcpSession) ReadResource(
 		slog.Debug("Translating resource URI", "clientURI", uri, "backendURI", backendURI)
 	}
 
-	result, err := callWithSessionRecovery(ctx, c, func(client *mcpclient.Client) (*mcp.ReadResourceResult, error) {
-		return client.ReadResource(ctx, mcp.ReadResourceRequest{
-			Params: mcp.ReadResourceParams{URI: backendURI},
-		})
+	result, err := c.client.ReadResource(ctx, mcp.ReadResourceRequest{
+		Params: mcp.ReadResourceParams{URI: backendURI},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("resource %q read failed on backend %s: %w", uri, c.target.WorkloadID, err)
@@ -351,13 +194,11 @@ func (c *mcpSession) GetPrompt(
 
 	stringArgs := conversion.ConvertPromptArguments(arguments)
 
-	result, err := callWithSessionRecovery(ctx, c, func(client *mcpclient.Client) (*mcp.GetPromptResult, error) {
-		return client.GetPrompt(ctx, mcp.GetPromptRequest{
-			Params: mcp.GetPromptParams{
-				Name:      backendName,
-				Arguments: stringArgs,
-			},
-		})
+	result, err := c.client.GetPrompt(ctx, mcp.GetPromptRequest{
+		Params: mcp.GetPromptParams{
+			Name:      backendName,
+			Arguments: stringArgs,
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("prompt %q get failed on backend %s: %w", name, c.target.WorkloadID, err)
@@ -376,122 +217,53 @@ func (c *mcpSession) GetPrompt(
 // registry provides the authentication strategy for outgoing backend requests.
 // Pass a registry configured with the "unauthenticated" strategy to disable auth.
 //
-// onCapabilityChange is an optional callback invoked (in a separate goroutine)
-// when the backend sends a tools/list_changed or resources/list_changed
-// notification. Pass nil to ignore capability change notifications.
-//
 // A single secrets.EnvironmentProvider is constructed once per connector and
 // shared across every session it creates; its lifetime matches the connector's.
 // It is consumed by BuildHeaderForwardTripper to resolve secret-backed entries
 // in target.HeaderForward.
-//
-// defaultRequestTimeout applies to streamable-HTTP backends. Entries in
-// perWorkloadRequestTimeouts override it by BackendTarget.WorkloadID. Invalid
-// or absent values retain the built-in timeout.
-func NewHTTPConnector(
-	registry vmcpauth.OutgoingAuthRegistry,
-	onCapabilityChange func(backendID string),
-	defaultRequestTimeout time.Duration,
-	perWorkloadRequestTimeouts map[string]time.Duration,
-) func(
+func NewHTTPConnector(registry vmcpauth.OutgoingAuthRegistry) func(
 	ctx context.Context,
 	target *vmcp.BackendTarget,
 	identity *auth.Identity,
 	sessionHint string,
 ) (Session, *vmcp.CapabilityList, error) {
-	// The restore-time session hint is intentionally not forwarded: backends
-	// that reject unknown Mcp-Session-Id values would fail the restore, and
-	// lost backend sessions are already recovered through reconnect.
 	provider := secrets.NewEnvironmentProvider()
 	return func(
 		ctx context.Context,
 		target *vmcp.BackendTarget,
 		identity *auth.Identity,
-		_ string,
+		sessionHint string,
 	) (Session, *vmcp.CapabilityList, error) {
-		requestTimeout := requestTimeoutForWorkload(
-			target.WorkloadID,
-			defaultRequestTimeout,
-			perWorkloadRequestTimeouts,
-		)
-		c, caps, backendSessionID, err := connectMCPClient(
-			ctx, target, identity, registry, requestTimeout, provider,
-		)
+		c, err := createMCPClient(ctx, target, identity, registry, sessionHint, provider)
 		if err != nil {
-			return nil, nil, err
-		}
-		registerCapabilityChangeNotifications(c, target, onCapabilityChange)
-
-		var reconnect func(context.Context) (*mcpclient.Client, string, error)
-		if _, ok := c.GetTransport().(*mcptransport.StreamableHTTP); ok {
-			reconnect = func(reconnectCtx context.Context) (*mcpclient.Client, string, error) {
-				newClient, _, sessionID, reconnectErr := connectMCPClient(
-					reconnectCtx, target, identity, registry, requestTimeout, provider,
-				)
-				if reconnectErr == nil {
-					registerCapabilityChangeNotifications(newClient, target, onCapabilityChange)
-				}
-				return newClient, sessionID, reconnectErr
-			}
+			return nil, nil, fmt.Errorf("failed to create MCP client for backend %s: %w", target.WorkloadID, err)
 		}
 
-		return &mcpSession{
-			client:           c,
-			target:           target,
-			backendSessionID: backendSessionID,
-			reconnect:        reconnect,
-		}, caps, nil
-	}
-}
-
-func registerCapabilityChangeNotifications(
-	c *mcpclient.Client,
-	target *vmcp.BackendTarget,
-	onCapabilityChange func(backendID string),
-) {
-	if onCapabilityChange == nil {
-		return
-	}
-	backendID := target.WorkloadID
-	c.OnNotification(func(n mcp.JSONRPCNotification) {
-		if n.Method == "notifications/tools/list_changed" ||
-			n.Method == "notifications/resources/list_changed" {
-			go onCapabilityChange(backendID)
+		caps, err := initAndQueryCapabilities(ctx, c, target)
+		if err != nil {
+			_ = c.Close()
+			return nil, nil, fmt.Errorf("failed to initialise backend %s: %w", target.WorkloadID, err)
 		}
-	})
-}
 
-func connectMCPClient(
-	ctx context.Context,
-	target *vmcp.BackendTarget,
-	identity *auth.Identity,
-	registry vmcpauth.OutgoingAuthRegistry,
-	requestTimeout time.Duration,
-	provider secrets.Provider,
-) (*mcpclient.Client, *vmcp.CapabilityList, string, error) {
-	c, err := createMCPClient(ctx, target, identity, registry, requestTimeout, provider)
-	if err != nil {
-		return nil, nil, "", fmt.Errorf("failed to create MCP client for backend %s: %w", target.WorkloadID, err)
-	}
+		// Extract the backend-assigned session ID when the transport supports it.
+		// Streamable-HTTP servers send an Mcp-Session-Id response header during
+		// Initialize; the mark3labs transport captures it internally and exposes
+		// it via GetSessionId(). SSE transports do not assign a session ID, so
+		// the field remains empty for those backends.
+		var backendSessionID string
+		if sh, ok := c.GetTransport().(*mcptransport.StreamableHTTP); ok {
+			backendSessionID = sh.GetSessionId()
+		}
 
-	caps, err := initAndQueryCapabilities(ctx, c, target)
-	if err != nil {
-		_ = c.Close()
-		return nil, nil, "", fmt.Errorf("failed to initialise backend %s: %w", target.WorkloadID, err)
+		return &mcpSession{client: c, target: target, backendSessionID: backendSessionID}, caps, nil
 	}
-
-	// Streamable-HTTP servers assign the session ID during Initialize. SSE
-	// transports do not assign one, so the value remains empty.
-	var backendSessionID string
-	if sh, ok := c.GetTransport().(*mcptransport.StreamableHTTP); ok {
-		backendSessionID = sh.GetSessionId()
-	}
-	return c, caps, backendSessionID, nil
 }
 
 // createMCPClient builds and starts a mark3labs MCP client for target.
 // The transport is started with context.Background() so its lifetime is bound
 // to client.Close(), not to any caller-supplied init context.
+// sessionHint, when non-empty, is passed as the initial Mcp-Session-Id for
+// streamable-HTTP transports so the backend can resume an existing session.
 //
 // ctx is used only to resolve secret-backed entries in target.HeaderForward at
 // client-creation time; the transport itself is started with context.Background()
@@ -501,7 +273,7 @@ func createMCPClient(
 	target *vmcp.BackendTarget,
 	identity *auth.Identity,
 	registry vmcpauth.OutgoingAuthRegistry,
-	requestTimeout time.Duration,
+	sessionHint string,
 	provider secrets.Provider,
 ) (*mcpclient.Client, error) {
 	// Resolve and validate the auth strategy once at client creation time.
@@ -542,7 +314,15 @@ func createMCPClient(
 	// refreshed identity placed on the request context by
 	// auth.TokenValidator.Middleware (see issue #5323).
 	base = &identityRoundTripper{base: base, fallbackIdentity: identity}
-	base, err = headerforward.BuildHeaderForwardTripper(ctx, base, target.HeaderForward, provider, target.WorkloadID)
+	// Forwarded headers ride the request context (set by headerforward.CaptureMiddleware
+	// at the vMCP server's incoming edge) and are merged into the per-session backend
+	// header-forward config here. The session is created once per request, so the
+	// captured headers are stable for the session's lifetime.
+	mergedHeaderForward, err := mergeForwardedHeaders(target.HeaderForward, headerforward.ForwardedHeadersFromContext(ctx))
+	if err != nil {
+		return nil, fmt.Errorf("backend %s: %w", target.WorkloadID, err)
+	}
+	base, err = headerforward.BuildHeaderForwardTripper(ctx, base, mergedHeaderForward, provider, target.WorkloadID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build header-forward transport for backend %s: %w", target.WorkloadID, err)
 	}
@@ -558,7 +338,7 @@ func createMCPClient(
 		// WithHTTPTimeout additionally wraps each SDK request in a
 		// context.WithTimeout so the mark3labs transport surfaces a descriptive
 		// error before the stdlib deadline fires. Both are set to
-		// requestTimeout: defense-in-depth.
+		// defaultBackendRequestTimeout: defense-in-depth.
 		sizeLimited := httpRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
 			resp, err := base.RoundTrip(req)
 			if err != nil {
@@ -575,13 +355,16 @@ func createMCPClient(
 		})
 		httpClient := &http.Client{
 			Transport: sizeLimited,
-			Timeout:   requestTimeout,
+			Timeout:   defaultBackendRequestTimeout,
 		}
-		c, err = mcpclient.NewStreamableHttpClient(
-			target.BaseURL,
-			mcptransport.WithHTTPTimeout(requestTimeout),
+		streamableOpts := []mcptransport.StreamableHTTPCOption{
+			mcptransport.WithHTTPTimeout(defaultBackendRequestTimeout),
 			mcptransport.WithHTTPBasicClient(httpClient),
-		)
+		}
+		if sessionHint != "" {
+			streamableOpts = append(streamableOpts, mcptransport.WithSession(sessionHint))
+		}
+		c, err = mcpclient.NewStreamableHttpClient(target.BaseURL, streamableOpts...)
 	case "sse":
 		// For SSE, the entire session is delivered as one long-lived HTTP
 		// response body. Applying io.LimitReader to that body would silently
@@ -616,20 +399,6 @@ func createMCPClient(
 	}
 
 	return c, nil
-}
-
-func requestTimeoutForWorkload(
-	workloadID string,
-	defaultTimeout time.Duration,
-	perWorkloadTimeouts map[string]time.Duration,
-) time.Duration {
-	if timeout := perWorkloadTimeouts[workloadID]; timeout > 0 {
-		return timeout
-	}
-	if defaultTimeout > 0 {
-		return defaultTimeout
-	}
-	return defaultBackendRequestTimeout
 }
 
 // initAndQueryCapabilities runs the MCP Initialize handshake then discovers
@@ -745,4 +514,14 @@ func initAndQueryCapabilities(
 	)
 
 	return caps, nil
+}
+
+// mergeForwardedHeaders returns a HeaderForwardConfig that combines the static
+// backend configuration (base) with any per-request forwarded headers captured
+// from the caller's request (see headerforward.CaptureMiddleware).
+// Delegates to headerforward.MergeForwardedHeaders, which is the shared
+// implementation used by both this connector and the shared backend client
+// (pkg/vmcp/client).
+func mergeForwardedHeaders(base *vmcp.HeaderForwardConfig, forwarded map[string]string) (*vmcp.HeaderForwardConfig, error) {
+	return headerforward.MergeForwardedHeaders(base, forwarded)
 }

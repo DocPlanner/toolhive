@@ -16,7 +16,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/stacklok/toolhive/pkg/auth"
-	"github.com/stacklok/toolhive/pkg/auth/upstreamtoken"
 	"github.com/stacklok/toolhive/pkg/authz/authorizers"
 )
 
@@ -1297,19 +1296,16 @@ func TestAuthorizeWithJWTClaims_UpstreamProvider(t *testing.T) {
 			errContains: "upstream authentication required",
 		},
 		{
-			name: "upstream_token_missing_with_status_reason",
+			name: "upstream_token_missing_reports_token_unavailable",
 			identity: &auth.Identity{
 				PrincipalInfo: auth.PrincipalInfo{
 					Subject: "thv-user",
 					Claims:  map[string]any{"sub": "thv-user"},
 				},
 				UpstreamTokens: map[string]string{},
-				UpstreamTokenStatuses: map[string]upstreamtoken.UpstreamCredentialStatus{
-					providerName: upstreamtoken.StatusRefreshFailed,
-				},
 			},
 			wantErr:     true,
-			errContains: string(upstreamtoken.StatusRefreshFailed),
+			errContains: "token_unavailable",
 		},
 		{
 			name: "upstream_token_opaque_falls_back_to_request_claims_denied",
@@ -3185,4 +3181,23 @@ func TestStaleTHVGroupWarning(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestFactory_ConfigKeyMatchesStructTag locks in the contract between
+// Factory.ConfigKey() and the Config struct's json tag. A future rename of
+// either string without updating the other would silently produce JSON the
+// backend's own Unmarshal could not parse. Building an envelope around
+// ConfigKey() and asserting it deserialises into Config.Options is the
+// cheapest way to make that drift impossible.
+func TestFactory_ConfigKeyMatchesStructTag(t *testing.T) {
+	t.Parallel()
+
+	envelope := []byte(`{"version":"1.0","type":"cedarv1","` + (&Factory{}).ConfigKey() +
+		`":{"policies":["permit(principal, action, resource);"],"entities_json":"[]"}}`)
+
+	var cfg Config
+	require.NoError(t, json.Unmarshal(envelope, &cfg),
+		"envelope built around Factory.ConfigKey() must parse into Config")
+	require.NotNil(t, cfg.Options,
+		"Config.Options must be set after Unmarshal — if nil, Factory.ConfigKey() and the Options struct tag have drifted apart")
 }
