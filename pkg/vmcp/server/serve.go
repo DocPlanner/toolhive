@@ -63,6 +63,10 @@ type ServerConfig struct {
 	// SessionTTL is the session time-to-live duration (default: 30 minutes).
 	SessionTTL time.Duration
 
+	// WriteTimeout is the HTTP server write deadline. Values below the default
+	// (30 s) are raised to it.
+	WriteTimeout time.Duration
+
 	// AuthMiddleware is the optional authentication middleware applied to MCP routes.
 	// If nil, no authentication is required.
 	AuthMiddleware func(http.Handler) http.Handler
@@ -331,6 +335,7 @@ func buildServeConfig(cfg *ServerConfig) *Config {
 		Port:                    cfg.Port,
 		EndpointPath:            cfg.EndpointPath,
 		SessionTTL:              cfg.SessionTTL,
+		WriteTimeout:            cfg.WriteTimeout,
 		AuthMiddleware:          cfg.AuthMiddleware,
 		RateLimitMiddleware:     cfg.RateLimitMiddleware,
 		AuthInfoHandler:         cfg.AuthInfoHandler,

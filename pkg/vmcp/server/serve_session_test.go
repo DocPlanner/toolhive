@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/stretchr/testify/assert"
@@ -450,6 +451,27 @@ func TestBuildSessionDataStorageRedis(t *testing.T) {
 	// error can't satisfy this test. ("redis" alone is unsuitable — the unsupported-
 	// provider error text also lists "redis".)
 	assert.ErrorContains(t, err, "redis: failed to connect")
+}
+
+// TestBuildSessionDataStorageRedisACLUser verifies the Redis client authenticates with
+// the ACL username from THV_SESSION_REDIS_USERNAME (operator-injected from
+// sessionStorage.usernameRef): the server rejects password-only AUTH.
+func TestBuildSessionDataStorageRedisACLUser(t *testing.T) {
+	mr := miniredis.RunT(t)
+	mr.RequireUserAuth("toolhive-sessions", "topsecret")
+	t.Setenv(vmcpconfig.RedisUsernameEnvVar, "toolhive-sessions")
+	t.Setenv(vmcpconfig.RedisPasswordEnvVar, "topsecret")
+
+	ds, err := buildSessionDataStorage(context.Background(), &Config{
+		SessionTTL: time.Minute,
+		SessionStorage: &vmcpconfig.SessionStorageConfig{
+			Provider: "redis",
+			Address:  mr.Addr(),
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ds.Close() })
+	assert.IsType(t, &transportsession.RedisSessionDataStorage{}, ds)
 }
 
 // TestServeHandlerSkipsDiscoveryAndRoutesCallThroughCore drives the FULL shared

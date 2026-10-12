@@ -130,6 +130,11 @@ type Config struct {
 	// Sessions inactive for this duration will be automatically cleaned up
 	SessionTTL time.Duration
 
+	// WriteTimeout is the server-level write deadline. Values below
+	// defaultWriteTimeout are raised to it; larger values let configured backend
+	// request timeouts finish and leave time to write the MCP response.
+	WriteTimeout time.Duration
+
 	// AuthMiddleware is the optional authentication middleware to apply to MCP routes.
 	// If nil, no authentication is required.
 	// This should be a composed middleware chain (e.g., TokenValidator + MCP parser).
@@ -312,7 +317,8 @@ type Server struct {
 // When cfg.SessionStorage is nil or provider is "memory" (or empty), local in-process
 // storage is used. When provider is "redis", a Redis-backed store is created
 // using the address, DB, and key prefix from cfg.SessionStorage; the password
-// is read from the THV_SESSION_REDIS_PASSWORD environment variable.
+// is read from the THV_SESSION_REDIS_PASSWORD environment variable and the optional
+// ACL username from THV_SESSION_REDIS_USERNAME.
 // Any other provider value is a misconfiguration and returns an error.
 func buildSessionDataStorage(ctx context.Context, cfg *Config) (transportsession.DataStorage, error) {
 	// Default to in-process storage when session storage is not configured,
@@ -330,8 +336,11 @@ func buildSessionDataStorage(ctx context.Context, cfg *Config) (transportsession
 	if keyPrefix == "" {
 		keyPrefix = "thv:vmcp:session:"
 	}
+	// toolhive-core's client config has no username source of its own; the
+	// operator injects the ACL username from sessionStorage.usernameRef.
 	redisCfg := tcredis.Config{
 		Addr:     cfg.SessionStorage.Address,
+		Username: os.Getenv(vmcpconfig.RedisUsernameEnvVar),
 		Password: os.Getenv(vmcpconfig.RedisPasswordEnvVar),
 		DB:       int(cfg.SessionStorage.DB),
 	}
@@ -496,6 +505,9 @@ func (s *Server) Handler(_ context.Context) (http.Handler, error) {
 		server.WithEndpointPath(s.config.EndpointPath),
 		server.WithSessionIdManager(s.vmcpSessionMgr),
 		server.WithHeartbeatInterval(defaultHeartbeatInterval),
+		// Sweep the SDK's per-session tool/resource stores for sessions that go idle
+		// without a DELETE, using the same TTL as the session storage.
+		server.WithSessionIdleTTL(s.config.SessionTTL),
 	)
 
 	// Create HTTP mux with separated authenticated and unauthenticated routes
@@ -599,7 +611,7 @@ func (s *Server) Handler(_ context.Context) (http.Handler, error) {
 	// Accept: text/event-stream + MCP endpoint path) so the server-level
 	// WriteTimeout does not kill long-lived SSE streams (see golang/go#16100).
 	// Non-qualifying requests are left untouched; http.Server.WriteTimeout
-	// (defaultWriteTimeout) remains in effect for them.
+	// (effectiveWriteTimeout) remains in effect for them.
 	mcpHandler = transportmiddleware.WriteTimeout(s.config.EndpointPath)(mcpHandler)
 
 	// Cap request body size before the MCP parser (and all inner middleware)
@@ -655,7 +667,7 @@ func (s *Server) Start(ctx context.Context) error {
 		Handler:           handler,
 		ReadHeaderTimeout: defaultReadHeaderTimeout,
 		ReadTimeout:       defaultReadTimeout,
-		WriteTimeout:      defaultWriteTimeout,
+		WriteTimeout:      effectiveWriteTimeout(s.config.WriteTimeout),
 		IdleTimeout:       defaultIdleTimeout,
 		MaxHeaderBytes:    defaultMaxHeaderBytes,
 	}
@@ -738,6 +750,12 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 		return err
 	}
+}
+
+// effectiveWriteTimeout returns the configured write timeout when it is above the
+// secure default, else the default.
+func effectiveWriteTimeout(configured time.Duration) time.Duration {
+	return max(configured, defaultWriteTimeout)
 }
 
 // Stop gracefully stops the Virtual MCP Server.

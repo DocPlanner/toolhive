@@ -347,8 +347,10 @@ func Serve(ctx context.Context, cfg ServeConfig) error {
 			"env_var", "VMCP_SESSION_HMAC_SECRET")
 	}
 	// The factory never aggregates — the core is the single source of capability
-	// aggregation (agg feeds it via Config.Aggregator below).
-	sessionFactory := vmcpsession.NewSessionFactory(outgoingRegistry)
+	// aggregation (agg feeds it via Config.Aggregator below). The backend init
+	// timeout follows the operational config (non-positive keeps the default).
+	sessionFactory := vmcpsession.NewSessionFactory(outgoingRegistry,
+		vmcpsession.WithBackendInitTimeout(backendInitTimeoutFromConfig(vmcpCfg)))
 
 	// When the optimizer is enabled, its meta-tools must pass through the authz
 	// response filter so they appear in tools/list.
@@ -418,6 +420,7 @@ func Serve(ctx context.Context, cfg ServeConfig) error {
 		Host:                    cfg.Host,
 		Port:                    cfg.Port,
 		SessionTTL:              sessionTTLFromConfig(cfg.SessionTTL, vmcpCfg),
+		WriteTimeout:            serverWriteTimeoutFromConfig(vmcpCfg),
 		AuthMiddleware:          authMiddleware,
 		AuthzMiddleware:         authzMiddleware,
 		AuthInfoHandler:         authInfoHandler,
