@@ -3,6 +3,10 @@ suite: namespace-scoped install
 # watched namespaces via WATCH_NAMESPACE, and the binding template must emit one
 # RoleBinding per allowedNamespaces entry (and no ClusterRoleBinding). An empty
 # allowlist must produce zero bindings rather than silently binding nothing.
+# The fork names RBAC objects after the release (operator.rbacName), so pin the
+# release name the manager-role assertion depends on.
+release:
+  name: toolhive-operator
 set:
   operator.rbac.scope: namespace
   operator.rbac.allowedNamespaces: [team-a, team-b]
