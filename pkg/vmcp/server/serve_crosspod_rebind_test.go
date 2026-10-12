@@ -22,6 +22,7 @@ import (
 	vmcpauth "github.com/stacklok/toolhive/pkg/vmcp/auth"
 	"github.com/stacklok/toolhive/pkg/vmcp/auth/strategies"
 	authtypes "github.com/stacklok/toolhive/pkg/vmcp/auth/types"
+	"github.com/stacklok/toolhive/pkg/vmcp/health"
 	"github.com/stacklok/toolhive/pkg/vmcp/server/sessionmanager"
 	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
 )
@@ -217,14 +218,18 @@ func (w *sseWriter) status() int {
 // response headers are written. mcp-go runs RegisterSession (and so the
 // OnRegisterSession hook) synchronously before it writes the SSE headers, so the
 // hook has finished when this returns. The stream is closed before returning.
-func openSSE(t *testing.T, pod *crossPod, user, sessionID string) int {
+func openSSE(t *testing.T, pod *crossPod, user, sessionID string, extraHeaders ...string) int {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	w := newSSEWriter()
+	req := newCrossPodRequest(ctx, http.MethodGet, user, sessionID, "")
+	for i := 0; i+1 < len(extraHeaders); i += 2 {
+		req.Header.Set(extraHeaders[i], extraHeaders[i+1])
+	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		pod.handler.ServeHTTP(w, newCrossPodRequest(ctx, http.MethodGet, user, sessionID, ""))
+		pod.handler.ServeHTTP(w, req)
 	}()
 	select {
 	case <-w.headerWritten:
@@ -289,6 +294,13 @@ func TestCrossPodSessionRebind(t *testing.T) {
 					"binding before=%q after=%q", tc.caller, status, podB.factory.makes.Load(),
 					podB.factory.restores.Load(), aliceBinding, storedBinding(t, shared, sessionID))
 
+				// mcp-go answers a GET with 200 whatever its registration hook does, so
+				// only an HTTP-level check can refuse a different caller.
+				if tc.caller == "alice" {
+					assert.Equal(t, http.StatusOK, status, "the owner's GET on pod B must open the stream")
+				} else {
+					assert.Equal(t, http.StatusForbidden, status, "a different identity's GET on pod B must be refused")
+				}
 				// A GET for an existing session must not run phase-2 creation again.
 				assert.Equal(t, int32(0), podB.factory.makes.Load(),
 					"GET on pod B must not call CreateSession/MakeSessionWithID for an existing session")
@@ -390,6 +402,7 @@ func TestCrossPodGETDuringRegistration(t *testing.T) {
 	cancelGET()
 	<-getDone
 
+	assert.Equal(t, http.StatusForbidden, getW.status(), "eve's GET must be refused once alice's binding is written")
 	assert.Equal(t, int32(0), podB.factory.makes.Load(),
 		"a GET on pod B must not call CreateSession/MakeSessionWithID")
 	binding := storedBinding(t, shared, sessionID)
@@ -444,4 +457,77 @@ func TestCrossPodRehydration(t *testing.T) {
 			assert.Equal(t, binding, storedBinding(t, shared, sessionID), "the stored binding must not change")
 		})
 	}
+}
+
+// TestListenStreamGuard covers the HTTP-level check of GET listen streams. mcp-go
+// answers a GET with 200 even when the registration hook rejects it, keeps the
+// GET's session object for later requests on that pod, and on the pod that holds
+// the session in memory runs no hook at all, so the check must refuse the request
+// before mcp-go sees it.
+func TestListenStreamGuard(t *testing.T) {
+	t.Parallel()
+
+	newPods := func(t *testing.T) (transportsession.DataStorage, *crossPod, *crossPod) {
+		t.Helper()
+		shared, err := transportsession.NewLocalSessionDataStorage(time.Hour)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = shared.Close() })
+		return shared, startCrossPod(t, shared, nil), startCrossPod(t, shared, nil)
+	}
+
+	t.Run("GET on the owner pod", func(t *testing.T) {
+		t.Parallel()
+		shared, podA, _ := newPods(t)
+		sessionID := initSession(t, shared, podA, "bob")
+
+		assert.Equal(t, http.StatusForbidden, openSSE(t, podA, "eve", sessionID),
+			"eve's GET on the pod that holds bob's session must be refused")
+		assert.Equal(t, http.StatusForbidden,
+			openSSE(t, podA, "eve", sessionID, health.ProbeHeader, health.ProbeHeaderValue),
+			"the probe header must not skip the listen-stream check")
+		assert.Equal(t, http.StatusOK, openSSE(t, podA, "bob", sessionID),
+			"bob's GET on his own session must open the stream")
+		assert.Contains(t, callEcho(t, podA, "bob", sessionID), `"ok"`)
+	})
+
+	t.Run("GET held open on another pod", func(t *testing.T) {
+		t.Parallel()
+		shared, podA, podB := newPods(t)
+		sessionID := initSession(t, shared, podA, "alice")
+
+		// eve's GET on pod B, kept open while alice uses pod B.
+		ctx, cancel := context.WithCancel(context.Background())
+		w := newSSEWriter()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			podB.handler.ServeHTTP(w, newCrossPodRequest(ctx, http.MethodGet, "eve", sessionID, ""))
+		}()
+		t.Cleanup(func() {
+			cancel()
+			<-done
+		})
+		select {
+		case <-w.headerWritten:
+		case <-time.After(5 * time.Second):
+			t.Fatal("GET did not write response headers")
+		}
+		assert.Equal(t, http.StatusForbidden, w.status(), "eve's GET on pod B must be refused")
+
+		body := callEcho(t, podB, "alice", sessionID)
+		assert.Contains(t, body, `"ok"`, "alice must be able to use her session on pod B")
+		assert.Equal(t, "alice", podB.core.lastCallSubject.Load(), "alice's call must run with her own identity")
+	})
+
+	t.Run("GET without a session ID", func(t *testing.T) {
+		t.Parallel()
+		_, podA, _ := newPods(t)
+		assert.Equal(t, http.StatusBadRequest, openSSE(t, podA, "alice", ""))
+	})
+
+	t.Run("GET for an unknown session", func(t *testing.T) {
+		t.Parallel()
+		_, podA, _ := newPods(t)
+		assert.Equal(t, http.StatusNotFound, openSSE(t, podA, "alice", "unknown-session"))
+	})
 }

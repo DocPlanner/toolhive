@@ -618,7 +618,7 @@ func (s *Server) Handler(_ context.Context) (http.Handler, error) {
 	// and lazy injection skip them, and refuse any probe request beyond the
 	// handshake and capability lists. Runs after authentication.
 	mcpHandler = peerProbeMiddleware(mcpHandler)
-	mcpHandler = listenStreamContextMiddleware(mcpHandler)
+	mcpHandler = s.listenStreamGuardMiddleware(mcpHandler)
 
 	mcpHandler = s.applyRateLimiting(mcpHandler)
 
@@ -1124,12 +1124,13 @@ func (s *Server) lazyInjectSessionResources(ctx context.Context) {
 //
 // A health probe from a peer vMCP only checks that the MCP handshake works, so
 // it neither opens backend connections nor lists capabilities, and it is not
-// counted as an active session.
+// counted as an active session. A GET registration is never skipped as a probe:
+// it always goes through the identity check in attachToBoundSession.
 func (s *Server) handleSessionRegistration(
 	ctx context.Context,
 	session server.ClientSession,
 ) {
-	if isPeerProbe(ctx) {
+	if isPeerProbe(ctx) && !isListenStreamRegistration(ctx) {
 		return
 	}
 	// Error is logged and handled within handleSessionRegistrationImpl.
@@ -1226,30 +1227,43 @@ func (s *Server) handleSessionRegistrationImpl(ctx context.Context, session serv
 // session's own initialize. mcp-go registers a session again when a GET listen
 // stream (or an SSE reconnect) reaches a pod that does not hold it in memory, and
 // CreateSession would then build a new session with the caller's identity and
-// overwrite the stored binding. Instead, this never creates a session: it waits
-// while the creating pod's registration is still pending (see
-// waitWhileRegistrationPending), then gives a caller that matches the binding the
-// session's capabilities. A different caller, or a session that is missing,
-// terminated or still not bound, is rejected and unregistered from this pod; the
-// stored session is not changed in any case.
+// overwrite the stored binding. Instead, this never creates a session: it gives a
+// caller that passes checkListenStreamCaller the session's capabilities. Any
+// other caller is rejected and unregistered from this pod; the stored session is
+// not changed in any case.
+//
+// listenStreamGuardMiddleware already runs the same check before mcp-go sees the
+// GET, and rejects the request with an HTTP error; this is the fallback for a
+// registration that reaches the hook anyway.
 //
 // Upstream stops the re-bind only from v0.40.0, as a side effect of #5729. Drop
 // this guard once the fork is on v0.40 or later and TestCrossPodSessionRebind and
 // TestCrossPodGETDuringRegistration pass without it.
 func (s *Server) attachToBoundSession(ctx context.Context, session server.ClientSession) error {
 	sessionID := session.SessionID()
-	s.waitWhileRegistrationPending(ctx, sessionID)
-	binding, err := s.storedBinding(ctx, sessionID)
-	if err == nil {
-		caller, _ := auth.IdentityFromContext(ctx)
-		err = vmcpsession.ValidateCaller(binding, caller)
-	}
-	if err != nil {
+	if _, err := s.checkListenStreamCaller(ctx, sessionID); err != nil {
 		slog.Warn("rejected re-registration of a session", "session_id", sessionID, "error", err)
 		s.mcpServer.UnregisterSession(ctx, sessionID)
 		return err
 	}
 	return s.injectCoreSessionCapabilities(ctx, session)
+}
+
+// checkListenStreamCaller decides whether the caller in ctx may open a listen
+// stream on sessionID. It waits while the creating pod's registration is still
+// pending (see waitWhileRegistrationPending), then requires a live session with
+// an identity binding (else it returns 404) that matches the caller (else 403).
+func (s *Server) checkListenStreamCaller(ctx context.Context, sessionID string) (int, error) {
+	s.waitWhileRegistrationPending(ctx, sessionID)
+	binding, err := s.storedBinding(ctx, sessionID)
+	if err != nil {
+		return http.StatusNotFound, err
+	}
+	caller, _ := auth.IdentityFromContext(ctx)
+	if err := vmcpsession.ValidateCaller(binding, caller); err != nil {
+		return http.StatusForbidden, err
+	}
+	return http.StatusOK, nil
 }
 
 // storedBinding returns the identity binding of a live stored session record.
@@ -1377,19 +1391,61 @@ var notAcceptableBody = []byte(
 )
 
 // listenStreamKey marks the context of a GET request (the Streamable HTTP listen
-// stream) for handleSessionRegistrationImpl.
+// stream) that passed listenStreamGuardMiddleware, for handleSessionRegistrationImpl.
 type listenStreamKey struct{}
 
-// listenStreamContextMiddleware marks GET requests, so a session registration that
-// mcp-go runs for a GET never creates the session (see
-// handleSessionRegistrationImpl).
-func listenStreamContextMiddleware(next http.Handler) http.Handler {
+// listenStreamGuardMiddleware checks every GET (the Streamable HTTP listen
+// stream) before mcp-go sees it. mcp-go's handleGet attaches the GET to the
+// session object it holds in memory, or registers a new one for the session ID,
+// and then always answers 200: a registration hook cannot fail the request, and
+// on a pod that already holds the session no hook runs at all. Without this
+// check a caller with someone else's session ID would receive that session's
+// notifications and elicitation requests, and on a pod that did not hold the
+// session the caller's object would stay in mcp-go for later requests.
+//
+// A GET without Mcp-Session-Id gets 400: a vMCP session starts with initialize,
+// and mcp-go would otherwise generate a session ID that nothing ever binds. A GET
+// with a session ID must pass checkListenStreamCaller (404 for a session that is
+// missing, terminated or never bound, 403 for a different caller). A GET that
+// passes is marked for handleSessionRegistrationImpl, so a registration that
+// mcp-go runs for it never creates the session. Runs after authentication.
+func (s *Server) listenStreamGuardMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
-			r = r.WithContext(context.WithValue(r.Context(), listenStreamKey{}, true))
+		if r.Method != http.MethodGet {
+			next.ServeHTTP(w, r)
+			return
 		}
-		next.ServeHTTP(w, r)
+		sessionID := r.Header.Get(server.HeaderKeySessionID)
+		if sessionID == "" {
+			writeJSONRPCHTTPError(w, http.StatusBadRequest, "Bad Request: Mcp-Session-Id header is required")
+			return
+		}
+		if status, err := s.checkListenStreamCaller(r.Context(), sessionID); err != nil {
+			slog.Warn("rejected listen stream", "session_id", sessionID, "status", status, "error", err)
+			writeJSONRPCHTTPError(w, status, http.StatusText(status))
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), listenStreamKey{}, true)))
 	})
+}
+
+// writeJSONRPCHTTPError writes an HTTP error status with a JSON-RPC error body,
+// in the same shape as notAcceptableBody.
+func writeJSONRPCHTTPError(w http.ResponseWriter, status int, message string) {
+	body, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "server-error",
+		"error":   map[string]any{"code": -32600, "message": message},
+	})
+	if err != nil {
+		http.Error(w, message, status)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if _, err := w.Write(body); err != nil {
+		slog.Debug("failed to write error response", "error", err)
+	}
 }
 
 // isListenStreamRegistration reports whether ctx belongs to a GET request.

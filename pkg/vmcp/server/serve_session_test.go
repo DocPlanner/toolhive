@@ -121,6 +121,7 @@ type fakeCore struct {
 	// healthMarkedCalls counts CallTool/ReadResource calls whose context carries
 	// the health-check marker (which switches outgoing auth to service credentials).
 	healthMarkedCalls atomic.Int32
+	lastCallSubject   atomic.Value // string: the identity CallTool ran with
 
 	callErr error // when set, CallTool returns it (e.g. vmcp.ErrAuthorizationFailed)
 	readErr error // when set, ReadResource returns it
@@ -134,9 +135,12 @@ func (f *fakeCore) ListTools(context.Context, *auth.Identity) ([]vmcp.Tool, erro
 }
 
 func (f *fakeCore) CallTool(
-	ctx context.Context, _ *auth.Identity, name string, _ map[string]any, _ map[string]any,
+	ctx context.Context, caller *auth.Identity, name string, _ map[string]any, _ map[string]any,
 ) (*vmcp.ToolCallResult, error) {
 	f.callToolCalls.Add(1)
+	if caller != nil {
+		f.lastCallSubject.Store(caller.Subject)
+	}
 	if health.IsHealthCheck(ctx) {
 		f.healthMarkedCalls.Add(1)
 	}
