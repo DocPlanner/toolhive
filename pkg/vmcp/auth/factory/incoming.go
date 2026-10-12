@@ -72,7 +72,8 @@ func NewIncomingAuthMiddleware(
 
 	switch cfg.Type {
 	case "oidc":
-		authMiddleware, authInfoHandler, err = newOIDCAuthMiddleware(ctx, cfg.OIDC, upstreamReader, keyProvider)
+		authMiddleware, authInfoHandler, err = newOIDCAuthMiddleware(
+			ctx, cfg.OIDC, upstreamReader, keyProvider, primaryUpstreamProvider(cfg))
 	case "local":
 		authMiddleware, authInfoHandler, err = newLocalAuthMiddleware(ctx)
 	case "anonymous":
@@ -186,6 +187,15 @@ func buildCedarAuthzConfig(authzCfg *config.AuthzConfig) (*authz.Config, error) 
 	return authorizers.NewConfig(cedarConfig)
 }
 
+// primaryUpstreamProvider returns the upstream provider whose token Cedar reads
+// claims from, or "" when none is configured.
+func primaryUpstreamProvider(cfg *config.IncomingAuthConfig) string {
+	if cfg.Authz == nil {
+		return ""
+	}
+	return cfg.Authz.PrimaryUpstreamProvider
+}
+
 // newOIDCAuthMiddleware creates OIDC authentication middleware.
 // Reuses pkg/auth.GetAuthenticationMiddleware for OIDC token validation.
 // The middleware now directly creates Identity in context (no separate conversion needed).
@@ -193,11 +203,17 @@ func buildCedarAuthzConfig(authzCfg *config.AuthzConfig) (*authz.Config, error) 
 // The reader parameter, when non-nil, enables the JWT validator to load upstream
 // provider tokens from the embedded auth server's storage. This is required for
 // upstream_inject outgoing auth to work with an embedded auth server.
+//
+// A non-empty requiredProvider (the authz primaryUpstreamProvider) must have
+// upstream credentials for every request with a token session: without them Cedar
+// sees no claims and denies everything, so the client would get an empty
+// tools/list instead of a 401 that makes it authenticate again.
 func newOIDCAuthMiddleware(
 	ctx context.Context,
 	oidcCfg *config.OIDCConfig,
 	reader upstreamtoken.TokenReader,
 	keyProvider keys.PublicKeyProvider,
+	requiredProvider string,
 ) (func(http.Handler) http.Handler, http.Handler, error) {
 	if oidcCfg == nil {
 		return nil, nil, fmt.Errorf("OIDC configuration required when Type='oidc'")
@@ -232,6 +248,9 @@ func newOIDCAuthMiddleware(
 	}
 	if reader != nil {
 		opts = append(opts, auth.WithUpstreamTokenReader(reader))
+		if requiredProvider != "" {
+			opts = append(opts, auth.WithRequiredUpstreamProviders(requiredProvider))
+		}
 	}
 
 	// pkg/auth.GetAuthenticationMiddleware now returns middleware that creates Identity

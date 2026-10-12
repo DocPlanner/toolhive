@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -373,6 +374,10 @@ type TokenValidator struct {
 	// nil means no enrichment (no embedded auth server).
 	upstreamTokenReader upstreamtoken.TokenReader
 
+	// requiredUpstreamProviders must have credentials for every request with a
+	// token session (see WithRequiredUpstreamProviders).
+	requiredUpstreamProviders []string
+
 	// keyProvider provides in-process JWKS key lookups from the embedded auth
 	// server's key provider. When set, getKeyFromJWKS resolves keys locally
 	// before falling back to HTTP. Eliminates self-referential HTTP calls.
@@ -540,9 +545,10 @@ func registerIntrospectionProviders(config TokenValidatorConfig, clientSecret st
 
 // tokenValidatorOptions holds optional dependencies for NewTokenValidator.
 type tokenValidatorOptions struct {
-	envReader           env.Reader
-	upstreamTokenReader upstreamtoken.TokenReader
-	keyProvider         keys.PublicKeyProvider
+	envReader                 env.Reader
+	upstreamTokenReader       upstreamtoken.TokenReader
+	requiredUpstreamProviders []string
+	keyProvider               keys.PublicKeyProvider
 }
 
 // TokenValidatorOption is a functional option for NewTokenValidator.
@@ -564,6 +570,18 @@ func WithEnvReader(reader env.Reader) TokenValidatorOption {
 func WithUpstreamTokenReader(reader upstreamtoken.TokenReader) TokenValidatorOption {
 	return func(o *tokenValidatorOptions) {
 		o.upstreamTokenReader = reader
+	}
+}
+
+// WithRequiredUpstreamProviders names upstream providers whose credentials every
+// request with a token session (tsid claim) must have. A required provider that
+// has no access token in the loaded credentials counts as a failed refresh: the
+// request gets 401 with WWW-Authenticate, so the client authenticates again.
+// Requests without a tsid claim are not affected. It has no effect without
+// WithUpstreamTokenReader.
+func WithRequiredUpstreamProviders(providers ...string) TokenValidatorOption {
+	return func(o *tokenValidatorOptions) {
+		o.requiredUpstreamProviders = slices.Clone(providers)
 	}
 }
 
@@ -677,21 +695,22 @@ func NewTokenValidator(ctx context.Context, config TokenValidatorConfig, opts ..
 	}
 
 	validator := &TokenValidator{
-		issuer:              config.Issuer,
-		audience:            config.Audience,
-		jwksURL:             jwksURL,
-		introspectURL:       config.IntrospectionURL,
-		clientID:            config.ClientID,
-		allowedClientIDs:    config.AllowedClientIDs,
-		clientSecret:        clientSecret,
-		jwksClient:          cache,
-		client:              config.httpClient,
-		resourceURL:         config.ResourceURL,
-		scopes:              config.Scopes,
-		registry:            registry,
-		insecureAllowHTTP:   config.InsecureAllowHTTP,
-		upstreamTokenReader: o.upstreamTokenReader,
-		keyProvider:         o.keyProvider,
+		issuer:                    config.Issuer,
+		audience:                  config.Audience,
+		jwksURL:                   jwksURL,
+		introspectURL:             config.IntrospectionURL,
+		clientID:                  config.ClientID,
+		allowedClientIDs:          config.AllowedClientIDs,
+		clientSecret:              clientSecret,
+		jwksClient:                cache,
+		client:                    config.httpClient,
+		resourceURL:               config.ResourceURL,
+		scopes:                    config.Scopes,
+		registry:                  registry,
+		insecureAllowHTTP:         config.InsecureAllowHTTP,
+		upstreamTokenReader:       o.upstreamTokenReader,
+		requiredUpstreamProviders: o.requiredUpstreamProviders,
+		keyProvider:               o.keyProvider,
 	}
 
 	return validator, nil
@@ -1211,7 +1230,8 @@ func writeOAuthError(w http.ResponseWriter, errorCode, description string) {
 // Returns (nil, nil, nil) if no tsid claim exists. Returns a non-nil error
 // when a tsid claim is present but token loading fails due to an infrastructure
 // error (storage unavailable). A non-empty failed slice means one or more
-// providers' tokens could not be refreshed; the caller should return HTTP 401
+// providers' tokens could not be refreshed, or a required provider (see
+// WithRequiredUpstreamProviders) has none; the caller should return HTTP 401
 // to trigger re-authentication.
 func (v *TokenValidator) loadUpstreamTokens(
 	ctx context.Context, claims jwt.MapClaims,
@@ -1227,6 +1247,11 @@ func (v *TokenValidator) loadUpstreamTokens(
 		// leak into WARN-level logs or returned error strings.
 		slog.DebugContext(ctx, "load upstream credentials failed", "tsid", tsid, "error", err)
 		return nil, nil, fmt.Errorf("load upstream credentials: %w", err)
+	}
+	for _, provider := range v.requiredUpstreamProviders {
+		if creds[provider].AccessToken == "" && !slices.Contains(failed, provider) {
+			failed = append(slices.Clip(failed), provider)
+		}
 	}
 	return creds, failed, nil
 }

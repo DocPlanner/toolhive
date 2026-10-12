@@ -2547,6 +2547,55 @@ func TestMiddleware_UpstreamTokenEnrichment(t *testing.T) {
 		require.Equal(t, map[string]string{"github": "gh-id-tok"}, captured.UpstreamIDTokens)
 	})
 
+	t.Run("required upstream provider", func(t *testing.T) {
+		t.Parallel()
+		claimsWithoutTsid := jwt.MapClaims{
+			"iss": "test-issuer", "aud": "test-audience", "sub": "m2m-client",
+			"exp": time.Now().Add(time.Hour).Unix(),
+		}
+		tests := []struct {
+			name     string
+			claims   jwt.MapClaims
+			creds    map[string]upstreamtoken.UpstreamCredential // nil: reader not called
+			wantCode int
+		}{
+			{"provider present", claimsWithTsid,
+				map[string]upstreamtoken.UpstreamCredential{"cognito": {AccessToken: "tok"}}, http.StatusOK},
+			{"provider missing", claimsWithTsid,
+				map[string]upstreamtoken.UpstreamCredential{"github": {AccessToken: "gh-tok"}}, http.StatusUnauthorized},
+			{"provider without access token", claimsWithTsid,
+				map[string]upstreamtoken.UpstreamCredential{"cognito": {IDToken: "id"}}, http.StatusUnauthorized},
+			{"no tsid claim is not affected", claimsWithoutTsid, nil, http.StatusOK},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				ctrl := gomock.NewController(t)
+				reader := upstreamtokenmocks.NewMockTokenReader(ctrl)
+				if tc.creds != nil {
+					reader.EXPECT().GetAllUpstreamCredentials(gomock.Any(), "session-xyz").
+						Return(tc.creds, []string(nil), nil)
+				}
+				v := makeValidator(t, WithUpstreamTokenReader(reader), WithRequiredUpstreamProviders("cognito"))
+
+				nextCalled := false
+				handler := v.Middleware(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+					nextCalled = true
+				}))
+				req := httptest.NewRequest("GET", "/", nil)
+				req.Header.Set("Authorization", "Bearer "+signToken(tc.claims))
+				rr := httptest.NewRecorder()
+				handler.ServeHTTP(rr, req)
+
+				require.Equal(t, tc.wantCode, rr.Code)
+				require.Equal(t, tc.wantCode == http.StatusOK, nextCalled)
+				if tc.wantCode == http.StatusUnauthorized {
+					require.Contains(t, rr.Header().Get("WWW-Authenticate"), "invalid_token")
+				}
+			})
+		}
+	})
+
 	t.Run("all access tokens with no ID tokens yields non-nil empty UpstreamIDTokens", func(t *testing.T) {
 		t.Parallel()
 		ctrl := gomock.NewController(t)
