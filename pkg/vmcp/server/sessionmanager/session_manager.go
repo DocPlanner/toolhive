@@ -27,6 +27,7 @@ import (
 	"github.com/stacklok/toolhive/pkg/cache"
 	transportsession "github.com/stacklok/toolhive/pkg/transport/session"
 	"github.com/stacklok/toolhive/pkg/vmcp"
+	"github.com/stacklok/toolhive/pkg/vmcp/health"
 	"github.com/stacklok/toolhive/pkg/vmcp/optimizer"
 	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
 	sessiontypes "github.com/stacklok/toolhive/pkg/vmcp/session/types"
@@ -77,6 +78,9 @@ type Manager struct {
 	factory    vmcpsession.MultiSessionFactory
 	backendReg vmcp.BackendRegistry
 
+	// healthStatus filters the backends CreateSession connects to (may be nil).
+	healthStatus health.StatusProvider
+
 	// sessions is a node-local cache of live MultiSession objects, separate
 	// from storage because MultiSession contains un-serialisable runtime state
 	// (HTTP connections, routing tables). On a cache miss it restores the
@@ -122,8 +126,9 @@ func New(
 	// Build the Manager first so we can reference sm.Terminate and sm.sessions
 	// directly in closures, eliminating the forward-reference variable pattern.
 	sm := &Manager{
-		storage:    storage,
-		backendReg: backendRegistry,
+		storage:      storage,
+		backendReg:   backendRegistry,
+		healthStatus: cfg.HealthStatusProvider,
 	}
 
 	// Surface the resolved optimizer factory to the Serve path ONLY when
@@ -271,7 +276,8 @@ func (sm *Manager) Generate() string {
 // It is called from the OnRegisterSession hook once the request context is
 // available. It:
 //  1. Resolves the caller identity from the context.
-//  2. Lists available backends from the registry.
+//  2. Lists the registry's backends that are eligible for exposure (healthy,
+//     degraded or without a status).
 //  3. Calls MultiSessionFactory.MakeSessionWithID() to build a fully-formed
 //     MultiSession (which opens real HTTP connections to each backend).
 //  4. Persists session metadata to storage and caches the live MultiSession
@@ -314,8 +320,9 @@ func (sm *Manager) CreateSession(
 	// Resolve the caller identity (may be nil for anonymous access).
 	identity, _ := auth.IdentityFromContext(ctx)
 
-	// List all available backends from the registry.
-	backends := sm.listAllBackends(ctx)
+	// List the registry's backends that are currently eligible for exposure, so a
+	// new session does not open connections to backends the core does not advertise.
+	backends := toBackendPointers(health.FilterBackendsForExposure(sm.backendReg.List(ctx), sm.healthStatus))
 
 	// Build the fully-formed MultiSession using the SDK-assigned session ID.
 	sess, err := sm.factory.MakeSessionWithID(ctx, sessionID, identity, backends)
@@ -802,7 +809,10 @@ func (sm *Manager) DecorateSession(sessionID string, fn func(sessiontypes.MultiS
 
 // listAllBackends returns all backends from the registry as a pointer slice.
 func (sm *Manager) listAllBackends(ctx context.Context) []*vmcp.Backend {
-	raw := sm.backendReg.List(ctx)
+	return toBackendPointers(sm.backendReg.List(ctx))
+}
+
+func toBackendPointers(raw []vmcp.Backend) []*vmcp.Backend {
 	backends := make([]*vmcp.Backend, len(raw))
 	for i := range raw {
 		backends[i] = &raw[i]

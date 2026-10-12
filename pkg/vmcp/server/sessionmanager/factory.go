@@ -22,6 +22,7 @@ import (
 	"github.com/stacklok/toolhive/pkg/telemetry"
 	"github.com/stacklok/toolhive/pkg/vmcp"
 	"github.com/stacklok/toolhive/pkg/vmcp/conversion"
+	"github.com/stacklok/toolhive/pkg/vmcp/health"
 	"github.com/stacklok/toolhive/pkg/vmcp/optimizer"
 	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
 	"github.com/stacklok/toolhive/pkg/vmcp/session/optimizerdec"
@@ -81,6 +82,11 @@ type FactoryConfig struct {
 	// effect when the optimizer is disabled. The legacy server.New path leaves this
 	// false, so its optimizer decorator is unchanged.
 	AdvertiseFromCore bool
+
+	// HealthStatusProvider filters the backends a new session connects to: backends
+	// it reports as unhealthy, unknown or unauthenticated are skipped, the same rule
+	// the core applies to the advertised set. Nil falls back to the registry status.
+	HealthStatusProvider health.StatusProvider
 }
 
 // resolveOptimizer wires the optimizer factory from cfg, applying telemetry

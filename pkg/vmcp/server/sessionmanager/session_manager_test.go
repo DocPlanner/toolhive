@@ -192,6 +192,15 @@ func (r *fakeBackendRegistry) Count() int {
 	return len(r.backends)
 }
 
+// fakeHealthStatus is a health.StatusProvider backed by a map; backends absent
+// from the map are reported as not monitored.
+type fakeHealthStatus map[string]vmcp.BackendHealthStatus
+
+func (f fakeHealthStatus) QueryBackendStatus(id string) (vmcp.BackendHealthStatus, bool) {
+	status, ok := f[id]
+	return status, ok
+}
+
 // newTestSessionDataStorage creates a LocalSessionDataStorage with a long TTL.
 // The storage is closed via t.Cleanup.
 func newTestSessionDataStorage(t *testing.T) transportsession.DataStorage {
@@ -321,6 +330,37 @@ func TestSessionManager_CreateSession(t *testing.T) {
 		// Storage must still hold the session metadata after CreateSession.
 		_, loadErr := storage.Load(context.Background(), sessionID)
 		assert.NoError(t, loadErr, "session should still exist in storage after CreateSession")
+	})
+
+	t.Run("connects only to backends eligible for exposure", func(t *testing.T) {
+		t.Parallel()
+
+		ctrl := gomock.NewController(t)
+		var gotBackends []string
+		factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
+		factory.EXPECT().
+			MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, backends []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+				for _, b := range backends {
+					gotBackends = append(gotBackends, b.ID)
+				}
+				return newMockSession(t, ctrl, id, nil), nil
+			}).Times(1)
+
+		registry := &fakeBackendRegistry{backends: []vmcp.Backend{
+			{ID: "healthy"}, {ID: "unhealthy"}, {ID: "registry-unknown", HealthStatus: vmcp.BackendUnknown},
+		}}
+		health := fakeHealthStatus{"healthy": vmcp.BackendHealthy, "unhealthy": vmcp.BackendUnhealthy}
+		sm, cleanup, err := New(newTestSessionDataStorage(t),
+			&FactoryConfig{Base: factory, HealthStatusProvider: health}, registry)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = cleanup(context.Background()) })
+
+		sessionID := sm.Generate()
+		require.NotEmpty(t, sessionID)
+		_, err = sm.CreateSession(context.Background(), sessionID)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"healthy"}, gotBackends)
 	})
 
 	t.Run("returns error for empty session ID", func(t *testing.T) {

@@ -487,6 +487,9 @@ func New(
 		OptimizerFactory:  cfg.OptimizerFactory,
 		TelemetryProvider: cfg.TelemetryProvider,
 		AdvertiseFromCore: true,
+		// New sessions connect only to the backends the core's health monitor
+		// reports as eligible (nil when health monitoring is disabled).
+		HealthStatusProvider: coreVMCP.BackendHealth(),
 	}
 
 	srv, err := Serve(ctx, coreVMCP, deriveServerConfig(resolved, backendRegistry, sessMgrCfg))
