@@ -67,29 +67,40 @@ above, a replay keeps these, as long as each commit is replayed.
 
 | Behaviour | Where it lives now | Commit | Original commit |
 |---|---|---|---|
-| Session Redis ACL username, `WithSessionIdleTTL`, HTTP write timeout and backend init timeout wired on the Serve path | `pkg/vmcp/server/server.go` (`buildSessionDataStorage`, `Handler`), `pkg/vmcp/cli/serve.go`, `pkg/vmcp/server/derive.go` | `bafe4d46a` | `8d09330f5`, `d104dfc9f`, `3533730ce`, `5feb1b1c9` |
+| Session Redis ACL username, `WithSessionIdleTTL`, HTTP write timeout and backend init timeout wired on the Serve path; mcp-go's idle sweep clears only this pod's SDK state (`sessionIDManagerResolver`) and `Stop` stops it | `pkg/vmcp/server/server.go` (`buildSessionDataStorage`, `Handler`), `pkg/vmcp/cli/serve.go`, `pkg/vmcp/server/derive.go` | `bafe4d46a`, `7f57d1f6f` | `8d09330f5`, `d104dfc9f`, `3533730ce`, `5feb1b1c9` |
 | Session registration runs on a detached context (request values kept, 45 s timeout) | `pkg/vmcp/server/server.go` (`handleSessionRegistrationImpl`) | `0d62ea671` | `596f6ccf8` |
-| Session-cardinality gauges (transport sessions, SDK sessions, in-flight registrations) | `pkg/vmcp/server/session_telemetry.go` | `0d62ea671` | `560c1d023` |
+| Session-cardinality gauges (transport sessions, SDK sessions, in-flight registrations) | `pkg/vmcp/server/session_telemetry.go`, `client_sessions.go` | `0d62ea671`, `f387a57f2` | `560c1d023` |
 | New sessions connect only to backends eligible for exposure | `pkg/vmcp/server/sessionmanager/session_manager.go` (`FactoryConfig.HealthStatusProvider`) | `ee875852d` | `currentEligibleBackends` |
-| `timeouts.default` / `timeouts.perWorkload` applied to each backend call (keyed by `WorkloadID`, 90 s fallback) | `pkg/vmcp/client/client.go` (`WithRequestTimeouts`) | `4cf28e14c` | `3533730ce` |
-| `Terminate` closes the node-local cached session; idle sweep closes cached sessions after the session TTL | `pkg/vmcp/server/sessionmanager/session_manager.go`, `pkg/cache/validating_cache.go` (`Remove`, `EvictIdle`) | `036974570` | `596f6ccf8`, `c9ab3ccbc` |
-| A call that arrives before the registration wrote the identity binding waits (25 ms steps, 10 s) instead of failing | `pkg/vmcp/server/serve_handlers.go` (`waitForRegisteredSession`) | `c94881448` | `d6a23fcda` |
-| Health probes between vMCPs neither create sessions nor list capabilities | `pkg/vmcp/server/server.go` (`healthProbeContextMiddleware`) | `37d40cf78` | `46dd7a465` |
+| `timeouts.default` / `timeouts.perWorkload` applied to each backend call (keyed by `WorkloadID`, 90 s fallback); the HTTP write timeout covers the longest of them, fallback included | `pkg/vmcp/client/client.go` (`WithRequestTimeouts`, `DefaultBackendRequestTimeout`), `pkg/vmcp/cli/serve_timeouts.go` (`serverWriteTimeoutFromConfig`) | `4cf28e14c`, `703e8e849` | `3533730ce` |
+| `Terminate` closes the node-local cached session; idle sweep closes cached sessions after the session TTL; `Close` runs outside the cache lock | `pkg/vmcp/server/sessionmanager/session_manager.go`, `pkg/cache/validating_cache.go` (`Remove`, `EvictIdle`) | `036974570`, `51de52641` | `596f6ccf8`, `c9ab3ccbc` |
+| A call that arrives before the registration wrote the identity binding waits (one store read per step, 25 ms doubling to 500 ms, 10 s) instead of failing | `pkg/vmcp/server/serve_handlers.go` (`waitForRegisteredSession`, `waitWhileRegistrationPending`) | `c94881448`, `7d04b4957` | `d6a23fcda` |
+| Health probes between vMCPs neither create sessions nor list capabilities. The probe header sets a package-private context key, never the `healthcontext` marker (which switches outgoing auth to the vMCP's service credentials), and a probe may only initialize, ping and list (else 403) | `pkg/vmcp/server/peer_probe.go` (`peerProbeMiddleware`) | `37d40cf78`, `43623c120` | `46dd7a465` |
 | Resources filled on a pod that did not register the session | `pkg/vmcp/server/server.go` (`lazyInjectSessionResources`), `serve.go` hooks | `536c603b4` | `d6a23fcda` |
 | Backend health or registry change clears the sessions' tool and resource stores and sends `list_changed` (15 s debounce, 60 s cooldown) | `pkg/vmcp/server/serve_refresh.go`, `refresh_scheduler.go` | `c4984e59c` | `560c1d023`, `35680e28c`, `e755493fe` |
 | GET re-registration of a bound session attaches a matching caller and rejects any other; it never rewrites the binding | `pkg/vmcp/server/server.go` (`attachToBoundSession`) | `ab1b5b667` | — (new, plan D5) |
-| A GET registration never creates a session: it waits for the creating pod's binding, then attaches or rejects | `pkg/vmcp/server/server.go` (`listenStreamContextMiddleware`, `attachToBoundSession`) | `fccda6842` | — (new) |
-| Missing credentials for `authz.primaryUpstreamProvider` return 401 with `WWW-Authenticate` | `pkg/auth/token.go` (`WithRequiredUpstreamProviders`), `pkg/vmcp/auth/factory/incoming.go` | `44b70f6a5` | `c2cb472a2` |
+| A GET registration never creates a session: it waits for the creating pod's binding, then attaches or rejects | `pkg/vmcp/server/server.go` (`attachToBoundSession`) | `fccda6842` | — (new) |
+| Every GET is checked before mcp-go sees it: 400 without `Mcp-Session-Id`, 404 for a missing, terminated or never-bound session, 403 for a different caller (mcp-go answers 200 whatever the hook does) | `pkg/vmcp/server/server.go` (`listenStreamGuardMiddleware`, `checkListenStreamCaller`) | `854448185` | — (new) |
+| Missing credentials for `authz.primaryUpstreamProvider` return 401 with `WWW-Authenticate` (empty provider names ignored) | `pkg/auth/token.go` (`WithRequiredUpstreamProviders`), `pkg/vmcp/auth/factory/incoming.go` | `44b70f6a5`, `f387a57f2` | `c2cb472a2` |
 
 Tests: `pkg/vmcp/server/serve_*_test.go`, `session_registration_context_test.go`,
 `session_telemetry_test.go`, `sessionmanager/session_cache_close_test.go`,
-`pkg/vmcp/client/request_timeout_test.go`, `pkg/auth/token_test.go`.
+`pkg/vmcp/client/request_timeout_test.go`, `pkg/vmcp/cli/serve_timeouts_test.go`,
+`pkg/cache/validating_cache_test.go`, `pkg/auth/token_test.go`.
+
+**Capability refresh scope.** The refresh (`c4984e59c`) clears only the sessions in
+`activeClientSessions`: sessions registered on this pod by initialize or a GET listen stream. A
+session that a pod only serves through POSTs (registered on another pod, tools filled by lazy
+injection) keeps that pod's tool and resource stores until mcp-go's idle sweep clears them, so it
+can see a stale tool set there. `startCapabilityRefresh` runs only from `Server.Start`; an embedder
+that serves `Handler` without `Start` gets no refresh.
 
 **GET guard.** mcp-go v0.55 registers a session again when a GET listen stream reaches a pod that
 does not hold it, and upstream's `CreateSession` would re-bind it to the caller. Upstream stops
 this only in v0.40.0, as a side effect of #5729 (mcp-go replaced by toolhive-core `mcpcompat`).
-Drop `ab1b5b667` and `fccda6842` once the fork is on v0.40 or later, if
-`TestCrossPodSessionRebind` and `TestCrossPodGETDuringRegistration`
+mcp-go also answers the GET with 200 whatever the hook does, so `854448185` checks the GET in an
+HTTP middleware first; the hook check stays as a fallback. Drop `ab1b5b667`, `fccda6842` and the
+middleware of `854448185` once the fork is on v0.40 or later, if `TestCrossPodSessionRebind`,
+`TestCrossPodGETDuringRegistration` and `TestListenStreamGuard`
 (`pkg/vmcp/server/serve_crosspod_rebind_test.go`) pass without them.
 
 ## Dropped patches
