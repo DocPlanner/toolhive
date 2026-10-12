@@ -104,7 +104,8 @@ var _ = Describe("MCPExternalAuthConfig RedisStorageConfig CEL validation", func
 				ACLUserConfig: aclUserConfig,
 			},
 			shouldAdmit: false,
-			errMatch:    "exactly one of addr or sentinelConfig must be set",
+			// DocPlanner fork: the rule also accepts the deprecated address alias.
+			errMatch: "exactly one of addr (or its deprecated alias address) or sentinelConfig must be set",
 		},
 		{
 			name: "both addr and sentinelConfig set",
@@ -117,7 +118,8 @@ var _ = Describe("MCPExternalAuthConfig RedisStorageConfig CEL validation", func
 				ACLUserConfig: aclUserConfig,
 			},
 			shouldAdmit: false,
-			errMatch:    "exactly one of addr or sentinelConfig must be set",
+			// DocPlanner fork: the rule also accepts the deprecated address alias.
+			errMatch: "exactly one of addr (or its deprecated alias address) or sentinelConfig must be set",
 		},
 		{
 			name: "clusterMode without addr",
