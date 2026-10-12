@@ -1169,6 +1169,13 @@ func (s *Server) handleSessionRegistrationImpl(ctx context.Context, session serv
 	defer s.inFlightRegistrations.Add(-1)
 
 	sessionID := session.SessionID()
+
+	// Checked before the cleanup defer below: rejecting a re-registration must not
+	// terminate the owner's session.
+	if handled, err := s.attachToBoundSession(ctx, session); handled {
+		return err
+	}
+
 	slog.Debug("creating session-scoped backends", "session_id", sessionID)
 
 	// Defer cleanup: if any error occurs, terminate the session and log failures.
@@ -1207,6 +1214,39 @@ func (s *Server) handleSessionRegistrationImpl(ctx context.Context, session serv
 	// session record (identity binding, TTL, Validate). The returned error becomes retErr
 	// (named return), so the defer terminates the session on failure.
 	return s.injectCoreSessionCapabilities(ctx, session)
+}
+
+// attachToBoundSession handles a registration for a session whose stored record
+// already has an identity binding. mcp-go registers a session again when a GET
+// listen stream (or an SSE reconnect) reaches a pod that does not hold it in
+// memory, and CreateSession would then build a new session with the caller's
+// identity and overwrite the stored binding. Instead, a caller that matches the
+// binding gets the session's capabilities, and a different caller is rejected and
+// unregistered from this pod; the stored session is not changed in either case.
+// It reports false when the record is missing, terminated or not bound yet, so
+// the caller goes on with CreateSession.
+//
+// Upstream stops the re-bind only from v0.40.0, as a side effect of #5729. Drop
+// this guard once the fork is on v0.40 or later and TestCrossPodSessionRebind
+// passes without it.
+func (s *Server) attachToBoundSession(ctx context.Context, session server.ClientSession) (bool, error) {
+	sessionID := session.SessionID()
+	metadata, err := s.sessionDataStorage.Load(ctx, sessionID)
+	if err != nil || metadata[sessionmanager.MetadataKeyTerminated] == sessionmanager.MetadataValTrue {
+		return false, nil
+	}
+	binding, bound := metadata[vmcpsession.MetadataKeyIdentityBinding]
+	if !bound {
+		return false, nil
+	}
+	caller, _ := auth.IdentityFromContext(ctx)
+	if err := vmcpsession.ValidateCaller(binding, caller); err != nil {
+		slog.Warn("rejected re-registration of a bound session by another caller",
+			"session_id", sessionID, "error", err)
+		s.mcpServer.UnregisterSession(ctx, sessionID)
+		return true, err
+	}
+	return true, s.injectCoreSessionCapabilities(ctx, session)
 }
 
 // backendHealth returns the core-owned backend health reporter, or nil when health

@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/stacklok/toolhive/pkg/auth"
+	transportsession "github.com/stacklok/toolhive/pkg/transport/session"
 	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
 )
 
@@ -52,7 +53,12 @@ func TestHandleSessionRegistrationImpl_DetachedBoundedContext(t *testing.T) {
 	t.Parallel()
 
 	rec := &registrationContextRecorder{}
-	srv := &Server{vmcpSessionMgr: rec}
+	// An empty store: the session has no bound record, so registration goes on to
+	// CreateSession (see attachToBoundSession).
+	storage, err := transportsession.NewLocalSessionDataStorage(time.Minute)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = storage.Close() })
+	srv := &Server{vmcpSessionMgr: rec, sessionDataStorage: storage}
 	rec.srv = srv
 
 	ctx := auth.WithIdentity(context.Background(), &auth.Identity{
@@ -62,7 +68,7 @@ func TestHandleSessionRegistrationImpl_DetachedBoundedContext(t *testing.T) {
 	canceledCtx, cancel := context.WithCancel(ctx)
 	cancel()
 
-	err := srv.handleSessionRegistrationImpl(canceledCtx, &fakeSDKSession{id: "session-123"})
+	err = srv.handleSessionRegistrationImpl(canceledCtx, &fakeSDKSession{id: "session-123"})
 	require.ErrorIs(t, err, errStopRegistration)
 
 	assert.NoError(t, rec.ctxErr, "request cancellation must not reach session creation")
