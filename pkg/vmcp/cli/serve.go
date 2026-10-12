@@ -621,7 +621,9 @@ func discoverBackends(
 		return nil, nil, nil, fmt.Errorf("failed to create outgoing authentication registry: %w", err)
 	}
 
-	backendClient, err := vmcpclient.NewHTTPBackendClient(outgoingRegistry)
+	// timeouts.default / timeouts.perWorkload bound each backend call.
+	backendClient, err := vmcpclient.NewHTTPBackendClient(outgoingRegistry,
+		vmcpclient.WithRequestTimeouts(backendRequestTimeoutsFromConfig(cfg)))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to create backend client: %w", err)
 	}

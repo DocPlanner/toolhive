@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -101,6 +102,21 @@ func WithDialControl(control func(network, address string, c syscall.RawConn) er
 	}
 }
 
+// defaultBackendRequestTimeout bounds each streamable-HTTP backend request when
+// WithRequestTimeouts sets no value for the backend.
+const defaultBackendRequestTimeout = 90 * time.Second
+
+// WithRequestTimeouts sets the timeout of each streamable-HTTP backend request.
+// An entry in perWorkload (keyed by BackendTarget.WorkloadID) wins over
+// defaultTimeout; non-positive values fall back to the 90 s default. SSE
+// backends are not affected: a timeout would cut their long-lived stream.
+func WithRequestTimeouts(defaultTimeout time.Duration, perWorkload map[string]time.Duration) Option {
+	return func(h *httpBackendClient) {
+		h.defaultRequestTimeout = defaultTimeout
+		h.perWorkloadRequestTimeouts = maps.Clone(perWorkload)
+	}
+}
+
 // httpBackendClient implements vmcp.BackendClient using mark3labs/mcp-go HTTP client.
 // It supports streamable-HTTP and SSE transports for backend MCP servers.
 type httpBackendClient struct {
@@ -122,6 +138,11 @@ type httpBackendClient struct {
 	// receiving the resolved peer IP before the TCP handshake. Nil reproduces the
 	// default dialer behavior with no hook.
 	dialControl func(network, address string, c syscall.RawConn) error
+
+	// defaultRequestTimeout and perWorkloadRequestTimeouts are set by
+	// WithRequestTimeouts; see requestTimeout.
+	defaultRequestTimeout      time.Duration
+	perWorkloadRequestTimeouts map[string]time.Duration
 }
 
 // NewHTTPBackendClient creates a new HTTP-based backend client.
@@ -539,13 +560,14 @@ func (h *httpBackendClient) defaultClientFactory(ctx context.Context, target *vm
 			}
 			return resp, nil
 		})
+		requestTimeout := h.requestTimeout(target.WorkloadID)
 		httpClient := &http.Client{
 			Transport: sizeLimitedTransport,
-			Timeout:   90 * time.Second,
+			Timeout:   requestTimeout,
 		}
 		c, err = client.NewStreamableHttpClient(
 			target.BaseURL,
-			transport.WithHTTPTimeout(90*time.Second),
+			transport.WithHTTPTimeout(requestTimeout),
 			transport.WithHTTPBasicClient(httpClient),
 		)
 		if err != nil {
@@ -578,6 +600,18 @@ func (h *httpBackendClient) defaultClientFactory(ctx context.Context, target *vm
 	// Note: Initialization is deferred to the caller (e.g., ListCapabilities)
 	// so that ServerCapabilities can be captured and used for conditional querying
 	return c, nil
+}
+
+// requestTimeout returns the streamable-HTTP request timeout for a workload:
+// its per-workload value, else the configured default, else 90 s.
+func (h *httpBackendClient) requestTimeout(workloadID string) time.Duration {
+	if timeout := h.perWorkloadRequestTimeouts[workloadID]; timeout > 0 {
+		return timeout
+	}
+	if h.defaultRequestTimeout > 0 {
+		return h.defaultRequestTimeout
+	}
+	return defaultBackendRequestTimeout
 }
 
 // isAuthorizationRequired reports whether err is one of the mcp-go authorization-required
