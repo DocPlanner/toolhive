@@ -1089,6 +1089,31 @@ func (s *Server) lazyInjectSessionTools(ctx context.Context) {
 	}
 }
 
+// lazyInjectSessionResources is the resources counterpart of
+// lazyInjectSessionTools: it fills an empty per-session resource store (a session
+// that was registered on another pod) from core.ListResources for the request
+// identity. The call-time binding check in coreResourceHandler stays the backstop.
+func (s *Server) lazyInjectSessionResources(ctx context.Context) {
+	sess := server.ClientSessionFromContext(ctx)
+	if sess == nil || health.IsHealthCheck(ctx) {
+		return
+	}
+	sessionWithResources, ok := sess.(server.SessionWithResources)
+	if !ok || len(sessionWithResources.GetSessionResources()) > 0 {
+		return
+	}
+	sessionID := sess.SessionID()
+	identity, _ := auth.IdentityFromContext(ctx)
+	resources, err := s.coreSessionResources(ctx, sessionID, identity)
+	if err != nil || len(resources) == 0 {
+		slog.Debug("lazyInjectSessionResources: no resources available for session", "session_id", sessionID)
+		return
+	}
+	if err := setSessionResourcesDirect(sess, resources); err != nil {
+		slog.Warn("lazyInjectSessionResources: failed to inject resources", "session_id", sessionID, "error", err)
+	}
+}
+
 // handleSessionRegistration processes a new MCP session registration.
 // It fires AFTER the session is registered in the SDK.
 //

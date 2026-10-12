@@ -294,10 +294,10 @@ func Serve(ctx context.Context, v core.VMCP, cfg *ServerConfig) (*Server, error)
 		return v.Close()
 	})
 
-	// Register the three SDK hooks against the assembled *Server (relocated from
+	// Register the SDK hooks against the assembled *Server (relocated from
 	// server.New). They drive phase-2 of two-phase creation (OnRegisterSession) and
 	// the cross-pod Redis re-hydration of per-session tools (OnBeforeListTools /
-	// OnBeforeCallTool); the *Server receiver methods are unchanged.
+	// OnBeforeCallTool) and resources (OnBeforeListResources / OnBeforeReadResource).
 	hooks.AddOnRegisterSession(func(hookCtx context.Context, session server.ClientSession) {
 		srv.handleSessionRegistration(hookCtx, session)
 	})
@@ -309,6 +309,12 @@ func Serve(ctx context.Context, v core.VMCP, cfg *ServerConfig) (*Server, error)
 	})
 	hooks.AddBeforeCallTool(func(hookCtx context.Context, _ any, _ *mcp.CallToolRequest) {
 		srv.lazyInjectSessionTools(hookCtx)
+	})
+	hooks.AddBeforeListResources(func(hookCtx context.Context, _ any, _ *mcp.ListResourcesRequest) {
+		srv.lazyInjectSessionResources(hookCtx)
+	})
+	hooks.AddBeforeReadResource(func(hookCtx context.Context, _ any, _ *mcp.ReadResourceRequest) {
+		srv.lazyInjectSessionResources(hookCtx)
 	})
 
 	// Disarm the close-on-error guard: the Server is fully constructed.
