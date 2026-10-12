@@ -187,3 +187,37 @@ func TestRegistrationWaitBacksOff(t *testing.T) {
 	require.ErrorIs(t, err, errSessionNotRegistered)
 	assert.Less(t, storage.loads.Load(), int32(15), "a one-second wait must read the store only a few times")
 }
+
+// TestUnregisterDuringRegistration verifies that a session mcp-go unregisters
+// while its registration is still running is not left in the set of active
+// sessions (which feeds the gauges and the capability refresh).
+func TestUnregisterDuringRegistration(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	tools := []vmcp.Tool{{Name: "t"}}
+	base, _ := newToolSessionFactory(t, ctrl, tools)
+	factory := &gatedSessionFactory{MultiSessionFactory: base, release: make(chan struct{})}
+	srv, err := Serve(context.Background(), &fakeCore{tools: tools}, &ServerConfig{
+		SessionTTL:           time.Minute,
+		SessionManagerConfig: &sessionmanager.FactoryConfig{Base: factory},
+		BackendRegistry:      vmcp.NewImmutableRegistry([]vmcp.Backend{}),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = srv.Stop(context.Background()) })
+
+	sessionID := srv.vmcpSessionMgr.Generate()
+	sess := &fakeSDKSession{id: sessionID, tools: map[string]server.ServerTool{}}
+	registered := make(chan error, 1)
+	go func() { registered <- srv.mcpServer.RegisterSession(context.Background(), sess) }()
+
+	// Wait until the registration is blocked in the session factory, then
+	// unregister the session, as a DELETE or the end of a GET would.
+	require.Eventually(t, func() bool { return srv.inFlightRegistrations.Load() == 1 },
+		2*time.Second, 5*time.Millisecond)
+	srv.mcpServer.UnregisterSession(context.Background(), sessionID)
+	close(factory.release)
+	require.NoError(t, <-registered)
+
+	assert.Zero(t, srv.activeClientSessionCount(), "an unregistered session must not stay active")
+}

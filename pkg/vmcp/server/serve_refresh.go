@@ -102,11 +102,7 @@ func watchRegistryVersion(
 // refilled from the core, which already reflects the change.
 func (s *Server) refreshSessionCapabilities(trigger string, mode refreshTargetMode) {
 	refreshed := 0
-	s.activeClientSessions.Range(func(_, value any) bool {
-		sess, ok := value.(server.ClientSession)
-		if !ok {
-			return true
-		}
+	for _, sess := range s.activeClientSessions.snapshot() {
 		sessionID := sess.SessionID()
 		if withTools, ok := sess.(server.SessionWithTools); ok {
 			withTools.SetSessionTools(nil)
@@ -117,8 +113,7 @@ func (s *Server) refreshSessionCapabilities(trigger string, mode refreshTargetMo
 			s.notifySession(sessionID, mcp.MethodNotificationResourcesListChanged)
 		}
 		refreshed++
-		return true
-	})
+	}
 	slog.Info("refreshed session capabilities after backend change",
 		"trigger", trigger, "mode", mode.String(), "session_count", refreshed)
 }

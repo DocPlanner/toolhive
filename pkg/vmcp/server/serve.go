@@ -303,7 +303,7 @@ func Serve(ctx context.Context, v core.VMCP, cfg *ServerConfig) (*Server, error)
 		srv.handleSessionRegistration(hookCtx, session)
 	})
 	hooks.AddOnUnregisterSession(func(_ context.Context, session server.ClientSession) {
-		srv.activeClientSessions.Delete(session.SessionID())
+		srv.activeClientSessions.remove(session.SessionID())
 	})
 	hooks.AddBeforeListTools(func(hookCtx context.Context, _ any, _ *mcp.ListToolsRequest) {
 		srv.lazyInjectSessionTools(hookCtx)

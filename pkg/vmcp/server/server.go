@@ -319,10 +319,10 @@ type Server struct {
 	// returns (or, for an embedded Handler, after the caller stops serving it).
 	shutdownFuncs []func(context.Context) error
 
-	// activeClientSessions holds the SDK sessions registered on this replica
-	// (session ID -> server.ClientSession); it feeds the session cardinality
-	// gauges and selects the sessions a capability refresh clears (serve_refresh.go).
-	activeClientSessions sync.Map
+	// activeClientSessions holds the SDK sessions registered on this replica; it
+	// feeds the session cardinality gauges and selects the sessions a capability
+	// refresh clears (serve_refresh.go).
+	activeClientSessions clientSessionSet
 
 	// inFlightRegistrations counts session registrations currently running the
 	// post-initialize hook; it feeds the session cardinality gauges.
@@ -1141,10 +1141,13 @@ func (s *Server) handleSessionRegistration(
 	}
 	// Error is logged and handled within handleSessionRegistrationImpl.
 	// The session is terminated on failure; no further action needed here.
+	// An unregistration while this runs cancels the commit (clientSessionSet).
+	s.activeClientSessions.begin(session.SessionID())
 	if err := s.handleSessionRegistrationImpl(ctx, session); err != nil {
+		s.activeClientSessions.abort(session.SessionID())
 		return
 	}
-	s.activeClientSessions.Store(session.SessionID(), session)
+	s.activeClientSessions.commit(session)
 }
 
 // handleSessionRegistrationImpl handles session registration.

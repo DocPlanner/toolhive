@@ -577,11 +577,12 @@ func WithUpstreamTokenReader(reader upstreamtoken.TokenReader) TokenValidatorOpt
 // request with a token session (tsid claim) must have. A required provider that
 // has no access token in the loaded credentials counts as a failed refresh: the
 // request gets 401 with WWW-Authenticate, so the client authenticates again.
-// Requests without a tsid claim are not affected. It has no effect without
-// WithUpstreamTokenReader.
+// Requests without a tsid claim are not affected. Empty names are ignored. It has
+// no effect without WithUpstreamTokenReader.
 func WithRequiredUpstreamProviders(providers ...string) TokenValidatorOption {
 	return func(o *tokenValidatorOptions) {
-		o.requiredUpstreamProviders = slices.Clone(providers)
+		o.requiredUpstreamProviders = slices.DeleteFunc(slices.Clone(providers),
+			func(provider string) bool { return provider == "" })
 	}
 }
 

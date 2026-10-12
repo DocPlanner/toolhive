@@ -28,9 +28,10 @@ func TestMonitorSessionCardinality(t *testing.T) {
 	require.NoError(t, sessionManager.AddWithID("22222222-2222-2222-2222-222222222222"))
 
 	srv := &Server{sessionManager: sessionManager}
-	srv.activeClientSessions.Store("sdk-session-1", struct{}{})
-	srv.activeClientSessions.Store("sdk-session-2", struct{}{})
-	srv.activeClientSessions.Store("sdk-session-3", struct{}{})
+	for _, id := range []string{"sdk-session-1", "sdk-session-2", "sdk-session-3"} {
+		srv.activeClientSessions.begin(id)
+		srv.activeClientSessions.commit(&fakeSDKSession{id: id})
+	}
 	srv.inFlightRegistrations.Add(1)
 
 	require.NoError(t, monitorSessionCardinality(meterProvider, srv))

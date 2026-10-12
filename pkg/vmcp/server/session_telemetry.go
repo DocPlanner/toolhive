@@ -61,10 +61,5 @@ func monitorSessionCardinality(meterProvider metric.MeterProvider, srv *Server) 
 }
 
 func (s *Server) activeClientSessionCount() int64 {
-	var count int64
-	s.activeClientSessions.Range(func(_, _ any) bool {
-		count++
-		return true
-	})
-	return count
+	return s.activeClientSessions.count()
 }

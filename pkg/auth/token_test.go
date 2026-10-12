@@ -2558,14 +2558,18 @@ func TestMiddleware_UpstreamTokenEnrichment(t *testing.T) {
 			claims   jwt.MapClaims
 			creds    map[string]upstreamtoken.UpstreamCredential // nil: reader not called
 			wantCode int
+			required []string // nil: "cognito"
 		}{
 			{"provider present", claimsWithTsid,
-				map[string]upstreamtoken.UpstreamCredential{"cognito": {AccessToken: "tok"}}, http.StatusOK},
+				map[string]upstreamtoken.UpstreamCredential{"cognito": {AccessToken: "tok"}}, http.StatusOK, nil},
 			{"provider missing", claimsWithTsid,
-				map[string]upstreamtoken.UpstreamCredential{"github": {AccessToken: "gh-tok"}}, http.StatusUnauthorized},
+				map[string]upstreamtoken.UpstreamCredential{"github": {AccessToken: "gh-tok"}}, http.StatusUnauthorized, nil},
 			{"provider without access token", claimsWithTsid,
-				map[string]upstreamtoken.UpstreamCredential{"cognito": {IDToken: "id"}}, http.StatusUnauthorized},
-			{"no tsid claim is not affected", claimsWithoutTsid, nil, http.StatusOK},
+				map[string]upstreamtoken.UpstreamCredential{"cognito": {IDToken: "id"}}, http.StatusUnauthorized, nil},
+			{"no tsid claim is not affected", claimsWithoutTsid, nil, http.StatusOK, nil},
+			{"empty provider names are ignored", claimsWithTsid,
+				map[string]upstreamtoken.UpstreamCredential{"cognito": {AccessToken: "tok"}}, http.StatusOK,
+				[]string{"", "cognito", ""}},
 		}
 		for _, tc := range tests {
 			t.Run(tc.name, func(t *testing.T) {
@@ -2576,7 +2580,11 @@ func TestMiddleware_UpstreamTokenEnrichment(t *testing.T) {
 					reader.EXPECT().GetAllUpstreamCredentials(gomock.Any(), "session-xyz").
 						Return(tc.creds, []string(nil), nil)
 				}
-				v := makeValidator(t, WithUpstreamTokenReader(reader), WithRequiredUpstreamProviders("cognito"))
+				required := tc.required
+				if required == nil {
+					required = []string{"cognito"}
+				}
+				v := makeValidator(t, WithUpstreamTokenReader(reader), WithRequiredUpstreamProviders(required...))
 
 				nextCalled := false
 				handler := v.Middleware(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {

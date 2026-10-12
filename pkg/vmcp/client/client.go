@@ -568,7 +568,6 @@ func (h *httpBackendClient) defaultClientFactory(ctx context.Context, target *vm
 		}
 		c, err = client.NewStreamableHttpClient(
 			target.BaseURL,
-			transport.WithHTTPTimeout(requestTimeout),
 			transport.WithHTTPBasicClient(httpClient),
 		)
 		if err != nil {
