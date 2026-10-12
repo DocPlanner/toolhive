@@ -1376,8 +1376,6 @@ var notAcceptableBody = []byte(
 		`{"code":-32600,"message":"Not Acceptable: Client must accept text/event-stream"}}`,
 )
 
-// headerValidatingMiddleware rejects GET requests that do not include
-// Accept: text/event-stream, as required by the MCP Streamable HTTP transport spec.
 // healthProbeContextMiddleware marks the request context as a health check when
 // the request carries the inter-vMCP probe header (health.ProbeHeader).
 func healthProbeContextMiddleware(next http.Handler) http.Handler {
@@ -1411,6 +1409,8 @@ func isListenStreamRegistration(ctx context.Context) bool {
 	return marked
 }
 
+// headerValidatingMiddleware rejects GET requests that do not include
+// Accept: text/event-stream, as required by the MCP Streamable HTTP transport spec.
 func headerValidatingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet &&

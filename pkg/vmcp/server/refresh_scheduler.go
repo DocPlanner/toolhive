@@ -8,8 +8,9 @@ import (
 	"time"
 )
 
-// refreshTargetMode selects which active sessions a backend-triggered refresh
-// rebuilds.
+// refreshTargetMode describes which active sessions a backend-triggered refresh
+// concerns. On the Serve path every refresh clears all sessions on the pod, so the
+// mode is only logged (see refreshSessionCapabilities).
 type refreshTargetMode int
 
 const (
@@ -49,13 +50,13 @@ func mergeRefreshModes(a, b refreshTargetMode) refreshTargetMode {
 
 const (
 	// defaultRefreshDebounceWindow coalesces refresh triggers for one backend. A
-	// backend that flaps (health transitions, repeated list_changed notifications)
-	// produces a single rebuild per window instead of one per event.
+	// backend that flaps (health transitions, registry changes) produces a single
+	// refresh per window instead of one per event.
 	defaultRefreshDebounceWindow = 15 * time.Second
 
 	// defaultRefreshCooldown is the minimum spacing between two refresh runs for
-	// the same backend. Every run tears down and rebuilds the backend connections
-	// of every targeted session, so it must not happen more often than this.
+	// the same backend. Every run makes every session on the pod list its tools
+	// and resources again, so it must not happen more often than this.
 	defaultRefreshCooldown = 60 * time.Second
 )
 

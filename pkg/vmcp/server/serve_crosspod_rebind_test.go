@@ -41,8 +41,9 @@ import (
 // no network listeners.
 
 const (
-	crossPodUserHeader = "X-Test-User"
-	crossPodIssuer     = "https://idp.example"
+	crossPodUserHeader  = "X-Test-User"
+	crossPodIssuer      = "https://idp.example"
+	crossPodResourceURI = "file:///doc.txt"
 )
 
 // countingFactory wraps a MultiSessionFactory and counts phase-2 creations
@@ -103,7 +104,10 @@ func startCrossPod(t *testing.T, shared transportsession.DataStorage, gate chan 
 	require.NoError(t, authReg.RegisterStrategy(authtypes.StrategyTypeUnauthenticated, strategies.NewUnauthenticatedStrategy()))
 	factory := &countingFactory{base: vmcpsession.NewSessionFactory(authReg), gate: gate}
 	registry := vmcp.NewImmutableRegistry([]vmcp.Backend{})
-	fc := &fakeCore{tools: []vmcp.Tool{{Name: "echo", Description: "echo"}}}
+	fc := &fakeCore{
+		tools:     []vmcp.Tool{{Name: "echo", Description: "echo"}},
+		resources: []vmcp.Resource{{URI: crossPodResourceURI, Name: "doc"}},
+	}
 
 	srv, err := Serve(context.Background(), fc, &ServerConfig{
 		SessionTTL:           time.Hour,
@@ -234,9 +238,15 @@ func openSSE(t *testing.T, pod *crossPod, user, sessionID string) int {
 
 func callEcho(t *testing.T, pod *crossPod, user, sessionID string) string {
 	t.Helper()
+	return crossPodRPC(t, pod, user, sessionID, "tools/call", `{"name":"echo","arguments":{}}`)
+}
+
+// crossPodRPC sends one JSON-RPC request on pod and returns the response body.
+func crossPodRPC(t *testing.T, pod *crossPod, user, sessionID, method, params string) string {
+	t.Helper()
 	rec := httptest.NewRecorder()
 	pod.handler.ServeHTTP(rec, newCrossPodRequest(context.Background(), http.MethodPost, user, sessionID,
-		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo","arguments":{}}}`))
+		`{"jsonrpc":"2.0","id":2,"method":"`+method+`","params":`+params+`}`))
 	return rec.Body.String()
 }
 
@@ -391,4 +401,46 @@ func TestCrossPodGETDuringRegistration(t *testing.T) {
 	assert.Contains(t, body, `"ok"`, "alice must own her session after eve's GET")
 	body = callEcho(t, podB, "eve", sessionID)
 	assert.Contains(t, body, "Unauthorized", "eve must not be able to use alice's session")
+}
+
+// TestCrossPodRehydration covers a session initialized on pod A and used on pod B,
+// which never ran the registration for it: pod B restores the session from the
+// shared store and fills the per-session tool and resource stores from the core,
+// without creating the session again.
+func TestCrossPodRehydration(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		method string
+		params string
+		want   string
+	}{
+		{name: "tools/list", method: "tools/list", params: `{}`, want: `"name":"echo"`},
+		{name: "tools/call", method: "tools/call", params: `{"name":"echo","arguments":{}}`, want: `"text":"ok"`},
+		{name: "resources/list", method: "resources/list", params: `{}`, want: `"uri":"` + crossPodResourceURI + `"`},
+		{
+			name: "resources/read", method: "resources/read",
+			params: `{"uri":"` + crossPodResourceURI + `"}`, want: `"text":"resource-body"`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			shared, err := transportsession.NewLocalSessionDataStorage(time.Hour)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = shared.Close() })
+			podA := startCrossPod(t, shared, nil)
+			podB := startCrossPod(t, shared, nil)
+
+			sessionID := initSession(t, shared, podA, "alice")
+			binding := storedBinding(t, shared, sessionID)
+
+			body := crossPodRPC(t, podB, "alice", sessionID, tc.method, tc.params)
+			assert.Contains(t, body, tc.want, "pod B must serve %s for a session from pod A", tc.method)
+			assert.NotContains(t, body, `"error"`)
+			assert.Equal(t, int32(0), podB.factory.makes.Load(), "pod B must not create the session again")
+			assert.Equal(t, binding, storedBinding(t, shared, sessionID), "the stored binding must not change")
+		})
+	}
 }
