@@ -107,8 +107,9 @@ spec:
                 - name
                 type: object
               authzConfig:
-                description: AuthzConfig defines authorization policy configuration
-                  for the MCP server
+                description: |-
+                  AuthzConfig defines authorization policy configuration for the MCP server.
+                  AuthzConfig and AuthzConfigRef are mutually exclusive.
                 properties:
                   configMap:
                     description: |-
@@ -216,6 +217,20 @@ spec:
                 - message: inline must be set when type is 'inline', and must not
                     be set otherwise
                   rule: 'self.type == ''inline'' ? has(self.inline) : !has(self.inline)'
+              authzConfigRef:
+                description: |-
+                  AuthzConfigRef references a shared MCPAuthzConfig resource for authorization.
+                  The referenced MCPAuthzConfig must exist in the same namespace as this MCPServer.
+                  Mutually exclusive with authzConfig.
+                properties:
+                  name:
+                    description: Name is the name of the MCPAuthzConfig resource in
+                      the same namespace.
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                type: object
               backendReplicas:
                 description: |-
                   BackendReplicas is the desired number of MCP server backend pod replicas.
@@ -836,6 +851,9 @@ spec:
             - image
             type: object
             x-kubernetes-validations:
+            - message: authzConfig and authzConfigRef are mutually exclusive; use
+                authzConfigRef to reference a shared MCPAuthzConfig
+              rule: '!(has(self.authzConfig) && has(self.authzConfigRef))'
             - message: rateLimiting requires sessionStorage with provider 'redis'
               rule: '!has(self.rateLimiting) || (has(self.sessionStorage) && self.sessionStorage.provider
                 == ''redis'')'
@@ -854,6 +872,10 @@ spec:
                 description: |-
                   AuthServerConfigHash is the hash of the referenced authServerRef spec,
                   used to detect configuration changes and trigger reconciliation.
+                type: string
+              authzConfigHash:
+                description: AuthzConfigHash is the hash of the referenced MCPAuthzConfig
+                  spec for change detection
                 type: string
               conditions:
                 description: Conditions represent the latest available observations
@@ -1047,8 +1069,9 @@ spec:
                 - name
                 type: object
               authzConfig:
-                description: AuthzConfig defines authorization policy configuration
-                  for the MCP server
+                description: |-
+                  AuthzConfig defines authorization policy configuration for the MCP server.
+                  AuthzConfig and AuthzConfigRef are mutually exclusive.
                 properties:
                   configMap:
                     description: |-
@@ -1156,6 +1179,20 @@ spec:
                 - message: inline must be set when type is 'inline', and must not
                     be set otherwise
                   rule: 'self.type == ''inline'' ? has(self.inline) : !has(self.inline)'
+              authzConfigRef:
+                description: |-
+                  AuthzConfigRef references a shared MCPAuthzConfig resource for authorization.
+                  The referenced MCPAuthzConfig must exist in the same namespace as this MCPServer.
+                  Mutually exclusive with authzConfig.
+                properties:
+                  name:
+                    description: Name is the name of the MCPAuthzConfig resource in
+                      the same namespace.
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                type: object
               backendReplicas:
                 description: |-
                   BackendReplicas is the desired number of MCP server backend pod replicas.
@@ -1776,6 +1813,9 @@ spec:
             - image
             type: object
             x-kubernetes-validations:
+            - message: authzConfig and authzConfigRef are mutually exclusive; use
+                authzConfigRef to reference a shared MCPAuthzConfig
+              rule: '!(has(self.authzConfig) && has(self.authzConfigRef))'
             - message: rateLimiting requires sessionStorage with provider 'redis'
               rule: '!has(self.rateLimiting) || (has(self.sessionStorage) && self.sessionStorage.provider
                 == ''redis'')'
@@ -1794,6 +1834,10 @@ spec:
                 description: |-
                   AuthServerConfigHash is the hash of the referenced authServerRef spec,
                   used to detect configuration changes and trigger reconciliation.
+                type: string
+              authzConfigHash:
+                description: AuthzConfigHash is the hash of the referenced MCPAuthzConfig
+                  spec for change detection
                 type: string
               conditions:
                 description: Conditions represent the latest available observations

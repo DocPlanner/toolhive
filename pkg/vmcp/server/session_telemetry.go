@@ -13,13 +13,10 @@ import (
 // sessionTelemetryInstrumentationName matches the vMCP backend telemetry meter.
 const sessionTelemetryInstrumentationName = "github.com/stacklok/toolhive/pkg/vmcp"
 
-// monitorSessionCardinality registers observable gauges for the main vMCP
-// session layers so operators can distinguish transport/session churn from
-// live SDK-session growth and post-initialize registration backlog.
-func monitorSessionCardinality(
-	meterProvider metric.MeterProvider,
-	srv *Server,
-) error {
+// monitorSessionCardinality registers observable gauges for the vMCP session
+// layers, so operators can tell transport-session churn apart from live SDK
+// session growth and from a post-initialize registration backlog.
+func monitorSessionCardinality(meterProvider metric.MeterProvider, srv *Server) error {
 	meter := meterProvider.Meter(sessionTelemetryInstrumentationName)
 
 	activeTransportSessions, err := meter.Int64ObservableGauge(
@@ -50,7 +47,7 @@ func monitorSessionCardinality(
 		func(_ context.Context, observer metric.Observer) error {
 			observer.ObserveInt64(activeTransportSessions, int64(srv.sessionManager.Count()))
 			observer.ObserveInt64(activeSDKSessions, srv.activeClientSessionCount())
-			observer.ObserveInt64(inFlightRegistrations, srv.inFlightRegistrationCount())
+			observer.ObserveInt64(inFlightRegistrations, srv.inFlightRegistrations.Load())
 			return nil
 		},
 		activeTransportSessions,
@@ -60,24 +57,9 @@ func monitorSessionCardinality(
 	if err != nil {
 		return fmt.Errorf("failed to register session cardinality callback: %w", err)
 	}
-
 	return nil
 }
 
 func (s *Server) activeClientSessionCount() int64 {
-	var count int64
-	s.activeClientSessions.Range(func(_, _ any) bool {
-		count++
-		return true
-	})
-	return count
-}
-
-func (s *Server) inFlightRegistrationCount() int64 {
-	var count int64
-	s.inFlightRegistrations.Range(func(_, _ any) bool {
-		count++
-		return true
-	})
-	return count
+	return s.activeClientSessions.count()
 }

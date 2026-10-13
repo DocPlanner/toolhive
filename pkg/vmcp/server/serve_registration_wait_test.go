@@ -1,0 +1,223 @@
+// SPDX-FileCopyrightText: Copyright 2025 Stacklok, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+package server
+
+import (
+	"context"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+
+	"github.com/stacklok/toolhive/pkg/auth"
+	transportsession "github.com/stacklok/toolhive/pkg/transport/session"
+	"github.com/stacklok/toolhive/pkg/vmcp"
+	"github.com/stacklok/toolhive/pkg/vmcp/server/sessionmanager"
+	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
+	sessiontypes "github.com/stacklok/toolhive/pkg/vmcp/session/types"
+)
+
+// gatedSessionFactory holds MakeSessionWithID until release is closed, so a test
+// can send a call while the session registration is still running.
+type gatedSessionFactory struct {
+	vmcpsession.MultiSessionFactory
+	release chan struct{}
+}
+
+func (f *gatedSessionFactory) MakeSessionWithID(
+	ctx context.Context, id string, identity *auth.Identity, backends []*vmcp.Backend,
+) (vmcpsession.MultiSession, error) {
+	<-f.release
+	return f.MultiSessionFactory.MakeSessionWithID(ctx, id, identity, backends)
+}
+
+// startGatedRegistration builds a Serve server, generates a session placeholder and
+// starts its registration, which blocks in the session factory until the returned
+// release func is called.
+func startGatedRegistration(t *testing.T) (*Server, string, func()) {
+	t.Helper()
+	ctrl := gomock.NewController(t)
+	tools := []vmcp.Tool{{Name: "t"}}
+	base, _ := newToolSessionFactory(t, ctrl, tools)
+	factory := &gatedSessionFactory{MultiSessionFactory: base, release: make(chan struct{})}
+
+	srv, err := Serve(context.Background(), &fakeCore{tools: tools}, &ServerConfig{
+		SessionTTL:           time.Minute,
+		SessionManagerConfig: &sessionmanager.FactoryConfig{Base: factory},
+		BackendRegistry:      vmcp.NewImmutableRegistry([]vmcp.Backend{}),
+	})
+	require.NoError(t, err)
+
+	sessionID := srv.vmcpSessionMgr.Generate()
+	require.NotEmpty(t, sessionID)
+	registered := make(chan struct{})
+	go func() {
+		defer close(registered)
+		srv.handleSessionRegistration(context.Background(),
+			&fakeSDKSession{id: sessionID, tools: map[string]server.ServerTool{}})
+	}()
+
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			close(factory.release)
+		}
+	}
+	t.Cleanup(func() {
+		release()
+		<-registered
+		_ = srv.Stop(context.Background())
+	})
+	return srv, sessionID, release
+}
+
+// TestEnforceSessionBindingWaitsForRegistration covers a call that arrives after
+// initialize returned the session ID but before the registration wrote the
+// identity binding.
+func TestEnforceSessionBindingWaitsForRegistration(t *testing.T) {
+	t.Parallel()
+
+	t.Run("call waits and succeeds once the registration finishes", func(t *testing.T) {
+		t.Parallel()
+		srv, sessionID, release := startGatedRegistration(t)
+
+		result := make(chan error, 1)
+		go func() { result <- srv.enforceSessionBinding(context.Background(), sessionID, nil) }()
+
+		select {
+		case err := <-result:
+			t.Fatalf("enforceSessionBinding returned before the registration finished: %v", err)
+		case <-time.After(150 * time.Millisecond):
+		}
+
+		release()
+		select {
+		case err := <-result:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("enforceSessionBinding did not return after the registration finished")
+		}
+	})
+
+	t.Run("call that gives up waiting does not terminate the session", func(t *testing.T) {
+		t.Parallel()
+		srv, sessionID, release := startGatedRegistration(t)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		req := mcp.CallToolRequest{Params: mcp.CallToolParams{Name: "t", Arguments: map[string]any{}}}
+		res, err := srv.coreToolHandler(sessionID, "t", "")(ctx, req)
+		require.NoError(t, err)
+		require.True(t, res.IsError)
+
+		isTerminated, err := srv.vmcpSessionMgr.Validate(sessionID)
+		require.NoError(t, err, "the placeholder must still exist")
+		assert.False(t, isTerminated, "the session must not be terminated on 'not registered yet'")
+
+		release()
+		require.Eventually(t, func() bool {
+			return srv.enforceSessionBinding(context.Background(), sessionID, nil) == nil
+		}, 5*time.Second, 25*time.Millisecond, "the session must be usable after the registration")
+	})
+
+	t.Run("unknown session is rejected without waiting", func(t *testing.T) {
+		t.Parallel()
+		srv, _, _ := startGatedRegistration(t)
+
+		start := time.Now()
+		err := srv.enforceSessionBinding(context.Background(), "no-such-session", nil)
+		require.ErrorIs(t, err, sessiontypes.ErrUnauthorizedCaller)
+		assert.Less(t, time.Since(start), time.Second)
+	})
+}
+
+// countingStorage counts Load calls on a DataStorage.
+type countingStorage struct {
+	transportsession.DataStorage
+	loads atomic.Int32
+}
+
+func (c *countingStorage) Load(ctx context.Context, id string) (map[string]string, error) {
+	c.loads.Add(1)
+	return c.DataStorage.Load(ctx, id)
+}
+
+// TestRegistrationWaitBacksOff verifies that a call waiting for a registration
+// reads the session store once per step, with a growing step, instead of a full
+// session lookup plus a placeholder check every 25 ms.
+func TestRegistrationWaitBacksOff(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	tools := []vmcp.Tool{{Name: "t"}}
+	base, _ := newToolSessionFactory(t, ctrl, tools)
+	srv, err := Serve(context.Background(), &fakeCore{tools: tools}, &ServerConfig{
+		SessionTTL:           time.Minute,
+		SessionManagerConfig: &sessionmanager.FactoryConfig{Base: base},
+		BackendRegistry:      vmcp.NewImmutableRegistry([]vmcp.Backend{}),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = srv.Stop(context.Background()) })
+
+	local, err := transportsession.NewLocalSessionDataStorage(time.Minute)
+	require.NoError(t, err)
+	storage := &countingStorage{DataStorage: local}
+	mgr, cleanup, err := sessionmanager.New(storage, &sessionmanager.FactoryConfig{Base: base},
+		vmcp.NewImmutableRegistry([]vmcp.Backend{}))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cleanup(context.Background()) })
+	srv.vmcpSessionMgr = mgr
+	_ = srv.sessionDataStorage.Close()
+	srv.sessionDataStorage = storage
+
+	// A placeholder whose registration never runs stays pending.
+	sessionID := mgr.Generate()
+	storage.loads.Store(0)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err = srv.enforceSessionBinding(ctx, sessionID, nil)
+	require.ErrorIs(t, err, errSessionNotRegistered)
+	assert.Less(t, storage.loads.Load(), int32(15), "a one-second wait must read the store only a few times")
+}
+
+// TestUnregisterDuringRegistration verifies that a session mcp-go unregisters
+// while its registration is still running is not left in the set of active
+// sessions (which feeds the gauges and the capability refresh).
+func TestUnregisterDuringRegistration(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	tools := []vmcp.Tool{{Name: "t"}}
+	base, _ := newToolSessionFactory(t, ctrl, tools)
+	factory := &gatedSessionFactory{MultiSessionFactory: base, release: make(chan struct{})}
+	srv, err := Serve(context.Background(), &fakeCore{tools: tools}, &ServerConfig{
+		SessionTTL:           time.Minute,
+		SessionManagerConfig: &sessionmanager.FactoryConfig{Base: factory},
+		BackendRegistry:      vmcp.NewImmutableRegistry([]vmcp.Backend{}),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = srv.Stop(context.Background()) })
+
+	sessionID := srv.vmcpSessionMgr.Generate()
+	sess := &fakeSDKSession{id: sessionID, tools: map[string]server.ServerTool{}}
+	registered := make(chan error, 1)
+	go func() { registered <- srv.mcpServer.RegisterSession(context.Background(), sess) }()
+
+	// Wait until the registration is blocked in the session factory, then
+	// unregister the session, as a DELETE or the end of a GET would.
+	require.Eventually(t, func() bool { return srv.inFlightRegistrations.Load() == 1 },
+		2*time.Second, 5*time.Millisecond)
+	srv.mcpServer.UnregisterSession(context.Background(), sessionID)
+	close(factory.release)
+	require.NoError(t, <-registered)
+
+	assert.Zero(t, srv.activeClientSessionCount(), "an unregistered session must not stay active")
+}

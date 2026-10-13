@@ -74,13 +74,6 @@ type RedisRunConfig struct {
 	// Mutually exclusive with SentinelConfig.
 	Addr string `json:"addr,omitempty" yaml:"addr,omitempty"`
 
-	// LegacyAddress is the pre-v0.27 serialized name of Addr. DocPlanner fork:
-	// still read so an image can start from a RunConfig written by an older
-	// operator. Never written by the current operator. Remove with PAIINFRA-228.
-	//
-	// Deprecated: use Addr.
-	LegacyAddress string `json:"address,omitempty" yaml:"address,omitempty"`
-
 	// ClusterMode enables the Redis Cluster protocol. Requires Addr to be set.
 	ClusterMode bool `json:"cluster_mode,omitempty" yaml:"cluster_mode,omitempty"`
 
@@ -143,15 +136,4 @@ type ACLUserRunConfig struct {
 
 	// PasswordEnvVar is the environment variable containing the Redis password.
 	PasswordEnvVar string `json:"password_env_var" yaml:"password_env_var"`
-}
-
-// EffectiveAddr returns Addr, falling back to the legacy serialized address.
-func (c *RedisRunConfig) EffectiveAddr() string {
-	if c == nil {
-		return ""
-	}
-	if c.Addr != "" {
-		return c.Addr
-	}
-	return c.LegacyAddress
 }

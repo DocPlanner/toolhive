@@ -72,7 +72,8 @@ func NewIncomingAuthMiddleware(
 
 	switch cfg.Type {
 	case "oidc":
-		authMiddleware, authInfoHandler, err = newOIDCAuthMiddleware(ctx, cfg.OIDC, upstreamReader, keyProvider)
+		authMiddleware, authInfoHandler, err = newOIDCAuthMiddleware(
+			ctx, cfg.OIDC, upstreamReader, keyProvider, primaryUpstreamProvider(cfg))
 	case "local":
 		authMiddleware, authInfoHandler, err = newLocalAuthMiddleware(ctx)
 	case "anonymous":
@@ -123,6 +124,40 @@ func newCedarAuthzMiddleware(
 
 	slog.Info("creating Cedar authorization middleware", "policies", len(authzCfg.Policies))
 
+	authzConfig, err := buildCedarAuthzConfig(authzCfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create authz config: %w", err)
+	}
+
+	// Create the middleware using the existing factory
+	middlewareFn, err := authz.CreateMiddlewareFromConfig(authzConfig, serverName, passThroughTools)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Cedar middleware: %w", err)
+	}
+
+	return middlewareFn, nil
+}
+
+// BuildAuthzConfig builds the authorizer-agnostic *authz.Config that the vMCP core
+// admission seam (core.Config.Authz) consumes from the incoming-auth config, or
+// (nil, nil) when no Cedar policies are configured.
+//
+// It is the SAME config newCedarAuthzMiddleware builds the HTTP authz middleware from,
+// surfaced so the composition root can feed it to core.New via server.Config.Authz once
+// server.New routes through Serve. The nil return mirrors that middleware's nil result
+// for the no-policies case, preserving allow-all parity (a nil core Authz is allow-all).
+func BuildAuthzConfig(authzCfg *config.AuthzConfig) (*authz.Config, error) {
+	if authzCfg == nil || authzCfg.Type != "cedar" || len(authzCfg.Policies) == 0 {
+		return nil, nil
+	}
+	return buildCedarAuthzConfig(authzCfg)
+}
+
+// buildCedarAuthzConfig converts the vMCP Cedar authz config into the authorizer-agnostic
+// authorizers.Config (aliased as authz.Config) consumed by both the HTTP authz middleware
+// (newCedarAuthzMiddleware) and the core admission seam (via BuildAuthzConfig). Callers
+// guarantee authzCfg is non-nil with at least one policy.
+func buildCedarAuthzConfig(authzCfg *config.AuthzConfig) (*authz.Config, error) {
 	// Default EntitiesJSON to "[]" when the operator/CLI did not set it. Cedar
 	// requires a valid JSON array; an empty string would fail to parse.
 	entitiesJSON := authzCfg.EntitiesJSON
@@ -149,19 +184,16 @@ func newCedarAuthzMiddleware(
 		},
 	}
 
-	// Create the authz Config using the factory method
-	authzConfig, err := authorizers.NewConfig(cedarConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create authz config: %w", err)
-	}
+	return authorizers.NewConfig(cedarConfig)
+}
 
-	// Create the middleware using the existing factory
-	middlewareFn, err := authz.CreateMiddlewareFromConfig(authzConfig, serverName, passThroughTools)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Cedar middleware: %w", err)
+// primaryUpstreamProvider returns the upstream provider whose token Cedar reads
+// claims from, or "" when none is configured.
+func primaryUpstreamProvider(cfg *config.IncomingAuthConfig) string {
+	if cfg.Authz == nil {
+		return ""
 	}
-
-	return middlewareFn, nil
+	return cfg.Authz.PrimaryUpstreamProvider
 }
 
 // newOIDCAuthMiddleware creates OIDC authentication middleware.
@@ -171,11 +203,17 @@ func newCedarAuthzMiddleware(
 // The reader parameter, when non-nil, enables the JWT validator to load upstream
 // provider tokens from the embedded auth server's storage. This is required for
 // upstream_inject outgoing auth to work with an embedded auth server.
+//
+// A non-empty requiredProvider (the authz primaryUpstreamProvider) must have
+// upstream credentials for every request with a token session: without them Cedar
+// sees no claims and denies everything, so the client would get an empty
+// tools/list instead of a 401 that makes it authenticate again.
 func newOIDCAuthMiddleware(
 	ctx context.Context,
 	oidcCfg *config.OIDCConfig,
 	reader upstreamtoken.TokenReader,
 	keyProvider keys.PublicKeyProvider,
+	requiredProvider string,
 ) (func(http.Handler) http.Handler, http.Handler, error) {
 	if oidcCfg == nil {
 		return nil, nil, fmt.Errorf("OIDC configuration required when Type='oidc'")
@@ -210,6 +248,9 @@ func newOIDCAuthMiddleware(
 	}
 	if reader != nil {
 		opts = append(opts, auth.WithUpstreamTokenReader(reader))
+		if requiredProvider != "" {
+			opts = append(opts, auth.WithRequiredUpstreamProviders(requiredProvider))
+		}
 	}
 
 	// pkg/auth.GetAuthenticationMiddleware now returns middleware that creates Identity

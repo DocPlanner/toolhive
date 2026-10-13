@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	mcpv1beta1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1beta1"
+	"github.com/stacklok/toolhive/cmd/thv-operator/internal/testutil"
 	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/oidc"
 	"github.com/stacklok/toolhive/pkg/authserver"
 	authrunner "github.com/stacklok/toolhive/pkg/authserver/runner"
@@ -638,9 +639,7 @@ func TestGenerateAuthServerEnvVars(t *testing.T) {
 func TestGenerateAuthServerConfigByName(t *testing.T) {
 	t.Parallel()
 
-	scheme := runtime.NewScheme()
-	err := mcpv1beta1.AddToScheme(scheme)
-	require.NoError(t, err)
+	scheme := testutil.NewScheme(t)
 
 	tests := []struct {
 		name            string
@@ -1123,6 +1122,40 @@ func TestBuildAuthServerRunConfig(t *testing.T) {
 			},
 		},
 		{
+			name: "OIDC upstream propagates SubjectClaim",
+			authConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://auth.example.com",
+				SigningKeySecretRefs: []mcpv1beta1.SecretKeyRef{
+					{Name: "signing-key", Key: "private.pem"},
+				},
+				HMACSecretRefs: []mcpv1beta1.SecretKeyRef{
+					{Name: "hmac-secret", Key: "hmac"},
+				},
+				UpstreamProviders: []mcpv1beta1.UpstreamProviderConfig{
+					{
+						Name: "entra",
+						Type: mcpv1beta1.UpstreamProviderTypeOIDC,
+						OIDCConfig: &mcpv1beta1.OIDCUpstreamConfig{
+							IssuerURL:    "https://login.microsoftonline.com/tenant/v2.0",
+							ClientID:     "entra-client-id",
+							RedirectURI:  "https://auth.example.com/callback",
+							Scopes:       []string{"openid", "profile"},
+							SubjectClaim: "oid",
+						},
+					},
+				},
+			},
+			allowedAudiences: defaultAudiences,
+			scopesSupported:  defaultScopes,
+			checkFunc: func(t *testing.T, config *authserver.RunConfig) {
+				t.Helper()
+				require.Len(t, config.Upstreams, 1)
+				upstream := config.Upstreams[0]
+				require.NotNil(t, upstream.OIDCConfig)
+				assert.Equal(t, "oid", upstream.OIDCConfig.SubjectClaim)
+			},
+		},
+		{
 			name: "OAuth2 upstream propagates AdditionalAuthorizationParams",
 			authConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
 				Issuer: "https://auth.example.com",
@@ -1538,6 +1571,79 @@ func TestBuildAuthServerRunConfig(t *testing.T) {
 					"IdentityFromToken must be nil when not configured")
 			},
 		},
+		{
+			name: "DisableUpstreamTokenInjection is wired through",
+			authConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://auth.example.com",
+				SigningKeySecretRefs: []mcpv1beta1.SecretKeyRef{
+					{Name: "signing-key", Key: "private.pem"},
+				},
+				HMACSecretRefs: []mcpv1beta1.SecretKeyRef{
+					{Name: "hmac-secret", Key: "hmac"},
+				},
+				DisableUpstreamTokenInjection: true,
+			},
+			allowedAudiences: defaultAudiences,
+			scopesSupported:  defaultScopes,
+			checkFunc: func(t *testing.T, config *authserver.RunConfig) {
+				t.Helper()
+				assert.True(t, config.DisableUpstreamTokenInjection,
+					"DisableUpstreamTokenInjection should be wired from CRD to RunConfig")
+			},
+		},
+		{
+			name: "DisableUpstreamTokenInjection defaults to false",
+			authConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://auth.example.com",
+				SigningKeySecretRefs: []mcpv1beta1.SecretKeyRef{
+					{Name: "signing-key", Key: "private.pem"},
+				},
+				HMACSecretRefs: []mcpv1beta1.SecretKeyRef{
+					{Name: "hmac-secret", Key: "hmac"},
+				},
+			},
+			allowedAudiences: defaultAudiences,
+			scopesSupported:  defaultScopes,
+			checkFunc: func(t *testing.T, config *authserver.RunConfig) {
+				t.Helper()
+				assert.False(t, config.DisableUpstreamTokenInjection,
+					"DisableUpstreamTokenInjection should default to false")
+			},
+		},
+		{
+			name: "insecureAllowHTTP true is propagated to RunConfig",
+			authConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer:            "http://vmcp-test.default.svc.cluster.local:4483",
+				InsecureAllowHTTP: true,
+				HMACSecretRefs: []mcpv1beta1.SecretKeyRef{
+					{Name: "hmac-secret", Key: "hmac"},
+				},
+			},
+			allowedAudiences: defaultAudiences,
+			scopesSupported:  defaultScopes,
+			checkFunc: func(t *testing.T, config *authserver.RunConfig) {
+				t.Helper()
+				assert.True(t, config.InsecureAllowHTTP,
+					"InsecureAllowHTTP must propagate from CRD field to RunConfig")
+			},
+		},
+		{
+			name: "insecureAllowHTTP false is propagated to RunConfig",
+			authConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer:            "https://authserver.example.com",
+				InsecureAllowHTTP: false,
+				HMACSecretRefs: []mcpv1beta1.SecretKeyRef{
+					{Name: "hmac-secret", Key: "hmac"},
+				},
+			},
+			allowedAudiences: defaultAudiences,
+			scopesSupported:  defaultScopes,
+			checkFunc: func(t *testing.T, config *authserver.RunConfig) {
+				t.Helper()
+				assert.False(t, config.InsecureAllowHTTP,
+					"InsecureAllowHTTP false must propagate from CRD field to RunConfig")
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -1614,9 +1720,7 @@ func TestBuildAuthServerRunConfig_InvalidDCR(t *testing.T) {
 func TestAddEmbeddedAuthServerConfigOptions_Validation(t *testing.T) {
 	t.Parallel()
 
-	scheme := runtime.NewScheme()
-	err := mcpv1beta1.AddToScheme(scheme)
-	require.NoError(t, err)
+	scheme := testutil.NewScheme(t)
 
 	// Helper function to create a fresh external auth config for each test
 	// This avoids data races when running subtests in parallel
@@ -2090,7 +2194,7 @@ func TestBuildStorageRunConfig(t *testing.T) {
 				Storage: &mcpv1beta1.AuthServerStorageConfig{
 					Type: mcpv1beta1.AuthServerStorageTypeRedis,
 					Redis: &mcpv1beta1.RedisStorageConfig{
-						Address: "dragonfly.toolhive-operator-stg.svc.cluster.local:6379",
+						Addr: "dragonfly.toolhive-operator-stg.svc.cluster.local:6379",
 						ACLUserConfig: &mcpv1beta1.RedisACLUserConfig{
 							UsernameSecretRef: &mcpv1beta1.SecretKeyRef{Name: "s", Key: "u"},
 							PasswordSecretRef: &mcpv1beta1.SecretKeyRef{Name: "s", Key: "p"},
@@ -2139,7 +2243,7 @@ func TestBuildStorageRunConfig(t *testing.T) {
 				Storage: &mcpv1beta1.AuthServerStorageConfig{
 					Type: mcpv1beta1.AuthServerStorageTypeRedis,
 					Redis: &mcpv1beta1.RedisStorageConfig{
-						Address: "dragonfly:6379",
+						Addr: "dragonfly:6379",
 						SentinelConfig: &mcpv1beta1.RedisSentinelConfig{
 							MasterName:    "mymaster",
 							SentinelAddrs: []string{"10.0.0.1:26379"},
@@ -2258,7 +2362,7 @@ func TestBuildStorageRunConfig(t *testing.T) {
 				Storage: &mcpv1beta1.AuthServerStorageConfig{
 					Type: mcpv1beta1.AuthServerStorageTypeRedis,
 					Redis: &mcpv1beta1.RedisStorageConfig{
-						Address: "dragonfly:6379",
+						Addr: "dragonfly:6379",
 						ACLUserConfig: &mcpv1beta1.RedisACLUserConfig{
 							UsernameSecretRef: &mcpv1beta1.SecretKeyRef{Name: "s", Key: "u"},
 							PasswordSecretRef: &mcpv1beta1.SecretKeyRef{Name: "s", Key: "p"},
@@ -2379,7 +2483,7 @@ func TestBuildAuthServerRunConfig_WithDirectRedisStorage(t *testing.T) {
 		Storage: &mcpv1beta1.AuthServerStorageConfig{
 			Type: mcpv1beta1.AuthServerStorageTypeRedis,
 			Redis: &mcpv1beta1.RedisStorageConfig{
-				Address: "dragonfly.toolhive-operator-stg.svc.cluster.local:6379",
+				Addr: "dragonfly.toolhive-operator-stg.svc.cluster.local:6379",
 				ACLUserConfig: &mcpv1beta1.RedisACLUserConfig{
 					UsernameSecretRef: &mcpv1beta1.SecretKeyRef{Name: "redis-creds", Key: "username"},
 					PasswordSecretRef: &mcpv1beta1.SecretKeyRef{Name: "redis-creds", Key: "password"},
@@ -2408,9 +2512,7 @@ func TestBuildAuthServerRunConfig_WithDirectRedisStorage(t *testing.T) {
 func TestAddAuthServerRefOptions(t *testing.T) {
 	t.Parallel()
 
-	scheme := runtime.NewScheme()
-	require.NoError(t, mcpv1beta1.AddToScheme(scheme))
-	require.NoError(t, corev1.AddToScheme(scheme))
+	scheme := testutil.NewScheme(t)
 
 	newValidEmbeddedAuthConfig := func() *mcpv1beta1.MCPExternalAuthConfig {
 		return &mcpv1beta1.MCPExternalAuthConfig{
@@ -2584,9 +2686,7 @@ func TestAddAuthServerRefOptions(t *testing.T) {
 func TestValidateAndAddAuthServerRefOptions(t *testing.T) {
 	t.Parallel()
 
-	scheme := runtime.NewScheme()
-	require.NoError(t, mcpv1beta1.AddToScheme(scheme))
-	require.NoError(t, corev1.AddToScheme(scheme))
+	scheme := testutil.NewScheme(t)
 
 	newEmbeddedAuthConfig := func() *mcpv1beta1.MCPExternalAuthConfig {
 		return &mcpv1beta1.MCPExternalAuthConfig{

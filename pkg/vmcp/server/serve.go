@@ -4,12 +4,13 @@
 package server
 
 import (
-	"cmp"
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
+	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/stacklok/toolhive/pkg/audit"
@@ -19,7 +20,6 @@ import (
 	"github.com/stacklok/toolhive/pkg/vmcp"
 	vmcpconfig "github.com/stacklok/toolhive/pkg/vmcp/config"
 	"github.com/stacklok/toolhive/pkg/vmcp/core"
-	"github.com/stacklok/toolhive/pkg/vmcp/health"
 	"github.com/stacklok/toolhive/pkg/vmcp/server/sessionmanager"
 	vmcpstatus "github.com/stacklok/toolhive/pkg/vmcp/status"
 )
@@ -64,22 +64,30 @@ type ServerConfig struct {
 	// SessionTTL is the session time-to-live duration (default: 30 minutes).
 	SessionTTL time.Duration
 
+	// WriteTimeout is the HTTP server write deadline. Values below the default
+	// (30 s) are raised to it.
+	WriteTimeout time.Duration
+
 	// AuthMiddleware is the optional authentication middleware applied to MCP routes.
 	// If nil, no authentication is required.
 	AuthMiddleware func(http.Handler) http.Handler
+
+	// RateLimitMiddleware is the optional rate-limit middleware to apply after
+	// authentication and MCP request parsing.
+	RateLimitMiddleware func(http.Handler) http.Handler
 
 	// AuthInfoHandler is the optional handler for the
 	// /.well-known/oauth-protected-resource endpoint.
 	AuthInfoHandler http.Handler
 
+	// PassthroughHeaders is an allowlist of incoming client header names the vMCP
+	// forwards, unchanged, to every backend it calls (see headerforward.CaptureMiddleware).
+	// Empty disables capture.
+	PassthroughHeaders []string
+
 	// AuthServer is the optional embedded authorization server. When non-nil, its
 	// routes are registered on the mux alongside the protected resource metadata.
 	AuthServer *asrunner.EmbeddedAuthServer
-
-	// HealthMonitor is the already-built backend health monitor (constructed at the
-	// composition root so the same instance's StatusProvider can be injected into the
-	// core). Serve owns only its Start/Stop lifecycle. Nil disables health monitoring.
-	HealthMonitor *health.Monitor
 
 	// StatusReportingInterval is the interval for reporting status updates.
 	// If zero, the default reporting interval is used.
@@ -118,6 +126,23 @@ type ServerConfig struct {
 	// definitions before assembling this config (sessionmanager.New only checks the
 	// WorkflowDefs/ComposerFactory pairing). This responsibility moves here with the
 	// relocation and matters when server.New is routed through Serve in Phase 3.
+	//
+	// Caller responsibility (AC2, the single-aggregation contract): FactoryConfig.Base
+	// MUST be constructed WITHOUT a session.WithAggregator option on the Serve path. On
+	// this path the core is the single source of truth — session registration sources the
+	// advertised set from core.ListTools/ListResources and routes calls through the core
+	// (handleSessionRegistrationImpl/serve_handlers.go); the factory's role is reduced to
+	// opening the session's backend connections and binding identity. A factory that also
+	// aggregates would produce a second, divergent capability set (drift) whose routing
+	// table this path discards — exactly the double-aggregation AC2 forbids. This is an
+	// unenforced contract today because no production composition root wires the Serve path
+	// yet; it becomes load-bearing when one does.
+	//
+	// Caller responsibility (optimizer): to enable the optimizer on the Serve path, set
+	// FactoryConfig.OptimizerConfig/OptimizerFactory AND FactoryConfig.AdvertiseFromCore.
+	// Serve then builds a per-session optimizer over the core's tools (serve_optimizer.go);
+	// AdvertiseFromCore suppresses the factory's own optimizer decorator so the shared FTS5
+	// store is not double-indexed (see FactoryConfig.AdvertiseFromCore).
 	SessionManagerConfig *sessionmanager.FactoryConfig
 
 	// TelemetryProvider is the cross-cutting telemetry provider (also consumed by
@@ -143,24 +168,31 @@ type ServerConfig struct {
 // .well-known endpoints, and any embedded auth-server routes) when Serve's *Server
 // is served.
 //
-// The remaining transport concerns — the authenticated middleware chain (#5441), the
-// direct VMCP request path (#5442), and the AS runner / status reporter / optimizer /
-// health monitor lifecycle (#5443) — are relocated under Serve by the subsequent
-// Phase 2 tasks. server.New is not yet routed through Serve and keeps its own copy of
-// the session wiring until Phase 3, so this is purely additive and observable behavior
-// is unchanged.
+// The authenticated middleware chain is produced by the shared (*Server).Handler that
+// the Serve-built *Server already uses, with the authz and annotation-enrichment layers
+// guarded off via a nil AuthzMiddleware (#5441); authorization moves to the core
+// admission seam (#5438). The injected core is stored on the *Server, which makes the
+// "/" MCP route serveable: the shared Handler guards the discovery middleware to the
+// legacy path (s.core == nil), and on the Serve path session registration and request
+// handlers call the core directly (#5442). The last transport subsystems — the embedded
+// AS runner routes, the status reporter (and its periodic goroutine), and the optimizer
+// cleanup — are driven from the carried-forward shared (*Server).Handler/Start/Stop using
+// the fields Serve populates from ServerConfig below. The backend health monitor is owned
+// by the core (built/started in core.New, stopped in core.Close); Serve neither constructs
+// nor starts it, and the status reporter reads it back through the core (#5443 reversal).
 //
 // Serve returns a vmcp.ErrInvalidConfig-wrapped error for a nil cfg, a nil core, or a
 // nil required collaborator (SessionManagerConfig or BackendRegistry). The session
 // hooks close over the constructed *Server, so they are registered after it is
 // assembled.
 //
-// Contract: the returned *Server now has a live session manager and backend registry,
-// but a nil discovery manager, router, and backend client at this phase. It must NOT
-// be Start()ed or served on the "/" MCP route until #5441/#5442 wire those fields —
-// the carried-forward Handler passes them to discovery.Middleware, which would
-// nil-deref. The unauthenticated routes (registered as direct mux entries) are safe
-// to serve.
+// Contract: the returned *Server has a live session manager, backend registry, and core,
+// but a nil discovery manager, router, and backend client — the request path goes
+// through the core, so those legacy collaborators are unused on the Serve path. The
+// shared Handler skips the discovery middleware when s.core != nil, so serving the "/"
+// MCP route no longer nil-derefs. The embedded AS runner routes, the status reporter, and
+// the optimizer cleanup are driven from the shared Handler/Start/Stop via the fields Serve
+// populates from ServerConfig; the backend health monitor is owned by the core (#5443).
 func Serve(ctx context.Context, v core.VMCP, cfg *ServerConfig) (*Server, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("%w: nil server config", vmcp.ErrInvalidConfig)
@@ -187,12 +219,13 @@ func Serve(ctx context.Context, v core.VMCP, cfg *ServerConfig) (*Server, error)
 	hooks := &server.Hooks{}
 
 	// Build the mcp-go server (mirrors server.New): tools and resources are
-	// registered dynamically, so capabilities start disabled.
+	// registered per session. listChanged is advertised because a backend change
+	// sends list_changed to the sessions (serve_refresh.go).
 	mcpServer := server.NewMCPServer(
 		serveCfg.Name,
 		serveCfg.Version,
-		server.WithToolCapabilities(false),
-		server.WithResourceCapabilities(false, false),
+		server.WithToolCapabilities(true),
+		server.WithResourceCapabilities(false, true),
 		server.WithLogging(),
 		server.WithHooks(hooks),
 	)
@@ -216,13 +249,7 @@ func Serve(ctx context.Context, v core.VMCP, cfg *ServerConfig) (*Server, error)
 		}
 	}()
 
-	// sessionmanager.New takes an interface; avoid passing a typed-nil monitor.
-	var healthStatus health.StatusProvider
-	if cfg.HealthMonitor != nil {
-		healthStatus = cfg.HealthMonitor
-	}
-	vmcpSessMgr, optimizerCleanup, err := sessionmanager.New(
-		sessionDataStorage, cfg.SessionManagerConfig, cfg.BackendRegistry, healthStatus)
+	vmcpSessMgr, optimizerCleanup, err := sessionmanager.New(sessionDataStorage, cfg.SessionManagerConfig, cfg.BackendRegistry)
 	if err != nil {
 		return nil, err
 	}
@@ -234,14 +261,27 @@ func Serve(ctx context.Context, v core.VMCP, cfg *ServerConfig) (*Server, error)
 
 	srv := &Server{
 		config:             serveCfg,
+		core:               v,
 		mcpServer:          mcpServer,
 		backendRegistry:    cfg.BackendRegistry,
 		sessionManager:     sessionManager,
 		sessionDataStorage: sessionDataStorage,
 		vmcpSessionMgr:     vmcpSessMgr,
-		ready:              make(chan struct{}),
-		healthMonitor:      cfg.HealthMonitor,
-		statusReporter:     cfg.StatusReporter,
+		// Surface the resolved (telemetry-wrapped) optimizer factory so Serve-path
+		// session registration builds a per-session optimizer over the core's tools.
+		// Nil when the optimizer is disabled; the store/cleanup stay owned by the
+		// session manager (optimizerCleanup, appended to shutdownFuncs below).
+		optimizerFactory: vmcpSessMgr.OptimizerFactory(),
+		ready:            make(chan struct{}),
+		statusReporter:   cfg.StatusReporter,
+	}
+
+	if cfg.TelemetryProvider != nil {
+		// Gauges are diagnostics only: a registration failure must not stop the
+		// server (and an error return here would leak the components built above).
+		if err := monitorSessionCardinality(cfg.TelemetryProvider.MeterProvider(), srv); err != nil {
+			slog.Warn("failed to register session cardinality gauges", "error", err)
+		}
 	}
 
 	if optimizerCleanup != nil {
@@ -255,18 +295,27 @@ func Serve(ctx context.Context, v core.VMCP, cfg *ServerConfig) (*Server, error)
 		return v.Close()
 	})
 
-	// Register the SDK hooks against the assembled *Server, matching server.New.
-	// DocPlanner fork: the fork replaces upstream's lazyInjectSessionTools with
-	// cross-replica hydration in OnRequestInitialization and tracks live SDK
-	// sessions for owner forwarding.
-	hooks.AddOnRequestInitialization(func(hookCtx context.Context, id any, message any) error {
-		return srv.handleSessionRequestInitialization(hookCtx, id, message)
-	})
+	// Register the SDK hooks against the assembled *Server (relocated from
+	// server.New). They drive phase-2 of two-phase creation (OnRegisterSession) and
+	// the cross-pod Redis re-hydration of per-session tools (OnBeforeListTools /
+	// OnBeforeCallTool) and resources (OnBeforeListResources / OnBeforeReadResource).
 	hooks.AddOnRegisterSession(func(hookCtx context.Context, session server.ClientSession) {
 		srv.handleSessionRegistration(hookCtx, session)
 	})
 	hooks.AddOnUnregisterSession(func(_ context.Context, session server.ClientSession) {
-		srv.activeClientSessions.Delete(session.SessionID())
+		srv.activeClientSessions.remove(session.SessionID())
+	})
+	hooks.AddBeforeListTools(func(hookCtx context.Context, _ any, _ *mcp.ListToolsRequest) {
+		srv.lazyInjectSessionTools(hookCtx)
+	})
+	hooks.AddBeforeCallTool(func(hookCtx context.Context, _ any, _ *mcp.CallToolRequest) {
+		srv.lazyInjectSessionTools(hookCtx)
+	})
+	hooks.AddBeforeListResources(func(hookCtx context.Context, _ any, _ *mcp.ListResourcesRequest) {
+		srv.lazyInjectSessionResources(hookCtx)
+	})
+	hooks.AddBeforeReadResource(func(hookCtx context.Context, _ any, _ *mcp.ReadResourceRequest) {
+		srv.lazyInjectSessionResources(hookCtx)
 	})
 
 	// Disarm the close-on-error guard: the Server is fully constructed.
@@ -274,40 +323,42 @@ func Serve(ctx context.Context, v core.VMCP, cfg *ServerConfig) (*Server, error)
 	return srv, nil
 }
 
-// buildServeConfig maps the transport-only ServerConfig onto the existing *Config
-// the carried-forward (*Server) methods read from, applying the same transport
-// defaults server.New applies today. Defaults are applied here rather than by
-// mutating the caller's ServerConfig (go-style: copy before mutating caller input).
-// Port 0 is left untouched to mean "OS-assigned".
+// buildServeConfig maps the transport-only ServerConfig onto the existing *Config the
+// carried-forward (*Server) methods read from. It is a pure pass-through: transport
+// defaults are resolved once at the composition root via WithDefaults, so the
+// incoming ServerConfig is already resolved and buildServeConfig applies no defaulting of
+// its own. Port 0 still means "OS-assigned".
 //
 // Several Config fields are deliberately NOT mapped at this phase (see
 // TestBuildServeConfigMapsSharedFields, which guards this list against drift):
-//   - AuthzMiddleware: the authenticated/authz middleware chain is relocated under
-//     Serve by #5441, after which authorization moves to the core admission seam.
-//   - HealthMonitorConfig: Serve receives the already-built *health.Monitor via
-//     ServerConfig.HealthMonitor (A2) and assigns it to the Server directly, so it
-//     never needs the monitor's construction config.
+//   - AuthzMiddleware: intentionally left nil on the Serve path. The shared
+//     (*Server).Handler omits both the authz and annotation-enrichment blocks when
+//     AuthzMiddleware is nil; authorization moves to the core admission seam (#5438).
+//     The inert blocks stay in the shared Handler until Phase 3 (#5445) removes them.
+//   - HealthMonitorConfig: the backend health monitor is owned by the core (built from the
+//     composition root's server.Config.HealthMonitorConfig in core.New, stopped in
+//     core.Close), so the Serve-path Server never needs the monitor or its config.
 //   - StatusReporter: Serve assigns ServerConfig.StatusReporter to the Server field
-//     directly (like HealthMonitor); nothing reads Config.StatusReporter on the Serve
-//     path, so mapping it here would be dead.
+//     directly; nothing reads Config.StatusReporter on the Serve path, so mapping it here
+//     would be dead.
 //   - SessionFactory, OptimizerFactory, OptimizerConfig: the vMCP session manager is
 //     built directly in Serve from ServerConfig.SessionManagerConfig (a pre-built
 //     *sessionmanager.FactoryConfig that carries the session factory and optimizer
 //     wiring), not via Config→New, so these Config fields are unused on the Serve path.
-//   - WriteTimeout, SessionOwnerAdvertiseURL: DocPlanner fork fields. The fork's vMCP
-//     CLI builds the server through server.New with a full Config, never through
-//     Serve, so ServerConfig does not carry them.
 func buildServeConfig(cfg *ServerConfig) *Config {
 	return &Config{
-		Name:                    cmp.Or(cfg.Name, defaultServerName),
-		Version:                 cmp.Or(cfg.Version, defaultServerVersion),
+		Name:                    cfg.Name,
+		Version:                 cfg.Version,
 		GroupRef:                cfg.GroupRef,
-		Host:                    cmp.Or(cfg.Host, defaultHost),
+		Host:                    cfg.Host,
 		Port:                    cfg.Port,
-		EndpointPath:            cmp.Or(cfg.EndpointPath, defaultEndpointPath),
-		SessionTTL:              cmp.Or(cfg.SessionTTL, defaultSessionTTL),
+		EndpointPath:            cfg.EndpointPath,
+		SessionTTL:              cfg.SessionTTL,
+		WriteTimeout:            cfg.WriteTimeout,
 		AuthMiddleware:          cfg.AuthMiddleware,
+		RateLimitMiddleware:     cfg.RateLimitMiddleware,
 		AuthInfoHandler:         cfg.AuthInfoHandler,
+		PassthroughHeaders:      cfg.PassthroughHeaders,
 		AuthServer:              cfg.AuthServer,
 		TelemetryProvider:       cfg.TelemetryProvider,
 		AuditConfig:             cfg.AuditConfig,

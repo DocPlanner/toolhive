@@ -14,7 +14,6 @@ package sessionmanager
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -23,14 +22,14 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
 	"github.com/stacklok/toolhive/pkg/auth"
+	"github.com/stacklok/toolhive/pkg/cache"
 	transportsession "github.com/stacklok/toolhive/pkg/transport/session"
 	"github.com/stacklok/toolhive/pkg/vmcp"
-	"github.com/stacklok/toolhive/pkg/vmcp/conversion"
 	"github.com/stacklok/toolhive/pkg/vmcp/health"
+	"github.com/stacklok/toolhive/pkg/vmcp/optimizer"
 	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
 	sessiontypes "github.com/stacklok/toolhive/pkg/vmcp/session/types"
 )
@@ -44,15 +43,6 @@ const (
 	// when a session has been terminated.
 	MetadataValTrue = "true"
 )
-
-// terminatedSentinel is stored in sessions when Terminate() begins tearing
-// down a MultiSession. sessions.Get returns (nil, false) for sentinel entries
-// (non-V values), and the per-session mutation lock serializes storage/cache
-// writers so refreshes and decorations cannot recreate metadata after
-// Terminate() has deleted it.
-type terminatedSentinel struct{}
-
-const sessionMutationStripeCount = 64
 
 // Manager bridges the domain session lifecycle (MultiSession / MultiSessionFactory)
 // to the mark3labs SDK's SessionIdManager interface.
@@ -78,20 +68,32 @@ const sessionMutationStripeCount = 64
 // sticky routing when session-affinity is desired. When Redis is used as the
 // session-storage backend the metadata is durable across pod restarts, and the
 // live MultiSession can be re-created via factory.RestoreSession() on a cache miss.
+//
+// TODO: Long-term, the cache and storage should be layered behind a single
+// interface so the session manager does not need to coordinate between them.
+// Reads would go through the cache (handling misses, singleflight, and liveness
+// transparently); writes go to storage; caching is an implementation detail
+// hidden from the caller.
 type Manager struct {
 	storage    transportsession.DataStorage
 	factory    vmcpsession.MultiSessionFactory
 	backendReg vmcp.BackendRegistry
+
+	// healthStatus filters the backends CreateSession connects to (may be nil).
+	healthStatus health.StatusProvider
 
 	// sessions is a node-local cache of live MultiSession objects, separate
 	// from storage because MultiSession contains un-serialisable runtime state
 	// (HTTP connections, routing tables). On a cache miss it restores the
 	// session from stored metadata; on a cache hit it confirms liveness via
 	// storage.Load, which also refreshes the Redis TTL.
-	sessions *RestorableCache[string, vmcpsession.MultiSession]
+	sessions *cache.ValidatingCache[string, vmcpsession.MultiSession]
 
-	healthStatusProvider health.StatusProvider
-	sessionMutationMu    [sessionMutationStripeCount]sync.Mutex
+	// optimizerFactory is the resolved (telemetry-wrapped) optimizer factory, or
+	// nil when the optimizer is disabled. Surfaced via OptimizerFactory so the Serve
+	// path can build a per-session optimizer over the core's tools. The store and
+	// cleanup remain owned by this Manager (cleanup returned from New).
+	optimizerFactory func(context.Context, []mcpserver.ServerTool) (optimizer.Optimizer, error)
 }
 
 // New creates a Manager backed by the given SessionDataStorage and backend
@@ -105,46 +107,45 @@ func New(
 	storage transportsession.DataStorage,
 	cfg *FactoryConfig,
 	backendRegistry vmcp.BackendRegistry,
-	healthStatusProvider health.StatusProvider,
 ) (*Manager, func(context.Context) error, error) {
 	if cfg == nil || cfg.Base == nil {
 		return nil, nil, fmt.Errorf("sessionmanager.New: FactoryConfig.Base (SessionFactory) is required")
 	}
-	if len(cfg.WorkflowDefs) > 0 && cfg.ComposerFactory == nil {
-		return nil, nil, fmt.Errorf("sessionmanager.New: ComposerFactory is required when WorkflowDefs are provided")
+	if cfg.CacheCapacity < 0 {
+		return nil, nil, fmt.Errorf("sessionmanager.New: CacheCapacity must be >= 0 (got %d)", cfg.CacheCapacity)
 	}
-
+	capacity := cfg.CacheCapacity
+	if capacity == 0 {
+		capacity = defaultCacheCapacity
+	}
 	// Resolve optimizer factory from config, applying telemetry wrapping if needed.
 	optimizerFactory, optimizerCleanup, err := resolveOptimizer(cfg)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// Pre-create workflow telemetry instruments once so they are reused across
-	// all per-session executor wrappers without re-registering metrics.
-	var instruments *workflowExecutorInstruments
-	if cfg.TelemetryProvider != nil && len(cfg.WorkflowDefs) > 0 {
-		instruments, err = newWorkflowExecutorInstruments(
-			cfg.TelemetryProvider.MeterProvider(),
-			cfg.TelemetryProvider.TracerProvider(),
-		)
-		if err != nil {
-			if cleanupErr := optimizerCleanup(context.Background()); cleanupErr != nil {
-				slog.Warn("failed to clean up optimizer after instrument creation error", "error", cleanupErr)
-			}
-			return nil, nil, fmt.Errorf("failed to create workflow executor telemetry: %w", err)
-		}
-	}
-
 	// Build the Manager first so we can reference sm.Terminate and sm.sessions
 	// directly in closures, eliminating the forward-reference variable pattern.
 	sm := &Manager{
-		storage:              storage,
-		backendReg:           backendRegistry,
-		healthStatusProvider: healthStatusProvider,
+		storage:      storage,
+		backendReg:   backendRegistry,
+		healthStatus: cfg.HealthStatusProvider,
 	}
 
-	sm.sessions = newRestorableCache(
+	// Surface the resolved optimizer factory to the Serve path ONLY when
+	// AdvertiseFromCore is set. That makes the two store writers mutually exclusive:
+	// the session-factory decorator runs iff !AdvertiseFromCore (buildDecoratingFactory
+	// below), and OptimizerFactory() returns a non-nil factory iff AdvertiseFromCore —
+	// so a Serve composition root that enables the optimizer but forgets the flag gets a
+	// nil factory (no Serve-layer optimizer) rather than a silent double-index of the
+	// shared FTS5 store. The legacy server.New path leaves AdvertiseFromCore false and
+	// never calls OptimizerFactory(), so its decorator is unaffected.
+	if cfg.AdvertiseFromCore {
+		sm.optimizerFactory = optimizerFactory
+	}
+
+	sm.sessions = cache.New(
+		capacity,
 		sm.loadSession,
 		sm.checkSession,
 		func(id string, sess vmcpsession.MultiSession) {
@@ -152,19 +153,56 @@ func New(
 				slog.Warn("session cache: error closing evicted session",
 					"session_id", id, "error", closeErr)
 			}
-			slog.Warn("session cache: evicted expired session from node-local cache",
+			slog.Warn("session cache: session evicted from node-local cache",
 				"session_id", id)
 		},
 	)
-	sm.sessions.StartSweep(cfg.SessionTTL, 0)
 
-	sm.factory = buildDecoratingFactory(cfg, optimizerFactory, instruments, sm.Terminate)
+	sm.factory = buildDecoratingFactory(cfg, optimizerFactory, sm.Terminate)
 
+	stopSweep := sm.startIdleSweep(cfg.IdleTTL)
 	cleanup := func(ctx context.Context) error {
-		sm.sessions.StopSweep()
+		stopSweep()
 		return optimizerCleanup(ctx)
 	}
 	return sm, cleanup, nil
+}
+
+// startIdleSweep closes cached sessions that have been idle on this replica for
+// longer than idleTTL. It works on the node-local cache only and never refreshes
+// the storage TTL. The returned function stops the sweep; it is idempotent.
+func (sm *Manager) startIdleSweep(idleTTL time.Duration) func() {
+	if idleTTL <= 0 {
+		return func() {}
+	}
+	stop := make(chan struct{})
+	ticker := time.NewTicker(max(idleTTL/2, time.Millisecond))
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				sm.sessions.EvictIdle(idleTTL)
+			case <-stop:
+				return
+			}
+		}
+	}()
+	return sync.OnceFunc(func() { close(stop) })
+}
+
+// OptimizerFactory returns the resolved (telemetry-wrapped) optimizer factory, or
+// nil when the optimizer is disabled OR FactoryConfig.AdvertiseFromCore is false.
+//
+// It is consumed by the Serve path (FactoryConfig.AdvertiseFromCore), which builds
+// a per-session optimizer over the core's advertised tool set rather than via the
+// session decorator. Gating on AdvertiseFromCore makes the decorator and this getter
+// mutually exclusive store writers, so the shared FTS5 store can never be double-indexed
+// (see New). The optimizer's shared store and its cleanup remain owned by this Manager
+// (the cleanup function returned from New). On the legacy server.New path the factory is
+// applied internally via the session decorator and this getter is unused.
+func (m *Manager) OptimizerFactory() func(context.Context, []mcpserver.ServerTool) (optimizer.Optimizer, error) {
+	return m.optimizerFactory
 }
 
 // generateTimeout is the context deadline applied to the storage operations
@@ -215,22 +253,10 @@ const terminateTimeout = 5 * time.Second
 // performs a single Redis SET. 5 s is consistent with terminateTimeout.
 const decorateTimeout = 5 * time.Second
 
-// notifyBackendExpiredTimeout bounds each individual storage operation inside
-// NotifyBackendExpired() — one Load and one Upsert, each capped independently.
-// Each is a single-key Redis operation, so 5 s per call is consistent with
-// terminateTimeout and decorateTimeout. Worst-case wall-clock for the function
-// is 2 × 5 s = 10 s.
+// notifyBackendExpiredTimeout bounds the storage.Update call inside
+// NotifyBackendExpired() — a single-key Redis operation, consistent with
+// terminateTimeout and decorateTimeout.
 const notifyBackendExpiredTimeout = 5 * time.Second
-
-func (sm *Manager) currentEligibleBackends(ctx context.Context) []*vmcp.Backend {
-	rawBackends := sm.backendReg.List(ctx)
-	filtered := health.FilterBackendsForExposure(rawBackends, sm.healthStatusProvider)
-	backends := make([]*vmcp.Backend, len(filtered))
-	for i := range filtered {
-		backends[i] = &filtered[i]
-	}
-	return backends
-}
 
 // Generate implements the SDK's SessionIdManager.Generate().
 //
@@ -276,7 +302,8 @@ func (sm *Manager) Generate() string {
 // It is called from the OnRegisterSession hook once the request context is
 // available. It:
 //  1. Resolves the caller identity from the context.
-//  2. Lists available backends from the registry.
+//  2. Lists the registry's backends that are eligible for exposure (healthy,
+//     degraded or without a status).
 //  3. Calls MultiSessionFactory.MakeSessionWithID() to build a fully-formed
 //     MultiSession (which opens real HTTP connections to each backend).
 //  4. Persists session metadata to storage and caches the live MultiSession
@@ -319,8 +346,9 @@ func (sm *Manager) CreateSession(
 	// Resolve the caller identity (may be nil for anonymous access).
 	identity, _ := auth.IdentityFromContext(ctx)
 
-	// List and filter the currently eligible backends.
-	backends := sm.currentEligibleBackends(ctx)
+	// List the registry's backends that are currently eligible for exposure, so a
+	// new session does not open connections to backends the core does not advertise.
+	backends := toBackendPointers(health.FilterBackendsForExposure(sm.backendReg.List(ctx), sm.healthStatus))
 
 	// Build the fully-formed MultiSession using the SDK-assigned session ID.
 	sess, err := sm.factory.MakeSessionWithID(ctx, sessionID, identity, backends)
@@ -364,16 +392,29 @@ func (sm *Manager) CreateSession(
 	// Persist the serialisable session metadata to the pluggable backend (e.g.
 	// Redis) so that Validate() and TTL management work correctly. The live
 	// MultiSession itself is cached in the node-local multiSessions map below.
+	//
+	// Use Update (SET XX) rather than Upsert to close the TOCTOU window between
+	// the second placeholder check above and this write. If Terminate deleted the
+	// key in that window, Update returns (false, nil) and we bail without
+	// resurrecting the deleted session.
 	storeCtx, storeCancel := context.WithTimeout(ctx, createSessionStorageTimeout)
 	defer storeCancel()
-	if err := sm.storage.Upsert(storeCtx, sessionID, sess.GetMetadata()); err != nil {
+	stored, err := sm.storage.Update(storeCtx, sessionID, sess.GetMetadata())
+	if err != nil {
 		_ = sess.Close()
 		sm.cleanupFailedPlaceholder(sessionID, placeholder2)
 		return nil, fmt.Errorf("Manager.CreateSession: failed to store session metadata: %w", err)
 	}
+	if !stored {
+		_ = sess.Close()
+		return nil, fmt.Errorf(
+			"Manager.CreateSession: session %q was terminated between placeholder check and metadata store",
+			sessionID,
+		)
+	}
 
 	// Cache the live MultiSession so that GetMultiSession can retrieve it.
-	sm.sessions.Store(sessionID, sess)
+	sm.sessions.Set(sessionID, sess)
 
 	slog.Debug("Manager: created multi-session",
 		"session_id", sessionID,
@@ -387,69 +428,24 @@ func (sm *Manager) CreateSession(
 // as a valid session), and prevents repeated Validate() calls from refreshing
 // the Redis TTL and keeping the placeholder alive indefinitely.
 //
+// Uses Update (SET XX) so that a Terminate() that already deleted the key is
+// not inadvertently resurrected as a terminated entry.
+//
 // Cleanup is best-effort: errors are logged but not returned, since the caller
 // already has an error to report.
 func (sm *Manager) cleanupFailedPlaceholder(sessionID string, metadata map[string]string) {
-	metadata[MetadataKeyTerminated] = MetadataValTrue
+	// Copy before mutating so the caller's map is not modified.
+	terminated := make(map[string]string, len(metadata)+1)
+	for k, v := range metadata {
+		terminated[k] = v
+	}
+	terminated[MetadataKeyTerminated] = MetadataValTrue
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), createSessionStorageTimeout)
 	defer cancel()
-	if err := sm.storage.Upsert(cleanupCtx, sessionID, metadata); err != nil {
+	if _, err := sm.storage.Update(cleanupCtx, sessionID, terminated); err != nil {
 		slog.Warn("Manager.CreateSession: failed to mark failed placeholder as terminated; it will linger until TTL expires",
 			"session_id", sessionID, "error", err)
 	}
-}
-
-// RefreshSession rebuilds an existing session using the current eligible
-// backend set and replaces the stored MultiSession in-place.
-func (sm *Manager) RefreshSession(
-	ctx context.Context,
-	sessionID string,
-) (vmcpsession.MultiSession, error) {
-	if sessionID == "" {
-		return nil, fmt.Errorf("Manager.RefreshSession: session ID must not be empty")
-	}
-
-	unlock := sm.lockSessionMutation(sessionID)
-	current, ok := sm.GetMultiSession(ctx, sessionID)
-	if !ok {
-		unlock()
-		return nil, fmt.Errorf("Manager.RefreshSession: session %q not found or not a multi-session", sessionID)
-	}
-
-	identityProvider, ok := current.(sessiontypes.CreatorIdentityProvider)
-	if !ok {
-		unlock()
-		return nil, fmt.Errorf("Manager.RefreshSession: session %q cannot provide creator identity", sessionID)
-	}
-
-	identity := identityProvider.CreatorIdentity()
-	allowAnonymous := sessiontypes.ShouldAllowAnonymous(identity)
-	if allowAnonymous && isBoundSession(current) {
-		unlock()
-		return nil, fmt.Errorf("Manager.RefreshSession: session %q: %w", sessionID, errRefreshWithoutCallerToken)
-	}
-	unlock()
-
-	backends := sm.currentEligibleBackends(ctx)
-	refreshed, err := sm.factory.MakeSessionWithID(ctx, sessionID, identity, backends)
-	if err != nil {
-		return nil, fmt.Errorf("Manager.RefreshSession: failed to rebuild multi-session: %w", err)
-	}
-	if ownerURL, ok := current.GetMetadata()[sessiontypes.MetadataKeyOwnerURL]; ok && ownerURL != "" {
-		refreshed.SetMetadata(sessiontypes.MetadataKeyOwnerURL, ownerURL)
-	}
-
-	unlock = sm.lockSessionMutation(sessionID)
-	defer unlock()
-	if err := sm.replaceSessionLocked(ctx, sessionID, current, refreshed); err != nil {
-		_ = refreshed.Close()
-		return nil, fmt.Errorf("Manager.RefreshSession: failed to publish refreshed session: %w", err)
-	}
-
-	slog.Info("Manager: refreshed multi-session",
-		"session_id", sessionID,
-		"backend_count", len(backends))
-	return refreshed, nil
 }
 
 // Validate implements the SDK's SessionIdManager.Validate().
@@ -480,7 +476,6 @@ func (sm *Manager) Validate(sessionID string) (isTerminated bool, err error) {
 		return true, nil
 	}
 
-	sm.sessions.Touch(sessionID)
 	return false, nil
 }
 
@@ -490,11 +485,11 @@ func (sm *Manager) Validate(sessionID string) (isTerminated bool, err error) {
 // where client termination during the Phase 1→Phase 2 window could resurrect
 // sessions with open backend connections:
 //
-//   - MultiSession (Phase 2): Close() releases backend connections, then the
-//     session is deleted from storage immediately. After deletion Validate()
-//     returns (false, error) — the same response as "never existed". This is
-//     intentional: a terminated MultiSession has no resources to preserve, so
-//     immediate removal is cleaner than marking and waiting for TTL.
+//   - MultiSession (Phase 2): the storage key is deleted, then the node-local
+//     cache entry is removed and onEvict closes its backend connections. Caches
+//     on other replicas self-heal on their next Get (checkSession detects
+//     ErrSessionNotFound) or through the idle sweep. After deletion
+//     Validate() returns (false, error) — the same response as "never existed".
 //
 //   - Placeholder (Phase 1): the session is marked terminated=true and left
 //     for TTL cleanup. This prevents CreateSession() from opening backend
@@ -510,52 +505,15 @@ func (sm *Manager) Terminate(sessionID string) (isNotAllowed bool, err error) {
 		return false, fmt.Errorf("Manager.Terminate: empty session ID")
 	}
 
-	unlock := sm.lockSessionMutation(sessionID)
-	defer unlock()
-
 	ctx, cancel := context.WithTimeout(context.Background(), terminateTimeout)
 	defer cancel()
 
-	// Check the node-local cache first: a fully-formed MultiSession is stored
-	// here while this pod owns it.
-	if v, ok := sm.sessions.Peek(sessionID); ok {
-		// A terminatedSentinel means another goroutine is already tearing down
-		// this session. Do not fall through to the placeholder path — that would
-		// race with the concurrent Terminate's storage.Delete and potentially
-		// recreate the storage record after it was deleted.
-		if _, isSentinel := v.(terminatedSentinel); isSentinel {
-			slog.Debug("Manager.Terminate: concurrent termination in progress, skipping",
-				"session_id", sessionID)
-			return false, nil
-		}
-		if multiSess, ok := v.(vmcpsession.MultiSession); ok {
-			// Publish the tombstone before deleting from storage. Any concurrent
-			// GetMultiSession call will see the terminatedSentinel and return
-			// (nil, false), while the per-session mutation lock keeps refresh and
-			// decoration writers from racing the storage delete.
-			sm.sessions.Store(sessionID, terminatedSentinel{})
-
-			if deleteErr := sm.storage.Delete(ctx, sessionID); deleteErr != nil {
-				// Rollback: restore the live session so the caller can retry.
-				sm.sessions.Store(sessionID, multiSess)
-				return false, fmt.Errorf("Manager.Terminate: failed to delete session from storage: %w", deleteErr)
-			}
-
-			// Storage is clean; remove the sentinel and release backend connections.
-			sm.sessions.Delete(sessionID)
-			if closeErr := multiSess.Close(); closeErr != nil {
-				slog.Warn("Manager.Terminate: error closing multi-session backend connections",
-					"session_id", sessionID, "error", closeErr)
-			}
-			slog.Info("Manager.Terminate: session terminated", "session_id", sessionID)
-			return false, nil
-		}
-	}
-
-	// No MultiSession in the local map — treat as a placeholder session.
-	// Load current metadata, mark as terminated, and store back.
+	// Load current metadata to determine session phase.
 	metadata, loadErr := sm.storage.Load(ctx, sessionID)
 	if errors.Is(loadErr, transportsession.ErrSessionNotFound) {
+		// Already gone (concurrent termination or TTL expiry). Still close a
+		// cached copy so its backend connections do not outlive the session.
+		sm.sessions.Remove(sessionID)
 		slog.Debug("Manager.Terminate: session not found (already expired?)", "session_id", sessionID)
 		return false, nil
 	}
@@ -564,11 +522,15 @@ func (sm *Manager) Terminate(sessionID string) (isNotAllowed bool, err error) {
 	}
 
 	if _, isFullSession := metadata[sessiontypes.MetadataKeyIdentityBinding]; isFullSession {
-		// Phase 2 (full MultiSession): delete from storage. The cache entry will be
-		// evicted lazily on the next Get when checkSession finds the session gone.
+		// Phase 2 (full MultiSession): delete from storage, then close the cached
+		// session on this replica right away. Waiting for the next Get to evict it
+		// would keep its backend connections open, possibly forever, because no
+		// request uses a terminated session again. Other replicas close their
+		// copies through checkSession or the idle sweep.
 		if deleteErr := sm.storage.Delete(ctx, sessionID); deleteErr != nil {
 			return false, fmt.Errorf("Manager.Terminate: failed to delete session from storage: %w", deleteErr)
 		}
+		sm.sessions.Remove(sessionID)
 		slog.Info("Manager.Terminate: session terminated", "session_id", sessionID)
 		return false, nil
 	}
@@ -606,24 +568,21 @@ func (sm *Manager) Terminate(sessionID string) (isNotAllowed bool, err error) {
 // cross-pod RestoreSession call does not attempt to reconnect to the expired
 // backend session.
 //
-// After a successful storage update the session is evicted from the node-local
-// cache; the next GetMultiSession call triggers RestoreSession with the updated
-// metadata, discarding the stale in-memory copy.
+// The caller supplies the session metadata it already holds (e.g. from
+// MultiSession.GetMetadata). Passing nil metadata is treated as "no metadata
+// available" and is a silent no-op, avoiding a redundant storage round-trip.
 //
-// This is a best-effort operation. If the session is absent from storage (not
-// found or terminated) the call is a silent no-op. Storage errors are logged
-// but not returned; on error the cache is not evicted.
-func (sm *Manager) NotifyBackendExpired(sessionID, workloadID string) {
-	loadCtx, loadCancel := context.WithTimeout(context.Background(), notifyBackendExpiredTimeout)
-	defer loadCancel()
-	metadata, err := sm.storage.Load(loadCtx, sessionID)
-	if err != nil {
-		if !errors.Is(err, transportsession.ErrSessionNotFound) {
-			slog.Warn("NotifyBackendExpired: failed to load session from storage",
-				"session_id", sessionID,
-				"workload_id", workloadID,
-				"error", err)
-		}
+// After a successful storage update, the cached entry is not immediately evicted.
+// On the next GetMultiSession call, checkSession detects that the stored
+// MetadataKeyBackendIDs differs from the cached session's value, evicts the stale
+// entry via onEvict, and triggers RestoreSession with the updated metadata.
+// On storage error, no eviction occurs and the caller retries on the next access.
+//
+// This is a best-effort operation. If the session key is absent from storage
+// (terminated or expired), updateMetadata's SET XX is a no-op. Storage errors
+// are logged but not returned.
+func (sm *Manager) NotifyBackendExpired(sessionID, workloadID string, metadata map[string]string) {
+	if metadata == nil {
 		return
 	}
 	if metadata[MetadataKeyTerminated] == MetadataValTrue {
@@ -646,16 +605,26 @@ func (sm *Manager) NotifyBackendExpired(sessionID, workloadID string) {
 	// populateBackendMetadata, which uses key presence to distinguish an
 	// explicit zero-backend state from absent/corrupted metadata in
 	// RestoreSession. Trim spaces and drop empty parts for robustness.
-	delete(metadata, vmcpsession.MetadataKeyBackendSessionPrefix+workloadID)
+	//
+	// Copy before mutating so the caller's map is not modified. Mutating the
+	// caller's map would silently corrupt the in-memory session state, which
+	// would defeat lazy eviction: checkSession compares stored vs cached
+	// MetadataKeyBackendIDs to detect drift, so the values must differ after
+	// this update for eviction to trigger on the next GetMultiSession call.
+	updated := make(map[string]string, len(metadata))
+	for k, v := range metadata {
+		updated[k] = v
+	}
+	delete(updated, vmcpsession.MetadataKeyBackendSessionPrefix+workloadID)
 	var remaining []string
 	for _, p := range strings.Split(backendIDs, ",") {
 		if t := strings.TrimSpace(p); t != "" && t != workloadID {
 			remaining = append(remaining, t)
 		}
 	}
-	metadata[vmcpsession.MetadataKeyBackendIDs] = strings.Join(remaining, ",")
+	updated[vmcpsession.MetadataKeyBackendIDs] = strings.Join(remaining, ",")
 
-	if err := sm.updateMetadata(sessionID, metadata); err != nil {
+	if err := sm.updateMetadata(sessionID, updated); err != nil {
 		slog.Warn("NotifyBackendExpired: failed to persist backend expiry to storage",
 			"session_id", sessionID,
 			"workload_id", workloadID,
@@ -663,50 +632,27 @@ func (sm *Manager) NotifyBackendExpired(sessionID, workloadID string) {
 	}
 }
 
-// updateMetadata writes a complete metadata snapshot to storage and evicts the
-// session from the node-local cache so the next GetMultiSession call triggers a
-// fresh RestoreSession with the updated state.
-//
-// Cross-pod TOCTOU: a re-check Load is performed immediately before the Upsert
-// to detect cross-pod session termination (where another pod calls
-// storage.Delete). If the key is absent at re-check time we bail without
-// upserting. A residual race remains between the re-check and the Upsert (a
-// concurrent pod could delete the key in that window), but the window is now
-// microseconds rather than the full NotifyBackendExpired span. Closing the race
-// entirely would require a conditional write primitive (e.g. Redis SET XX /
-// UpsertIfPresent) added to the DataStorage interface.
-//
-// NOTE: concurrent calls for the same session are last-write-wins. We assume
-// parallel metadata writers within a session do not occur; NotifyBackendExpired
-// is the only post-creation writer and backend expiry events are serialised by
-// the backend registry. This can be retrofitted with CAS semantics or a version
-// counter if that assumption changes.
+// updateMetadata writes a complete metadata snapshot to storage using a
+// conditional Update (SET XX). If the key is absent at update time (concurrent
+// Delete), the call is a no-op. The cache self-heals on the next GetMultiSession
+// call: checkSession detects metadata drift, evicts the stale entry, and
+// RestoreSession reloads with fresh state.
 func (sm *Manager) updateMetadata(sessionID string, metadata map[string]string) error {
-	// Same-pod guard: if Terminate() is already tearing down this session on
-	// this pod the sentinel is in the cache and storage is already deleted.
-	if raw, ok := sm.sessions.Peek(sessionID); ok {
-		if _, isSentinel := raw.(terminatedSentinel); isSentinel {
-			return nil
-		}
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), notifyBackendExpiredTimeout)
 	defer cancel()
 
-	// Cross-pod guard: re-check that the storage record still exists before
-	// upserting. If another pod terminated the session (deleting the key) after
-	// NotifyBackendExpired's initial Load, we must not recreate the record.
-	if _, err := sm.storage.Load(ctx, sessionID); err != nil {
-		if errors.Is(err, transportsession.ErrSessionNotFound) {
-			return nil // session was terminated elsewhere; nothing to update
-		}
+	// Update only succeeds if the key still exists. A concurrent Delete (same
+	// pod or cross-pod) returns (false, nil), and we bail without resurrecting.
+	updated, err := sm.storage.Update(ctx, sessionID, metadata)
+	if err != nil {
 		return err
 	}
-
-	if err := sm.storage.Upsert(ctx, sessionID, metadata); err != nil {
-		return err
+	if !updated {
+		return nil // session was terminated; nothing to update
 	}
-	sm.sessions.Delete(sessionID)
+	// The cache self-heals lazily: on the next GetMultiSession, checkSession detects
+	// either the absent storage key or stale MetadataKeyBackendIDs and evicts the
+	// entry, triggering a fresh RestoreSession.
 	return nil
 }
 
@@ -718,6 +664,10 @@ func (sm *Manager) updateMetadata(sessionID string, metadata map[string]string) 
 // the Redis TTL). On a cache miss, the session is restored from storage via
 // factory.RestoreSession, enabling cross-pod session recovery when Redis is
 // used as the storage backend.
+//
+// The context is propagated to storage and restore operations using
+// context.WithoutCancel so caller identity (e.g. *auth.Identity in ctx) reaches
+// the backend Initialize handshake during cross-pod session restore.
 func (sm *Manager) GetMultiSession(ctx context.Context, sessionID string) (vmcpsession.MultiSession, bool) {
 	return sm.sessions.Get(ctx, sessionID)
 }
@@ -734,36 +684,35 @@ func (sm *Manager) GetMultiSession(ctx context.Context, sessionID string) (vmcps
 // replacing the old session and its backend connections. This ensures that a
 // backend-expiry update written by pod A propagates to pod B on the next
 // cache access rather than waiting for natural TTL expiry.
-func (sm *Manager) checkSession(ctx context.Context, sessionID string) error {
+func (sm *Manager) checkSession(ctx context.Context, sessionID string, sess vmcpsession.MultiSession) error {
 	checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), restoreStorageTimeout)
 	defer cancel()
 	metadata, err := sm.storage.Load(checkCtx, sessionID)
 	if errors.Is(err, transportsession.ErrSessionNotFound) {
-		return ErrExpired
+		return cache.ErrExpired
 	}
 	if err != nil {
 		return err // transient storage error — keep cached
 	}
 	if metadata[MetadataKeyTerminated] == MetadataValTrue {
-		return ErrExpired
+		return cache.ErrExpired
 	}
 
-	// If the cached session has backend metadata and it differs from storage,
-	// evict to pick up the update. Only compare when the cached session
-	// explicitly carries MetadataKeyBackendIDs to avoid spurious evictions for
-	// sessions whose in-memory representation does not track backend IDs (e.g.
-	// test mocks that return an empty metadata map).
-	if raw, ok := sm.sessions.Peek(sessionID); ok {
-		if sess, ok := raw.(vmcpsession.MultiSession); ok {
-			cachedMetadata := sess.GetMetadata()
-			cachedIDs, present := cachedMetadata[vmcpsession.MetadataKeyBackendIDs]
-			if restoredFrom, restored := cachedMetadata[metadataKeyRestoredFromBackendIDs]; restored {
-				cachedIDs, present = restoredFrom, true
-			}
-			if present && cachedIDs != metadata[vmcpsession.MetadataKeyBackendIDs] {
-				return ErrExpired
-			}
-		}
+	// Evict if the backend ID list has drifted (e.g. NotifyBackendExpired removed a
+	// backend), so the next Get calls RestoreSession with the updated backend list.
+	//
+	// We intentionally compare only MetadataKeyBackendIDs rather than the full
+	// metadata map. Per-backend session IDs (MetadataKeyBackendSessionPrefix+*)
+	// are the session IDs negotiated by each pod's independent RestoreSession call.
+	// Backends that do not honor Mcp-Session-Id hints (e.g. SSE transports, some
+	// StreamableHTTP backends) assign a fresh ID on every restore, so different pods
+	// legitimately hold different per-backend IDs for the same session. Comparing
+	// the full map would cause each pod's loadSession write-back to invalidate all
+	// other pods' cached sessions, creating an infinite eviction storm that prevents
+	// tools from ever being served in multi-pod deployments.
+	sessBackendIDs := sess.GetMetadata()[vmcpsession.MetadataKeyBackendIDs]
+	if sessBackendIDs != metadata[vmcpsession.MetadataKeyBackendIDs] {
+		return cache.ErrExpired
 	}
 
 	return nil
@@ -813,8 +762,6 @@ func (sm *Manager) loadSession(ctx context.Context, sessionID string) (vmcpsessi
 		return nil, restoreErr
 	}
 
-	keepStoredBackendIDs(restored, metadata)
-
 	// Persist the restored session's metadata back to Redis so that
 	// per-backend session IDs are kept current. Backends that do not honor
 	// Mcp-Session-Id hints (e.g. SSE transports) assign a fresh ID on every
@@ -827,7 +774,7 @@ func (sm *Manager) loadSession(ctx context.Context, sessionID string) (vmcpsessi
 	// cache never serves a session that no longer exists in storage.
 	updateCtx, updateCancel := context.WithTimeout(context.WithoutCancel(ctx), restoreMetadataWriteTimeout)
 	defer updateCancel()
-	updated, updateErr := sm.storage.Update(updateCtx, sessionID, persistedMetadata(restored))
+	updated, updateErr := sm.storage.Update(updateCtx, sessionID, restored.GetMetadata())
 	if updateErr != nil {
 		slog.Warn("Manager.loadSession: failed to persist restored session metadata",
 			"session_id", sessionID, "error", updateErr)
@@ -850,119 +797,18 @@ func (sm *Manager) loadSession(ctx context.Context, sessionID string) (vmcpsessi
 	return restored, nil
 }
 
-// StoreSession replaces the stored MultiSession for a session ID.
-func (sm *Manager) StoreSession(session vmcpsession.MultiSession) error {
-	if session == nil {
-		return fmt.Errorf("StoreSession: session must not be nil")
-	}
-	unlock := sm.lockSessionMutation(session.ID())
-	defer unlock()
-	storeCtx, cancel := context.WithTimeout(context.Background(), createSessionStorageTimeout)
-	defer cancel()
-	if err := sm.storage.Upsert(storeCtx, session.ID(), persistedMetadata(session)); err != nil {
-		return fmt.Errorf("StoreSession: failed to store session: %w", err)
-	}
-	sm.sessions.Store(session.ID(), session)
-	return nil
-}
-
-// ReplaceSession atomically swaps the stored MultiSession for sessionID from
-// current to replacement. It fails if the current live session was terminated
-// or changed before the swap could be published.
-func (sm *Manager) ReplaceSession(
-	ctx context.Context,
-	sessionID string,
-	current vmcpsession.MultiSession,
-	replacement vmcpsession.MultiSession,
-) error {
-	if sessionID == "" {
-		return fmt.Errorf("ReplaceSession: session ID must not be empty")
-	}
-	if current == nil {
-		return fmt.Errorf("ReplaceSession: current session must not be nil")
-	}
-	if replacement == nil {
-		return fmt.Errorf("ReplaceSession: replacement session must not be nil")
-	}
-	if current.ID() != sessionID {
-		return fmt.Errorf("ReplaceSession: current session ID %q does not match %q", current.ID(), sessionID)
-	}
-	if replacement.ID() != sessionID {
-		return fmt.Errorf("ReplaceSession: replacement session ID %q does not match %q", replacement.ID(), sessionID)
-	}
-
-	unlock := sm.lockSessionMutation(sessionID)
-	defer unlock()
-	return sm.replaceSessionLocked(ctx, sessionID, current, replacement)
-}
-
-// SetSessionMetadataValue stores a single metadata key/value pair for the
-// current live session. The storage write happens before the in-memory session
-// is updated so a failed persist does not leave local/runtime metadata ahead of
-// the shared storage state.
-func (sm *Manager) SetSessionMetadataValue(
-	ctx context.Context,
-	sessionID string,
-	current vmcpsession.MultiSession,
-	key string,
-	value string,
-) error {
-	if sessionID == "" {
-		return fmt.Errorf("SetSessionMetadataValue: session ID must not be empty")
-	}
-	if current == nil {
-		return fmt.Errorf("SetSessionMetadataValue: current session must not be nil")
-	}
-	if current.ID() != sessionID {
-		return fmt.Errorf("SetSessionMetadataValue: current session ID %q does not match %q", current.ID(), sessionID)
-	}
-	if key == "" {
-		return fmt.Errorf("SetSessionMetadataValue: metadata key must not be empty")
-	}
-
-	unlock := sm.lockSessionMutation(sessionID)
-	defer unlock()
-
-	liveValue, ok := sm.sessions.Peek(sessionID)
-	if !ok {
-		return fmt.Errorf("SetSessionMetadataValue: session %q not found", sessionID)
-	}
-	if _, isSentinel := liveValue.(terminatedSentinel); isSentinel {
-		return fmt.Errorf("SetSessionMetadataValue: session %q is terminating", sessionID)
-	}
-
-	liveSession, ok := liveValue.(vmcpsession.MultiSession)
-	if !ok {
-		return fmt.Errorf("SetSessionMetadataValue: session %q is not a multi-session", sessionID)
-	}
-	if liveSession != current {
-		return fmt.Errorf("SetSessionMetadataValue: session %q was concurrently replaced", sessionID)
-	}
-
-	metadata := persistedMetadata(current)
-	metadata[key] = value
-
-	storeCtx, storeCancel := context.WithTimeout(ctx, createSessionStorageTimeout)
-	defer storeCancel()
-	if err := sm.storage.Upsert(storeCtx, sessionID, metadata); err != nil {
-		return fmt.Errorf("SetSessionMetadataValue: failed to store metadata: %w", err)
-	}
-
-	current.SetMetadata(key, value)
-	return nil
-}
-
 // DecorateSession retrieves the MultiSession for sessionID, applies fn to it,
 // and stores the result back. Returns an error if the session is not found or
 // has not yet been upgraded from placeholder to MultiSession.
 //
-// The publish step is serialized per session so decoration cannot race with
-// Terminate() or refresh publication. The decorator callback itself runs
-// outside the mutation lock so it can safely call back into the manager.
+// storage.Update is the concurrency guard. If it returns (false, nil), the
+// session was deleted; the cache entry will be evicted on the next Get when
+// checkSession detects ErrSessionNotFound.
 func (sm *Manager) DecorateSession(sessionID string, fn func(sessiontypes.MultiSession) sessiontypes.MultiSession) error {
-	unlock := sm.lockSessionMutation(sessionID)
+	// context.Background() is intentional: DecorateSession is called from
+	// OnRegisterSession during session setup, not from a live authenticated
+	// HTTP request, so there is no caller identity to propagate.
 	sess, ok := sm.GetMultiSession(context.Background(), sessionID)
-	unlock()
 	if !ok {
 		return fmt.Errorf("DecorateSession: session %q not found or not a multi-session", sessionID)
 	}
@@ -973,419 +819,33 @@ func (sm *Manager) DecorateSession(sessionID string, fn func(sessiontypes.MultiS
 	if decorated.ID() != sessionID {
 		return fmt.Errorf("DecorateSession: decorator changed session ID from %q to %q", sessionID, decorated.ID())
 	}
+
+	// Persist metadata to storage first via conditional Update (SET XX).
+	// Only update the node-local cache after a successful write so that a
+	// storage error or a concurrent delete never leaves a decorated (but
+	// unpersisted) value in the cache where retries could stack decorations.
 	decorateCtx, decorateCancel := context.WithTimeout(context.Background(), decorateTimeout)
 	defer decorateCancel()
-	unlock = sm.lockSessionMutation(sessionID)
-	defer unlock()
-	if err := sm.replaceSessionLocked(decorateCtx, sessionID, sess, decorated); err != nil {
-		return fmt.Errorf("DecorateSession: %w", err)
+	updated, err := sm.storage.Update(decorateCtx, sessionID, decorated.GetMetadata())
+	if err != nil {
+		return fmt.Errorf("DecorateSession: failed to store decorated session metadata: %w", err)
 	}
+	if !updated {
+		// Session was deleted (by Terminate or TTL) between Get and Update.
+		// The cache entry will be evicted lazily on the next Get when checkSession
+		// finds the session gone from storage.
+		return fmt.Errorf("DecorateSession: session %q was deleted during decoration", sessionID)
+	}
+	sm.sessions.Set(sessionID, decorated)
 	return nil
-}
-
-func (sm *Manager) replaceSessionLocked(
-	ctx context.Context,
-	sessionID string,
-	current vmcpsession.MultiSession,
-	replacement vmcpsession.MultiSession,
-) error {
-	if !sm.sessions.CompareAndSwap(sessionID, current, replacement) {
-		return fmt.Errorf("session %q was terminated or concurrently modified during replacement", sessionID)
-	}
-
-	storeCtx, storeCancel := context.WithTimeout(ctx, createSessionStorageTimeout)
-	defer storeCancel()
-	if err := sm.storage.Upsert(storeCtx, sessionID, persistedMetadata(replacement)); err != nil {
-		sm.sessions.Store(sessionID, current)
-		return fmt.Errorf("failed to store replacement session metadata: %w", err)
-	}
-	return nil
-}
-
-func (sm *Manager) lockSessionMutation(sessionID string) func() {
-	mu := &sm.sessionMutationMu[sessionMutationStripeIndex(sessionID)]
-	mu.Lock()
-	return mu.Unlock
-}
-
-func sessionMutationStripeIndex(sessionID string) int {
-	var hash uint32 = 2166136261
-	for i := 0; i < len(sessionID); i++ {
-		hash ^= uint32(sessionID[i])
-		hash *= 16777619
-	}
-	return int(hash % sessionMutationStripeCount)
-}
-
-var errRefreshWithoutCallerToken = errors.New("bound session has no caller token to rebuild its backends with")
-
-const metadataKeyRestoredFromBackendIDs = "vmcp.session.restored_from_backend_ids"
-
-func isBoundSession(sess vmcpsession.MultiSession) bool {
-	return sessiontypes.HasBoundIdentity(sess.GetMetadata())
-}
-
-func keepStoredBackendIDs(restored vmcpsession.MultiSession, stored map[string]string) {
-	storedIDs := stored[vmcpsession.MetadataKeyBackendIDs]
-	restoredMetadata := restored.GetMetadata()
-	if restoredMetadata[vmcpsession.MetadataKeyBackendIDs] == storedIDs {
-		return
-	}
-	restored.SetMetadata(metadataKeyRestoredFromBackendIDs, storedIDs)
-	for key, value := range stored {
-		if !strings.HasPrefix(key, vmcpsession.MetadataKeyBackendSessionPrefix) {
-			continue
-		}
-		if _, present := restoredMetadata[key]; !present {
-			restored.SetMetadata(key, value)
-		}
-	}
-}
-
-func persistedMetadata(sess vmcpsession.MultiSession) map[string]string {
-	metadata := cloneStringMap(sess.GetMetadata())
-	if storedIDs, restored := metadata[metadataKeyRestoredFromBackendIDs]; restored {
-		metadata[vmcpsession.MetadataKeyBackendIDs] = storedIDs
-		delete(metadata, metadataKeyRestoredFromBackendIDs)
-	}
-	return metadata
-}
-
-func cloneStringMap(src map[string]string) map[string]string {
-	if len(src) == 0 {
-		return map[string]string{}
-	}
-	cloned := make(map[string]string, len(src))
-	for k, v := range src {
-		cloned[k] = v
-	}
-	return cloned
-}
-
-// GetAdaptedTools returns SDK-format tools for the given session, with handlers
-// that delegate tool invocations directly to the session's CallTool() method.
-//
-// When the session factory is configured with an aggregator (WithAggregator),
-// tools are in their final resolved form — overrides and conflict resolution
-// applied via ProcessPreQueriedCapabilities. Each handler passes the resolved
-// tool name to CallTool, which translates it back to the original backend name
-// via GetBackendCapabilityName.
-//
-// Without an aggregator, raw backend tool names are used as-is (no overrides
-// or conflict resolution applied).
-func (sm *Manager) GetAdaptedTools(sessionID string) ([]mcpserver.ServerTool, error) {
-	multiSess, ok := sm.GetMultiSession(context.Background(), sessionID)
-	if !ok {
-		return nil, fmt.Errorf("Manager.GetAdaptedTools: session %q not found or not a multi-session", sessionID)
-	}
-
-	domainTools := multiSess.Tools()
-	sdkTools := make([]mcpserver.ServerTool, 0, len(domainTools))
-
-	for _, domainTool := range domainTools {
-		schemaJSON, err := json.Marshal(domainTool.InputSchema)
-		if err != nil {
-			return nil, fmt.Errorf("Manager.GetAdaptedTools: failed to marshal schema for tool %s: %w", domainTool.Name, err)
-		}
-
-		tool := mcp.Tool{
-			Name:           domainTool.Name,
-			Description:    domainTool.Description,
-			RawInputSchema: schemaJSON,
-			Annotations:    conversion.ToMCPToolAnnotations(domainTool.Annotations),
-		}
-		if domainTool.OutputSchema != nil {
-			outputSchemaJSON, marshalErr := json.Marshal(domainTool.OutputSchema)
-			if marshalErr != nil {
-				slog.Warn("failed to marshal tool output schema",
-					"tool", domainTool.Name, "error", marshalErr)
-			} else {
-				tool.RawOutputSchema = outputSchemaJSON
-			}
-		}
-
-		capturedSess := multiSess
-		capturedSessionID := sessionID
-		capturedToolName := domainTool.Name
-		handler := func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			sm.sessions.Touch(capturedSessionID)
-
-			args, ok := req.Params.Arguments.(map[string]any)
-			if !ok {
-				wrappedErr := fmt.Errorf("%w: arguments must be object, got %T", vmcp.ErrInvalidInput, req.Params.Arguments)
-				slog.Warn("invalid arguments for tool", "tool", capturedToolName, "error", wrappedErr)
-				return mcp.NewToolResultError(wrappedErr.Error()), nil
-			}
-
-			meta := conversion.FromMCPMeta(req.Params.Meta)
-			caller, _ := auth.IdentityFromContext(ctx)
-
-			currentSess := sm.currentHandlerSession(ctx, capturedSessionID, capturedSess)
-			result, callErr := currentSess.CallTool(ctx, caller, capturedToolName, args, meta)
-			if callErr != nil {
-				if refreshed, ok := sm.refreshSessionForStaleBackend(ctx, capturedSessionID, "tool", capturedToolName, callErr); ok {
-					result, callErr = refreshed.CallTool(ctx, caller, capturedToolName, args, meta)
-					if callErr != nil {
-						slog.Warn("retry after backend session refresh failed",
-							"session_id", capturedSessionID, "tool", capturedToolName, "error", callErr)
-					}
-				}
-			}
-			if callErr != nil {
-				if errors.Is(callErr, sessiontypes.ErrUnauthorizedCaller) || errors.Is(callErr, sessiontypes.ErrNilCaller) {
-					slog.Warn("caller authorization failed, terminating session",
-						"session_id", capturedSessionID, "tool", capturedToolName, "error", callErr)
-					if _, termErr := sm.Terminate(capturedSessionID); termErr != nil {
-						slog.Error("failed to terminate session after auth failure",
-							"session_id", capturedSessionID, "error", termErr)
-					}
-					return mcp.NewToolResultError(fmt.Sprintf("Unauthorized: %v", callErr)), nil
-				}
-				return mcp.NewToolResultError(callErr.Error()), nil
-			}
-
-			return &mcp.CallToolResult{
-				Result: mcp.Result{
-					Meta: conversion.ToMCPMeta(result.Meta),
-				},
-				Content:           conversion.ToMCPContents(result.Content),
-				StructuredContent: result.StructuredContent,
-				IsError:           result.IsError,
-			}, nil
-		}
-
-		sdkTools = append(sdkTools, mcpserver.ServerTool{
-			Tool:    tool,
-			Handler: handler,
-		})
-		slog.Debug("Manager.GetAdaptedTools: adapted tool", "session_id", sessionID, "tool", domainTool.Name)
-	}
-
-	return sdkTools, nil
-}
-
-// GetAdaptedResources returns SDK-format resources for the given session, with handlers
-// that delegate read requests directly to the session's ReadResource() method.
-func (sm *Manager) GetAdaptedResources(sessionID string) ([]mcpserver.ServerResource, error) {
-	multiSess, ok := sm.GetMultiSession(context.Background(), sessionID)
-	if !ok {
-		return nil, fmt.Errorf("Manager.GetAdaptedResources: session %q not found or not a multi-session", sessionID)
-	}
-
-	domainResources := multiSess.Resources()
-	sdkResources := make([]mcpserver.ServerResource, 0, len(domainResources))
-
-	for _, domainResource := range domainResources {
-		resource := mcp.Resource{
-			Name:        domainResource.Name,
-			URI:         domainResource.URI,
-			Description: domainResource.Description,
-			MIMEType:    domainResource.MimeType,
-		}
-
-		capturedSess := multiSess
-		capturedSessionID := sessionID
-		capturedResourceURI := domainResource.URI
-		handler := func(ctx context.Context, _ mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-			sm.sessions.Touch(capturedSessionID)
-
-			caller, _ := auth.IdentityFromContext(ctx)
-
-			currentSess := sm.currentHandlerSession(ctx, capturedSessionID, capturedSess)
-			result, readErr := currentSess.ReadResource(ctx, caller, capturedResourceURI)
-			if readErr != nil {
-				if refreshed, ok := sm.refreshSessionForStaleBackend(ctx, capturedSessionID, "resource", capturedResourceURI, readErr); ok {
-					result, readErr = refreshed.ReadResource(ctx, caller, capturedResourceURI)
-					if readErr != nil {
-						slog.Warn("retry after backend session refresh failed",
-							"session_id", capturedSessionID, "resource", capturedResourceURI, "error", readErr)
-					}
-				}
-			}
-			if readErr != nil {
-				if errors.Is(readErr, sessiontypes.ErrUnauthorizedCaller) || errors.Is(readErr, sessiontypes.ErrNilCaller) {
-					slog.Warn("caller authorization failed, terminating session",
-						"session_id", capturedSessionID, "resource", capturedResourceURI, "error", readErr)
-					if _, termErr := sm.Terminate(capturedSessionID); termErr != nil {
-						slog.Error("failed to terminate session after auth failure",
-							"session_id", capturedSessionID, "error", termErr)
-					}
-					return nil, fmt.Errorf("unauthorized: %w", readErr)
-				}
-				return nil, readErr
-			}
-
-			return conversion.ToMCPResourceContents(result.Contents), nil
-		}
-
-		sdkResources = append(sdkResources, mcpserver.ServerResource{
-			Resource: resource,
-			Handler:  handler,
-		})
-		slog.Debug("Manager.GetAdaptedResources: adapted resource", "session_id", sessionID, "uri", domainResource.URI)
-	}
-
-	return sdkResources, nil
-}
-
-// GetAdaptedPrompts returns SDK-format prompts for the given session, with handlers
-// that delegate prompt requests directly to the session's GetPrompt() method.
-func (sm *Manager) GetAdaptedPrompts(sessionID string) ([]mcpserver.ServerPrompt, error) {
-	multiSess, ok := sm.GetMultiSession(context.Background(), sessionID)
-	if !ok {
-		return nil, fmt.Errorf("Manager.GetAdaptedPrompts: session %q not found or not a multi-session", sessionID)
-	}
-
-	domainPrompts := multiSess.Prompts()
-	sdkPrompts := make([]mcpserver.ServerPrompt, 0, len(domainPrompts))
-
-	for _, domainPrompt := range domainPrompts {
-		prompt := mcp.Prompt{
-			Name:        domainPrompt.Name,
-			Description: domainPrompt.Description,
-		}
-		for _, arg := range domainPrompt.Arguments {
-			prompt.Arguments = append(prompt.Arguments, mcp.PromptArgument{
-				Name:        arg.Name,
-				Description: arg.Description,
-				Required:    arg.Required,
-			})
-		}
-
-		capturedSess := multiSess
-		capturedSessionID := sessionID
-		capturedPromptName := domainPrompt.Name
-		handler := func(ctx context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
-			sm.sessions.Touch(capturedSessionID)
-
-			caller, _ := auth.IdentityFromContext(ctx)
-
-			args := make(map[string]any, len(req.Params.Arguments))
-			for k, v := range req.Params.Arguments {
-				args[k] = v
-			}
-			currentSess := sm.currentHandlerSession(ctx, capturedSessionID, capturedSess)
-			result, getErr := currentSess.GetPrompt(ctx, caller, capturedPromptName, args)
-			if getErr != nil {
-				if refreshed, ok := sm.refreshSessionForStaleBackend(ctx, capturedSessionID, "prompt", capturedPromptName, getErr); ok {
-					result, getErr = refreshed.GetPrompt(ctx, caller, capturedPromptName, args)
-					if getErr != nil {
-						slog.Warn("retry after backend session refresh failed",
-							"session_id", capturedSessionID, "prompt", capturedPromptName, "error", getErr)
-					}
-				}
-			}
-			if getErr != nil {
-				if errors.Is(getErr, sessiontypes.ErrUnauthorizedCaller) || errors.Is(getErr, sessiontypes.ErrNilCaller) {
-					slog.Warn("caller authorization failed, terminating session",
-						"session_id", capturedSessionID, "prompt", capturedPromptName, "error", getErr)
-					if _, termErr := sm.Terminate(capturedSessionID); termErr != nil {
-						slog.Error("failed to terminate session after auth failure",
-							"session_id", capturedSessionID, "error", termErr)
-					}
-					return nil, fmt.Errorf("unauthorized: %w", getErr)
-				}
-				return nil, getErr
-			}
-
-			mcpMessages := make([]mcp.PromptMessage, 0, len(result.Messages))
-			for _, msg := range result.Messages {
-				mcpMessages = append(mcpMessages, mcp.PromptMessage{
-					Role:    mcp.Role(msg.Role),
-					Content: conversion.ToMCPContent(msg.Content),
-				})
-			}
-			return &mcp.GetPromptResult{
-				Description: result.Description,
-				Messages:    mcpMessages,
-			}, nil
-		}
-
-		sdkPrompts = append(sdkPrompts, mcpserver.ServerPrompt{
-			Prompt:  prompt,
-			Handler: handler,
-		})
-		slog.Debug("Manager.GetAdaptedPrompts: adapted prompt", "session_id", sessionID, "prompt", domainPrompt.Name)
-	}
-
-	return sdkPrompts, nil
-}
-
-func (sm *Manager) currentHandlerSession(
-	ctx context.Context,
-	sessionID string,
-	fallback vmcpsession.MultiSession,
-) vmcpsession.MultiSession {
-	current, ok := sm.GetMultiSession(ctx, sessionID)
-	if ok && current != nil {
-		return current
-	}
-	return fallback
-}
-
-func (sm *Manager) refreshSessionForStaleBackend(
-	ctx context.Context,
-	sessionID string,
-	operation string,
-	capability string,
-	err error,
-) (vmcpsession.MultiSession, bool) {
-	if !isStaleBackendSessionError(err) {
-		return nil, false
-	}
-
-	slog.Info("refreshing vMCP session after stale backend session",
-		"session_id", sessionID,
-		"operation", operation,
-		"capability", capability,
-		"error", err)
-
-	refreshed, refreshErr := sm.RefreshSession(ctx, sessionID)
-	if refreshErr != nil {
-		slog.Warn("failed to refresh vMCP session after stale backend session",
-			"session_id", sessionID,
-			"operation", operation,
-			"capability", capability,
-			"error", refreshErr)
-		return nil, false
-	}
-	return refreshed, true
-}
-
-func isStaleBackendSessionError(err error) bool {
-	if err == nil {
-		return false
-	}
-	errLower := strings.ToLower(err.Error())
-	for _, marker := range staleBackendSessionMarkers {
-		if strings.Contains(errLower, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-// staleBackendSessionMarkers are lower-cased substrings of backend errors that
-// mean the per-backend connection is unusable and the whole multi-session should
-// be rebuilt. The backend client (pkg/vmcp/session/internal/backend) already
-// reinitializes a single backend on these; this is the fallback when that
-// reinitialization itself failed or the captured session was already closed.
-var staleBackendSessionMarkers = []string{
-	"invalid session id",
-	"invalid session_id",
-	"session terminated",
-	"need to re-initialize",
-	"session not found",
-	"no valid session id",
-	"expired session id",
-	"invalid during session initialization",
-	"backend session is closed",
-	"backend session expired",
 }
 
 // listAllBackends returns all backends from the registry as a pointer slice.
 func (sm *Manager) listAllBackends(ctx context.Context) []*vmcp.Backend {
-	raw := sm.backendReg.List(ctx)
+	return toBackendPointers(sm.backendReg.List(ctx))
+}
+
+func toBackendPointers(raw []vmcp.Backend) []*vmcp.Backend {
 	backends := make([]*vmcp.Backend, len(raw))
 	for i := range raw {
 		backends[i] = &raw[i]

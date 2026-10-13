@@ -140,20 +140,7 @@ type MultiSession interface {
 	GetRoutingTable() *vmcp.RoutingTable
 }
 
-// CreatorIdentityProvider exposes the creator identity associated with a
-// session. The returned identity is intended for in-memory session refresh and
-// backend reconnection logic; it must not be persisted to metadata.
-type CreatorIdentityProvider interface {
-	CreatorIdentity() *auth.Identity
-}
-
 const (
-	// MetadataKeyOwnerURL is the transport-session metadata key that holds the
-	// pod-local HTTP endpoint URL currently owning the live SDK session state
-	// for this vMCP session. Replicas use it to forward live-session traffic
-	// (SSE listen/delete and methodless client replies) back to the owning pod.
-	MetadataKeyOwnerURL = "vmcp.session.owner_url"
-
 	// MetadataKeyTokenHash held hex(HMAC-SHA256(bearerToken)) for authenticated
 	// sessions and "" for anonymous sessions.
 	//
@@ -175,15 +162,6 @@ const (
 	// Storage is plaintext PII — the Redis/Valkey instance must be access-controlled.
 	MetadataKeyIdentityBinding = "vmcp.identity.binding"
 )
-
-// HasBoundIdentity reports whether session metadata carries an authenticated
-// (iss, sub) identity binding, as opposed to the unauthenticated sentinel or no
-// binding at all (a placeholder). DocPlanner fork helper used by the session
-// refresh paths.
-func HasBoundIdentity(metadata map[string]string) bool {
-	b := metadata[MetadataKeyIdentityBinding]
-	return b != "" && !binding.IsUnauthenticated(b)
-}
 
 // ShouldAllowAnonymous reports whether a session has no per-user binding and
 // should be treated as anonymous. The identity is bound when Token is set, or

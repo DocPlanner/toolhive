@@ -98,6 +98,9 @@ func InjectUpstreamProvider(src *authorizers.Config, providerName string) (*auth
 // Factory implements the authorizers.AuthorizerFactory interface for Cedar.
 type Factory struct{}
 
+// ConfigKey returns the JSON key for Cedar-specific configuration ("cedar").
+func (*Factory) ConfigKey() string { return "cedar" }
+
 // ValidateConfig validates the Cedar-specific configuration.
 // It receives the full raw config and extracts the Cedar-specific portion.
 func (*Factory) ValidateConfig(rawConfig json.RawMessage) error {
@@ -485,11 +488,7 @@ func (a *Authorizer) resolveClaims(identity *auth.Identity) (jwt.MapClaims, erro
 		// Embedded auth server path: use the upstream IDP token's claims.
 		upstreamToken, tokenFound := identity.UpstreamTokens[a.primaryUpstreamProvider]
 		if !tokenFound || upstreamToken == "" {
-			reason := "token_unavailable"
-			if status, ok := identity.UpstreamTokenStatuses[a.primaryUpstreamProvider]; ok && status != "" {
-				reason = string(status)
-			}
-			return nil, authorizers.NewUpstreamAuthenticationRequiredError(a.primaryUpstreamProvider, reason)
+			return nil, authorizers.NewUpstreamAuthenticationRequiredError(a.primaryUpstreamProvider, "token_unavailable")
 		}
 		parsedClaims, err := parseUpstreamJWTClaims(upstreamToken)
 		if err != nil {

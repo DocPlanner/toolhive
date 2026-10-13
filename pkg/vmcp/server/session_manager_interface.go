@@ -27,23 +27,13 @@ type SessionManager interface {
 	// connections and replaces the placeholder with a fully-formed MultiSession.
 	CreateSession(ctx context.Context, sessionID string) (vmcpsession.MultiSession, error)
 
-	// RefreshSession rebuilds the session-scoped backend connections for an
-	// existing session using the current eligible backend set, then replaces the
-	// stored session.
-	RefreshSession(ctx context.Context, sessionID string) (vmcpsession.MultiSession, error)
-
-	// GetAdaptedTools returns SDK-format tools for the given session with session-scoped
-	// handlers. This enables session-scoped routing: each tool call goes through the
-	// session's backend connections rather than the global router.
-	GetAdaptedTools(sessionID string) ([]mcpserver.ServerTool, error)
-
-	// GetAdaptedResources returns SDK-format resources for the given session with
-	// session-scoped handlers, analogous to GetAdaptedTools for resources.
-	GetAdaptedResources(sessionID string) ([]mcpserver.ServerResource, error)
-
 	// GetMultiSession retrieves the fully-formed MultiSession for the given session ID.
 	// Returns (nil, false) if the session does not exist or is still a placeholder.
-	// Used to access session-scoped backend tool metadata (e.g. for conflict validation).
+	//
+	// ctx may carry request-scoped values (e.g. *auth.Identity) that implementations
+	// should forward to storage and backend-restore operations. Implementations must
+	// not let caller cancellation abort an in-progress restore that concurrent
+	// waiters depend on.
 	GetMultiSession(ctx context.Context, sessionID string) (vmcpsession.MultiSession, bool)
 
 	// DecorateSession retrieves the MultiSession for sessionID, applies fn to it,
@@ -55,25 +45,13 @@ type SessionManager interface {
 	Terminate(sessionID string) (bool, error)
 
 	// NotifyBackendExpired updates session metadata in storage to reflect that the
-	// backend identified by workloadID is no longer connected. It is a best-effort,
-	// metadata-only operation intended to be called by keepalive or health-monitoring
-	// components when they detect that a backend session has expired or been lost.
-	// Storage errors are logged but not returned.
-	NotifyBackendExpired(sessionID, workloadID string)
-
-	// ReplaceSession swaps the stored MultiSession for sessionID from current to
-	// replacement. Used for refresh rollback when the rebuilt session cannot be
-	// fully activated.
-	ReplaceSession(ctx context.Context, sessionID string, current, replacement vmcpsession.MultiSession) error
-
-	// SetSessionMetadataValue persists a single metadata key/value pair for the
-	// current live session without recreating the session. Used for owner-pod
-	// advertisement after session registration.
-	SetSessionMetadataValue(
-		ctx context.Context,
-		sessionID string,
-		current vmcpsession.MultiSession,
-		key string,
-		value string,
-	) error
+	// backend identified by workloadID is no longer connected. The caller must
+	// supply the session metadata it already holds (e.g. from MultiSession.GetMetadata);
+	// passing nil is treated as "no metadata available" and is a silent no-op.
+	// The metadata map is treated as read-only; the implementation copies it before
+	// making any modifications.
+	// It is a best-effort, metadata-only operation intended to be called by keepalive
+	// or health-monitoring components when they detect that a backend session has
+	// expired or been lost. Storage errors are logged but not returned.
+	NotifyBackendExpired(sessionID, workloadID string, metadata map[string]string)
 }

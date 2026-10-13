@@ -9,45 +9,44 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
 	tcredis "github.com/stacklok/toolhive-core/redis"
 	"github.com/stacklok/toolhive/pkg/audit"
 	"github.com/stacklok/toolhive/pkg/auth"
 	asrunner "github.com/stacklok/toolhive/pkg/authserver/runner"
+	"github.com/stacklok/toolhive/pkg/authz"
+	"github.com/stacklok/toolhive/pkg/bodylimit"
 	mcpparser "github.com/stacklok/toolhive/pkg/mcp"
 	"github.com/stacklok/toolhive/pkg/recovery"
 	"github.com/stacklok/toolhive/pkg/telemetry"
 	transportmiddleware "github.com/stacklok/toolhive/pkg/transport/middleware"
 	transportsession "github.com/stacklok/toolhive/pkg/transport/session"
 	"github.com/stacklok/toolhive/pkg/vmcp"
+	"github.com/stacklok/toolhive/pkg/vmcp/aggregator"
+	"github.com/stacklok/toolhive/pkg/vmcp/codemode"
 	"github.com/stacklok/toolhive/pkg/vmcp/composer"
 	vmcpconfig "github.com/stacklok/toolhive/pkg/vmcp/config"
-	"github.com/stacklok/toolhive/pkg/vmcp/discovery"
+	"github.com/stacklok/toolhive/pkg/vmcp/core"
+	"github.com/stacklok/toolhive/pkg/vmcp/headerforward"
 	"github.com/stacklok/toolhive/pkg/vmcp/health"
-	"github.com/stacklok/toolhive/pkg/vmcp/internal/backendtelemetry"
 	"github.com/stacklok/toolhive/pkg/vmcp/optimizer"
 	"github.com/stacklok/toolhive/pkg/vmcp/router"
-	"github.com/stacklok/toolhive/pkg/vmcp/server/adapter"
 	"github.com/stacklok/toolhive/pkg/vmcp/server/sessionmanager"
 	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
-	sessiontypes "github.com/stacklok/toolhive/pkg/vmcp/session/types"
 	vmcpstatus "github.com/stacklok/toolhive/pkg/vmcp/status"
 )
 
@@ -62,9 +61,7 @@ const (
 	// It protects all routes (health, metrics, well-known, etc.) from slow-write clients.
 	// For qualifying SSE (GET) connections, transportmiddleware.WriteTimeout clears this
 	// per-request via http.ResponseController.SetWriteDeadline(time.Time{}) (golang/go#16100).
-	// Configured values may raise this deadline so it exceeds the backend client
-	// timeout plus response-writing overhead.
-	defaultWriteTimeout = 120 * time.Second
+	defaultWriteTimeout = 30 * time.Second
 
 	// defaultIdleTimeout is the maximum amount of time to wait for the next request when keep-alive's are enabled.
 	defaultIdleTimeout = 120 * time.Second
@@ -83,63 +80,25 @@ const (
 	// Sessions that are inactive for this duration will be automatically cleaned up.
 	defaultSessionTTL = 30 * time.Minute
 
-	// defaultSessionRefreshTimeout bounds how long a live session refresh may take.
-	defaultSessionRefreshTimeout = 45 * time.Second
-
-	// defaultSessionRegistrationTimeout bounds how long post-initialize session
-	// registration may take when opening backend connections and injecting
-	// session-scoped capabilities.
-	defaultSessionRegistrationTimeout = 45 * time.Second
-
-	// defaultSessionRegistrationWaitTimeout bounds how long an early
-	// session-scoped request will wait for post-initialize registration to
-	// finish before falling back to best-effort hydration.
-	defaultSessionRegistrationWaitTimeout = 10 * time.Second
-
-	// defaultSessionRegistrationGracePeriod gives the OnRegisterSession hook a
-	// brief chance to publish its in-flight marker after initialize returns the
-	// session ID to the client.
-	defaultSessionRegistrationGracePeriod = 500 * time.Millisecond
-
-	// defaultSessionRegistrationPollInterval is the cadence used while waiting
-	// for an in-flight registration marker to appear.
-	defaultSessionRegistrationPollInterval = 25 * time.Millisecond
-
-	// defaultSessionHydrationTimeout bounds best-effort repair of pod-local SDK
-	// session state when a valid session ID lands on a different vMCP replica.
-	defaultSessionHydrationTimeout = 10 * time.Second
-
-	// defaultSessionOwnerLookupTimeout bounds loading owner metadata from the
-	// shared session metadata storage when deciding whether a request must be
-	// forwarded back to the owning replica.
-	defaultSessionOwnerLookupTimeout = 5 * time.Second
-
-	// defaultSessionCloseGracePeriod delays closing the replaced session so
-	// in-flight handlers that already captured it can drain gracefully.
-	defaultSessionCloseGracePeriod = 2 * time.Minute
-
-	sessionOwnerForwardedHeader = "X-ToolHive-Session-Forwarded"
-	sessionOwnerForwardedValue  = "1"
 	// Transport defaults shared by New and Serve (buildServeConfig) so the two
 	// entry points cannot drift while New is not yet routed through Serve.
 	defaultServerName    = "toolhive-vmcp"
 	defaultServerVersion = "0.1.0"
 	defaultHost          = "127.0.0.1"
 	defaultEndpointPath  = "/mcp"
+
+	// capabilityCacheTTL bounds how long the per-identity aggregated capability view is
+	// reused before re-sweeping backends. The core re-aggregates on every call (it holds no
+	// per-session cache), so without this the Serve path does a full backend tools/list sweep
+	// per tool call; a short TTL collapses bursts of calls into ~one sweep while keeping
+	// staleness tighter than the legacy once-per-session refresh.
+	capabilityCacheTTL = 30 * time.Second
+
+	// defaultSessionRegistrationTimeout bounds the post-initialize session
+	// registration (opening backend connections and injecting capabilities),
+	// which runs detached from the initialize request's cancellation.
+	defaultSessionRegistrationTimeout = 45 * time.Second
 )
-
-var errSessionOwnerUnavailable = errors.New("session owner unavailable")
-
-const ownerForwardDialTimeout = 2 * time.Second
-
-func newOwnerForwardTransport() *http.Transport {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.DialContext = (&net.Dialer{
-		Timeout:   ownerForwardDialTimeout,
-		KeepAlive: 30 * time.Second,
-	}).DialContext
-	return transport
-}
 
 //go:generate mockgen -destination=mocks/mock_watcher.go -package=mocks -source=server.go Watcher
 
@@ -177,9 +136,9 @@ type Config struct {
 	// Sessions inactive for this duration will be automatically cleaned up
 	SessionTTL time.Duration
 
-	// WriteTimeout is the server-level write deadline. Values below the secure
-	// default are raised to the default; larger values allow configured backend
-	// requests to finish and leave time to write the MCP response.
+	// WriteTimeout is the server-level write deadline. Values below
+	// defaultWriteTimeout are raised to it; larger values let configured backend
+	// request timeouts finish and leave time to write the MCP response.
 	WriteTimeout time.Duration
 
 	// AuthMiddleware is the optional authentication middleware to apply to MCP routes.
@@ -196,6 +155,17 @@ type Config struct {
 	// AuthInfoHandler is the optional handler for /.well-known/oauth-protected-resource endpoint.
 	// Exposes OIDC discovery information about the protected resource.
 	AuthInfoHandler http.Handler
+
+	// PassthroughHeaders is an allowlist of incoming client header names that the
+	// vMCP forwards, unchanged, to every backend it calls. They are captured
+	// per-request at the incoming edge (headerforward.CaptureMiddleware) and merged
+	// into the per-session backend client's header-forward config. Empty disables
+	// capture (no middleware is installed).
+	PassthroughHeaders []string
+
+	// RateLimitMiddleware is the optional rate-limit middleware to apply after
+	// authentication and MCP request parsing.
+	RateLimitMiddleware func(http.Handler) http.Handler
 
 	// AuthServer is the optional embedded authorization server.
 	// When non-nil, the routes returned by Routes() are registered on the mux
@@ -235,16 +205,26 @@ type Config struct {
 	// A nil value disables the optimizer.
 	OptimizerConfig *optimizer.Config
 
+	// CodeModeConfig enables vMCP code mode. When non-nil, New wraps the core with a
+	// codemode decorator that advertises the execute_tool_script virtual tool and runs
+	// submitted Starlark scripts, whose inner tool calls route back through core.CallTool
+	// (so the core admission seam authorizes each one). The decorator sits below any
+	// optimizer: execute_tool_script appears in the core's tool set, so an enabled
+	// optimizer indexes and routes to it like any other tool. A nil value (the default)
+	// leaves the core undecorated and execute_tool_script absent from tools/list.
+	//
+	// Unlike the optimizer (which is mutually exclusive with Authz, see the guard in New),
+	// code mode may be combined with Authz: a script's inner tool calls are re-authorized
+	// by real name through the core admission seam, so Cedar remains the gate on everything
+	// a script can do. See the codemode.decorator doc for the full rationale.
+	CodeModeConfig *codemode.Config
+
 	// StatusReporter enables vMCP runtime to report operational status.
 	// In Kubernetes mode: Updates VirtualMCPServer.Status (requires RBAC)
 	// In CLI mode: NoOpReporter (no persistent status)
 	// If nil, status reporting is disabled.
 	StatusReporter vmcpstatus.Reporter
 
-	// SessionOwnerAdvertiseURL is the pod-local HTTP endpoint used by sibling
-	// replicas to forward live-session traffic (SSE listen/delete and methodless
-	// client replies) back to the pod that owns the SDK session state.
-	SessionOwnerAdvertiseURL string
 	// SessionFactory creates MultiSessions for session management.
 	// Required; must not be nil.
 	SessionFactory vmcpsession.MultiSessionFactory
@@ -255,11 +235,43 @@ type Config struct {
 	// session persistence; the Redis password is read from the
 	// THV_SESSION_REDIS_PASSWORD environment variable.
 	SessionStorage *vmcpconfig.SessionStorageConfig
+
+	// Aggregator merges backend capabilities into the advertised set. It is consumed
+	// by the domain core (core.Config.Aggregator) that New builds via deriveCoreConfig:
+	// the core is the single aggregator on the New/Serve path, so the session factory
+	// must NOT also aggregate. Required; New fails (via core.New) when nil. The
+	// composition root supplies it (the same aggregator that backs discovery).
+	Aggregator aggregator.Aggregator
+
+	// Authz is the authorizer-agnostic authorization config fed to the core admission
+	// seam (core.Config.Authz). A nil value means authorization is unconfigured
+	// (allow-all), matching the legacy `AuthzMiddleware != nil` guard: the composition
+	// root populates it only when Cedar policies exist. It is distinct from the
+	// (vestigial) AuthzMiddleware field — the core enforces authz from this config, not
+	// from the HTTP middleware. When non-nil, Name must be non-empty (the Cedar resource
+	// entity name).
+	Authz *authz.Config
 }
 
 // Server is the Virtual MCP Server that aggregates multiple backends.
 type Server struct {
 	config *Config
+
+	// core is the domain VMCP and the single source of truth for the advertised
+	// capability set and call routing: session registration sources
+	// tools/resources from core.ListTools/ListResources, request handlers
+	// delegate to core.CallTool/ReadResource, and authorization is enforced by
+	// the core admission seam. Serve always sets it, so it is non-nil for every
+	// server (BackendHealth keeps a defensive nil guard regardless).
+	core core.VMCP
+
+	// optimizerFactory builds a per-session optimizer over the core's advertised
+	// tools. Set only when the optimizer is enabled (nil otherwise). When non-nil,
+	// session registration advertises find_tool/
+	// call_tool in place of the raw core tools and dispatches call_tool's inner
+	// invocation through core.CallTool. The shared store and cleanup are owned by the
+	// session manager; this is the resolved factory surfaced via Manager.OptimizerFactory.
+	optimizerFactory func(context.Context, []server.ServerTool) (optimizer.Optimizer, error)
 
 	// MCP protocol server (mark3labs/mcp-go)
 	mcpServer *server.MCPServer
@@ -270,18 +282,6 @@ type Server struct {
 	// Network listener (tracks actual bound port when using port 0)
 	listener   net.Listener
 	listenerMu sync.RWMutex
-
-	// Router for forwarding requests to backends
-	router router.Router
-
-	// Backend client for making requests to backends
-	backendClient vmcp.BackendClient
-
-	// Handler factory for creating MCP request handlers
-	handlerFactory *adapter.DefaultHandlerFactory
-
-	// Discovery manager for lazy per-user capability discovery
-	discoveryMgr discovery.Manager
 
 	// Backend registry for capability discovery
 	// For static mode (CLI), this is an immutable registry created from initial backends.
@@ -301,17 +301,6 @@ type Server struct {
 	// Redis-backed storage for multi-pod deployments is not yet wired.
 	sessionDataStorage transportsession.DataStorage
 
-	// sessionOwnerURL is the canonical pod-local URL advertised to sibling
-	// replicas for owner-aware forwarding of live-session traffic.
-	sessionOwnerURL string
-
-	// ownerForwardClient is used to proxy live-session traffic back to the pod
-	// that owns the SDK session state.
-	ownerForwardClient *http.Client
-
-	// Capability adapter for converting aggregator types to SDK types
-	capabilityAdapter *adapter.CapabilityAdapter
-
 	// vmcpSessionMgr manages session-scoped backend client lifecycle.
 	vmcpSessionMgr SessionManager
 
@@ -320,45 +309,32 @@ type Server struct {
 	ready     chan struct{}
 	readyOnce sync.Once
 
-	// healthMonitor performs periodic health checks on backends.
-	// Nil if health monitoring is disabled.
-	// Protected by healthMonitorMu: RLock for reads (getter methods, HTTP handlers),
-	// Lock for writes (initialization, disabling on start failure).
-	healthMonitor   *health.Monitor
-	healthMonitorMu sync.RWMutex
-
 	// statusReporter enables vMCP to report operational status to control plane.
 	// Nil if status reporting is disabled.
 	statusReporter vmcpstatus.Reporter
 
 	// shutdownFuncs contains cleanup functions to run during Stop().
-	// Populated during Start() initialization before blocking; no mutex needed
-	// since Stop() is only called after Start()'s select returns.
+	// Populated by Serve, by Handler and during Start() initialization before
+	// blocking; no mutex needed since Stop() is only called after Start()'s select
+	// returns (or, for an embedded Handler, after the caller stops serving it).
 	shutdownFuncs []func(context.Context) error
 
-	// activeClientSessions stores initialized SDK sessions by session ID so
-	// live refresh can replace per-session tools/resources directly.
-	activeClientSessions sync.Map
+	// activeClientSessions holds the SDK sessions registered on this replica; it
+	// feeds the session cardinality gauges and selects the sessions a capability
+	// refresh clears (serve_refresh.go).
+	activeClientSessions clientSessionSet
 
-	// inFlightRegistrations tracks sessions currently executing the
-	// post-initialize registration hook so early session-scoped requests can
-	// wait briefly instead of racing a still-empty SDK session.
-	inFlightRegistrations sync.Map
-
-	// refreshMu serializes session refresh work triggered by health transitions.
-	refreshMu sync.Mutex
-
-	// refreshSched debounces and rate-limits per-backend session refreshes so a
-	// flapping backend cannot rebuild every session on every transition.
-	refreshSched     *refreshScheduler
-	refreshSchedOnce sync.Once
+	// inFlightRegistrations counts session registrations currently running the
+	// post-initialize hook; it feeds the session cardinality gauges.
+	inFlightRegistrations atomic.Int64
 }
 
 // buildSessionDataStorage constructs the DataStorage backend from cfg.
 // When cfg.SessionStorage is nil or provider is "memory" (or empty), local in-process
 // storage is used. When provider is "redis", a Redis-backed store is created
 // using the address, DB, and key prefix from cfg.SessionStorage; the password
-// is read from the THV_SESSION_REDIS_PASSWORD environment variable.
+// is read from the THV_SESSION_REDIS_PASSWORD environment variable and the optional
+// ACL username from THV_SESSION_REDIS_USERNAME.
 // Any other provider value is a misconfiguration and returns an error.
 func buildSessionDataStorage(ctx context.Context, cfg *Config) (transportsession.DataStorage, error) {
 	// Default to in-process storage when session storage is not configured,
@@ -392,255 +368,144 @@ func buildSessionDataStorage(ctx context.Context, cfg *Config) (transportsession
 	return transportsession.NewRedisSessionDataStorage(ctx, redisCfg, keyPrefix, cfg.SessionTTL)
 }
 
-type sessionRegistrationState struct {
-	done chan struct{}
-	once sync.Once
-}
-
-func newSessionRegistrationState() *sessionRegistrationState {
-	return &sessionRegistrationState{done: make(chan struct{})}
-}
-
-func (s *sessionRegistrationState) close() {
-	s.once.Do(func() {
-		close(s.done)
-	})
-}
-
-// New creates a new Virtual MCP Server instance.
+// New creates a Virtual MCP Server by composing the domain core (core.New) with the
+// transport (Serve).
+//
+// It is the composition root for the in-memory Config form: it builds the backend
+// health monitor (A2), assembles the core via core.New using the config projected by
+// deriveCoreConfig, and hands that core to Serve with the transport config projected by
+// deriveServerConfig. The transport/core wiring it once performed inline now lives
+// behind core.New + Serve.
 //
 // The backendRegistry parameter provides the list of available backends:
 // - For static mode (CLI), pass an immutable registry created from initial backends
 // - For dynamic mode (K8s), pass a DynamicRegistry that will be updated by the operator
 //
-//nolint:gocyclo // Complexity from hook logic is acceptable
+// Signature/contract changes for embedders (the body now routes through core.New + Serve):
+//   - The discovery.Manager parameter was dropped when the discovery middleware was
+//     removed; capability discovery is the core's responsibility. Existing callers must
+//     drop that argument.
+//   - Config.Aggregator is now REQUIRED (core.New rejects a nil aggregator); the core is
+//     the single source of the advertised capability set.
+//   - Config.AuthzMiddleware is vestigial: the Serve path never applies it. Authorization
+//     is enforced by the core admission seam from Config.Authz. An embedder that enforced
+//     Cedar authz only via AuthzMiddleware must set Config.Authz instead — New returns an
+//     error (ErrInvalidConfig) if AuthzMiddleware is set without Authz, so a silent
+//     allow-all fails fast at construction.
 func New(
 	ctx context.Context,
 	cfg *Config,
 	rt router.Router,
 	backendClient vmcp.BackendClient,
-	discoveryMgr discovery.Manager,
 	backendRegistry vmcp.BackendRegistry,
 	workflowDefs map[string]*composer.WorkflowDefinition,
 ) (*Server, error) {
-	// Apply defaults
-	if cfg.Host == "" {
-		cfg.Host = defaultHost
-	}
-	// Note: Port 0 means "let OS assign random port" - intentionally no default applied here.
-	// CLI provides default via flag (4483), so Port is only 0 in tests for dynamic port assignment.
-	if cfg.EndpointPath == "" {
-		cfg.EndpointPath = defaultEndpointPath
-	}
-	if cfg.Name == "" {
-		cfg.Name = defaultServerName
-	}
-	if cfg.Version == "" {
-		cfg.Version = defaultServerVersion
-	}
-	if cfg.SessionTTL == 0 {
-		cfg.SessionTTL = defaultSessionTTL
-	}
-	sessionOwnerURL, err := normalizeSessionOwnerURL(cfg.SessionOwnerAdvertiseURL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid session owner advertise URL: %w", err)
+	// Resolve transport defaults for the transport side on a COPY (WithDefaults does not
+	// mutate cfg). The core receives the RAW cfg so its ServerName is the un-defaulted
+	// cfg.Name: Cedar authz keys on the real VirtualMCPServer name, not the synthetic
+	// "toolhive-vmcp" transport fallback.
+	resolved := WithDefaults(cfg)
+
+	// AuthzMiddleware is vestigial on the New/Serve path (Serve never applies it; authz
+	// moved to the core admission seam). Setting it without a corresponding Config.Authz
+	// would silently degrade to allow-all — a security regression for an embedder that
+	// relied on it for Cedar authz — so fail fast instead of logging a warning the embedder
+	// is unlikely to notice. cli/serve.go sets Authz whenever it sets AuthzMiddleware, so
+	// this never fires in-tree.
+	if cfg.AuthzMiddleware != nil && cfg.Authz == nil {
+		return nil, fmt.Errorf("%w: Config.AuthzMiddleware is set but has no effect on the "+
+			"New/Serve path; set Config.Authz to enforce authorization, or clear AuthzMiddleware",
+			vmcp.ErrInvalidConfig)
 	}
 
-	// Create hooks for SDK integration
-	hooks := &server.Hooks{}
-
-	// Create mark3labs MCP server
-	mcpServer := server.NewMCPServer(
-		cfg.Name,
-		cfg.Version,
-		server.WithToolCapabilities(true), // Session-scoped capability updates send list_changed notifications
-		server.WithResourceCapabilities(false, true), // Session-scoped resources may be refreshed live
-		server.WithLogging(),
-		server.WithHooks(hooks),
-	)
-
-	// Create SDK elicitation adapter for workflow engine
-	// This wraps the mark3labs SDK to provide elicitation functionality to the composer
-	sdkElicitationRequester := NewSDKElicitationAdapter(mcpServer)
-
-	// Create elicitation handler for workflow engine
-	// This provides SDK-agnostic elicitation with security validation
-	elicitationHandler := composer.NewDefaultElicitationHandler(sdkElicitationRequester)
-
-	// Decorate backend client with telemetry if provider is configured
-	// This must happen BEFORE creating the workflow engine so that workflow
-	// backend calls are instrumented when they occur during workflow execution.
-	if cfg.TelemetryProvider != nil {
-		var err error
-		// Get initial backends list from registry for telemetry setup
-		initialBackends := backendRegistry.List(ctx)
-		backendClient, err = backendtelemetry.MonitorBackends(
-			ctx,
-			cfg.TelemetryProvider.MeterProvider(),
-			cfg.TelemetryProvider.TracerProvider(),
-			initialBackends,
-			backendClient,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to monitor backends: %w", err)
-		}
+	// The core admission seam has no representation for the optimizer's meta-tools
+	// (find_tool/call_tool), so combining Authz with the optimizer would let those calls
+	// bypass Cedar evaluation entirely. Fail fast per the admission seam contract (see the
+	// core.Admission doc); the optimizer keeps its own HTTP-path authz until a focused PR.
+	if cfg.Authz != nil && cfg.OptimizerConfig != nil {
+		return nil, fmt.Errorf("%w: Config.Authz and Config.OptimizerConfig are mutually "+
+			"exclusive; the optimizer meta-tools (find_tool, call_tool) are not represented "+
+			"in the core admission seam", vmcp.ErrInvalidConfig)
 	}
 
-	// Create workflow auditor if audit config is provided
-	var workflowAuditor *audit.WorkflowAuditor
-	if cfg.AuditConfig != nil {
-		if err := cfg.AuditConfig.Validate(); err != nil {
-			return nil, fmt.Errorf("invalid audit configuration: %w", err)
-		}
-		var err error
-		workflowAuditor, err = audit.NewWorkflowAuditor(cfg.AuditConfig)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create workflow auditor: %w", err)
-		}
-		slog.Info("workflow audit logging enabled")
+	// Cedar resource entities are scoped to MCP::"<Name>" (see Config.Authz), so an empty
+	// Name with Authz set would key policies on MCP::"" and silently fail to match. core.New
+	// also rejects this (its admission seam), but fail at the construction root too for a
+	// clearer error consistent with the guards above.
+	if cfg.Authz != nil && cfg.Name == "" {
+		return nil, fmt.Errorf("%w: Config.Name is required when Config.Authz is set "+
+			"(it is the Cedar resource entity name)", vmcp.ErrInvalidConfig)
 	}
 
-	// Create workflow engine (composer) for executing composite tools
-	// The composer orchestrates multi-step workflows across backends
-	// Use in-memory state store with 5-minute cleanup interval and 1-hour max age for completed workflows
-	stateStore := composer.NewInMemoryStateStore(5*time.Minute, 1*time.Hour)
-	workflowComposer := composer.NewWorkflowEngine(rt, backendClient, elicitationHandler, stateStore, workflowAuditor, nil)
+	// The SDK elicitation adapter wraps the mcp-go server Serve builds below, so it
+	// cannot exist before core.New. Give the core a late-bound requester now and bind the
+	// real adapter to Serve's server before serving begins (RequestElicitation is only
+	// invoked at request time, after bind).
+	elicitation := newLateBoundElicitationRequester()
 
-	// composerFactory builds a per-session workflow engine at session registration
-	// time, binding composite tool routing to the session's own routing table and
-	// tool list. This removes composite tools' dependency on the discovery middleware
-	// injecting DiscoveredCapabilities into the request context.
-	sessionComposerFactory := func(sessionRT *vmcp.RoutingTable, sessionTools []vmcp.Tool) composer.Composer {
-		return composer.NewWorkflowEngine(
-			router.NewSessionRouter(sessionRT), backendClient, elicitationHandler, stateStore, workflowAuditor,
-			sessionTools,
-		)
-	}
+	// Wrap the aggregator in a per-identity caching decorator: the core re-derives the
+	// advertised view on every call, so without this the Serve path re-sweeps every backend's
+	// tools/list per tool call. The cache is keyed on identity + forwarded credentials, so it
+	// never serves one caller's capability view to another.
+	cachedAgg := aggregator.NewCachingAggregator(cfg.Aggregator, capabilityCacheTTL)
 
-	// Validate workflows (fail fast on invalid definitions)
-	workflowDefs, err = validateWorkflows(workflowComposer, workflowDefs)
-	if err != nil {
-		return nil, fmt.Errorf("workflow validation failed: %w", err)
-	}
-
-	// Create session manager using StreamableSession as the transport-layer placeholder.
-	// StreamableSession is a lightweight implementation of transportsession.Session that
-	// handles disconnect tracking, TTL, and metadata for Streamable HTTP connections.
-	// It intentionally carries no vmcp-specific state — backend connections, routing
-	// tables, tool lists, and token binding all live in the separate sessionmanager.Manager,
-	// keyed by the same session ID.
-	sessionManager := transportsession.NewManager(cfg.SessionTTL, transportsession.NewStreamableSession)
-
-	sessionDataStorage, err := buildSessionDataStorage(ctx, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create session data storage: %w", err)
-	}
-	// Close sessionDataStorage if New() returns an error after this point so the
-	// background cleanup goroutine does not leak.
-	closeStorageOnErr := true
-	defer func() {
-		if closeStorageOnErr {
-			_ = sessionDataStorage.Close()
-		}
-	}()
-
-	// Create handler factory (used by adapter and for future dynamic registration)
-	handlerFactory := adapter.NewDefaultHandlerFactory(rt, backendClient)
-
-	// Create capability adapter (single source of truth for converting aggregator types to SDK types)
-	capabilityAdapter := adapter.NewCapabilityAdapter(handlerFactory)
-
-	// Create health monitor if configured
-	var healthMon *health.Monitor
-	if cfg.HealthMonitorConfig != nil {
-		// Get initial backends list from registry for health monitoring setup
-		initialBackends := backendRegistry.List(ctx)
-		healthMon, err = health.NewMonitor(backendClient, initialBackends, *cfg.HealthMonitorConfig)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create health monitor: %w", err)
-		}
-		slog.Info("health monitoring enabled",
-			"check_interval", cfg.HealthMonitorConfig.CheckInterval,
-			"unhealthy_threshold", cfg.HealthMonitorConfig.UnhealthyThreshold,
-			"timeout", cfg.HealthMonitorConfig.Timeout,
-			"degraded_threshold", cfg.HealthMonitorConfig.DegradedThreshold)
-	} else {
-		slog.Info("health monitoring disabled")
-	}
-
-	// Pass the whole factory config so the session manager constructs everything
-	// it needs (optimizer wiring, composite tool layers, telemetry instruments).
-	sessMgrCfg := &sessionmanager.FactoryConfig{
-		Base:              cfg.SessionFactory,
-		SessionTTL:        cfg.SessionTTL,
-		WorkflowDefs:      workflowDefs,
-		ComposerFactory:   sessionComposerFactory,
-		OptimizerConfig:   cfg.OptimizerConfig,
-		OptimizerFactory:  cfg.OptimizerFactory,
-		TelemetryProvider: cfg.TelemetryProvider,
-	}
-	vmcpSessMgr, optimizerCleanup, err := sessionmanager.New(sessionDataStorage, sessMgrCfg, backendRegistry, healthMon)
+	coreVMCP, err := core.New(deriveCoreConfig(
+		cfg, cachedAgg, rt, backendClient, backendRegistry, workflowDefs,
+		cfg.Authz, elicitation,
+	))
 	if err != nil {
 		return nil, err
 	}
 
-	// Create Server instance
-	srv := &Server{
-		config:             cfg,
-		mcpServer:          mcpServer,
-		router:             rt,
-		backendClient:      backendClient,
-		handlerFactory:     handlerFactory,
-		discoveryMgr:       discoveryMgr,
-		backendRegistry:    backendRegistry,
-		sessionManager:     sessionManager,
-		sessionDataStorage: sessionDataStorage,
-		sessionOwnerURL:    sessionOwnerURL,
-		ownerForwardClient: &http.Client{Transport: newOwnerForwardTransport()},
-		capabilityAdapter:  capabilityAdapter,
-		ready:              make(chan struct{}),
-		healthMonitor:      healthMon,
-		statusReporter:     cfg.StatusReporter,
-		vmcpSessionMgr:     vmcpSessMgr,
+	// Wrap the core with the code mode decorator when enabled. It sits BELOW any optimizer:
+	// ListTools now advertises execute_tool_script alongside the backend tools, so the
+	// Serve-layer optimizer (if enabled) indexes it like any other tool, and the script's
+	// inner calls route back through core.CallTool for admission. The decorator delegates
+	// Close to the inner core, so the closeCoreOnErr guard below still releases it.
+	if cfg.CodeModeConfig != nil {
+		coreVMCP = codemode.NewDecorator(coreVMCP, cfg.CodeModeConfig)
 	}
 
-	if cfg.TelemetryProvider != nil {
-		if err := monitorSessionCardinality(cfg.TelemetryProvider.MeterProvider(), srv); err != nil {
-			return nil, fmt.Errorf("failed to monitor session cardinality: %w", err)
+	// core.New started the workflow state store's cleanup goroutine and the backend health
+	// monitor (both owned by the core now). If Serve fails after this point, close the core so
+	// neither leaks (mirrors Serve's closeStorageOnErr guard); on success the core's lifecycle
+	// is owned by srv.Stop, so the guard is disarmed before returning.
+	closeCoreOnErr := true
+	defer func() {
+		if closeCoreOnErr {
+			_ = coreVMCP.Close()
 		}
+	}()
+
+	// On the New/Serve path the core is the single aggregator and the source of the
+	// advertised set; the session factory only opens per-session backend connections and
+	// binds identity. AdvertiseFromCore makes the session manager source tools from the
+	// core and (when the optimizer is enabled) build the Serve-layer optimizer over the
+	// core's tools instead of decorating the factory. Composite-tool workflows are owned
+	// by the core, so no WorkflowDefs/ComposerFactory are wired here.
+	sessMgrCfg := &sessionmanager.FactoryConfig{
+		Base:              cfg.SessionFactory,
+		OptimizerConfig:   cfg.OptimizerConfig,
+		OptimizerFactory:  cfg.OptimizerFactory,
+		TelemetryProvider: cfg.TelemetryProvider,
+		AdvertiseFromCore: true,
+		// New sessions connect only to the backends the core's health monitor
+		// reports as eligible (nil when health monitoring is disabled).
+		HealthStatusProvider: coreVMCP.BackendHealth(),
+		// Close cached sessions idle on this replica for a full session TTL.
+		IdleTTL: resolved.SessionTTL,
 	}
 
-	if optimizerCleanup != nil {
-		srv.shutdownFuncs = append(srv.shutdownFuncs, optimizerCleanup)
+	srv, err := Serve(ctx, coreVMCP, deriveServerConfig(resolved, backendRegistry, sessMgrCfg))
+	if err != nil {
+		return nil, err
 	}
 
-	if healthMon != nil {
-		healthMon.AddOnStatusChange(srv.handleBackendStatusChange)
-	}
+	// Bind the elicitation adapter to the SDK server Serve built so composite-workflow
+	// elicitation reaches the same mcp-go server that serves client traffic.
+	elicitation.bind(NewSDKElicitationAdapter(srv.MCPServer()))
 
-	// Late-bind capability-change notifications: when a backend sends
-	// tools/list_changed the server refreshes all sessions that contain it.
-	if reg, ok := cfg.SessionFactory.(vmcpsession.CapabilityChangeRegistrar); ok {
-		reg.SetOnCapabilityChange(srv.handleBackendCapabilityChange)
-	}
-
-	// Repair session-scoped SDK state for valid sessions that arrive on a
-	// different replica than the one that originally registered them.
-	hooks.AddOnRequestInitialization(func(ctx context.Context, id any, message any) error {
-		return srv.handleSessionRequestInitialization(ctx, id, message)
-	})
-
-	// Register OnRegisterSession hook to inject capabilities after SDK registers session.
-	// See handleSessionRegistration for implementation details.
-	hooks.AddOnRegisterSession(func(ctx context.Context, session server.ClientSession) {
-		srv.handleSessionRegistration(ctx, session)
-	})
-	hooks.AddOnUnregisterSession(func(_ context.Context, session server.ClientSession) {
-		srv.activeClientSessions.Delete(session.SessionID())
-	})
-
-	// Disarm the close-on-error guard: Server is fully constructed.
-	closeStorageOnErr = false
+	closeCoreOnErr = false // Serve succeeded; srv.Stop now owns the core's lifecycle.
 	return srv, nil
 }
 
@@ -648,8 +513,8 @@ func New(
 // This enables embedding the vmcp server inside another HTTP server or framework.
 //
 // The returned handler includes all routes (health, metrics, well-known, MCP)
-// and the full middleware chain (recovery, header validation, auth, audit,
-// discovery, backend enrichment, MCP parsing, telemetry).
+// and the full middleware chain (recovery, body limit, header validation, auth,
+// rate limit, audit, MCP parsing, telemetry).
 //
 // Each call builds a fresh handler. The method is safe to call multiple times.
 // All returned handlers share the same underlying MCPServer and SessionManager,
@@ -659,10 +524,17 @@ func (s *Server) Handler(_ context.Context) (http.Handler, error) {
 	streamableServer := server.NewStreamableHTTPServer(
 		s.mcpServer,
 		server.WithEndpointPath(s.config.EndpointPath),
-		server.WithSessionIdManager(s.vmcpSessionMgr),
+		server.WithSessionIdManagerResolver(sessionIDManagerResolver{manager: s.vmcpSessionMgr}),
 		server.WithHeartbeatInterval(defaultHeartbeatInterval),
+		// Sweep the SDK's per-session tool/resource stores for sessions that go idle
+		// on this replica without a DELETE, using the same TTL as the session
+		// storage. The sweep clears only this replica's state (see
+		// sessionIDManagerResolver); the storage TTL expires the shared record.
 		server.WithSessionIdleTTL(s.config.SessionTTL),
 	)
+	// Stop the idle sweeper's goroutine on Stop. Shutdown only cancels the sweeper
+	// here: the StreamableHTTPServer is used as a handler and owns no listener.
+	s.shutdownFuncs = append(s.shutdownFuncs, streamableServer.Shutdown)
 
 	// Create HTTP mux with separated authenticated and unauthenticated routes
 	mux := http.NewServeMux()
@@ -702,11 +574,19 @@ func (s *Server) Handler(_ context.Context) (http.Handler, error) {
 	}
 
 	// MCP endpoint - apply middleware chain (wrapping order, execution happens in reverse):
-	// Code wraps: auth+parser → audit → discovery → annotation-enrichment →
-	//   authz → backend-enrichment → MCP-parsing → telemetry
-	// Execution order: recovery → header-val → auth+parser → audit →
-	//   discovery → annotation-enrichment → authz → backend-enrichment →
-	//   MCP-parsing → telemetry → handler
+	// Code wraps: auth → rate-limit → audit → MCP-parsing → telemetry
+	// Execution order: recovery → body-limit → header-val → auth →
+	//   rate-limit → audit → MCP-parsing → telemetry → handler
+	//
+	// Upstream token refresh failures are detected inside AuthMiddleware itself:
+	// GetAllUpstreamCredentials returns a non-empty failed-provider slice when
+	// any upstream refresh fails, and the middleware short-circuits with
+	// HTTP 401 + WWW-Authenticate before the request reaches any inner layer.
+	//
+	// The legacy HTTP authz, annotation-enrichment, and discovery layers have all been
+	// removed: every caller now routes through Serve, so authorization is enforced by the
+	// core admission seam (#5438) and capability/health filtering by the core, rather than
+	// by HTTP middleware.
 
 	var mcpHandler http.Handler = streamableServer
 
@@ -724,48 +604,6 @@ func (s *Server) Handler(_ context.Context) (http.Handler, error) {
 	// when auth middleware is nil.
 	mcpHandler = mcpparser.ParsingMiddleware(mcpHandler)
 
-	// Apply backend enrichment middleware if audit is configured
-	// This runs after discovery populates the routing table, so it can extract backend names
-	if s.config.AuditConfig != nil {
-		mcpHandler = s.backendEnrichmentMiddleware(mcpHandler)
-		slog.Info("backend enrichment middleware enabled for audit events")
-	}
-
-	// Apply authorization middleware if configured (runs AFTER discovery in execution).
-	// Wrapping it here (before discovery wrap) means discovery runs first, then authz.
-	if s.config.AuthzMiddleware != nil {
-		mcpHandler = s.config.AuthzMiddleware(mcpHandler)
-		slog.Info("authorization middleware enabled for MCP endpoints (post-discovery)")
-	}
-
-	// Apply annotation enrichment middleware (runs after discovery, before authz in execution).
-	// Reads tool annotations from discovered capabilities and injects them into the
-	// request context so the authz middleware can make annotation-aware decisions.
-	if s.config.AuthzMiddleware != nil {
-		mcpHandler = AnnotationEnrichmentMiddleware(mcpHandler)
-		slog.Info("annotation enrichment middleware enabled for MCP endpoints")
-	}
-
-	// Apply discovery middleware (runs after audit/auth middleware)
-	// Discovery middleware performs per-request capability aggregation with user context.
-	// vmcpSessionMgr (MultiSessionGetter) is used to retrieve the fully-formed MultiSession
-	// for subsequent requests so the routing table can be injected into context.
-	// The backend registry provides a dynamic backend list (supports DynamicRegistry for K8s).
-	// The health monitor enables filtering based on current health status (respects circuit breaker).
-	s.healthMonitorMu.RLock()
-	healthMon := s.healthMonitor
-	s.healthMonitorMu.RUnlock()
-
-	var healthStatusProvider health.StatusProvider
-	if healthMon != nil {
-		healthStatusProvider = healthMon
-	}
-	mcpHandler = discovery.Middleware(
-		s.discoveryMgr, s.backendRegistry, s.vmcpSessionMgr, healthStatusProvider,
-		discovery.WithSessionScopedRouting(),
-	)(mcpHandler)
-	slog.Info("discovery middleware enabled for lazy per-user capability discovery")
-
 	// Apply audit middleware if configured (runs after auth, before discovery)
 	if s.config.AuditConfig != nil {
 		if err := s.config.AuditConfig.Validate(); err != nil {
@@ -782,7 +620,13 @@ func (s *Server) Handler(_ context.Context) (http.Handler, error) {
 		slog.Info("audit middleware enabled for MCP endpoints")
 	}
 
-	mcpHandler = s.claimOrphanedSessionMiddleware(mcpHandler)
+	// Mark health probes from a peer vMCP (peer_probe.go), so session registration
+	// and lazy injection skip them, and refuse any probe request beyond the
+	// handshake and capability lists. Runs after authentication.
+	mcpHandler = peerProbeMiddleware(mcpHandler)
+	mcpHandler = s.listenStreamGuardMiddleware(mcpHandler)
+
+	mcpHandler = s.applyRateLimiting(mcpHandler)
 
 	// Apply authentication middleware if configured (runs first in chain)
 	if s.config.AuthMiddleware != nil {
@@ -790,16 +634,7 @@ func (s *Server) Handler(_ context.Context) (http.Handler, error) {
 		slog.Info("authentication middleware enabled for MCP endpoints")
 	}
 
-	// Restore the health-check marker from the wire so receiving spokes can
-	// serve inter-vMCP health probes without opening full session-scoped
-	// backend connections.
-	mcpHandler = healthProbeContextMiddleware(mcpHandler)
-
-	// Forward the sticky-only live-session paths (listen/delete and client
-	// replies to server-initiated requests) back to the replica that owns the
-	// SDK session state. Regular tool/resource requests stay local and rely on
-	// session rehydration instead.
-	mcpHandler = s.ownerForwardingMiddleware(mcpHandler)
+	mcpHandler = s.applyForwardedHeaderCapture(mcpHandler)
 
 	// Apply Accept header validation (rejects GET requests without Accept: text/event-stream)
 	mcpHandler = headerValidatingMiddleware(mcpHandler)
@@ -808,8 +643,14 @@ func (s *Server) Handler(_ context.Context) (http.Handler, error) {
 	// Accept: text/event-stream + MCP endpoint path) so the server-level
 	// WriteTimeout does not kill long-lived SSE streams (see golang/go#16100).
 	// Non-qualifying requests are left untouched; http.Server.WriteTimeout
-	// remains in effect for them.
+	// (effectiveWriteTimeout) remains in effect for them.
 	mcpHandler = transportmiddleware.WriteTimeout(s.config.EndpointPath)(mcpHandler)
+
+	// Cap request body size before the MCP parser (and all inner middleware)
+	// buffers it via io.ReadAll, rejecting oversized bodies with 413. This is
+	// parity with the proxy transports (see pkg/bodylimit). It only bounds the
+	// request body and does not affect long-lived SSE response streams.
+	mcpHandler = bodylimit.Middleware(bodylimit.DefaultMaxRequestBodySize)(mcpHandler)
 
 	// Apply recovery middleware as outermost (catches panics from all inner middleware)
 	mcpHandler = recovery.Middleware(mcpHandler)
@@ -820,9 +661,30 @@ func (s *Server) Handler(_ context.Context) (http.Handler, error) {
 	return mux, nil
 }
 
+func (s *Server) applyRateLimiting(next http.Handler) http.Handler {
+	if s.config.RateLimitMiddleware == nil {
+		return next
+	}
+	slog.Info("rate limit middleware enabled for MCP endpoints")
+	return s.config.RateLimitMiddleware(next)
+}
+
+// applyForwardedHeaderCapture wraps next with the forwarded-header capture
+// middleware when passthrough headers are configured. It copies the allowlisted
+// incoming headers into the request context so the per-session backend client
+// forwards them to backends (see pkg/vmcp/headerforward). Identity-independent
+// plumbing: its position relative to auth is immaterial; it must only run before
+// session creation, which every inner handler satisfies. No-op when the allowlist
+// is empty.
+func (s *Server) applyForwardedHeaderCapture(next http.Handler) http.Handler {
+	if len(s.config.PassthroughHeaders) == 0 {
+		return next
+	}
+	slog.Info("forwarded-header capture enabled for MCP endpoints", "headers", s.config.PassthroughHeaders)
+	return headerforward.CaptureMiddleware(s.config.PassthroughHeaders)(next)
+}
+
 // Start starts the Virtual MCP Server and begins serving requests.
-//
-//nolint:gocyclo // Complexity from health monitoring and startup orchestration is acceptable
 func (s *Server) Start(ctx context.Context) error {
 	// Build the HTTP handler (middleware chain, routes, mux)
 	handler, err := s.Handler(ctx)
@@ -873,36 +735,8 @@ func (s *Server) Start(ctx context.Context) error {
 		close(s.ready)
 	})
 
-	// Start health monitor if configured
-	s.healthMonitorMu.RLock()
-	healthMon := s.healthMonitor
-	s.healthMonitorMu.RUnlock()
-
-	if healthMon != nil {
-		if err := healthMon.Start(ctx); err != nil {
-			// Log error and disable health monitoring - treat as if it wasn't configured
-			// This ensures getter methods correctly report monitoring as disabled
-			slog.Warn("failed to start health monitor, disabling health monitoring", "error", err)
-			s.healthMonitorMu.Lock()
-			s.healthMonitor = nil
-			s.healthMonitorMu.Unlock()
-		} else {
-			slog.Info("health monitor started")
-		}
-	}
-
-	// Re-attach backends that recovered without a health transition. Sessions
-	// are built in best_effort mode, so a backend whose initialization failed
-	// once would otherwise stay missing from that session until the client
-	// reconnects.
-	if s.backendRegistry != nil {
-		reconcileCtx, reconcileCancel := context.WithCancel(ctx)
-		go s.runBackendReconciliation(reconcileCtx, defaultBackendReconcileInterval)
-		s.shutdownFuncs = append(s.shutdownFuncs, func(context.Context) error {
-			reconcileCancel()
-			return nil
-		})
-	}
+	// The backend health monitor is owned by the core (built and started in core.New, stopped
+	// in core.Close), so the server no longer starts or stops it here.
 
 	// Start status reporter if configured
 	if s.statusReporter != nil {
@@ -934,6 +768,9 @@ func (s *Server) Start(ctx context.Context) error {
 		})
 	}
 
+	// Refresh session capabilities when the set of exposed backends changes.
+	s.shutdownFuncs = append(s.shutdownFuncs, s.startCapabilityRefresh())
+
 	// Wait for either context cancellation or server error
 	select {
 	case <-ctx.Done():
@@ -950,11 +787,10 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 }
 
+// effectiveWriteTimeout returns the configured write timeout when it is above the
+// secure default, else the default.
 func effectiveWriteTimeout(configured time.Duration) time.Duration {
-	if configured > defaultWriteTimeout {
-		return configured
-	}
-	return defaultWriteTimeout
+	return max(configured, defaultWriteTimeout)
 }
 
 // Stop gracefully stops the Virtual MCP Server.
@@ -979,20 +815,8 @@ func (s *Server) Stop(ctx context.Context) error {
 	s.listener = nil
 	s.listenerMu.Unlock()
 
-	// Stop health monitor to clean up health check goroutines
-	s.healthMonitorMu.RLock()
-	healthMon := s.healthMonitor
-	s.healthMonitorMu.RUnlock()
-
-	if healthMon != nil {
-		if err := healthMon.Stop(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to stop health monitor: %w", err))
-		}
-	}
-
-	if s.refreshSched != nil {
-		s.refreshSched.stop()
-	}
+	// The backend health monitor is stopped by core.Close (the core owns it); Serve registered
+	// a shutdown function that closes the core, run in the loop below.
 
 	// Run shutdown functions (e.g., status reporter cleanup, future components)
 	for _, shutdown := range s.shutdownFuncs {
@@ -1006,11 +830,6 @@ func (s *Server) Stop(ctx context.Context) error {
 		if err := s.sessionManager.Stop(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to stop session manager: %w", err))
 		}
-	}
-
-	// Stop discovery manager to clean up background goroutines
-	if s.discoveryMgr != nil {
-		s.discoveryMgr.Stop()
 	}
 
 	// Close session data storage last: HTTP server is down (no new in-flight requests),
@@ -1207,34 +1026,6 @@ func setSessionResourcesDirect(session server.ClientSession, resources []server.
 	return nil
 }
 
-// replaceSessionResourcesDirect replaces the session-specific resource set.
-// Returns true when the visible resource URIs changed.
-func replaceSessionResourcesDirect(session server.ClientSession, resources []server.ServerResource) (bool, error) {
-	sessionWithResources, ok := session.(server.SessionWithResources)
-	if !ok {
-		return false, fmt.Errorf("session does not support per-session resources")
-	}
-
-	existing := sessionWithResources.GetSessionResources()
-	newResources := make(map[string]server.ServerResource, len(resources))
-	for _, res := range resources {
-		newResources[res.Resource.URI] = res
-	}
-
-	changed := len(existing) != len(newResources)
-	if !changed {
-		for uri := range existing {
-			if _, ok := newResources[uri]; !ok {
-				changed = true
-				break
-			}
-		}
-	}
-
-	sessionWithResources.SetSessionResources(newResources)
-	return changed, nil
-}
-
 // setSessionToolsDirect sets tools directly on the session via the SessionWithTools
 // interface, bypassing MCPServer.AddSessionTools. This avoids sending notifications
 // through the session's notification channel, which would accumulate as stale
@@ -1259,49 +1050,104 @@ func setSessionToolsDirect(session server.ClientSession, tools []server.ServerTo
 	return nil
 }
 
-// replaceSessionToolsDirect replaces the session-specific tool set.
-// Returns true when the visible tool names changed.
-func replaceSessionToolsDirect(session server.ClientSession, tools []server.ServerTool) (bool, error) {
-	sessionWithTools, ok := session.(server.SessionWithTools)
+// lazyInjectSessionTools injects tools into the SDK ephemeral session for sessions
+// that were reconstructed from Redis on a different pod (cross-pod session sharing).
+//
+// When a client connects to pod B with an existing session ID (established on pod A),
+// the SDK creates an ephemeral session with no tools because OnRegisterSession only fires
+// during Initialize, which the client doesn't re-send to pod B. This method is called
+// from OnBeforeListTools and OnBeforeCallTool hooks to lazily inject the tools before
+// the SDK handler reads from the per-session tool store.
+//
+// For sessions initialized on this pod (normal case), tools are already in the store
+// (set by setSessionToolsDirect during OnRegisterSession); this method is a no-op.
+//
+// Health probes from a peer vMCP are skipped: they get no tools.
+func (s *Server) lazyInjectSessionTools(ctx context.Context) {
+	sess := server.ClientSessionFromContext(ctx)
+	if sess == nil || isPeerProbe(ctx) {
+		return
+	}
+	sessionWithTools, ok := sess.(server.SessionWithTools)
 	if !ok {
-		return false, fmt.Errorf("session does not support per-session tools")
+		return
 	}
-
-	existing := sessionWithTools.GetSessionTools()
-	newTools := make(map[string]server.ServerTool, len(tools))
-	for _, tool := range tools {
-		newTools[tool.Tool.Name] = tool
+	if len(sessionWithTools.GetSessionTools()) > 0 {
+		return // tools already registered (normal pod-local case)
 	}
+	sessionID := sess.SessionID()
 
-	changed := len(existing) != len(newTools)
-	if !changed {
-		for name := range existing {
-			if _, ok := newTools[name]; !ok {
-				changed = true
-				break
-			}
-		}
+	// Re-derive the tool set the same way registration did, so cross-pod re-injection
+	// matches the advertised set: a fresh core.ListTools for the request identity (the core
+	// is stateless, so re-deriving on pod B is the cache-miss equivalent of the
+	// once-per-session registration call), optimizer-wrapped into find_tool/call_tool when
+	// the optimizer is enabled — via serveSessionTools, the same helper registration uses.
+	//
+	// Note: this lists under the CURRENT request identity, not the session's bound identity.
+	// For the realistic same-principal load-balanced case they are equal, so the advertised
+	// set is identical across pods. A cross-identity re-hydration would advertise the
+	// requester's own filtered set, but the call-time binding check (enforceSessionBinding,
+	// run before core.CallTool/ReadResource) is the backstop — it rejects a mismatched
+	// caller, so no other principal's capabilities can be invoked.
+	identity, _ := auth.IdentityFromContext(ctx)
+	adaptedTools, err := s.serveSessionTools(ctx, sessionID, identity)
+	if err != nil || len(adaptedTools) == 0 {
+		slog.Debug("lazyInjectSessionTools: no tools available for session", "session_id", sessionID)
+		return
 	}
+	if err := setSessionToolsDirect(sess, adaptedTools); err != nil {
+		slog.Warn("lazyInjectSessionTools: failed to inject tools", "session_id", sessionID, "error", err)
+	}
+}
 
-	sessionWithTools.SetSessionTools(newTools)
-	return changed, nil
+// lazyInjectSessionResources is the resources counterpart of
+// lazyInjectSessionTools: it fills an empty per-session resource store (a session
+// that was registered on another pod) from core.ListResources for the request
+// identity. The call-time binding check in coreResourceHandler stays the backstop.
+func (s *Server) lazyInjectSessionResources(ctx context.Context) {
+	sess := server.ClientSessionFromContext(ctx)
+	if sess == nil || isPeerProbe(ctx) {
+		return
+	}
+	sessionWithResources, ok := sess.(server.SessionWithResources)
+	if !ok || len(sessionWithResources.GetSessionResources()) > 0 {
+		return
+	}
+	sessionID := sess.SessionID()
+	identity, _ := auth.IdentityFromContext(ctx)
+	resources, err := s.coreSessionResources(ctx, sessionID, identity)
+	if err != nil || len(resources) == 0 {
+		slog.Debug("lazyInjectSessionResources: no resources available for session", "session_id", sessionID)
+		return
+	}
+	if err := setSessionResourcesDirect(sess, resources); err != nil {
+		slog.Warn("lazyInjectSessionResources: failed to inject resources", "session_id", sessionID, "error", err)
+	}
 }
 
 // handleSessionRegistration processes a new MCP session registration.
 // It fires AFTER the session is registered in the SDK.
+//
+// A health probe from a peer vMCP only checks that the MCP handshake works, so
+// it neither opens backend connections nor lists capabilities, and it is not
+// counted as an active session. A GET registration is never skipped as a probe:
+// it always goes through the identity check in attachToBoundSession.
 func (s *Server) handleSessionRegistration(
 	ctx context.Context,
 	session server.ClientSession,
 ) {
-	registration := s.beginSessionRegistration(session.SessionID())
-	defer s.finishSessionRegistration(session.SessionID(), registration)
-
-	// Error is logged and handled within handleSessionRegistrationImpl.
-	// The session is terminated on failure; no further action needed here.
-	if err := s.handleSessionRegistrationImpl(ctx, session); err != nil {
+	if isPeerProbe(ctx) && !isListenStreamRegistration(ctx) {
 		return
 	}
-	s.activeClientSessions.Store(session.SessionID(), session)
+	// Error is logged and handled within handleSessionRegistrationImpl.
+	// The session is terminated on failure; no further action needed here.
+	// An unregistration while this runs cancels the commit (clientSessionSet).
+	s.activeClientSessions.begin(session.SessionID())
+	if err := s.handleSessionRegistrationImpl(ctx, session); err != nil {
+		s.activeClientSessions.abort(session.SessionID())
+		return
+	}
+	s.activeClientSessions.commit(session)
 }
 
 // handleSessionRegistrationImpl handles session registration.
@@ -1312,7 +1158,7 @@ func (s *Server) handleSessionRegistration(
 //  3. Registers backend tools, composite tools, and resources with the SDK for the session.
 //
 // Tool and resource calls are routed directly through the session's backend connections
-// rather than through the global router and discovery middleware.
+// rather than through a global router.
 // Composite tool executors use the shared backend client and router.
 //
 // # Current capability surface
@@ -1323,40 +1169,30 @@ func (s *Server) handleSessionRegistration(
 //
 //   - Prompts: not supported until the SDK adds AddSessionPrompts.
 func (s *Server) handleSessionRegistrationImpl(ctx context.Context, session server.ClientSession) (retErr error) {
-	// The SDK invokes this hook with the original request context. For
-	// initialize over streamable HTTP, the response has already been written by
-	// the time registration runs, so a fast client-side close can cancel the
-	// request context while backend initialization is still in progress. Detach
-	// from request cancellation, but preserve request-scoped values such as
-	// identity and session, then bound the work with a server-side timeout.
-	registrationCtx, cancel := context.WithTimeout(
-		context.WithoutCancel(ctx),
-		defaultSessionRegistrationTimeout,
-	)
+	s.inFlightRegistrations.Add(1)
+	defer s.inFlightRegistrations.Add(-1)
+
+	// Only the session's own initialize may create it. mcp-go v0.55 registers a
+	// session from the initialize POST and from a GET listen stream (or SSE
+	// reconnect) on a pod that does not hold the session in memory; the latter
+	// attaches to the bound session or is rejected, and never calls CreateSession.
+	// It keeps the GET's own context, so its wait for the binding ends when the
+	// client goes away. Checked before the cleanup defer below: rejecting a
+	// re-registration must not terminate the owner's session.
+	if isListenStreamRegistration(ctx) {
+		return s.attachToBoundSession(ctx, session)
+	}
+
+	// The SDK runs this hook with the initialize request's context, whose response
+	// is already written. A client that closes the connection fast would cancel
+	// backend initialization half-way. Keep the request values (identity, session),
+	// drop the cancellation, and bound the work with a server-side timeout.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultSessionRegistrationTimeout)
 	defer cancel()
-	ctx = registrationCtx
 
 	sessionID := session.SessionID()
-	slog.Debug("creating session-scoped backends", "session_id", sessionID)
 
-	if health.IsHealthCheck(ctx) {
-		// Health probes validate connectivity, not tool completeness.
-		// Discovery is intentionally skipped for probes to avoid slow
-		// backends inflating probe response time. If cached capabilities
-		// happen to be available in the context they are injected;
-		// otherwise the session remains empty, which is fine — the hub's
-		// health checker only inspects timing and errors.
-		if err := s.injectHealthCheckCapabilities(ctx, session, true, true); err != nil {
-			slog.Debug("health probe registered without capabilities (discovery skipped)",
-				"session_id", sessionID)
-		} else {
-			slog.Debug("health probe registered with cached capabilities",
-				"session_id", sessionID,
-				"tool_count", sessionToolCount(session),
-				"resource_count", sessionResourceCount(session))
-		}
-		return nil
-	}
+	slog.Debug("creating session-scoped backends", "session_id", sessionID)
 
 	// Defer cleanup: if any error occurs, terminate the session and log failures.
 	defer func() {
@@ -1378,1044 +1214,97 @@ func (s *Server) handleSessionRegistrationImpl(ctx context.Context, session serv
 	// is no way to retract the session ID after it has been sent.
 	//
 	// NOTE: there is a brief race window between the client receiving the session
-	// ID and this hook completing. A client that pipelines a tools/call immediately
-	// after initialize may receive a "tool not found" error before AddSessionTools
-	// completes. Conforming MCP clients call tools/list before tools/call, so this
-	// window is expected to be harmless in practice.
-	multiSession, retErr := s.vmcpSessionMgr.CreateSession(ctx, sessionID)
-	if retErr != nil {
+	// ID and this hook completing. A tools/call that arrives in it gets its tools
+	// from lazyInjectSessionTools, and enforceSessionBinding waits until
+	// CreateSession below has written the identity binding.
+	if _, retErr = s.vmcpSessionMgr.CreateSession(ctx, sessionID); retErr != nil {
 		slog.Error("failed to create session-scoped backends",
 			"session_id", sessionID,
 			"error", retErr)
 		return retErr
 	}
-	if s.sessionOwnerURL != "" {
-		if retErr = s.vmcpSessionMgr.SetSessionMetadataValue(
-			ctx,
-			sessionID,
-			multiSession,
-			sessiontypes.MetadataKeyOwnerURL,
-			s.sessionOwnerURL,
-		); retErr != nil {
-			slog.Error("failed to persist session owner metadata",
-				"session_id", sessionID,
-				"owner_url", s.sessionOwnerURL,
-				"error", retErr)
-			return retErr
-		}
-	}
 
-	// Uniform registration — same code path regardless of which decorators are active.
-	// session.Tools() returns the final decorated tool list.
-	adaptedTools, retErr := s.vmcpSessionMgr.GetAdaptedTools(sessionID)
-	if retErr != nil {
-		slog.Error("failed to get session-scoped tools",
-			"session_id", sessionID,
-			"error", retErr)
-		return retErr
-	}
-
-	adaptedResources, retErr := s.vmcpSessionMgr.GetAdaptedResources(sessionID)
-	if retErr != nil {
-		slog.Error("failed to get session-scoped resources",
-			"session_id", sessionID,
-			"error", retErr)
-		return retErr
-	}
-
-	if len(adaptedResources) > 0 {
-		if err := setSessionResourcesDirect(session, adaptedResources); err != nil {
-			slog.Error("failed to add session resources", "session_id", sessionID, "error", err)
-			return err
-		}
-	}
-
-	if len(adaptedTools) > 0 {
-		if err := setSessionToolsDirect(session, adaptedTools); err != nil {
-			slog.Error("failed to add session tools", "session_id", sessionID, "error", err)
-			return err
-		}
-	}
-
-	slog.Info("session capabilities injected",
-		"session_id", sessionID,
-		"tool_count", len(adaptedTools))
-	return nil
+	// The core is the single authoritative aggregation: source the advertised tool/resource
+	// set from core.ListTools/ListResources (called once per session here) and install
+	// handlers that route through the core. CreateSession above still establishes the bound
+	// session record (identity binding, TTL, Validate). The returned error becomes retErr
+	// (named return), so the defer terminates the session on failure.
+	return s.injectCoreSessionCapabilities(ctx, session)
 }
 
-func (s *Server) handleSessionRequestInitialization(
-	ctx context.Context,
-	_ any,
-	message any,
-) error {
-	method, err := parseRequestMethod(message)
-	if err != nil {
-		slog.Debug("failed to parse MCP method during session hydration", "error", err)
-		return nil
-	}
-
-	needsTools, needsResources := requestHydrationNeeds(method)
-	if !needsTools && !needsResources {
-		return nil
-	}
-
-	session := server.ClientSessionFromContext(ctx)
-	if session == nil || session.SessionID() == "" {
-		return nil
-	}
-
-	needsTools = needsTools && sessionToolCount(session) == 0
-	needsResources = needsResources && sessionResourceCount(session) == 0
-	if !needsTools && !needsResources {
-		return nil
-	}
-
-	if health.IsHealthCheck(ctx) {
-		// Best-effort injection: if cached capabilities are available in the
-		// context they are injected; otherwise the request proceeds with an
-		// empty list. This is safe because health probes only validate
-		// connectivity and timing — the hub's health checker discards the
-		// actual tool/resource list.
-		if err := s.injectHealthCheckCapabilities(ctx, session, needsTools, needsResources); err != nil {
-			slog.Debug("health probe request proceeding without capabilities (discovery skipped)",
-				"session_id", session.SessionID(),
-				"method", method)
-		}
-		return nil
-	}
-
-	if err := s.waitForSessionRegistration(ctx, session.SessionID()); err != nil {
-		slog.Debug("session registration wait finished without full readiness",
-			"session_id", session.SessionID(),
-			"method", method,
-			"error", err)
-	}
-
-	hydrationCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultSessionHydrationTimeout)
-	defer cancel()
-
-	if err := s.rehydrateSessionCapabilities(hydrationCtx, session, needsTools, needsResources); err != nil {
-		slog.Warn("failed to rehydrate session-scoped capabilities",
-			"session_id", session.SessionID(),
-			"method", method,
-			"error", err)
-	}
-
-	return nil
-}
-
-func (s *Server) injectHealthCheckCapabilities(
-	ctx context.Context,
-	session server.ClientSession,
-	needsTools bool,
-	needsResources bool,
-) error {
-	capabilities, ok := discovery.DiscoveredCapabilitiesFromContext(ctx)
-	if !ok || capabilities == nil {
-		return fmt.Errorf("discovered capabilities unavailable for health probe")
-	}
-	if s.capabilityAdapter == nil {
-		return fmt.Errorf("capability adapter is not configured")
-	}
-
-	if needsResources {
-		adaptedResources := s.capabilityAdapter.ToSDKResources(capabilities.Resources)
-		if len(adaptedResources) > 0 {
-			if err := setSessionResourcesDirect(session, adaptedResources); err != nil {
-				return err
-			}
-		}
-	}
-
-	if needsTools {
-		adaptedTools, err := s.capabilityAdapter.ToSDKTools(capabilities.Tools)
-		if err != nil {
-			return err
-		}
-		if len(adaptedTools) > 0 {
-			if err := setSessionToolsDirect(session, adaptedTools); err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
-}
-
-func (s *Server) beginSessionRegistration(sessionID string) *sessionRegistrationState {
-	if sessionID == "" {
-		return nil
-	}
-
-	state := newSessionRegistrationState()
-	actual, loaded := s.inFlightRegistrations.LoadOrStore(sessionID, state)
-	if loaded {
-		if existing, ok := actual.(*sessionRegistrationState); ok {
-			return existing
-		}
-		return nil
-	}
-	return state
-}
-
-func (s *Server) finishSessionRegistration(sessionID string, state *sessionRegistrationState) {
-	if sessionID == "" || state == nil {
-		return
-	}
-
-	state.close()
-	s.inFlightRegistrations.CompareAndDelete(sessionID, state)
-}
-
-func (s *Server) lookupSessionRegistration(sessionID string) *sessionRegistrationState {
-	if sessionID == "" {
-		return nil
-	}
-
-	value, ok := s.inFlightRegistrations.Load(sessionID)
-	if !ok {
-		return nil
-	}
-	state, ok := value.(*sessionRegistrationState)
-	if !ok {
-		return nil
-	}
-	return state
-}
-
-func (s *Server) waitForSessionRegistration(ctx context.Context, sessionID string) error {
-	if sessionID == "" {
-		return nil
-	}
-	if _, ok := s.vmcpSessionMgr.GetMultiSession(ctx, sessionID); ok {
-		return nil
-	}
-
-	registration := s.lookupSessionRegistration(sessionID)
-	if registration == nil {
-		isTerminated, err := s.vmcpSessionMgr.Validate(sessionID)
-		if err != nil || isTerminated {
-			return nil
-		}
-
-		graceCtx, cancel := context.WithTimeout(ctx, defaultSessionRegistrationGracePeriod)
-		defer cancel()
-
-		registration, err = s.waitForRegistrationMarker(graceCtx, sessionID)
-		if err != nil || registration == nil {
-			return err
-		}
-	}
-
-	waitCtx, cancel := context.WithTimeout(ctx, defaultSessionRegistrationWaitTimeout)
-	defer cancel()
-
-	select {
-	case <-registration.done:
-		return nil
-	case <-waitCtx.Done():
-		return waitCtx.Err()
-	}
-}
-
-func (s *Server) waitForRegistrationMarker(
-	ctx context.Context,
-	sessionID string,
-) (*sessionRegistrationState, error) {
-	registration := s.lookupSessionRegistration(sessionID)
-	if registration != nil {
-		return registration, nil
-	}
-
-	ticker := time.NewTicker(defaultSessionRegistrationPollInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-ticker.C:
-			registration = s.lookupSessionRegistration(sessionID)
-			if registration != nil {
-				return registration, nil
-			}
-		}
-	}
-}
-
-func requestHydrationNeeds(method mcp.MCPMethod) (bool, bool) {
-	switch method {
-	case mcp.MethodToolsList, mcp.MethodToolsCall:
-		return true, false
-	case mcp.MethodResourcesList, mcp.MethodResourcesRead, mcp.MethodResourcesTemplatesList:
-		return false, true
-	default:
-		return false, false
-	}
-}
-
-func parseRequestMethod(message any) (mcp.MCPMethod, error) {
-	var raw json.RawMessage
-
-	switch msg := message.(type) {
-	case json.RawMessage:
-		raw = msg
-	case []byte:
-		raw = json.RawMessage(msg)
-	default:
-		return "", fmt.Errorf("unexpected request hook message type %T", message)
-	}
-
-	var envelope struct {
-		Method mcp.MCPMethod `json:"method"`
-	}
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return "", err
-	}
-
-	return envelope.Method, nil
-}
-
-func healthProbeContextMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !health.HasProbeHeader(r) {
-			next.ServeHTTP(w, r)
-			return
-		}
-		next.ServeHTTP(w, r.WithContext(health.WithHealthCheckMarker(r.Context())))
-	})
-}
-
-func (s *Server) rehydrateSessionCapabilities(
-	ctx context.Context,
-	session server.ClientSession,
-	hydrateTools bool,
-	hydrateResources bool,
-) error {
+// attachToBoundSession handles a registration that does not come from the
+// session's own initialize. mcp-go registers a session again when a GET listen
+// stream (or an SSE reconnect) reaches a pod that does not hold it in memory, and
+// CreateSession would then build a new session with the caller's identity and
+// overwrite the stored binding. Instead, this never creates a session: it gives a
+// caller that passes checkListenStreamCaller the session's capabilities. Any
+// other caller is rejected and unregistered from this pod; the stored session is
+// not changed in any case.
+//
+// listenStreamGuardMiddleware already runs the same check before mcp-go sees the
+// GET, and rejects the request with an HTTP error; this is the fallback for a
+// registration that reaches the hook anyway.
+//
+// Upstream stops the re-bind only from v0.40.0, as a side effect of #5729. Drop
+// this guard once the fork is on v0.40 or later and TestCrossPodSessionRebind and
+// TestCrossPodGETDuringRegistration pass without it.
+func (s *Server) attachToBoundSession(ctx context.Context, session server.ClientSession) error {
 	sessionID := session.SessionID()
-
-	if _, ok := s.vmcpSessionMgr.GetMultiSession(ctx, sessionID); !ok {
-		return fmt.Errorf("session %q not found", sessionID)
-	}
-
-	if hydrateResources {
-		adaptedResources, err := s.vmcpSessionMgr.GetAdaptedResources(sessionID)
-		if err != nil {
-			return fmt.Errorf("get adapted resources: %w", err)
-		}
-		if _, err := replaceSessionResourcesDirect(session, adaptedResources); err != nil {
-			return fmt.Errorf("replace session resources: %w", err)
-		}
-	}
-
-	if hydrateTools {
-		adaptedTools, err := s.vmcpSessionMgr.GetAdaptedTools(sessionID)
-		if err != nil {
-			return fmt.Errorf("get adapted tools: %w", err)
-		}
-		if _, err := replaceSessionToolsDirect(session, adaptedTools); err != nil {
-			return fmt.Errorf("replace session tools: %w", err)
-		}
-	}
-
-	return nil
-}
-
-func (s *Server) ownerForwardingMiddleware(next http.Handler) http.Handler {
-	if s.sessionDataStorage == nil {
-		return next
-	}
-
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		forwarded, err := s.tryForwardSessionRequest(w, r)
-		if err != nil {
-			if errors.Is(err, errSessionOwnerUnavailable) {
-				r = r.WithContext(context.WithValue(r.Context(), sessionOwnerUnavailableKey{}, true))
-			}
-			slog.Warn("failed to forward live session request to owner",
-				"method", r.Method,
-				"path", r.URL.Path,
-				"error", err)
-			if !forwarded {
-				next.ServeHTTP(w, r)
-			}
-			return
-		}
-		if forwarded {
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-type sessionOwnerUnavailableKey struct{}
-
-func (s *Server) claimOrphanedSessionMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if unavailable, _ := r.Context().Value(sessionOwnerUnavailableKey{}).(bool); unavailable {
-			s.handleOwnerUnavailable(r)
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-// handleOwnerUnavailable restores an orphaned session and claims ownership
-// so subsequent requests route directly to this pod.
-func (s *Server) handleOwnerUnavailable(r *http.Request) {
-	if s.sessionOwnerURL == "" || s.vmcpSessionMgr == nil {
-		return
-	}
-	sessionID := r.Header.Get(server.HeaderKeySessionID)
-	if sessionID == "" {
-		return
-	}
-
-	ms, ok := s.vmcpSessionMgr.GetMultiSession(r.Context(), sessionID)
-	if !ok || ms == nil {
-		return
-	}
-
-	currentOwner := ms.GetMetadata()[sessiontypes.MetadataKeyOwnerURL]
-	if currentOwner == s.sessionOwnerURL {
-		return
-	}
-
-	if err := s.vmcpSessionMgr.SetSessionMetadataValue(
-		context.WithoutCancel(r.Context()), sessionID, ms,
-		sessiontypes.MetadataKeyOwnerURL,
-		s.sessionOwnerURL,
-	); err != nil {
-		slog.Warn("failed to claim session ownership after restore",
-			"session_id", sessionID, "error", err)
-		return
-	}
-
-	slog.Info("session ownership claimed after pod loss",
-		"session_id", sessionID,
-		"previous_owner", currentOwner,
-		"new_owner", s.sessionOwnerURL)
-}
-
-func (s *Server) tryForwardSessionRequest(w http.ResponseWriter, r *http.Request) (bool, error) {
-	if s.sessionOwnerURL == "" {
-		return false, nil
-	}
-	if r.Header.Get(sessionOwnerForwardedHeader) == sessionOwnerForwardedValue {
-		return false, nil
-	}
-
-	sessionID := r.Header.Get(server.HeaderKeySessionID)
-	if sessionID == "" {
-		return false, nil
-	}
-
-	shouldForward, err := shouldForwardToSessionOwner(r)
-	if err != nil {
-		return false, err
-	}
-	if !shouldForward {
-		return false, nil
-	}
-
-	if _, ok := s.activeClientSessions.Load(sessionID); ok {
-		return false, nil
-	}
-
-	ownerURL, err := s.loadSessionOwnerURL(r.Context(), sessionID)
-	if err != nil {
-		return false, fmt.Errorf("load session owner URL for %q: %w", sessionID, err)
-	}
-	if ownerURL == "" || ownerURL == s.sessionOwnerURL {
-		return false, nil
-	}
-
-	if err := s.forwardRequestToSessionOwner(w, r, ownerURL); err != nil {
-		if errors.Is(err, errSessionOwnerUnavailable) {
-			return false, err
-		}
-		return true, err
-	}
-	return true, nil
-}
-
-func shouldForwardToSessionOwner(r *http.Request) (bool, error) {
-	switch r.Method {
-	case http.MethodGet, http.MethodDelete:
-		return true, nil
-	case http.MethodPost:
-		envelope, err := parseForwardableEnvelope(r)
-		if err != nil {
-			return false, nil
-		}
-		if isSessionScopedClientResponse(envelope) {
-			return true, nil
-		}
-		if isSessionScopedClientRequest(envelope.Method) {
-			return true, nil
-		}
-		return envelope.Method == mcp.MethodSetLogLevel || envelope.Method == mcp.MethodNotificationElicitationComplete, nil
-	default:
-		return false, nil
-	}
-}
-
-type forwardableEnvelope struct {
-	Method mcp.MCPMethod   `json:"method"`
-	ID     json.RawMessage `json:"id,omitempty"`
-	Result json.RawMessage `json:"result,omitempty"`
-	Error  json.RawMessage `json:"error,omitempty"`
-}
-
-func parseForwardableEnvelope(r *http.Request) (forwardableEnvelope, error) {
-	var envelope forwardableEnvelope
-
-	if r.Body == nil {
-		return envelope, io.EOF
-	}
-
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		return envelope, err
-	}
-
-	if closeErr := r.Body.Close(); closeErr != nil {
-		slog.Debug("failed to close request body after peek", "error", closeErr)
-	}
-
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	r.ContentLength = int64(len(body))
-	r.GetBody = func() (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(body)), nil
-	}
-
-	if len(bytes.TrimSpace(body)) == 0 {
-		return envelope, io.EOF
-	}
-
-	if err := json.Unmarshal(body, &envelope); err != nil {
-		return envelope, err
-	}
-
-	return envelope, nil
-}
-
-func isSessionScopedClientResponse(envelope forwardableEnvelope) bool {
-	return envelope.Method == "" &&
-		len(envelope.ID) > 0 &&
-		(len(envelope.Result) > 0 || len(envelope.Error) > 0)
-}
-
-func isSessionScopedClientRequest(method mcp.MCPMethod) bool {
-	switch method {
-	case mcp.MethodToolsList,
-		mcp.MethodToolsCall,
-		mcp.MethodResourcesList,
-		mcp.MethodResourcesRead,
-		mcp.MethodResourcesTemplatesList,
-		mcp.MethodPromptsList,
-		mcp.MethodPromptsGet:
-		return true
-	default:
-		return false
-	}
-}
-
-func (s *Server) loadSessionOwnerURL(ctx context.Context, sessionID string) (string, error) {
-	loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultSessionOwnerLookupTimeout)
-	defer cancel()
-
-	metadata, err := s.sessionDataStorage.Load(loadCtx, sessionID)
-	if err != nil {
-		return "", err
-	}
-
-	ownerURL, err := normalizeSessionOwnerURL(metadata[sessiontypes.MetadataKeyOwnerURL])
-	if err != nil {
-		return "", fmt.Errorf("normalize stored owner URL: %w", err)
-	}
-	return ownerURL, nil
-}
-
-func (s *Server) forwardRequestToSessionOwner(
-	w http.ResponseWriter,
-	r *http.Request,
-	ownerURL string,
-) error {
-	targetReq, err := cloneRequestForOwner(r, ownerURL)
-	if err != nil {
+	if _, err := s.checkListenStreamCaller(ctx, sessionID); err != nil {
+		slog.Warn("rejected re-registration of a session", "session_id", sessionID, "error", err)
+		s.mcpServer.UnregisterSession(ctx, sessionID)
 		return err
 	}
+	return s.injectCoreSessionCapabilities(ctx, session)
+}
 
-	client := s.ownerForwardClient
-	if client == nil {
-		client = http.DefaultClient
-	}
-
-	resp, err := client.Do(targetReq)
+// checkListenStreamCaller decides whether the caller in ctx may open a listen
+// stream on sessionID. It waits while the creating pod's registration is still
+// pending (see waitWhileRegistrationPending), then requires a live session with
+// an identity binding (else it returns 404) that matches the caller (else 403).
+func (s *Server) checkListenStreamCaller(ctx context.Context, sessionID string) (int, error) {
+	s.waitWhileRegistrationPending(ctx, sessionID)
+	binding, err := s.storedBinding(ctx, sessionID)
 	if err != nil {
-		return fmt.Errorf("%w: %w", errSessionOwnerUnavailable, err)
+		return http.StatusNotFound, err
 	}
-	defer resp.Body.Close()
-
-	copyHeader(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-
-	writer := io.Writer(w)
-	if flusher, ok := w.(http.Flusher); ok {
-		writer = &flushingWriter{writer: w, flusher: flusher}
+	caller, _ := auth.IdentityFromContext(ctx)
+	if err := vmcpsession.ValidateCaller(binding, caller); err != nil {
+		return http.StatusForbidden, err
 	}
-	if _, err := io.Copy(writer, resp.Body); err != nil {
-		return err
-	}
-	if flusher, ok := w.(http.Flusher); ok {
-		flusher.Flush()
-	}
-	return nil
+	return http.StatusOK, nil
 }
 
-func cloneRequestForOwner(r *http.Request, ownerURL string) (*http.Request, error) {
-	targetURL, err := normalizeOwnerURLForRequest(ownerURL)
+// storedBinding returns the identity binding of a live stored session record.
+func (s *Server) storedBinding(ctx context.Context, sessionID string) (string, error) {
+	metadata, err := s.sessionDataStorage.Load(ctx, sessionID)
 	if err != nil {
-		return nil, err
+		return "", fmt.Errorf("load session %s: %w", sessionID, err)
 	}
-
-	outReq := r.Clone(r.Context())
-	outReq.URL = targetURL
-	outReq.URL.RawQuery = r.URL.RawQuery
-	outReq.Host = targetURL.Host
-	outReq.RequestURI = ""
-	outReq.Header = r.Header.Clone()
-	outReq.Header.Set(sessionOwnerForwardedHeader, sessionOwnerForwardedValue)
-	return outReq, nil
+	if metadata[sessionmanager.MetadataKeyTerminated] == sessionmanager.MetadataValTrue {
+		return "", fmt.Errorf("session %s is terminated", sessionID)
+	}
+	binding, bound := metadata[vmcpsession.MetadataKeyIdentityBinding]
+	if !bound {
+		return "", errSessionNotRegistered
+	}
+	return binding, nil
 }
 
-func normalizeSessionOwnerURL(raw string) (string, error) {
-	if strings.TrimSpace(raw) == "" {
-		return "", nil
-	}
-
-	normalizedURL, err := normalizeOwnerURLForRequest(raw)
-	if err != nil {
-		return "", err
-	}
-	return normalizedURL.String(), nil
-}
-
-func normalizeOwnerURLForRequest(raw string) (*url.URL, error) {
-	targetURL, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil {
-		return nil, err
-	}
-	if !targetURL.IsAbs() || targetURL.Host == "" {
-		return nil, fmt.Errorf("owner URL %q must be absolute", raw)
-	}
-	if targetURL.Path == "" {
-		targetURL.Path = "/"
-	}
-	return targetURL, nil
-}
-
-type flushingWriter struct {
-	writer  io.Writer
-	flusher http.Flusher
-}
-
-func (w *flushingWriter) Write(p []byte) (int, error) {
-	n, err := w.writer.Write(p)
-	if n > 0 {
-		w.flusher.Flush()
-	}
-	return n, err
-}
-
-func copyHeader(dst, src http.Header) {
-	for key, values := range src {
-		for _, value := range values {
-			dst.Add(key, value)
-		}
-	}
-}
-
-func sessionToolCount(session server.ClientSession) int {
-	sessionWithTools, ok := session.(server.SessionWithTools)
-	if !ok {
-		return 0
-	}
-	return len(sessionWithTools.GetSessionTools())
-}
-
-func sessionResourceCount(session server.ClientSession) int {
-	sessionWithResources, ok := session.(server.SessionWithResources)
-	if !ok {
-		return 0
-	}
-	return len(sessionWithResources.GetSessionResources())
-}
-
-// handleBackendStatusChange schedules a session refresh when a backend crosses
-// the exposure boundary. A backend that becomes eligible must be added to the
-// sessions that were built without it; a backend that becomes ineligible must be
-// removed from the sessions that expose it. Triggers are debounced per backend
-// (see refreshScheduler) so a flapping backend does not rebuild every session on
-// every transition.
-func (s *Server) handleBackendStatusChange(event health.StatusChangeEvent) {
-	previousEligible := health.IsStatusEligibleForExposure(event.PreviousStatus)
-	currentEligible := health.IsStatusEligibleForExposure(event.Status)
-	if previousEligible == currentEligible {
-		return
-	}
-
-	mode := refreshSessionsContainingBackend
-	if currentEligible {
-		mode = refreshSessionsLackingBackend
-	}
-
-	slog.Info("scheduling session refresh after backend exposure change",
-		"backend_id", event.BackendID,
-		"backend_name", event.BackendName,
-		"previous_status", event.PreviousStatus,
-		"status", event.Status,
-		"mode", mode.String())
-
-	s.scheduler().schedule(event.BackendID, mode)
-}
-
-// handleBackendCapabilityChange is called (asynchronously) when a backend
-// sends a tools/list_changed or resources/list_changed notification via the
-// persistent MCP session. It schedules a refresh of the sessions that expose
-// the backend so clients see the updated tool/resource list.
-func (s *Server) handleBackendCapabilityChange(backendID string) {
-	slog.Info("scheduling session refresh after backend capability change notification",
-		"backend_id", backendID)
-	s.scheduler().schedule(backendID, refreshSessionsContainingBackend)
-}
-
-// scheduler returns the per-backend refresh scheduler, creating it on first use
-// so servers constructed without New (tests) get one as well.
-func (s *Server) scheduler() *refreshScheduler {
-	s.refreshSchedOnce.Do(func() {
-		if s.refreshSched == nil {
-			s.refreshSched = newRefreshScheduler(
-				defaultRefreshDebounceWindow,
-				defaultRefreshCooldown,
-				s.runBackendRefresh,
-			)
-		}
-	})
-	return s.refreshSched
-}
-
-// runBackendRefresh rebuilds the sessions selected by mode for backendID. It is
-// invoked by the refresh scheduler once the debounce window has elapsed.
-func (s *Server) runBackendRefresh(backendID string, mode refreshTargetMode) {
-	s.refreshMu.Lock()
-	defer s.refreshMu.Unlock()
-
-	targets := s.targetSessionsForRefresh(backendID, mode)
-	if len(targets) == 0 {
-		slog.Debug("no active sessions need a refresh for backend",
-			"backend_id", backendID, "mode", mode.String())
-		return
-	}
-
-	slog.Info("refreshing active sessions after backend change",
-		"backend_id", backendID,
-		"mode", mode.String(),
-		"session_count", len(targets))
-
-	failed := 0
-	for _, target := range targets {
-		refreshCtx, cancel := context.WithTimeout(context.Background(), defaultSessionRefreshTimeout)
-		if err := s.refreshSessionCapabilities(refreshCtx, target.sessionID, target.session); err != nil {
-			failed++
-			slog.Warn("failed to refresh session capabilities",
-				"session_id", target.sessionID,
-				"backend_id", backendID,
-				"error", err)
-		}
-		cancel()
-	}
-
-	slog.Info("finished refreshing active sessions after backend change",
-		"backend_id", backendID,
-		"mode", mode.String(),
-		"session_count", len(targets),
-		"failed", failed)
-}
-
-type refreshTarget struct {
-	sessionID string
-	session   server.ClientSession
-}
-
-// targetSessionsForRefresh selects the active SDK sessions to rebuild for a
-// backend change. Entries whose MultiSession no longer exists (expired, or
-// terminated on another replica) are stale and are dropped from the registry so
-// they are not reconsidered on the next trigger.
-// defaultBackendReconcileInterval bounds how long an active session keeps
-// lacking an eligible backend after a transient initialization failure before
-// it is rebuilt with that backend. Health transitions trigger refreshes
-// immediately; this is the safety net for backends that recovered without the
-// health monitor ever seeing them unhealthy (proxy restarts between two checks,
-// a slow aggregator, a transient network error during session creation).
-const defaultBackendReconcileInterval = 5 * time.Minute
-
-// runBackendReconciliation runs reconcileSessionsLackingBackends every
-// interval until ctx is cancelled.
-func (s *Server) runBackendReconciliation(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			s.reconcileSessionsLackingBackends(ctx)
-		}
-	}
-}
-
-// reconcileSessionsLackingBackends schedules a lacking-backend refresh for
-// every backend that is eligible for exposure but absent from at least one
-// active session. Scheduling goes through the shared refresh scheduler, so
-// the usual debounce and cooldown apply. It returns the IDs of the backends
-// scheduled, in registry order.
-func (s *Server) reconcileSessionsLackingBackends(ctx context.Context) []string {
-	scheduled := make([]string, 0)
-	for _, backend := range s.eligibleBackends(ctx) {
-		lacking := s.targetSessionsForRefresh(backend.ID, refreshSessionsLackingBackend)
-		if len(lacking) == 0 {
-			continue
-		}
-		slog.Info("scheduling session refresh for sessions lacking an eligible backend",
-			"backendID", backend.ID,
-			"session_count", len(lacking))
-		s.scheduler().schedule(backend.ID, refreshSessionsLackingBackend)
-		scheduled = append(scheduled, backend.ID)
-	}
-	return scheduled
-}
-
-// eligibleBackends returns the registered backends currently eligible for
-// exposure, consulting the health monitor when one is running.
-func (s *Server) eligibleBackends(ctx context.Context) []vmcp.Backend {
-	if s.backendRegistry == nil {
+// backendHealth returns the core-owned backend health reporter, or nil when health
+// monitoring is disabled (the core owns the monitor's lifecycle; #5443 reversal). The
+// s.core nil guard is defensive: a Serve-built server always has a non-nil core.
+func (s *Server) backendHealth() health.Reporter {
+	if s.core == nil {
 		return nil
 	}
-
-	s.healthMonitorMu.RLock()
-	healthMon := s.healthMonitor
-	s.healthMonitorMu.RUnlock()
-
-	var healthStatusProvider health.StatusProvider
-	if healthMon != nil {
-		healthStatusProvider = healthMon
-	}
-	return health.FilterBackendsForExposure(s.backendRegistry.List(ctx), healthStatusProvider)
-}
-
-func (s *Server) targetSessionsForRefresh(
-	backendID string,
-	mode refreshTargetMode,
-) []refreshTarget {
-	targets := make([]refreshTarget, 0)
-	stale := 0
-	s.activeClientSessions.Range(func(key, value any) bool {
-		sessionID, ok := key.(string)
-		if !ok {
-			return true
-		}
-		clientSession, ok := value.(server.ClientSession)
-		if !ok {
-			return true
-		}
-		multiSess, exists := s.vmcpSessionMgr.GetMultiSession(context.Background(), sessionID)
-		if !exists || multiSess == nil {
-			s.activeClientSessions.Delete(key)
-			stale++
-			return true
-		}
-		contains := sessionContainsBackend(multiSess, backendID)
-		switch mode {
-		case refreshSessionsLackingBackend:
-			if contains || !canRebuildInBackground(multiSess) {
-				return true
-			}
-		case refreshSessionsContainingBackend:
-			if !contains {
-				return true
-			}
-		case refreshAllSessions:
-			// both groups
-		}
-		targets = append(targets, refreshTarget{
-			sessionID: sessionID,
-			session:   clientSession,
-		})
-		return true
-	})
-	if stale > 0 {
-		slog.Info("dropped stale client session registrations",
-			"backend_id", backendID, "count", stale)
-	}
-	return targets
-}
-
-func canRebuildInBackground(sess sessiontypes.MultiSession) bool {
-	if !sessiontypes.HasBoundIdentity(sess.GetMetadata()) {
-		return true
-	}
-	provider, ok := sess.(sessiontypes.CreatorIdentityProvider)
-	if !ok {
-		return false
-	}
-	return !sessiontypes.ShouldAllowAnonymous(provider.CreatorIdentity())
-}
-
-func sessionContainsBackend(sess sessiontypes.MultiSession, backendID string) bool {
-	metadata := sess.GetMetadata()
-	if len(metadata) == 0 {
-		return false
-	}
-
-	backendIDs := metadata[vmcpsession.MetadataKeyBackendIDs]
-	if backendIDs == "" {
-		return false
-	}
-
-	for _, current := range strings.Split(backendIDs, ",") {
-		if current == backendID {
-			return true
-		}
-	}
-	return false
-}
-
-func (s *Server) refreshSessionCapabilities(
-	ctx context.Context,
-	sessionID string,
-	clientSession server.ClientSession,
-) error {
-	previous, ok := s.vmcpSessionMgr.GetMultiSession(ctx, sessionID)
-	if !ok {
-		return fmt.Errorf("session %q not found", sessionID)
-	}
-
-	refreshed, err := s.vmcpSessionMgr.RefreshSession(ctx, sessionID)
-	if err != nil {
-		return err
-	}
-
-	rollback := func(refreshErr error) error {
-		if storeErr := s.vmcpSessionMgr.ReplaceSession(context.Background(), sessionID, refreshed, previous); storeErr != nil {
-			return fmt.Errorf("%w (rollback failed: %v)", refreshErr, storeErr)
-		}
-
-		go func(rebuilt sessiontypes.MultiSession) {
-			time.Sleep(defaultSessionCloseGracePeriod)
-			if closeErr := rebuilt.Close(); closeErr != nil {
-				slog.Warn("failed to close rolled back refreshed session",
-					"session_id", sessionID,
-					"error", closeErr)
-			}
-		}(refreshed)
-
-		return refreshErr
-	}
-
-	adaptedTools, err := s.vmcpSessionMgr.GetAdaptedTools(sessionID)
-	if err != nil {
-		return rollback(err)
-	}
-	adaptedResources, err := s.vmcpSessionMgr.GetAdaptedResources(sessionID)
-	if err != nil {
-		return rollback(err)
-	}
-
-	resourcesChanged, err := replaceSessionResourcesDirect(clientSession, adaptedResources)
-	if err != nil {
-		return rollback(err)
-	}
-	toolsChanged, err := replaceSessionToolsDirect(clientSession, adaptedTools)
-	if err != nil {
-		return rollback(err)
-	}
-
-	if resourcesChanged {
-		if err := s.mcpServer.SendNotificationToSpecificClient(sessionID, "notifications/resources/list_changed", nil); err != nil {
-			slog.Debug("failed to send session resource refresh notification",
-				"session_id", sessionID,
-				"error", err)
-		}
-	}
-	if toolsChanged {
-		if err := s.mcpServer.SendNotificationToSpecificClient(sessionID, "notifications/tools/list_changed", nil); err != nil {
-			slog.Debug("failed to send session tool refresh notification",
-				"session_id", sessionID,
-				"error", err)
-		}
-	}
-
-	go func(previous sessiontypes.MultiSession) {
-		time.Sleep(defaultSessionCloseGracePeriod)
-		if err := previous.Close(); err != nil {
-			slog.Warn("failed to close replaced session",
-				"session_id", sessionID,
-				"error", err)
-		}
-	}(previous)
-
-	slog.Info("refreshed session capabilities",
-		"session_id", sessionID,
-		"tool_count", len(adaptedTools),
-		"resource_count", len(adaptedResources),
-		"tools_changed", toolsChanged,
-		"resources_changed", resourcesChanged)
-
-	return nil
-}
-
-// validateWorkflows validates workflow definitions, returning only the valid ones.
-//
-// This function:
-//  1. Validates each workflow definition (cycle detection, tool references, etc.)
-//  2. Returns error on first validation failure (fail-fast)
-//
-// Failing fast on invalid workflows provides immediate user feedback and prevents
-// security issues (resource exhaustion from cycles, information disclosure from errors).
-func validateWorkflows(
-	validator composer.Composer,
-	workflowDefs map[string]*composer.WorkflowDefinition,
-) (map[string]*composer.WorkflowDefinition, error) {
-	if len(workflowDefs) == 0 {
-		return nil, nil
-	}
-
-	validDefs := make(map[string]*composer.WorkflowDefinition, len(workflowDefs))
-
-	for name, def := range workflowDefs {
-		if err := validator.ValidateWorkflow(context.Background(), def); err != nil {
-			return nil, fmt.Errorf("invalid workflow definition '%s': %w", name, err)
-		}
-
-		validDefs[name] = def
-		slog.Debug("validated workflow definition", "name", name)
-	}
-
-	if len(validDefs) > 0 {
-		slog.Info("loaded valid composite tool workflows", "count", len(validDefs))
-	}
-
-	return validDefs, nil
+	return s.core.BackendHealth()
 }
 
 // GetBackendHealthStatus returns the health status of a specific backend.
 // Returns error if health monitoring is disabled or backend not found.
 func (s *Server) GetBackendHealthStatus(backendID string) (vmcp.BackendHealthStatus, error) {
-	s.healthMonitorMu.RLock()
-	healthMon := s.healthMonitor
-	s.healthMonitorMu.RUnlock()
+	healthMon := s.backendHealth()
 
 	if healthMon == nil {
 		return vmcp.BackendUnknown, fmt.Errorf("health monitoring is disabled")
@@ -2426,9 +1315,7 @@ func (s *Server) GetBackendHealthStatus(backendID string) (vmcp.BackendHealthSta
 // GetBackendHealthState returns the full health state of a specific backend.
 // Returns error if health monitoring is disabled or backend not found.
 func (s *Server) GetBackendHealthState(backendID string) (*health.State, error) {
-	s.healthMonitorMu.RLock()
-	healthMon := s.healthMonitor
-	s.healthMonitorMu.RUnlock()
+	healthMon := s.backendHealth()
 
 	if healthMon == nil {
 		return nil, fmt.Errorf("health monitoring is disabled")
@@ -2439,9 +1326,7 @@ func (s *Server) GetBackendHealthState(backendID string) (*health.State, error) 
 // GetAllBackendHealthStates returns the health states of all backends.
 // Returns empty map if health monitoring is disabled.
 func (s *Server) GetAllBackendHealthStates() map[string]*health.State {
-	s.healthMonitorMu.RLock()
-	healthMon := s.healthMonitor
-	s.healthMonitorMu.RUnlock()
+	healthMon := s.backendHealth()
 
 	if healthMon == nil {
 		return make(map[string]*health.State)
@@ -2452,9 +1337,7 @@ func (s *Server) GetAllBackendHealthStates() map[string]*health.State {
 // GetHealthSummary returns a summary of backend health across all backends.
 // Returns zero-valued summary if health monitoring is disabled.
 func (s *Server) GetHealthSummary() health.Summary {
-	s.healthMonitorMu.RLock()
-	healthMon := s.healthMonitor
-	s.healthMonitorMu.RUnlock()
+	healthMon := s.backendHealth()
 
 	if healthMon == nil {
 		return health.Summary{}
@@ -2482,9 +1365,7 @@ type BackendHealthResponse struct {
 // Security Note: This endpoint is unauthenticated and may expose backend topology.
 // Consider applying authentication middleware if operating in multi-tenant mode.
 func (s *Server) handleBackendHealth(w http.ResponseWriter, _ *http.Request) {
-	s.healthMonitorMu.RLock()
-	healthMon := s.healthMonitor
-	s.healthMonitorMu.RUnlock()
+	healthMon := s.backendHealth()
 
 	response := BackendHealthResponse{
 		MonitoringEnabled: healthMon != nil,
@@ -2517,6 +1398,103 @@ var notAcceptableBody = []byte(
 	`{"jsonrpc":"2.0","id":"server-error","error":` +
 		`{"code":-32600,"message":"Not Acceptable: Client must accept text/event-stream"}}`,
 )
+
+// sessionIDManagerResolver gives mcp-go the vMCP session manager for every
+// request. mcp-go's idle sweeper (WithSessionIdleTTL) resolves the manager with a
+// nil request and calls Terminate for each session that is idle on this replica;
+// the vMCP manager's Terminate would delete the shared session record for every
+// replica, including one where the session is still in use. For the sweeper the
+// resolver returns localSweepSessionIDManager, whose Terminate keeps the shared
+// record; mcp-go then clears only this replica's SDK state. The node-local
+// MultiSession is closed by the session manager's own idle sweep
+// (sessionmanager.FactoryConfig.IdleTTL), and the storage TTL expires the shared
+// record once no replica uses the session.
+type sessionIDManagerResolver struct {
+	manager server.SessionIdManager
+}
+
+// ResolveSessionIdManager implements server.SessionIdManagerResolver.
+func (r sessionIDManagerResolver) ResolveSessionIdManager(req *http.Request) server.SessionIdManager {
+	if req == nil {
+		return localSweepSessionIDManager{SessionIdManager: r.manager}
+	}
+	return r.manager
+}
+
+// localSweepSessionIDManager is the session ID manager mcp-go's idle sweeper
+// uses: Terminate is a no-op, so the sweep never touches the shared session record.
+type localSweepSessionIDManager struct {
+	server.SessionIdManager
+}
+
+// Terminate keeps the shared session record; see sessionIDManagerResolver.
+func (localSweepSessionIDManager) Terminate(string) (bool, error) {
+	return false, nil
+}
+
+// listenStreamKey marks the context of a GET request (the Streamable HTTP listen
+// stream) that passed listenStreamGuardMiddleware, for handleSessionRegistrationImpl.
+type listenStreamKey struct{}
+
+// listenStreamGuardMiddleware checks every GET (the Streamable HTTP listen
+// stream) before mcp-go sees it. mcp-go's handleGet attaches the GET to the
+// session object it holds in memory, or registers a new one for the session ID,
+// and then always answers 200: a registration hook cannot fail the request, and
+// on a pod that already holds the session no hook runs at all. Without this
+// check a caller with someone else's session ID would receive that session's
+// notifications and elicitation requests, and on a pod that did not hold the
+// session the caller's object would stay in mcp-go for later requests.
+//
+// A GET without Mcp-Session-Id gets 400: a vMCP session starts with initialize,
+// and mcp-go would otherwise generate a session ID that nothing ever binds. A GET
+// with a session ID must pass checkListenStreamCaller (404 for a session that is
+// missing, terminated or never bound, 403 for a different caller). A GET that
+// passes is marked for handleSessionRegistrationImpl, so a registration that
+// mcp-go runs for it never creates the session. Runs after authentication.
+func (s *Server) listenStreamGuardMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			next.ServeHTTP(w, r)
+			return
+		}
+		sessionID := r.Header.Get(server.HeaderKeySessionID)
+		if sessionID == "" {
+			writeJSONRPCHTTPError(w, http.StatusBadRequest, "Bad Request: Mcp-Session-Id header is required")
+			return
+		}
+		if status, err := s.checkListenStreamCaller(r.Context(), sessionID); err != nil {
+			slog.Warn("rejected listen stream", "session_id", sessionID, "status", status, "error", err)
+			writeJSONRPCHTTPError(w, status, http.StatusText(status))
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), listenStreamKey{}, true)))
+	})
+}
+
+// writeJSONRPCHTTPError writes an HTTP error status with a JSON-RPC error body,
+// in the same shape as notAcceptableBody.
+func writeJSONRPCHTTPError(w http.ResponseWriter, status int, message string) {
+	body, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "server-error",
+		"error":   map[string]any{"code": -32600, "message": message},
+	})
+	if err != nil {
+		http.Error(w, message, status)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if _, err := w.Write(body); err != nil {
+		slog.Debug("failed to write error response", "error", err)
+	}
+}
+
+// isListenStreamRegistration reports whether ctx belongs to a GET request.
+func isListenStreamRegistration(ctx context.Context) bool {
+	marked, _ := ctx.Value(listenStreamKey{}).(bool)
+	return marked
+}
 
 // headerValidatingMiddleware rejects GET requests that do not include
 // Accept: text/event-stream, as required by the MCP Streamable HTTP transport spec.

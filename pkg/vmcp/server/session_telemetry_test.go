@@ -16,32 +16,6 @@ import (
 	transportsession "github.com/stacklok/toolhive/pkg/transport/session"
 )
 
-func findMetric(rm metricdata.ResourceMetrics, name string) *metricdata.Metrics {
-	for _, sm := range rm.ScopeMetrics {
-		for i := range sm.Metrics {
-			if sm.Metrics[i].Name == name {
-				return &sm.Metrics[i]
-			}
-		}
-	}
-	return nil
-}
-
-func gaugeValue(m *metricdata.Metrics) int64 {
-	if m == nil {
-		return 0
-	}
-	gauge, ok := m.Data.(metricdata.Gauge[int64])
-	if !ok {
-		return 0
-	}
-	var latest int64
-	for _, dp := range gauge.DataPoints {
-		latest = dp.Value
-	}
-	return latest
-}
-
 func TestMonitorSessionCardinality(t *testing.T) {
 	t.Parallel()
 
@@ -49,27 +23,33 @@ func TestMonitorSessionCardinality(t *testing.T) {
 	meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 
 	sessionManager := transportsession.NewManager(time.Minute, transportsession.NewStreamableSession)
-	t.Cleanup(func() {
-		_ = sessionManager.Stop()
-	})
-
+	t.Cleanup(func() { _ = sessionManager.Stop() })
 	require.NoError(t, sessionManager.AddWithID("11111111-1111-1111-1111-111111111111"))
 	require.NoError(t, sessionManager.AddWithID("22222222-2222-2222-2222-222222222222"))
 
-	srv := &Server{
-		sessionManager: sessionManager,
+	srv := &Server{sessionManager: sessionManager}
+	for _, id := range []string{"sdk-session-1", "sdk-session-2", "sdk-session-3"} {
+		srv.activeClientSessions.begin(id)
+		srv.activeClientSessions.commit(&fakeSDKSession{id: id})
 	}
-	srv.activeClientSessions.Store("sdk-session-1", &hydrationTestSession{sessionID: "sdk-session-1"})
-	srv.activeClientSessions.Store("sdk-session-2", &hydrationTestSession{sessionID: "sdk-session-2"})
-	srv.activeClientSessions.Store("sdk-session-3", &hydrationTestSession{sessionID: "sdk-session-3"})
-	srv.inFlightRegistrations.Store("registering-session-1", newSessionRegistrationState())
+	srv.inFlightRegistrations.Add(1)
 
 	require.NoError(t, monitorSessionCardinality(meterProvider, srv))
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(context.Background(), &rm))
 
-	assert.Equal(t, int64(2), gaugeValue(findMetric(rm, "toolhive_vmcp_active_transport_sessions")))
-	assert.Equal(t, int64(3), gaugeValue(findMetric(rm, "toolhive_vmcp_active_sdk_sessions")))
-	assert.Equal(t, int64(1), gaugeValue(findMetric(rm, "toolhive_vmcp_inflight_session_registrations")))
+	gauges := map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if g, ok := m.Data.(metricdata.Gauge[int64]); ok && len(g.DataPoints) > 0 {
+				gauges[m.Name] = g.DataPoints[len(g.DataPoints)-1].Value
+			}
+		}
+	}
+	assert.Equal(t, map[string]int64{
+		"toolhive_vmcp_active_transport_sessions":      2,
+		"toolhive_vmcp_active_sdk_sessions":            3,
+		"toolhive_vmcp_inflight_session_registrations": 1,
+	}, gauges)
 }

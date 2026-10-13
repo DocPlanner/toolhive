@@ -40,9 +40,6 @@ import (
 //   - LocalSessionDataStorage (in-memory, single-process)
 //   - RedisSessionDataStorage (Redis/Valkey, multi-process)
 type DataStorage interface {
-	// Upsert creates or updates session metadata with a sliding TTL.
-	Upsert(ctx context.Context, id string, metadata map[string]string) error
-
 	// Create atomically creates session metadata only if the session ID
 	// does not already exist. Returns (true, nil) if the entry was created,
 	// (false, nil) if it already existed, or (false, err) on storage errors.

@@ -4,34 +4,13 @@
 package cli
 
 import (
-	"fmt"
-	"net"
-	"strings"
 	"time"
 
+	vmcpclient "github.com/stacklok/toolhive/pkg/vmcp/client"
 	"github.com/stacklok/toolhive/pkg/vmcp/config"
-	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
 )
 
-const (
-	envVMCPSessionOwnerURL = "THV_VMCP_SESSION_OWNER_URL"
-	envPodIP               = "POD_IP"
-	backendResponseMargin  = 5 * time.Second
-)
-
-// backendTimeoutSessionOptions translates the operational timeout settings into
-// session factory options so backend init and request deadlines follow config.
-func backendTimeoutSessionOptions(cfg *config.Config) []vmcpsession.MultiSessionFactoryOption {
-	var opts []vmcpsession.MultiSessionFactoryOption
-	if initTimeout := backendInitTimeoutFromConfig(cfg); initTimeout > 0 {
-		opts = append(opts, vmcpsession.WithBackendInitTimeout(initTimeout))
-	}
-	requestTimeout, perWorkload := backendRequestTimeoutsFromConfig(cfg)
-	if requestTimeout > 0 || len(perWorkload) > 0 {
-		opts = append(opts, vmcpsession.WithBackendRequestTimeouts(requestTimeout, perWorkload))
-	}
-	return opts
-}
+const backendResponseMargin = 5 * time.Second
 
 func backendInitTimeoutFromConfig(cfg *config.Config) time.Duration {
 	if cfg == nil || cfg.Operational == nil {
@@ -63,28 +42,22 @@ func backendRequestTimeoutsFromConfig(cfg *config.Config) (time.Duration, map[st
 	return time.Duration(timeouts.Default), perWorkload
 }
 
+// serverWriteTimeoutFromConfig returns the HTTP write timeout that lets the
+// longest backend call finish and leaves backendResponseMargin to write the MCP
+// response. It mirrors the backend client's choice of timeout per call: the
+// per-workload value, else timeouts.default, else
+// vmcpclient.DefaultBackendRequestTimeout. The server raises values below its own
+// default write timeout.
 func serverWriteTimeoutFromConfig(cfg *config.Config) time.Duration {
 	defaultTimeout, perWorkload := backendRequestTimeoutsFromConfig(cfg)
+	if defaultTimeout <= 0 {
+		defaultTimeout = vmcpclient.DefaultBackendRequestTimeout
+	}
 	maxTimeout := defaultTimeout
 	for _, timeout := range perWorkload {
-		if timeout > maxTimeout {
-			maxTimeout = timeout
-		}
-	}
-	if maxTimeout <= 0 {
-		return 0
+		maxTimeout = max(maxTimeout, timeout)
 	}
 	return maxTimeout + backendResponseMargin
-}
-
-func resolveSessionOwnerAdvertiseURL(explicit, podIP string, port int) string {
-	if explicit = strings.TrimSpace(explicit); explicit != "" {
-		return explicit
-	}
-	if podIP == "" || port <= 0 {
-		return ""
-	}
-	return fmt.Sprintf("http://%s/mcp", net.JoinHostPort(podIP, fmt.Sprintf("%d", port)))
 }
 
 // sessionTTLFromConfig returns the vMCP session TTL. The --session-ttl flag

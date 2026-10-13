@@ -15,54 +15,55 @@ import "context"
 // which defines "sid" for different purposes (RFC 7519, OIDC Session Management).
 const TokenSessionIDClaimKey = "tsid"
 
-// UpstreamCredentialStatus describes the current state of an upstream credential.
-// StatusValid means AccessToken is present and usable. The other statuses mean
-// the provider still exists in session storage, but the caller must not treat the
-// access token as usable without user re-authentication.
-type UpstreamCredentialStatus string
-
-const (
-	// StatusValid indicates the access token is present and usable.
-	StatusValid UpstreamCredentialStatus = "valid"
-	// StatusNoRefreshToken indicates the access token expired and no refresh token exists.
-	StatusNoRefreshToken UpstreamCredentialStatus = "no_refresh_token"
-	// StatusRefreshFailed indicates the refresh token existed, but refresh failed.
-	StatusRefreshFailed UpstreamCredentialStatus = "refresh_failed"
-	// StatusInvalidBinding indicates the stored upstream token no longer matches
-	// the authenticated session (subject/client mismatch).
-	StatusInvalidBinding UpstreamCredentialStatus = "invalid_binding"
-)
-
-// RequiresReauthentication reports whether the credential state means the caller
-// must perform a fresh upstream login to recover.
-func (s UpstreamCredentialStatus) RequiresReauthentication() bool {
-	switch s {
-	case StatusNoRefreshToken, StatusRefreshFailed, StatusInvalidBinding:
-		return true
-	default:
-		return false
-	}
-}
-
-// UpstreamCredential is the opaque result of GetValidTokens/GetAllValidTokens.
-// The caller only needs the access token for upstream injection, but the status
-// is preserved so authz can distinguish between a missing provider and an
-// upstream session that now requires re-authentication.
+// UpstreamCredential bundles the access token and the ID token for a single
+// upstream provider. Access tokens are refreshed when expired.
+//
+// The IDToken is the rotated ID token when a refresh produced one (OIDC Core
+// 1.0 §12.2 permits but does not require a new id_token on refresh), otherwise
+// the original JWT captured at the initial OIDC login (OIDC Core 1.0 §3.1.3.7).
+// It is not independently validated for freshness.
+//
+// Callers MUST check its `exp` claim before using it (e.g. as the subject_token
+// of an RFC 8693 token exchange), as it may be expired. Note also that the ID
+// token's `aud` is this auth server's client registration with the issuing
+// upstream, not the token-exchange endpoint — whether a target authorization
+// server accepts it as a subject token is governed by that server's policy and
+// is typically limited to the same issuer/audience.
+//
+// IDToken may be empty when the upstream login did not return an id_token
+// (e.g. the provider was not asked for the openid scope). An empty IDToken
+// is a legitimate state, not an error. Note that Identity.UpstreamTokens and
+// Identity.UpstreamIDTokens are projected independently and are NOT guaranteed
+// to share the same key set: a provider with an access token but no ID token
+// appears only in UpstreamTokens.
 type UpstreamCredential struct {
 	AccessToken string
-	Status      UpstreamCredentialStatus
+	IDToken     string
 }
 
-// TokenReader retrieves upstream provider access tokens for a session.
+// TokenReader retrieves upstream provider credentials for a session.
 // This narrow interface decouples the auth middleware from storage internals.
 type TokenReader interface {
-	// GetAllValidTokens returns the current upstream credential state for all
-	// providers in a session. Expired access tokens are refreshed transparently
-	// when possible. If refresh fails, the provider remains in the result with a
-	// non-valid status so downstream middleware can surface a precise error
-	// instead of silently acting as if the provider never existed.
-	// Returns an empty map (not error) for unknown sessions.
-	GetAllValidTokens(ctx context.Context, sessionID string) (map[string]UpstreamCredential, error)
+	// GetAllUpstreamCredentials returns the access tokens (refreshing them if
+	// expired) and ID tokens for every upstream provider associated with the
+	// given session ID. Returns an empty map if the session has no stored
+	// upstream tokens.
+	//
+	// The second return value contains the names of providers whose access tokens
+	// were expired and could not be refreshed (e.g. the refresh token is missing
+	// or the upstream IDP rejected the refresh). Those providers are omitted from
+	// the creds map. Callers should treat a non-empty failed list as a signal to
+	// return HTTP 401 + WWW-Authenticate so the client can re-authenticate.
+	//
+	// Each returned IDToken is the rotated ID token when a refresh produced
+	// one (OIDC Core 1.0 §12.2), otherwise the original JWT captured at OIDC
+	// login (OIDC Core 1.0 §3.1.3.7). Callers MUST check each ID token's `exp`
+	// claim before using it for e.g. RFC 8693 subject-token exchange, as it may
+	// be expired.
+	//
+	// Returns an empty map and nil failed slice (not error) for unknown sessions.
+	GetAllUpstreamCredentials(ctx context.Context, sessionID string) (
+		creds map[string]UpstreamCredential, failed []string, err error)
 }
 
 // Service owns the upstream token lifecycle: read, refresh, error handling.
@@ -76,5 +77,9 @@ type Service interface {
 	//   - ErrSessionNotFound if no upstream tokens exist for the session/provider
 	//   - ErrNoRefreshToken if the access token is expired and no refresh token is available
 	//   - ErrRefreshFailed if the refresh attempt fails (e.g., revoked refresh token)
+	//
+	// The returned UpstreamCredential.IDToken may be empty or expired; callers
+	// MUST check its `exp` claim before using it (e.g. as the subject_token of
+	// an RFC 8693 token exchange). See UpstreamCredential for details.
 	GetValidTokens(ctx context.Context, sessionID, providerName string) (*UpstreamCredential, error)
 }

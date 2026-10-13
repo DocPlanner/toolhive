@@ -473,6 +473,14 @@ components:
             authorization requests. Useful for provider-specific parameters like
             Google's access_type=offline.
           type: object
+        allow_private_ips:
+          description: |-
+            AllowPrivateIPs permits the upstream provider's HTTP client to connect to
+            private IP ranges (RFC-1918, link-local). Use only when the upstream is
+            hosted inside the same cluster and has no public endpoint. HTTP-scheme
+            restrictions are unchanged — HTTPS is still required for non-localhost hosts.
+            Defaults to false.
+          type: boolean
         authorization_endpoint:
           description: AuthorizationEndpoint is the URL for the OAuth authorization
             endpoint.
@@ -529,6 +537,14 @@ components:
             authorization requests. Useful for provider-specific parameters like
             Google's access_type=offline.
           type: object
+        allow_private_ips:
+          description: |-
+            AllowPrivateIPs permits the OIDC discovery and token HTTP clients to
+            connect to private IP ranges (RFC-1918, link-local). Use only when the
+            upstream is hosted inside the same cluster and has no public endpoint.
+            HTTP-scheme restrictions are unchanged — HTTPS is still required for
+            non-localhost hosts. Defaults to false.
+          type: boolean
         client_id:
           description: ClientID is the OAuth 2.0 client identifier registered with
             the upstream IDP.
@@ -564,6 +580,12 @@ components:
             type: string
           type: array
           uniqueItems: false
+        subject_claim:
+          description: |-
+            SubjectClaim names the validated ID-token claim to use as the upstream
+            subject. Defaults to "sub" when empty. Set for IdPs where "sub" isn't
+            stable per user (e.g. Entra/Azure AD's "oid"). See upstream.OIDCConfig.
+          type: string
         userinfo_override:
           $ref: '#/components/schemas/github_com_stacklok_toolhive_pkg_authserver.UserInfoRunConfig'
       type: object
@@ -605,6 +627,15 @@ components:
           uniqueItems: false
         cimd:
           $ref: '#/components/schemas/github_com_stacklok_toolhive_pkg_authserver.CIMDRunConfig'
+        disable_upstream_token_injection:
+          description: |-
+            DisableUpstreamTokenInjection prevents the upstream swap middleware from being added.
+            When true, the embedded auth server handles OAuth flows for clients, but instead of
+            injecting upstream IdP tokens the proxy strips the client's credential headers
+            (Authorization, Cookie, Proxy-Authorization) after the JWT is validated — the
+            backend receives an unauthenticated request. Incompatible with token exchange
+            and AWS STS, which would re-add credentials after the strip.
+          type: boolean
         hmac_secret_files:
           description: |-
             HMACSecretFiles contains file paths to HMAC secrets for signing authorization codes
@@ -616,6 +647,12 @@ components:
             type: string
           type: array
           uniqueItems: false
+        insecure_allow_http:
+          description: |-
+            InsecureAllowHTTP permits an http:// issuer URL for non-localhost hosts.
+            Only set this for in-cluster Kubernetes deployments on a trusted network.
+            Production deployments reachable outside the cluster MUST use https://.
+          type: boolean
         issuer:
           description: |-
             Issuer is the issuer identifier for this authorization server.
@@ -824,14 +861,6 @@ components:
             Addr is the Redis server address (host:port). Required for standalone and cluster modes.
             Mutually exclusive with SentinelConfig.
           type: string
-        address:
-          description: |-
-            LegacyAddress is the pre-v0.27 serialized name of Addr. DocPlanner fork:
-            still read so an image can start from a RunConfig written by an older
-            operator. Never written by the current operator. Remove with PAIINFRA-228.
-
-            Deprecated: use Addr.
-          type: string
         auth_type:
           description: AuthType must be "aclUser" - only ACL user authentication is
             supported.
@@ -1012,6 +1041,7 @@ components:
       - removing
       - unknown
       - unauthenticated
+      - auth_retrying
       - policy_stopped
       - running
       - stopped
@@ -1022,6 +1052,7 @@ components:
       - removing
       - unknown
       - unauthenticated
+      - auth_retrying
       - policy_stopped
       - running
       - stopped
@@ -1032,6 +1063,7 @@ components:
       - removing
       - unknown
       - unauthenticated
+      - auth_retrying
       - policy_stopped
       type: string
       x-enum-varnames:
@@ -1044,6 +1076,7 @@ components:
       - WorkloadStatusRemoving
       - WorkloadStatusUnknown
       - WorkloadStatusUnauthenticated
+      - WorkloadStatusAuthRetrying
       - WorkloadStatusPolicyStopped
     github_com_stacklok_toolhive_pkg_container_templates.RuntimeConfig:
       description: |-
@@ -1262,6 +1295,26 @@ components:
       type: object
     github_com_stacklok_toolhive_pkg_runner.RunConfig:
       properties:
+        additional_middleware_configs:
+          description: |-
+            AdditionalMiddlewareConfigs carries pre-built middleware configs injected by
+            external-auth handlers (reached via *[]RunConfigBuilderOption) rather than
+            derived from typed RunConfig fields. PopulateMiddlewareConfigs splices these
+            into the chain in the backend-egress group — after auth and before recovery —
+            instead of discarding them. Upstream carries these configs verbatim and never
+            inspects their parameters; the middleware type identity (e.g. an enterprise
+            auth type) is supplied by the caller via types.MiddlewareConfig.Type.
+
+            Each entry's Type is expected to be a NEW egress middleware type (e.g. OBO),
+            not one already produced from a typed RunConfig field (auth, authz, audit,
+            tokenExchange, awssts, …). Dispatch in the proxyrunner is purely by Type
+            string, so an injected Type that shadows a typed-field type would add a
+            second instance of that middleware to the chain; the seam does not validate
+            against this.
+          items:
+            $ref: '#/components/schemas/github_com_stacklok_toolhive_pkg_transport_types.MiddlewareConfig'
+          type: array
+          uniqueItems: false
         allow_docker_gateway:
           description: |-
             AllowDockerGateway permits outbound connections to Docker gateway addresses
@@ -1269,6 +1322,18 @@ components:
             blocked by default in the egress proxy even when InsecureAllowAll is set.
             Only applicable to Docker deployments with network isolation enabled.
           type: boolean
+        allowed_origins:
+          description: |-
+            AllowedOrigins is the allowlist of values accepted on the HTTP Origin header,
+            used for DNS-rebinding protection per MCP 2025-11-25 §"Security Warning".
+            When empty and Host is loopback (127.0.0.1 / localhost / [::1]), a default
+            loopback-only allowlist is derived at middleware-wiring time.
+            When empty and Host is non-loopback, the middleware is disabled — operators
+            exposing the proxy publicly must configure an explicit allowlist.
+          items:
+            type: string
+          type: array
+          uniqueItems: false
         audit_config:
           $ref: '#/components/schemas/github_com_stacklok_toolhive_pkg_audit.Config'
         audit_config_path:
@@ -2532,8 +2597,13 @@ components:
           description: Name of the workload
           type: string
         network_isolation:
-          description: Whether network isolation is turned on. This applies the rules
-            in the permission profile.
+          description: |-
+            Whether network isolation is turned on. This applies the rules in the permission profile.
+            Pointer so that omitting the field defaults to network isolation ENABLED (matching the
+            `thv run` CLI default); set it explicitly to false to disable network isolation.
+            This also applies on update: a request that omits this field enables isolation, so
+            clients that build update requests from scratch should send it explicitly to avoid
+            unintentionally turning isolation on for a workload that had it off.
           type: boolean
         oauth_config:
           $ref: '#/components/schemas/pkg_api_v1.remoteOAuthConfig'
@@ -3056,8 +3126,13 @@ components:
           description: Docker image to use
           type: string
         network_isolation:
-          description: Whether network isolation is turned on. This applies the rules
-            in the permission profile.
+          description: |-
+            Whether network isolation is turned on. This applies the rules in the permission profile.
+            Pointer so that omitting the field defaults to network isolation ENABLED (matching the
+            `thv run` CLI default); set it explicitly to false to disable network isolation.
+            This also applies on update: a request that omits this field enables isolation, so
+            clients that build update requests from scratch should send it explicitly to avoid
+            unintentionally turning isolation on for a workload that had it off.
           type: boolean
         oauth_config:
           $ref: '#/components/schemas/pkg_api_v1.remoteOAuthConfig'

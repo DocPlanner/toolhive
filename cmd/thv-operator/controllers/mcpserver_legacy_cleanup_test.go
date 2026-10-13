@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	mcpv1beta1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1beta1"
+	"github.com/stacklok/toolhive/cmd/thv-operator/internal/testutil"
 	"github.com/stacklok/toolhive/pkg/container/kubernetes"
 )
 
@@ -28,7 +29,7 @@ func TestMCPServerReconciler_cleanupLegacyMCPServerResources(t *testing.T) {
 		namespace = testNamespaceDefault
 	)
 
-	scheme := createTestScheme()
+	scheme := testutil.NewScheme(t)
 	mcpServer := &mcpv1beta1.MCPServer{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -87,7 +88,7 @@ func TestMCPServerReconciler_cleanupLegacyMCPServerResources_SkipsForeignObjects
 		namespace = testNamespaceDefault
 	)
 
-	scheme := createTestScheme()
+	scheme := testutil.NewScheme(t)
 	mcpServer := &mcpv1beta1.MCPServer{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
