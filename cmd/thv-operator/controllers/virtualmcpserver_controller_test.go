@@ -864,6 +864,33 @@ func TestVirtualMCPServerServiceNeedsUpdate(t *testing.T) {
 			}(),
 			needsUpdate: false,
 		},
+		{
+			// Regression for #5730: a Service co-owned by GKE NEG/Gateway gets
+			// cloud.google.com/* annotations written by the cloud controller. These are
+			// not operator-owned and must not be treated as drift, or the operator
+			// hot-loops Update and races the concurrent writer.
+			name: "external cloud annotations ignored",
+			service: func() *corev1.Service {
+				s := baseService.DeepCopy()
+				s.Annotations = map[string]string{
+					"cloud.google.com/neg":        `{"ingress":true}`,
+					"cloud.google.com/neg-status": `{"network_endpoint_groups":{"8080":"k8s1-abc"}}`,
+				}
+				return s
+			}(),
+			vmcp:        baseVmcp.DeepCopy(),
+			needsUpdate: false,
+		},
+		{
+			name: "external label ignored",
+			service: func() *corev1.Service {
+				s := baseService.DeepCopy()
+				s.Labels["external.example.com/managed"] = "true"
+				return s
+			}(),
+			vmcp:        baseVmcp.DeepCopy(),
+			needsUpdate: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -2507,6 +2534,117 @@ func TestVirtualMCPServerEnsureDeployment_NoUpdateNeeded(t *testing.T) {
 	assert.Equal(t, ctrl.Result{}, result)
 }
 
+// TestVirtualMCPServerEnsureDeployment_RemovesStaleImagePullSecretsHash is a
+// regression test for #5817: a stale imagePullRefsHashAnnotation left over
+// from a prior reconcile (when imagePullSecrets was non-empty) must be
+// removed once the desired list is empty, and reconciling again from that
+// cleaned-up state must be a no-op rather than looping forever.
+func TestVirtualMCPServerEnsureDeployment_RemovesStaleImagePullSecretsHash(t *testing.T) {
+	t.Parallel()
+
+	scheme := testutil.NewScheme(t)
+
+	vmcp := v1beta1test.NewVirtualMCPServer(testVmcpName, "default",
+		v1beta1test.WithVMCPGroupRef(testGroupName),
+	)
+
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      vmcpConfigMapName(vmcp.Name),
+			Namespace: "default",
+			Annotations: map[string]string{
+				checksum.ContentChecksumAnnotation: "test-checksum",
+			},
+		},
+		Data: map[string]string{
+			"config.yaml": "test-config",
+		},
+	}
+
+	reconciler := &VirtualMCPServerReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).Build(),
+		Scheme: scheme,
+	}
+
+	expectedLabels, expectedAnnotations := reconciler.buildPodTemplateMetadata(
+		labelsForVirtualMCPServer(vmcp.Name), vmcp, "test-checksum",
+	)
+
+	// Deployment otherwise matches the desired state exactly, except it
+	// carries a stale imagePullRefsHashAnnotation from before imagePullSecrets
+	// was cleared on the VirtualMCPServer.
+	staleDeployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      testVmcpName,
+			Namespace: "default",
+			Labels:    labelsForVirtualMCPServer(vmcp.Name),
+			Annotations: map[string]string{
+				imagePullRefsHashAnnotation: "stale-hash",
+			},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: labelsForVirtualMCPServer(vmcp.Name),
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels:      expectedLabels,
+					Annotations: expectedAnnotations,
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  "vmcp",
+							Image: getVmcpImage(),
+							Ports: []corev1.ContainerPort{
+								{ContainerPort: 4483},
+							},
+							Env: mustBuildEnvVarsForVmcp(reconciler, vmcp),
+						},
+					},
+					ServiceAccountName: vmcpServiceAccountName(vmcp.Name),
+				},
+			},
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(vmcp, configMap, staleDeployment).
+		Build()
+	reconciler.Client = k8sClient
+
+	// First reconcile cleans up the stale annotation.
+	result, err := reconciler.ensureDeployment(context.Background(), vmcp, nil, []workloads.TypedWorkload{})
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{}, result)
+
+	deployment := &appsv1.Deployment{}
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{
+		Name:      vmcp.Name,
+		Namespace: vmcp.Namespace,
+	}, deployment))
+	_, present := deployment.Annotations[imagePullRefsHashAnnotation]
+	assert.False(t, present, "stale imagePullRefsHashAnnotation must be removed once desired list is empty")
+
+	resourceVersionAfterCleanup := deployment.ResourceVersion
+
+	// Second reconcile from the now-clean steady state must be a no-op.
+	// Without both fixes, this would keep re-detecting drift and updating
+	// forever — the hot-reconcile loop from #5817.
+	result, err = reconciler.ensureDeployment(context.Background(), vmcp, nil, []workloads.TypedWorkload{})
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{}, result)
+
+	deployment = &appsv1.Deployment{}
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{
+		Name:      vmcp.Name,
+		Namespace: vmcp.Namespace,
+	}, deployment))
+	assert.Equal(t, resourceVersionAfterCleanup, deployment.ResourceVersion,
+		"reconciling from steady state must not write again")
+}
+
 func TestVirtualMCPServerEnsureService_CreateService(t *testing.T) {
 	t.Parallel()
 
@@ -2595,6 +2733,61 @@ func TestVirtualMCPServerEnsureService_UpdateService(t *testing.T) {
 	}, service)
 	assert.NoError(t, err)
 	assert.Equal(t, corev1.ServiceTypeLoadBalancer, service.Spec.Type)
+}
+
+// TestVirtualMCPServerEnsureService_PreservesExternalAnnotations is a regression test
+// for #5730: when a genuine operator-owned change triggers a Service update, annotations
+// written by an external controller (e.g. GKE NEG) must be preserved, not stripped.
+func TestVirtualMCPServerEnsureService_PreservesExternalAnnotations(t *testing.T) {
+	t.Parallel()
+
+	scheme := testutil.NewScheme(t)
+
+	vmcp := v1beta1test.NewVirtualMCPServer(testVmcpName, "default",
+		v1beta1test.WithVMCPGroupRef(testGroupName),
+		v1beta1test.MutateVMCP(func(v *mcpv1beta1.VirtualMCPServer) {
+			v.Spec.ServiceType = "LoadBalancer"
+		}),
+	)
+
+	// Existing service with wrong type (triggers update) plus a cloud-owned annotation.
+	oldService := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      vmcpServiceName(vmcp.Name),
+			Namespace: "default",
+			Labels:    labelsForVirtualMCPServer(vmcp.Name),
+			Annotations: map[string]string{
+				"cloud.google.com/neg-status": `{"network_endpoint_groups":{"8080":"k8s1-abc"}}`,
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Type:     corev1.ServiceTypeClusterIP,
+			Selector: labelsForVirtualMCPServer(vmcp.Name),
+			Ports:    []corev1.ServicePort{{Port: 4483, TargetPort: intstr.FromInt(4483)}},
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(vmcp, oldService).
+		Build()
+
+	reconciler := &VirtualMCPServerReconciler{Client: k8sClient, Scheme: scheme}
+
+	_, err := reconciler.ensureService(context.Background(), vmcp)
+	assert.NoError(t, err)
+
+	service := &corev1.Service{}
+	err = k8sClient.Get(context.Background(), types.NamespacedName{
+		Name:      vmcpServiceName(vmcp.Name),
+		Namespace: vmcp.Namespace,
+	}, service)
+	assert.NoError(t, err)
+	// Operator-owned field applied...
+	assert.Equal(t, corev1.ServiceTypeLoadBalancer, service.Spec.Type)
+	// ...and the external annotation preserved.
+	assert.Equal(t, `{"network_endpoint_groups":{"8080":"k8s1-abc"}}`,
+		service.Annotations["cloud.google.com/neg-status"])
 }
 
 func TestVirtualMCPServerEnsureService_NoUpdateNeeded(t *testing.T) {

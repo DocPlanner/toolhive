@@ -107,16 +107,14 @@ type storedSession struct {
 
 // NewRedisStorage creates Redis-backed storage. Connection-mode topology,
 // timeouts, TLS, and credentials are configured through cfg; keyPrefix is the
-// per-tenant key prefix (e.g. "thv:auth:{ns}:{name}:"). The auth server
-// requires ACL authentication, so cfg.Password and keyPrefix must be non-empty.
+// per-tenant key prefix (e.g. "thv:auth:{ns}:{name}:") and must be non-empty.
 //
 // Connection-mode validation, timeout defaults, client construction (standalone,
 // cluster, or sentinel), TLS plumbing, and connectivity verification are
-// delegated to the shared toolhive-core redis package.
+// delegated to the shared toolhive-core redis package. cfg.Password may be
+// empty when the Redis server does not require authentication (the auth server
+// does not mandate ACL auth); the keyPrefix is storage-specific and required.
 func NewRedisStorage(ctx context.Context, cfg tcredis.Config, keyPrefix string) (*RedisStorage, error) {
-	if cfg.Password == "" {
-		return nil, errors.New("invalid redis configuration: ACL password is required")
-	}
 	if keyPrefix == "" {
 		return nil, errors.New("invalid redis configuration: key prefix is required")
 	}
@@ -1404,6 +1402,7 @@ type storedPendingAuthorization struct {
 	ResolvedUserName     string   `json:"resolved_user_name,omitempty"`
 	ResolvedUserEmail    string   `json:"resolved_user_email,omitempty"`
 	SingleLeg            bool     `json:"single_leg,omitempty"`
+	ChainUpstreams       []string `json:"chain_upstreams,omitempty"`
 	CreatedAt            int64    `json:"created_at"`
 }
 
@@ -1434,6 +1433,7 @@ func (s *RedisStorage) StorePendingAuthorization(ctx context.Context, state stri
 		ResolvedUserName:     pending.ResolvedUserName,
 		ResolvedUserEmail:    pending.ResolvedUserEmail,
 		SingleLeg:            pending.SingleLeg,
+		ChainUpstreams:       slices.Clone(pending.ChainUpstreams),
 		CreatedAt:            pending.CreatedAt.Unix(),
 	}
 
@@ -1485,6 +1485,7 @@ func (s *RedisStorage) LoadPendingAuthorization(ctx context.Context, state strin
 		ResolvedUserName:     stored.ResolvedUserName,
 		ResolvedUserEmail:    stored.ResolvedUserEmail,
 		SingleLeg:            stored.SingleLeg,
+		ChainUpstreams:       slices.Clone(stored.ChainUpstreams),
 		CreatedAt:            createdAt,
 	}, nil
 }

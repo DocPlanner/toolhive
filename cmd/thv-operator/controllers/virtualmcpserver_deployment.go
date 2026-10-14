@@ -35,10 +35,6 @@ import (
 )
 
 const (
-	// podTemplateSpecHashAnnotation tracks the SHA256 hash of the user-provided PodTemplateSpec.
-	// Used to detect changes without comparing full rendered templates (which include K8s-defaulted fields).
-	podTemplateSpecHashAnnotation = "toolhive.stacklok.io/podtemplatespec-hash"
-
 	// imagePullRefsHashAnnotation tracks the SHA256 hash of the desired
 	// imagePullSecrets list — chart-level defaults merged with
 	// vmcp.Spec.ImagePullSecrets — used by buildDeploymentMetadataForVmcp.
@@ -534,9 +530,6 @@ func (r *VirtualMCPServerReconciler) buildOutgoingAuthEnvVars(
 		}
 	}
 
-	// Ensure deterministic ordering so reconcile comparisons don't flap when source maps/slices vary.
-	sortEnvVarsByName(env)
-
 	return env
 }
 
@@ -716,16 +709,8 @@ func (r *VirtualMCPServerReconciler) discoverExternalAuthConfigSecrets(
 		return envVars
 	}
 
-	workloadsForDiscovery := append([]workloads.TypedWorkload(nil), typedWorkloads...)
-	sort.SliceStable(workloadsForDiscovery, func(i, j int) bool {
-		if workloadsForDiscovery[i].Type != workloadsForDiscovery[j].Type {
-			return workloadsForDiscovery[i].Type < workloadsForDiscovery[j].Type
-		}
-		return workloadsForDiscovery[i].Name < workloadsForDiscovery[j].Name
-	})
-
 	// Discover ExternalAuthConfigs from workloads (MCPServers, MCPRemoteProxies, and MCPServerEntries)
-	for _, workloadInfo := range workloadsForDiscovery {
+	for _, workloadInfo := range typedWorkloads {
 		configName := r.getExternalAuthConfigNameFromWorkload(
 			workloadInfo, mcpServerMap, mcpRemoteProxyMap, mcpServerEntryMap)
 		if configName == "" {
@@ -771,14 +756,7 @@ func (r *VirtualMCPServerReconciler) discoverInlineExternalAuthConfigSecrets(
 	seenConfigs := make(map[string]bool) // Track which ExternalAuthConfigs we've already processed
 
 	// Process per-backend configs
-	backendNames := make([]string, 0, len(vmcp.Spec.OutgoingAuth.Backends))
-	for backendName := range vmcp.Spec.OutgoingAuth.Backends {
-		backendNames = append(backendNames, backendName)
-	}
-	sort.Strings(backendNames)
-
-	for _, backendName := range backendNames {
-		backendAuth := vmcp.Spec.OutgoingAuth.Backends[backendName]
+	for _, backendAuth := range vmcp.Spec.OutgoingAuth.Backends {
 		if backendAuth.ExternalAuthConfigRef == nil {
 			continue
 		}
@@ -891,6 +869,9 @@ func (r *VirtualMCPServerReconciler) getExternalAuthConfigSecretEnvVars(
 		// masked as a no-op.
 		return ctrlutil.OBOSecretEnvVars(externalAuthConfig)
 
+	case mcpv1beta1.ExternalAuthTypeXAA:
+		return xaaSecretEnvVars(externalAuthConfig, externalAuthConfigName), nil
+
 	default:
 		return nil, nil // Not applicable
 	}
@@ -908,10 +889,36 @@ func (r *VirtualMCPServerReconciler) getExternalAuthConfigSecretEnvVars(
 	}}, nil
 }
 
-func sortEnvVarsByName(envVars []corev1.EnvVar) {
-	sort.SliceStable(envVars, func(i, j int) bool {
-		return envVars[i].Name < envVars[j].Name
-	})
+// xaaSecretEnvVars returns the env vars needed to mount XAA client secrets into
+// the vMCP pod. Returns nil when the XAA spec is absent or has no secret refs.
+func xaaSecretEnvVars(externalAuthConfig *mcpv1beta1.MCPExternalAuthConfig, configName string) []corev1.EnvVar {
+	if externalAuthConfig.Spec.XAA == nil {
+		return nil
+	}
+	var envVars []corev1.EnvVar
+	if ref := externalAuthConfig.Spec.XAA.IDPClientSecretRef; ref != nil {
+		envVars = append(envVars, corev1.EnvVar{
+			Name: ctrlutil.GenerateUniqueXAAIDPSecretEnvVarName(configName),
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: ref.Name},
+					Key:                  ref.Key,
+				},
+			},
+		})
+	}
+	if ref := externalAuthConfig.Spec.XAA.TargetClientSecretRef; ref != nil {
+		envVars = append(envVars, corev1.EnvVar{
+			Name: ctrlutil.GenerateUniqueXAATargetSecretEnvVarName(configName),
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: ref.Name},
+					Key:                  ref.Key,
+				},
+			},
+		})
+	}
+	return envVars
 }
 
 // buildDeploymentMetadataForVmcp builds deployment-level labels and annotations

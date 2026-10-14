@@ -18,7 +18,6 @@ import (
 
 	"github.com/stacklok/toolhive-core/env"
 	"github.com/stacklok/toolhive/pkg/auth"
-	"github.com/stacklok/toolhive/pkg/networking"
 	"github.com/stacklok/toolhive/pkg/oauthproto"
 	"github.com/stacklok/toolhive/pkg/oauthproto/jwtbearer"
 	"github.com/stacklok/toolhive/pkg/oauthproto/tokenexchange"
@@ -29,16 +28,16 @@ import (
 // XAAStrategy implements XAA (Cross-Application Access) as a two-step token
 // exchange, following draft-ietf-oauth-identity-assertion-authz-grant (ID-JAG):
 //
-//   - Step A (RFC 8693): Exchange the user's ID token at the IdP for an ID-JAG JWT.
-//   - Step B (RFC 7523): Exchange the ID-JAG at the target AS for an access token.
+//   - IdP exchange (RFC 8693): Exchange the user's ID token at the IdP for an ID-JAG JWT.
+//   - Target grant (RFC 7523): Exchange the ID-JAG at the target AS for an access token.
 //
 // Both steps run on every Authenticate call. The upper vMCP TokenCache layer is
 // responsible for reusing the resulting access token across requests; this
 // strategy holds no local cache.
 //
-// The subject ID token is not validated locally before Step A. The IdP enforces
-// its own exp check; if the token is expired, Step A returns an OAuth
-// invalid_grant error which propagates to the caller. Callers that need
+// The subject ID token is not validated locally before IdP exchange. The IdP
+// enforces its own exp check; if the token is expired, IdP exchange returns an
+// OAuth invalid_grant error which propagates to the caller. Callers that need
 // fine-grained re-auth signals can inspect it with:
 //
 //	var re *oauth2.RetrieveError
@@ -67,8 +66,8 @@ func (*XAAStrategy) Name() string {
 //  2. For health check requests: uses a client credentials grant at TargetTokenURL
 //     if target client credentials are configured; otherwise skips authentication
 //  3. For regular requests: retrieves the user's ID token from the identity's
-//     UpstreamIDTokens map, performs Step A (token exchange for ID-JAG) and
-//     Step B (JWT Bearer grant for access token), then injects the access token
+//     UpstreamIDTokens map, performs IdP exchange (token exchange for ID-JAG) and
+//     target grant (JWT Bearer grant for access token), then injects the access token
 //
 // Parameters:
 //   - ctx: Request context containing the authenticated identity (or health check marker)
@@ -79,7 +78,7 @@ func (*XAAStrategy) Name() string {
 //   - Strategy configuration is invalid or incomplete
 //   - No identity is found in the context (regular requests only)
 //   - The upstream ID token for the configured provider is not found
-//   - Step A (token exchange) or Step B (JWT Bearer grant) fails
+//   - IdP exchange (token exchange) or target grant (JWT Bearer grant) fails
 func (s *XAAStrategy) Authenticate(
 	ctx context.Context, req *http.Request, strategy *authtypes.BackendAuthStrategy,
 ) error {
@@ -122,23 +121,23 @@ func (s *XAAStrategy) Authenticate(
 
 	slog.Debug("xaa: found ID token for provider", "provider", config.subjectProviderName)
 
-	// Step A: Exchange the user's ID token for an ID-JAG at the IdP.
-	assertion, err := s.performStepA(ctx, idToken, config)
+	// IdP exchange: Exchange the user's ID token for an ID-JAG at the IdP.
+	assertion, err := s.performIDPExchange(ctx, idToken, config)
 	if err != nil {
-		slog.Debug("xaa: Step A failed", "error", err)
-		return fmt.Errorf("step A (ID-JAG exchange) failed: %w", err)
+		slog.Debug("xaa: IdP exchange failed", "error", err)
+		return fmt.Errorf("IdP exchange failed: %w", err)
 	}
 
-	slog.Debug("xaa: Step A succeeded, got ID-JAG")
+	slog.Debug("xaa: IdP exchange succeeded, got ID-JAG")
 
-	// Step B: Exchange the ID-JAG for an access token at the target AS.
-	accessToken, err := s.performStepB(ctx, assertion, config)
+	// Target grant: Exchange the ID-JAG for an access token at the target AS.
+	accessToken, err := s.performTargetGrant(ctx, assertion, config)
 	if err != nil {
-		slog.Debug("xaa: Step B failed", "error", err)
-		return fmt.Errorf("step B (JWT Bearer grant) failed: %w", err)
+		slog.Debug("xaa: target grant failed", "error", err)
+		return fmt.Errorf("target grant failed: %w", err)
 	}
 
-	slog.Debug("xaa: Step B succeeded, setting Bearer token")
+	slog.Debug("xaa: target grant succeeded, setting Bearer token")
 
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
 	return nil
@@ -159,8 +158,26 @@ func (s *XAAStrategy) Authenticate(
 // This validation is typically called during configuration parsing to fail fast
 // if the strategy is misconfigured.
 func (s *XAAStrategy) Validate(strategy *authtypes.BackendAuthStrategy) error {
-	_, err := s.parseXAAConfig(strategy)
-	return err
+	config, err := s.parseXAAConfig(strategy)
+	if err != nil {
+		return err
+	}
+
+	// Emit configuration warnings here rather than in parseXAAConfig: Validate
+	// runs once per backend at wire-up, whereas parseXAAConfig also runs on every
+	// Authenticate call and would spam these on every request.
+	if config.allowInsecureHTTP {
+		slog.Warn("xaa: plain HTTP enabled for TargetTokenURL; do not use in production",
+			"targetTokenURL", config.targetTokenURL,
+		)
+	}
+	if config.targetClientID == "" {
+		slog.Warn("xaa: target grant will run without client authentication; " +
+			"most authorization servers reject unauthenticated JWT-bearer grants " +
+			"(ID-JAG draft §9.1 recommends confidential clients)")
+	}
+
+	return nil
 }
 
 // xaaParsedConfig holds the parsed and resolved XAA configuration.
@@ -175,6 +192,7 @@ type xaaParsedConfig struct {
 	targetResource      string
 	scopes              []string
 	subjectProviderName string
+	subjectTokenType    string
 	allowInsecureHTTP   bool
 }
 
@@ -204,17 +222,20 @@ func (*XAAStrategy) authenticateWithClientCredentials(
 	return nil
 }
 
-// performStepA runs the RFC 8693 token exchange at the IdP to obtain an ID-JAG.
-// It verifies the response's issued_token_type matches the ID-JAG URN per
-// draft-ietf-oauth-identity-assertion-authz-grant §4.3.3.
-func (*XAAStrategy) performStepA(
+// performIDPExchange runs the RFC 8693 token exchange at the IdP to obtain an
+// ID-JAG. It verifies the response's issued_token_type matches the ID-JAG URN
+// (draft §4.3.3) and that token_type is N_A (draft §5.2), logs a mismatch on
+// the JWT typ header, rejects an empty or unparsable assertion, and validates
+// the aud/resource binding claims against what was requested (confused-deputy
+// defence; see validateIDJAGClaims).
+func (*XAAStrategy) performIDPExchange(
 	ctx context.Context, idToken string, config *xaaParsedConfig,
 ) (string, error) {
 	exchangeCfg := &tokenexchange.ExchangeConfig{
 		TokenURL:           config.idpTokenURL,
 		ClientID:           config.idpClientID,
 		ClientSecret:       config.idpClientSecret,
-		SubjectTokenType:   oauthproto.TokenTypeIDToken,
+		SubjectTokenType:   config.subjectTokenType,
 		RequestedTokenType: oauthproto.TokenTypeIDJAG,
 		Audience:           config.targetAudience,
 		Resource:           config.targetResource,
@@ -226,55 +247,143 @@ func (*XAAStrategy) performStepA(
 
 	token, err := exchangeCfg.TokenSource(ctx).Token()
 	if err != nil {
-		return "", fmt.Errorf("step A token exchange: %w", err)
+		return "", fmt.Errorf("IdP exchange: %w", err)
 	}
 
 	// Per draft-ietf-oauth-identity-assertion-authz-grant §4.3.3, the IdP MUST
 	// return issued_token_type = urn:ietf:params:oauth:token-type:id-jag. Fail
-	// loudly if it returned anything else so Step B cannot accidentally be fed
-	// a non-assertion token.
+	// loudly if it returned anything else so target grant cannot accidentally
+	// be fed a non-assertion token.
 	got, _ := token.Extra("issued_token_type").(string)
 	if got != oauthproto.TokenTypeIDJAG {
-		return "", fmt.Errorf("step A: IdP returned issued_token_type=%q, want %q", got, oauthproto.TokenTypeIDJAG)
+		return "", fmt.Errorf("IdP exchange: IdP returned issued_token_type=%q, want %q", got, oauthproto.TokenTypeIDJAG)
 	}
 
 	// Per draft-ietf-oauth-identity-assertion-authz-grant §5.2, the RFC 8693
 	// response MUST carry token_type=N_A for an assertion that is not usable
 	// as a bearer token at the IdP.
 	if !strings.EqualFold(token.TokenType, "N_A") {
-		return "", fmt.Errorf("step A: IdP returned token_type=%q, want N_A (draft §5.2)", token.TokenType)
+		return "", fmt.Errorf("IdP exchange: IdP returned token_type=%q, want N_A (draft §5.2)", token.TokenType)
 	}
 
 	// The AccessToken field holds the ID-JAG per RFC 8693 response format.
 	assertion := token.AccessToken
 	if assertion == "" {
-		return "", fmt.Errorf("step A: IdP returned an empty ID-JAG assertion")
+		return "", fmt.Errorf("IdP exchange: IdP returned an empty ID-JAG assertion")
 	}
 
 	// Defence-in-depth: inspect the JWT typ header. The draft §3.1 MUST for
 	// typ: oauth-id-jag+jwt is on the issuer (IdP); ToolHive is the
-	// holder/presenter — the target AS validates the ID-JAG in Step B. A
+	// holder/presenter — the target AS validates the ID-JAG in target grant. A
 	// mismatch is deliberately logged rather than fatal; the fatal contract
 	// enforced here is issued_token_type (RFC 8693 §2.2.1, checked above).
 	const idJAGJWTType = "oauth-id-jag+jwt"
 	parser := jwt.NewParser()
 	parsed, _, parseErr := parser.ParseUnverified(assertion, jwt.MapClaims{})
-	if parseErr == nil {
-		if typ, _ := parsed.Header["typ"].(string); !strings.EqualFold(typ, idJAGJWTType) {
-			slog.Debug("xaa: ID-JAG JWT typ header mismatch",
-				"got", typ, "want", idJAGJWTType,
-			)
-		}
-	} else {
-		slog.Debug("xaa: could not parse ID-JAG JWT header for typ check", "error", parseErr)
+	if parseErr != nil {
+		// A non-parseable assertion cannot carry valid aud/resource claims and
+		// therefore cannot be a valid ID-JAG. Fail fast rather than forwarding
+		// an unvalidated assertion to the target AS.
+		return "", fmt.Errorf("IdP exchange: ID-JAG assertion is not a valid JWT: %w", parseErr)
+	}
+	if typ, _ := parsed.Header["typ"].(string); !strings.EqualFold(typ, idJAGJWTType) {
+		slog.Debug("xaa: ID-JAG JWT typ header mismatch",
+			"got", typ, "want", idJAGJWTType,
+		)
+	}
+	// The assertion cannot fail: ParseUnverified was called with a literal
+	// jwt.MapClaims{}, which it decodes into in place. The !ok branch is
+	// defensive.
+	claims, ok := parsed.Claims.(jwt.MapClaims)
+	if !ok {
+		return "", fmt.Errorf("IdP exchange: ID-JAG claims are not MapClaims")
+	}
+	if err := validateIDJAGClaims(claims, config.targetAudience, config.targetResource); err != nil {
+		return "", err
 	}
 
 	return assertion, nil
 }
 
-// performStepB runs the RFC 7523 JWT Bearer grant at the target AS using the
-// ID-JAG assertion returned by Step A.
-func (*XAAStrategy) performStepB(
+// validateIDJAGClaims checks the aud and resource claims of the returned ID-JAG
+// JWT against the values requested in the IdP exchange (draft §3.1, §5).
+//
+// Per draft §4.4.1, aud MUST be a single-value issuer identifier: either a JSON
+// string, or a JSON array containing exactly one element. A multi-element aud
+// array is malformed and is rejected (see audMatches). resource is checked
+// only when one was requested (the resource parameter is OPTIONAL per draft
+// §4.3); when one was requested, ToolHive requires the returned ID-JAG to echo
+// it — a deliberate strict-binding policy, stricter than the draft, which
+// leaves resource OPTIONAL in the response even when requested.
+//
+// This is defence-in-depth against token misbinding: if the IdP mints an ID-JAG
+// for a different audience/resource, the target AS should reject it — but
+// ToolHive fails fast rather than forwarding a mismatched assertion.
+//
+// Per RFC 7519 §4.1.3, the aud claim may be a string or an array of strings;
+// golang-jwt/v5 decodes a JSON array as []interface{} whose elements are
+// strings. resource legitimately allows an array of URIs per draft §3.1, so a
+// membership check (claimContainsString) is used there; aud does not permit
+// multiple values, so a dedicated single-value check (audMatches) is used
+// instead.
+func validateIDJAGClaims(claims jwt.MapClaims, wantAudience, wantResource string) error {
+	// aud is REQUIRED and single-valued per draft §4.4.1.
+	if !audMatches(claims, wantAudience) {
+		return fmt.Errorf("IdP exchange: ID-JAG aud claim %v does not match requested audience %q", claims["aud"], wantAudience)
+	}
+
+	// Deliberately stricter than the draft: resource is OPTIONAL in the ID-JAG
+	// even when requested, but ToolHive rejects an ID-JAG that omits it once
+	// the operator has configured a resource to bind to.
+	if wantResource != "" && !claimContainsString(claims, "resource", wantResource) {
+		return fmt.Errorf(
+			"IdP exchange: ID-JAG resource claim %v does not contain requested resource %q",
+			claims["resource"], wantResource,
+		)
+	}
+
+	return nil
+}
+
+// audMatches reports whether the aud claim is a single-value issuer identifier
+// equal to want, per draft §4.4.1: either a JSON string, or a JSON array
+// containing exactly one element. Any other shape — missing, multi-element
+// array, empty array, wrong type, or a non-string element — is rejected.
+func audMatches(claims jwt.MapClaims, want string) bool {
+	switch v := claims["aud"].(type) {
+	case string:
+		return v == want
+	case []interface{}:
+		if len(v) != 1 {
+			return false
+		}
+		s, ok := v[0].(string)
+		return ok && s == want
+	default:
+		return false
+	}
+}
+
+// claimContainsString reports whether the named claim contains want. Per RFC
+// 7519 the claim may be a single string or an array; golang-jwt/v5 decodes JSON
+// arrays as []interface{} whose elements are strings.
+func claimContainsString(claims jwt.MapClaims, key, want string) bool {
+	switch v := claims[key].(type) {
+	case string:
+		return v == want
+	case []interface{}:
+		for _, e := range v {
+			if s, ok := e.(string); ok && s == want {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// performTargetGrant runs the RFC 7523 JWT Bearer grant at the target AS using
+// the ID-JAG assertion returned by IdP exchange.
+func (*XAAStrategy) performTargetGrant(
 	ctx context.Context, assertion string, config *xaaParsedConfig,
 ) (string, error) {
 	bearerCfg := &jwtbearer.Config{
@@ -290,43 +399,10 @@ func (*XAAStrategy) performStepB(
 
 	token, err := bearerCfg.TokenSource(ctx).Token()
 	if err != nil {
-		return "", fmt.Errorf("step B jwt-bearer grant: %w", err)
+		return "", fmt.Errorf("target grant: %w", err)
 	}
 
 	return token.AccessToken, nil
-}
-
-// validateTokenURL checks that a configured token endpoint is a syntactically
-// valid HTTPS (or localhost HTTP) URL with a host and no fragment. Mirrors the
-// validator in pkg/oauthproto/jwtbearer.Config.Validate.
-func validateTokenURL(label, endpoint string) error {
-	return validateTokenURLWithInsecure(label, endpoint, false)
-}
-
-// validateTokenURLWithInsecure is like validateTokenURL but allows plain HTTP
-// when allowInsecureHTTP is true. Used for the TargetTokenURL when
-// InsecureTargetTokenURL is set.
-func validateTokenURLWithInsecure(label, endpoint string, allowInsecureHTTP bool) error {
-	if err := networking.ValidateEndpointURLWithInsecure(endpoint, allowInsecureHTTP); err != nil {
-		return fmt.Errorf("%s: %w", label, err)
-	}
-	u, err := url.Parse(endpoint)
-	if err != nil {
-		return fmt.Errorf("%s is not a valid URL: %w", label, err)
-	}
-	if u.Scheme != "https" && u.Scheme != "http" {
-		return fmt.Errorf("%s must use http or https scheme", label)
-	}
-	if u.Host == "" {
-		return fmt.Errorf("%s must include a host", label)
-	}
-	if u.Fragment != "" {
-		return fmt.Errorf("%s must not contain a fragment", label)
-	}
-	if u.User != nil {
-		return fmt.Errorf("%s must not contain embedded credentials", label)
-	}
-	return nil
 }
 
 // resolveClientSecret resolves a client secret from either a direct value or an
@@ -396,10 +472,10 @@ func (s *XAAStrategy) parseXAAConfig(strategy *authtypes.BackendAuthStrategy) (*
 
 	// Token endpoint URL shape: must be https (or http on localhost), have a
 	// host, and not carry a fragment. Applied to both IdP and target endpoints.
-	if err := validateTokenURL("IDPTokenURL", cfg.IDPTokenURL); err != nil {
+	if err := jwtbearer.ValidateTokenURL("IDPTokenURL", cfg.IDPTokenURL, false); err != nil {
 		return nil, err
 	}
-	if err := validateTokenURLWithInsecure("TargetTokenURL", cfg.TargetTokenURL, cfg.InsecureTargetTokenURL); err != nil {
+	if err := jwtbearer.ValidateTokenURL("TargetTokenURL", cfg.TargetTokenURL, cfg.InsecureTargetTokenURL); err != nil {
 		return nil, err
 	}
 
@@ -415,6 +491,11 @@ func (s *XAAStrategy) parseXAAConfig(strategy *authtypes.BackendAuthStrategy) (*
 		return nil, fmt.Errorf("target credentials: %w", err)
 	}
 
+	subjectTokenType := cfg.SubjectTokenType
+	if subjectTokenType == "" {
+		subjectTokenType = oauthproto.TokenTypeIDToken
+	}
+
 	return &xaaParsedConfig{
 		idpTokenURL:         cfg.IDPTokenURL,
 		idpClientID:         cfg.IDPClientID,
@@ -426,6 +507,7 @@ func (s *XAAStrategy) parseXAAConfig(strategy *authtypes.BackendAuthStrategy) (*
 		targetResource:      cfg.TargetResource,
 		scopes:              cfg.Scopes,
 		subjectProviderName: cfg.SubjectProviderName,
+		subjectTokenType:    subjectTokenType,
 		allowInsecureHTTP:   cfg.InsecureTargetTokenURL,
 	}, nil
 }

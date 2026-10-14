@@ -455,6 +455,10 @@ const docTemplate = `{
                     "identity_from_token": {
                         "$ref": "#/components/schemas/github_com_stacklok_toolhive_pkg_authserver.IdentityFromTokenRunConfig"
                     },
+                    "insecure_allow_http": {
+                        "description": "InsecureAllowHTTP permits plain-HTTP authorization and token endpoint URLs\nfor this upstream. Only for in-cluster development environments (e.g. an\nOAuth2 provider served over HTTP in a kind cluster) where TLS is not\navailable. Never set this in production.",
+                        "type": "boolean"
+                    },
                     "redirect_uri": {
                         "description": "RedirectURI is the callback URL where the upstream IDP will redirect after authentication.\nWhen not specified, defaults to ` + "`" + `{issuer}/oauth/callback` + "`" + `.",
                         "type": "string"
@@ -505,6 +509,10 @@ const docTemplate = `{
                     "client_secret_file": {
                         "description": "ClientSecretFile is the path to a file containing the OAuth 2.0 client secret.\nMutually exclusive with ClientSecretEnvVar. Optional for public clients using PKCE.",
                         "type": "string"
+                    },
+                    "insecure_allow_http": {
+                        "description": "InsecureAllowHTTP permits a plain-HTTP issuer URL and HTTP discovery\nendpoints for this upstream. Only for in-cluster development environments\n(e.g. Dex served over HTTP in a kind cluster) where TLS is not available.\nNever set this in production.",
+                        "type": "boolean"
                     },
                     "issuer_url": {
                         "description": "IssuerURL is the OIDC issuer URL for automatic endpoint discovery.\nMust be a valid HTTPS URL.",
@@ -891,10 +899,6 @@ const docTemplate = `{
                     "windsurf",
                     "windsurf-jetbrains",
                     "amp-cli",
-                    "amp-vscode",
-                    "amp-cursor",
-                    "amp-vscode-insider",
-                    "amp-windsurf",
                     "lm-studio",
                     "goose",
                     "trae",
@@ -922,10 +926,6 @@ const docTemplate = `{
                     "Windsurf",
                     "WindsurfJetBrains",
                     "AmpCli",
-                    "AmpVSCode",
-                    "AmpCursor",
-                    "AmpVSCodeInsider",
-                    "AmpWindsurf",
                     "LMStudio",
                     "Goose",
                     "Trae",
@@ -954,6 +954,10 @@ const docTemplate = `{
                     },
                     "registered": {
                         "description": "Registered indicates whether the client is registered in the ToolHive configuration",
+                        "type": "boolean"
+                    },
+                    "supports_plugins": {
+                        "description": "SupportsPlugins indicates whether ToolHive can install plugins for this client",
                         "type": "boolean"
                     },
                     "supports_skills": {
@@ -1044,6 +1048,13 @@ const docTemplate = `{
                     "builder_image": {
                         "description": "BuilderImage is the full image reference for the builder stage.\nAn empty string signals \"use the default for this transport type\" during config merging.\nExamples: \"golang:1.26-alpine\", \"node:24-alpine\", \"python:3.14-slim\"",
                         "type": "string"
+                    },
+                    "runtime_env": {
+                        "additionalProperties": {
+                            "type": "string"
+                        },
+                        "description": "RuntimeEnv contains environment variables to inject into the Dockerfile's\nfinal runtime stage. Unlike BuildEnv (pkg/container/templates.TemplateData.BuildEnv),\nwhich only affects the builder stage, these variables are baked into the\nshipped image and are present in the running container's process\nenvironment at startup. Use this for values a packaged MCP server reads at\nprocess start (e.g. feature flags, cache backend selection), not for\nbuild-time package manager configuration.\nKeys must be uppercase with underscores, values are validated for safety.",
+                        "type": "object"
                     }
                 },
                 "type": "object"
@@ -1118,6 +1129,13 @@ const docTemplate = `{
                 "properties": {
                     "name": {
                         "type": "string"
+                    },
+                    "plugins": {
+                        "items": {
+                            "type": "string"
+                        },
+                        "type": "array",
+                        "uniqueItems": false
                     },
                     "registered_clients": {
                         "items": {
@@ -1273,7 +1291,7 @@ const docTemplate = `{
                         "uniqueItems": false
                     },
                     "allow_docker_gateway": {
-                        "description": "AllowDockerGateway permits outbound connections to Docker gateway addresses\n(host.docker.internal, gateway.docker.internal, 172.17.0.1). These are\nblocked by default in the egress proxy even when InsecureAllowAll is set.\nOnly applicable to Docker deployments with network isolation enabled.",
+                        "description": "AllowDockerGateway permits outbound connections to Docker gateway addresses\n(host.docker.internal, gateway.docker.internal, 172.17.0.1). These are\nblocked by default in the egress proxy even when InsecureAllowAll is set.\nOnly applicable to Docker deployments with network isolation enabled.\nGateway access is port-independent: it ignores the permission profile's\nallowed ports, so once enabled the gateway is reachable on any port.",
                         "type": "boolean"
                     },
                     "allowed_origins": {
@@ -2349,13 +2367,13 @@ const docTemplate = `{
                         "uniqueItems": false
                     },
                     "registryBaseUrl": {
-                        "description": "RegistryBaseURL is the base URL of the package registry (used by npm, pypi, nuget; not used by oci, mcpb)",
+                        "description": "RegistryBaseURL is the base URL of the package registry (used by npm, pypi, nuget, cargo; not used by oci, mcpb)",
                         "example": "https://registry.npmjs.org",
                         "format": "uri",
                         "type": "string"
                     },
                     "registryType": {
-                        "description": "RegistryType indicates how to download packages (e.g., \"npm\", \"pypi\", \"oci\", \"nuget\", \"mcpb\")",
+                        "description": "RegistryType indicates how to download packages (e.g., \"npm\", \"pypi\", \"cargo\", \"oci\", \"nuget\", \"mcpb\")",
                         "example": "npm",
                         "minLength": 1,
                         "type": "string"
@@ -2732,6 +2750,10 @@ const docTemplate = `{
             "pkg_api_v1.createRequest": {
                 "description": "Request to create a new workload",
                 "properties": {
+                    "allow_docker_gateway": {
+                        "description": "Whether to permit outbound connections to Docker gateway addresses\n(host.docker.internal, gateway.docker.internal, 172.17.0.1). These are\nblocked by default in the egress proxy even when network isolation is on.\nOnly applicable to Docker deployments with network isolation enabled.",
+                        "type": "boolean"
+                    },
                     "authz_config": {
                         "description": "Authorization configuration",
                         "type": "string"
@@ -3418,6 +3440,10 @@ const docTemplate = `{
             "pkg_api_v1.updateRequest": {
                 "description": "Request to update an existing workload (name cannot be changed)",
                 "properties": {
+                    "allow_docker_gateway": {
+                        "description": "Whether to permit outbound connections to Docker gateway addresses\n(host.docker.internal, gateway.docker.internal, 172.17.0.1). These are\nblocked by default in the egress proxy even when network isolation is on.\nOnly applicable to Docker deployments with network isolation enabled.",
+                        "type": "boolean"
+                    },
                     "authz_config": {
                         "description": "Authorization configuration",
                         "type": "string"
