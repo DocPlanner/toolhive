@@ -125,10 +125,10 @@ func TestCachingAggregator_ErrorNotCached(t *testing.T) {
 	require.NoError(t, err, "the error must not have been cached")
 }
 
-// TestCachingAggregator_PartialNotCached: a view built while a backend failed is returned to
-// the caller but not cached, so the next call re-sweeps and can complete it; a complete view
-// is then cached as usual.
-func TestCachingAggregator_PartialNotCached(t *testing.T) {
+// TestCachingAggregator_PartialCachedBriefly: a view built while a backend failed is cached
+// for at most the short partial TTL (never the full TTL), so a later call re-sweeps and can
+// complete it, while calls inside that window do not sweep again.
+func TestCachingAggregator_PartialCachedBriefly(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
 	mock := mocks.NewMockAggregator(ctrl)
@@ -139,16 +139,19 @@ func TestCachingAggregator_PartialNotCached(t *testing.T) {
 		mock.EXPECT().AggregateCapabilities(gomock.Any(), gomock.Any()).Return(complete, nil),
 	)
 
-	c := aggregator.NewCachingAggregator(mock, time.Hour)
+	// The TTL is shorter than the partial TTL, so the partial entry expires with it.
+	c := aggregator.NewCachingAggregator(mock, 20*time.Millisecond)
 	ctx := ctxWithSubject("alice")
 
 	first, err := c.AggregateCapabilities(ctx, testBackends)
 	require.NoError(t, err)
-	assert.Same(t, partial, first, "the partial view is still returned to the caller")
+	assert.Same(t, partial, first)
+	again, err := c.AggregateCapabilities(ctx, testBackends)
+	require.NoError(t, err)
+	assert.Same(t, partial, again, "inside the window the partial view is served without a new sweep")
+
+	time.Sleep(40 * time.Millisecond)
 	second, err := c.AggregateCapabilities(ctx, testBackends)
 	require.NoError(t, err)
-	assert.Same(t, complete, second, "the partial view must not have been cached")
-	third, err := c.AggregateCapabilities(ctx, testBackends)
-	require.NoError(t, err)
-	assert.Same(t, complete, third, "a complete view is cached")
+	assert.Same(t, complete, second, "after the window the next call sweeps again and completes the view")
 }

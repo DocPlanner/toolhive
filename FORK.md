@@ -80,7 +80,7 @@ above, a replay keeps these, as long as each commit is replayed.
 | GET re-registration of a bound session attaches a matching caller and rejects any other; it never rewrites the binding | `pkg/vmcp/server/server.go` (`attachToBoundSession`) | `ab1b5b667` | — (new, plan D5) |
 | A GET registration never creates a session: it waits for the creating pod's binding, then attaches or rejects | `pkg/vmcp/server/server.go` (`attachToBoundSession`) | `fccda6842` | — (new) |
 | Every GET is checked before mcp-go sees it: 400 without `Mcp-Session-Id`, 404 for a missing, terminated or never-bound session, 403 for a different caller (mcp-go answers 200 whatever the hook does) | `pkg/vmcp/server/server.go` (`listenStreamGuardMiddleware`, `checkListenStreamCaller`) | `854448185` | — (new) |
-| A capability query that misses a backend is marked partial (`AggregationMetadata.Partial`) and never cached; a `tools/call` for a tool the session store lacks tops the store up from a fresh query | `pkg/vmcp/aggregator/caching_aggregator.go`, `default_aggregator.go`, `pkg/vmcp/server/server.go` (`lazyInjectSessionTools`) | `d6d76710c` | — (new, PAIINFRA-343) |
+| A capability query that misses a backend is marked partial (`AggregationMetadata.Partial`) and cached for at most 5 s (`partialCapabilityTTL`); a `tools/call` for a tool the session store lacks tops the store up from a fresh query (own caller only, not in optimizer mode, add-only) | `pkg/vmcp/aggregator/caching_aggregator.go`, `default_aggregator.go`, `pkg/vmcp/server/server.go` (`lazyInjectSessionTools`) | `d6d76710c` | — (new, PAIINFRA-343) |
 | Missing credentials for `authz.primaryUpstreamProvider` return 401 with `WWW-Authenticate` (empty provider names ignored) | `pkg/auth/token.go` (`WithRequiredUpstreamProviders`), `pkg/vmcp/auth/factory/incoming.go` | `44b70f6a5`, `f387a57f2` | `c2cb472a2` |
 
 Tests: `pkg/vmcp/server/serve_*_test.go`, `session_registration_context_test.go`,
@@ -98,7 +98,7 @@ that serves `Handler` without `Start` gets no refresh.
 **Partial capabilities.** Upstream fills a session's tool store once per pod and caches a partial
 aggregation for 30 s (#5786), so a backend that misses one query (here the fork's 3 s
 `capabilityQueryTimeout`, or a 502 during a rollout) leaves calls failing with `tool not found`.
-`d6d76710c` is the interim fix. A `tools/list` still never re-derives a filled store: a session
+`d6d76710c` (and the follow-up that bounds its cost) is the interim fix. A `tools/list` still never re-derives a filled store: a session
 whose first list was partial gets the rest on the next backend refresh or reconnect. Drop the patch
 once upstream lands the same fix (PAIINFRA-343); the 3 s timeout is a separate decision there.
 

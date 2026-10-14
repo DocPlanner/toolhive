@@ -1065,10 +1065,12 @@ func setSessionToolsDirect(session server.ClientSession, tools []server.ServerTo
 // wantTool is the tool a tools/call asks for, or empty for a tools/list. A filled store is
 // topped up when it lacks wantTool: a fill made while a backend was down is partial, and
 // without this the call would fail with "tool not found" for the life of the session on this
-// pod. The merge only adds tools. Re-deriving is cheap when the aggregator holds a complete
-// cached view, and a partial view is never cached. A tools/list never re-derives a filled
-// store; a session whose list was partial gets the rest on the next backend refresh or
-// reconnect.
+// pod. The top-up adds only names the store lacks and runs only for the session's own caller
+// and outside optimizer mode. It re-derives the set (cheap while the aggregator holds a cached
+// view; a partial view is cached for a few seconds), and can race a refresh that clears the
+// store, which at worst restores a tool of a backend just removed (the call still fails in the
+// core). A tools/list never re-derives a filled store; a session whose list was partial gets
+// the rest on the next backend refresh or reconnect.
 //
 // Health probes from a peer vMCP are skipped: they get no tools.
 func (s *Server) lazyInjectSessionTools(ctx context.Context, wantTool string) {
@@ -1080,12 +1082,20 @@ func (s *Server) lazyInjectSessionTools(ctx context.Context, wantTool string) {
 	if !ok {
 		return
 	}
-	if existing := sessionWithTools.GetSessionTools(); len(existing) > 0 {
+	sessionID := sess.SessionID()
+	existing := sessionWithTools.GetSessionTools()
+	topUp := len(existing) > 0
+	if topUp {
 		if _, found := existing[wantTool]; wantTool == "" || found {
 			return // tools already registered (normal pod-local case)
 		}
+		// The optimizer store holds only find_tool/call_tool, so a missing name cannot be
+		// added to it. The caller must own the session: this hook runs before the binding
+		// check, and a top-up lists tools under the caller's identity.
+		if s.optimizerFactory != nil || !s.callerOwnsSession(ctx, sessionID) {
+			return
+		}
 	}
-	sessionID := sess.SessionID()
 
 	// Re-derive the tool set the same way registration did, so cross-pod re-injection
 	// matches the advertised set: a fresh core.ListTools for the request identity (the core
@@ -1105,9 +1115,30 @@ func (s *Server) lazyInjectSessionTools(ctx context.Context, wantTool string) {
 		slog.Debug("lazyInjectSessionTools: no tools available for session", "session_id", sessionID)
 		return
 	}
+	if topUp {
+		// Add only what the store lacks, so an entry that is already there is never replaced.
+		missing := adaptedTools[:0:0]
+		for _, tool := range adaptedTools {
+			if _, have := existing[tool.Tool.Name]; !have {
+				missing = append(missing, tool)
+			}
+		}
+		adaptedTools = missing
+	}
 	if err := setSessionToolsDirect(sess, adaptedTools); err != nil {
 		slog.Warn("lazyInjectSessionTools: failed to inject tools", "session_id", sessionID, "error", err)
 	}
+}
+
+// callerOwnsSession reports whether the caller in ctx matches the identity binding stored for
+// sessionID. A missing, terminated or unbound session does not match.
+func (s *Server) callerOwnsSession(ctx context.Context, sessionID string) bool {
+	binding, err := s.storedBinding(ctx, sessionID)
+	if err != nil {
+		return false
+	}
+	caller, _ := auth.IdentityFromContext(ctx)
+	return vmcpsession.ValidateCaller(binding, caller) == nil
 }
 
 // lazyInjectSessionResources is the resources counterpart of

@@ -374,27 +374,42 @@ func TestServeLazyInjectsToolsForRehydratedSession(t *testing.T) {
 	assert.NotContains(t, populated.tools, testTool.Name, "a store that has the called tool must not be modified (no-op)")
 	assert.Contains(t, populated.tools, "preexisting")
 
-	// Top-up branch: a call for a tool the store lacks completes the store without dropping
-	// what it already holds (a partial fill would otherwise stay partial), but a tools/list
+	// Top-up: a call for a tool the store lacks completes the store without dropping or
+	// replacing what it holds (a partial fill would otherwise stay partial), but a tools/list
 	// (empty wantTool) leaves a filled store alone.
-	for name, tc := range map[string]struct {
+	for _, tc := range []struct {
+		name     string
 		wantTool string
 		toppedUp bool
 	}{
-		"call for a missing tool": {wantTool: testTool.Name, toppedUp: true},
-		"tools/list":              {wantTool: "", toppedUp: false},
+		{name: "call for a missing tool", wantTool: testTool.Name, toppedUp: true},
+		{name: "tools/list", wantTool: "", toppedUp: false},
 	} {
-		partial := &fakeSDKSession{id: sessionID, tools: map[string]server.ServerTool{
-			"preexisting": {Tool: mcp.Tool{Name: "preexisting"}},
-		}}
-		srv.lazyInjectSessionTools(srv.mcpServer.WithContext(context.Background(), partial), tc.wantTool)
-		if tc.toppedUp {
-			assert.Contains(t, partial.tools, testTool.Name, "%s: the store should be topped up", name)
-		} else {
-			assert.NotContains(t, partial.tools, testTool.Name, "%s: the store must stay as it was", name)
-		}
-		assert.Contains(t, partial.tools, "preexisting", "%s: existing tools must be kept", name)
+		t.Run(tc.name, func(t *testing.T) {
+			preexisting := server.ServerTool{Tool: mcp.Tool{Name: "preexisting"}}
+			partial := &fakeSDKSession{id: sessionID, tools: map[string]server.ServerTool{"preexisting": preexisting}}
+			srv.lazyInjectSessionTools(srv.mcpServer.WithContext(context.Background(), partial), tc.wantTool)
+			_, toppedUp := partial.tools[testTool.Name]
+			assert.Equal(t, tc.toppedUp, toppedUp, "the store should be topped up only for a call for a missing tool")
+			assert.Equal(t, preexisting.Tool.Name, partial.tools["preexisting"].Tool.Name, "existing tools must be kept")
+		})
 	}
+
+	// A top-up never replaces an entry the store already has.
+	marker := server.ServerTool{Tool: mcp.Tool{Name: testTool.Name, Description: "already here"}}
+	held := &fakeSDKSession{id: sessionID, tools: map[string]server.ServerTool{testTool.Name: marker}}
+	srv.lazyInjectSessionTools(srv.mcpServer.WithContext(context.Background(), held), "some-other-tool")
+	assert.Equal(t, "already here", held.tools[testTool.Name].Tool.Description, "an existing entry must not be replaced")
+
+	// A caller that does not own the session cannot top up its store (the test session is
+	// anonymous, so a caller presenting a token is rejected).
+	mallory := auth.WithIdentity(context.Background(),
+		&auth.Identity{PrincipalInfo: auth.PrincipalInfo{Subject: "mallory"}, Token: "mallory-token"})
+	stranger := &fakeSDKSession{id: sessionID, tools: map[string]server.ServerTool{
+		"preexisting": {Tool: mcp.Tool{Name: "preexisting"}},
+	}}
+	srv.lazyInjectSessionTools(srv.mcpServer.WithContext(mallory, stranger), testTool.Name)
+	assert.NotContains(t, stranger.tools, testTool.Name, "a caller that does not own the session must not top up its store")
 }
 
 // TestServeReturnsErrorWhenSessionManagerConstructionFails verifies Serve surfaces a

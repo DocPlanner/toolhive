@@ -24,6 +24,11 @@ import (
 // node is generous for a vMCP instance; tune if real workloads exceed it.
 const capabilityCacheMaxEntries = 1024
 
+// partialCapabilityTTL is how long a partial view (a backend missed the query) is cached. It is
+// short so the gap closes soon, but non-zero so a backend that stays slow does not make every
+// tool call sweep all backends and wait for its timeout.
+const partialCapabilityTTL = 5 * time.Second
+
 // cachingAggregator wraps an Aggregator and memoizes AggregateCapabilities for a bounded
 // TTL, so the Serve path does not re-sweep every backend's tools/list on every tool call.
 //
@@ -57,6 +62,7 @@ type cachingAggregator struct {
 type cacheEntry struct {
 	caps *AggregatedCapabilities
 	at   time.Time
+	ttl  time.Duration
 }
 
 // NewCachingAggregator wraps next so AggregateCapabilities results are memoized per identity
@@ -79,14 +85,14 @@ func NewCachingAggregator(next Aggregator, ttl time.Duration) Aggregator {
 
 // AggregateCapabilities returns a cached view when a fresh entry exists for the caller's
 // identity + forwarded credentials + backend set, and otherwise sweeps the backends (via the
-// wrapped aggregator) and caches the result. Errors and partial views are never cached. The returned value is
+// wrapped aggregator) and caches the result. Errors are never cached; a partial view is cached for at most partialCapabilityTTL. The returned value is
 // treated as immutable by the core (it derives fresh per-call routers from it), so the cached
 // pointer is shared rather than deep-copied.
 func (c *cachingAggregator) AggregateCapabilities(
 	ctx context.Context, backends []vmcp.Backend,
 ) (*AggregatedCapabilities, error) {
 	key := cacheKey(ctx, backends)
-	if e, ok := c.cache.Get(key); ok && time.Since(e.at) < c.ttl {
+	if e, ok := c.cache.Get(key); ok && time.Since(e.at) < e.ttl {
 		return e.caps, nil
 	}
 
@@ -97,12 +103,13 @@ func (c *cachingAggregator) AggregateCapabilities(
 	if err != nil {
 		return nil, err
 	}
-	// A partial view (a backend timed out or errored) is returned but never cached, so the
-	// next caller sweeps again instead of serving the gap for the whole TTL.
+	// A partial view (a backend timed out or errored) is cached only briefly, so the gap closes
+	// on a later call instead of lasting the full TTL.
+	ttl := c.ttl
 	if caps != nil && caps.Metadata != nil && caps.Metadata.Partial {
-		return caps, nil
+		ttl = min(ttl, partialCapabilityTTL)
 	}
-	c.cache.Add(key, cacheEntry{caps: caps, at: time.Now()})
+	c.cache.Add(key, cacheEntry{caps: caps, at: time.Now(), ttl: ttl})
 	return caps, nil
 }
 
