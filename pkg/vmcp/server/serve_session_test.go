@@ -361,17 +361,40 @@ func TestServeLazyInjectsToolsForRehydratedSession(t *testing.T) {
 
 	// Empty-store (cross-pod) branch: a fresh SDK session with no tools gets them injected.
 	rehydrated := &fakeSDKSession{id: sessionID, tools: map[string]server.ServerTool{}}
-	srv.lazyInjectSessionTools(srv.mcpServer.WithContext(context.Background(), rehydrated))
+	srv.lazyInjectSessionTools(srv.mcpServer.WithContext(context.Background(), rehydrated), "")
 	assert.Contains(t, rehydrated.tools, testTool.Name,
 		"an empty per-session store should be re-injected from the vMCP session manager")
 
-	// No-op branch: a populated store is left untouched (early return before re-derivation).
+	// No-op branch: a call for a tool the store already has leaves it untouched (early
+	// return before re-derivation).
 	populated := &fakeSDKSession{id: sessionID, tools: map[string]server.ServerTool{
 		"preexisting": {Tool: mcp.Tool{Name: "preexisting"}},
 	}}
-	srv.lazyInjectSessionTools(srv.mcpServer.WithContext(context.Background(), populated))
-	assert.NotContains(t, populated.tools, testTool.Name, "a populated store must not be modified (no-op)")
+	srv.lazyInjectSessionTools(srv.mcpServer.WithContext(context.Background(), populated), "preexisting")
+	assert.NotContains(t, populated.tools, testTool.Name, "a store that has the called tool must not be modified (no-op)")
 	assert.Contains(t, populated.tools, "preexisting")
+
+	// Top-up branch: a call for a tool the store lacks completes the store without dropping
+	// what it already holds (a partial fill would otherwise stay partial), but a tools/list
+	// (empty wantTool) leaves a filled store alone.
+	for name, tc := range map[string]struct {
+		wantTool string
+		toppedUp bool
+	}{
+		"call for a missing tool": {wantTool: testTool.Name, toppedUp: true},
+		"tools/list":              {wantTool: "", toppedUp: false},
+	} {
+		partial := &fakeSDKSession{id: sessionID, tools: map[string]server.ServerTool{
+			"preexisting": {Tool: mcp.Tool{Name: "preexisting"}},
+		}}
+		srv.lazyInjectSessionTools(srv.mcpServer.WithContext(context.Background(), partial), tc.wantTool)
+		if tc.toppedUp {
+			assert.Contains(t, partial.tools, testTool.Name, "%s: the store should be topped up", name)
+		} else {
+			assert.NotContains(t, partial.tools, testTool.Name, "%s: the store must stay as it was", name)
+		}
+		assert.Contains(t, partial.tools, "preexisting", "%s: existing tools must be kept", name)
+	}
 }
 
 // TestServeReturnsErrorWhenSessionManagerConstructionFails verifies Serve surfaces a

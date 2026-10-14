@@ -384,7 +384,7 @@ func TestServeOptimizerLazyInjectsForRehydratedSession(t *testing.T) {
 	buildsBefore := optFactory.calls.Load()
 
 	rehydrated := &fakeSDKSession{id: sessionID, tools: map[string]server.ServerTool{}}
-	srv.lazyInjectSessionTools(srv.mcpServer.WithContext(context.Background(), rehydrated))
+	srv.lazyInjectSessionTools(srv.mcpServer.WithContext(context.Background(), rehydrated), "")
 
 	assert.Contains(t, rehydrated.tools, optimizerdec.FindToolName,
 		"cross-pod re-injection must advertise find_tool")

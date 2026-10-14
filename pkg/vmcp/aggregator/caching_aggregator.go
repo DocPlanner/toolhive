@@ -79,7 +79,7 @@ func NewCachingAggregator(next Aggregator, ttl time.Duration) Aggregator {
 
 // AggregateCapabilities returns a cached view when a fresh entry exists for the caller's
 // identity + forwarded credentials + backend set, and otherwise sweeps the backends (via the
-// wrapped aggregator) and caches the result. Errors are never cached. The returned value is
+// wrapped aggregator) and caches the result. Errors and partial views are never cached. The returned value is
 // treated as immutable by the core (it derives fresh per-call routers from it), so the cached
 // pointer is shared rather than deep-copied.
 func (c *cachingAggregator) AggregateCapabilities(
@@ -96,6 +96,11 @@ func (c *cachingAggregator) AggregateCapabilities(
 	caps, err := c.Aggregator.AggregateCapabilities(ctx, backends)
 	if err != nil {
 		return nil, err
+	}
+	// A partial view (a backend timed out or errored) is returned but never cached, so the
+	// next caller sweeps again instead of serving the gap for the whole TTL.
+	if caps != nil && caps.Metadata != nil && caps.Metadata.Partial {
+		return caps, nil
 	}
 	c.cache.Add(key, cacheEntry{caps: caps, at: time.Now()})
 	return caps, nil

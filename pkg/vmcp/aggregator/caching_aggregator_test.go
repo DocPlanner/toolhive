@@ -124,3 +124,31 @@ func TestCachingAggregator_ErrorNotCached(t *testing.T) {
 	_, err = c.AggregateCapabilities(ctx, testBackends)
 	require.NoError(t, err, "the error must not have been cached")
 }
+
+// TestCachingAggregator_PartialNotCached: a view built while a backend failed is returned to
+// the caller but not cached, so the next call re-sweeps and can complete it; a complete view
+// is then cached as usual.
+func TestCachingAggregator_PartialNotCached(t *testing.T) {
+	t.Parallel()
+	ctrl := gomock.NewController(t)
+	mock := mocks.NewMockAggregator(ctrl)
+	partial := &aggregator.AggregatedCapabilities{Metadata: &aggregator.AggregationMetadata{Partial: true}}
+	complete := &aggregator.AggregatedCapabilities{Metadata: &aggregator.AggregationMetadata{}}
+	gomock.InOrder(
+		mock.EXPECT().AggregateCapabilities(gomock.Any(), gomock.Any()).Return(partial, nil),
+		mock.EXPECT().AggregateCapabilities(gomock.Any(), gomock.Any()).Return(complete, nil),
+	)
+
+	c := aggregator.NewCachingAggregator(mock, time.Hour)
+	ctx := ctxWithSubject("alice")
+
+	first, err := c.AggregateCapabilities(ctx, testBackends)
+	require.NoError(t, err)
+	assert.Same(t, partial, first, "the partial view is still returned to the caller")
+	second, err := c.AggregateCapabilities(ctx, testBackends)
+	require.NoError(t, err)
+	assert.Same(t, complete, second, "the partial view must not have been cached")
+	third, err := c.AggregateCapabilities(ctx, testBackends)
+	require.NoError(t, err)
+	assert.Same(t, complete, third, "a complete view is cached")
+}

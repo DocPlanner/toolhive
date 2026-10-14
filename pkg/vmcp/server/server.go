@@ -1062,8 +1062,16 @@ func setSessionToolsDirect(session server.ClientSession, tools []server.ServerTo
 // For sessions initialized on this pod (normal case), tools are already in the store
 // (set by setSessionToolsDirect during OnRegisterSession); this method is a no-op.
 //
+// wantTool is the tool a tools/call asks for, or empty for a tools/list. A filled store is
+// topped up when it lacks wantTool: a fill made while a backend was down is partial, and
+// without this the call would fail with "tool not found" for the life of the session on this
+// pod. The merge only adds tools. Re-deriving is cheap when the aggregator holds a complete
+// cached view, and a partial view is never cached. A tools/list never re-derives a filled
+// store; a session whose list was partial gets the rest on the next backend refresh or
+// reconnect.
+//
 // Health probes from a peer vMCP are skipped: they get no tools.
-func (s *Server) lazyInjectSessionTools(ctx context.Context) {
+func (s *Server) lazyInjectSessionTools(ctx context.Context, wantTool string) {
 	sess := server.ClientSessionFromContext(ctx)
 	if sess == nil || isPeerProbe(ctx) {
 		return
@@ -1072,8 +1080,10 @@ func (s *Server) lazyInjectSessionTools(ctx context.Context) {
 	if !ok {
 		return
 	}
-	if len(sessionWithTools.GetSessionTools()) > 0 {
-		return // tools already registered (normal pod-local case)
+	if existing := sessionWithTools.GetSessionTools(); len(existing) > 0 {
+		if _, found := existing[wantTool]; wantTool == "" || found {
+			return // tools already registered (normal pod-local case)
+		}
 	}
 	sessionID := sess.SessionID()
 

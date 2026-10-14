@@ -165,6 +165,10 @@ type AggregationMetadata struct {
 	// BackendCount is the number of backends aggregated.
 	BackendCount int
 
+	// Partial is true when at least one backend failed to answer the capability query, so the
+	// view lacks that backend's capabilities. Callers must not cache or treat it as complete.
+	Partial bool
+
 	// ToolCount is the total number of tools.
 	ToolCount int
 
