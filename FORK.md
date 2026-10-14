@@ -4,7 +4,7 @@
 fork patches we carry. Upstream releases are brought in with a merge commit
 (`Merge upstream vX.Y.Z into dp-stable`), never a rebase.
 
-Merge base: upstream **v0.32.0** (`ecb9a8d84`), merged in `38edac4e3` (PAIINFRA-228).
+Merge base: upstream **v0.39.0** (`4ebb610f2`), merged in `75ba8d1d5` (PAIINFRA-233).
 
 ## Changes that live only in a merge commit
 
@@ -55,6 +55,17 @@ merge, see below):
 
 `VMCP_SESSION_HMAC_SECRET` is no longer used (upstream logs and ignores it). Sessions stored with the
 old token-hash key are invalidated on read, so clients re-initialize once after the upgrade.
+
+### `75ba8d1d5` — Merge upstream v0.39.0
+
+Fork behaviour kept while resolving:
+
+| Behaviour | Where it lives now | Original commit |
+|---|---|---|
+| The MCPServer Service is updated before the Deployment, so Deployment drift cannot starve a port fix; labels and annotations are now merged, as upstream #5731 does | `cmd/thv-operator/controllers/mcpserver_controller.go` (`Reconcile`) | `5df636980`, `e88959899` |
+| Explicit `spec.config.backends` (hub remote backends) are merged with the discovered backends, an explicit backend winning on the same name; upstream's `excludedBackends` filters only the discovered ones | `cmd/thv-operator/controllers/virtualmcpserver_vmcpconfig.go` (`mergeStaticBackends`) | `8e474c8b2` |
+
+`PodTemplateSpecBuilder.SchedulingSpec()` stays: MCPServer and the vMCP drift check still use it.
 
 ## Fork behaviour re-ported after the v0.32.0 merge
 
@@ -124,3 +135,5 @@ They stay in history; don't re-apply them on a replay.
 | `7a6c9a2f3` | Restore with the owner's live identity (`ownsStoredSession`) | Upstream #5650 restores with the request identity; `enforceSessionBinding` rejects other callers. Dropped in the v0.32.0 merge. |
 | `c2cb472a2` (status map) | Upstream-token status map (`UpstreamCredentialStatus`, `UpstreamTokenStatuses`) | Upstream #5651 returns 401 when a refresh fails; the missing-token case is `44b70f6a5`. No Cedar policy read the status. Dropped in the v0.32.0 merge. |
 | `8d09330f5` (alias) | Redis `address` alias of `addr` on `MCPExternalAuthConfig` (CRD, `EffectiveAddr`) and `LegacyAddress` in the auth-server RunConfig | All values and live objects use `addr` (PAIINFRA-219). Dropped in the v0.32.0 merge. |
+| `5b6448a0d` (remote proxy part) | `MCPRemoteProxy.spec.podTemplateSpec`, applying only nodeSelector, tolerations and affinity | Upstream #5531 (v0.37.0) adds the same field with a full strategic-merge patch, a `PodTemplateValid` condition and drift detection by hash. No live MCPRemoteProxy exists. Dropped in the v0.39.0 merge. |
+| `8e474c8b2` (env sort) | `sortEnvVarsByName` on the vMCP env, plus sorted workload and backend loops | Upstream already sorts each discovered and inline secret env group; the rest of the list has a fixed order. Dropping it changes the env order once, inside the rollout the new image causes anyway. Dropped in the v0.39.0 merge. |
