@@ -79,10 +79,9 @@ func isNilStatusProvider(provider StatusProvider) bool {
 	}
 
 	value := reflect.ValueOf(provider)
-	switch value.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+	if kind := value.Kind(); kind == reflect.Chan || kind == reflect.Func || kind == reflect.Interface ||
+		kind == reflect.Map || kind == reflect.Pointer || kind == reflect.Slice {
 		return value.IsNil()
-	default:
-		return false
 	}
+	return false
 }
