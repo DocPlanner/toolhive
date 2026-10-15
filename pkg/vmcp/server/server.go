@@ -1214,7 +1214,7 @@ func (s *Server) handleSessionRegistrationImpl(ctx context.Context, session serv
 	// session from the initialize POST and from a GET listen stream (or SSE
 	// reconnect) on a pod that does not hold the session in memory; the latter
 	// attaches to the bound session or is rejected, and never calls CreateSession.
-	// It keeps the GET's own context, so its wait for the binding ends when the
+	// It keeps the context of the GET request, so its wait for the binding ends when the
 	// client goes away. Checked before the cleanup defer below: rejecting a
 	// re-registration must not terminate the owner's session.
 	if isListenStreamRegistration(ctx) {
