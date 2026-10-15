@@ -395,6 +395,7 @@ func TestServeLazyInjectsToolsForRehydratedSession(t *testing.T) {
 		{name: "tools/list", wantTool: "", toppedUp: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			preexisting := server.ServerTool{Tool: mcp.Tool{Name: "preexisting"}}
 			partial := &fakeSDKSession{id: sessionID, tools: map[string]server.ServerTool{"preexisting": preexisting}}
 			srv.lazyInjectSessionTools(srv.mcpServer.WithContext(context.Background(), partial), tc.wantTool)

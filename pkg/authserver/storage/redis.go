@@ -814,6 +814,8 @@ func marshalUpstreamTokensWithTTL(tokens *UpstreamTokens) ([]byte, time.Duration
 // StoreUpstreamTokens stores the upstream IDP tokens for a session and provider.
 // The write is coordinated with WATCH/MULTI so Dragonfly sees every accessed key
 // explicitly and reverse-index maintenance stays consistent under concurrent writes.
+//
+//nolint:gocyclo // the WATCH/MULTI retry and index-TTL rules replace a single Lua script
 func (s *RedisStorage) StoreUpstreamTokens(ctx context.Context, sessionID, providerName string, tokens *UpstreamTokens) error {
 	if sessionID == "" {
 		return fosite.ErrInvalidRequest.WithHint("session ID cannot be empty")

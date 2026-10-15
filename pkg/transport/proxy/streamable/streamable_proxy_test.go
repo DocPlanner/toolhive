@@ -212,7 +212,7 @@ func TestWriteJSONRPCError_WithID(t *testing.T) {
 	t.Parallel()
 
 	w := &httpRecorder{header: make(map[string][]string)}
-	writeJSONRPCError(w, jsonrpc2.StringID("req-1"), -32603, "Timeout waiting for response from container")
+	writeJSONRPCError(w, jsonrpc2.StringID("req-1"), "Timeout waiting for response from container")
 
 	assert.Equal(t, "application/json", w.header.Get("Content-Type"))
 	assert.Contains(t, string(w.body), `"error"`)
@@ -223,7 +223,7 @@ func TestWriteJSONRPCError_Notification(t *testing.T) {
 	t.Parallel()
 
 	w := &httpRecorder{header: make(map[string][]string)}
-	writeJSONRPCError(w, jsonrpc2.ID{}, -32603, "Timeout")
+	writeJSONRPCError(w, jsonrpc2.ID{}, "Timeout")
 
 	assert.Equal(t, 202, w.statusCode)
 	assert.Empty(t, w.body)

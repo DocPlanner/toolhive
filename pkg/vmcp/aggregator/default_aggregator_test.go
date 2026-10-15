@@ -167,7 +167,7 @@ func TestDefaultAggregator_QueryAllCapabilities_SlowBackendFailsFast(t *testing.
 	mockClient := mocks.NewMockBackendClient(ctrl)
 	backends := []vmcp.Backend{
 		newTestBackend(testBackendID1),
-		newTestBackend("backend2", withBackendURL("http://localhost:8081")),
+		newTestBackend("backend2", withBackendURL("http://localhost:8082")),
 	}
 
 	caps1 := newTestCapabilityList(withTools(newTestTool("tool1", testBackendID1)))

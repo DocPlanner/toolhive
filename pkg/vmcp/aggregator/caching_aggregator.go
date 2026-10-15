@@ -85,7 +85,8 @@ func NewCachingAggregator(next Aggregator, ttl time.Duration) Aggregator {
 
 // AggregateCapabilities returns a cached view when a fresh entry exists for the caller's
 // identity + forwarded credentials + backend set, and otherwise sweeps the backends (via the
-// wrapped aggregator) and caches the result. Errors are never cached; a partial view is cached for at most partialCapabilityTTL. The returned value is
+// wrapped aggregator) and caches the result. Errors are never cached; a partial view is cached
+// for at most partialCapabilityTTL. The returned value is
 // treated as immutable by the core (it derives fresh per-call routers from it), so the cached
 // pointer is shared rather than deep-copied.
 func (c *cachingAggregator) AggregateCapabilities(

@@ -1442,7 +1442,7 @@ func (r *VirtualMCPServerReconciler) getVmcpConfigChecksum(
 
 // ensureDeployment ensures the Deployment exists and is up to date
 //
-//nolint:unparam // ctrl.Result needed for ConfigMap not found case (RequeueAfter)
+//nolint:unparam,gocyclo // ctrl.Result needed for ConfigMap not found case (RequeueAfter); fork conflict requeues add branches
 func (r *VirtualMCPServerReconciler) ensureDeployment(
 	ctx context.Context,
 	vmcp *mcpv1beta1.VirtualMCPServer,

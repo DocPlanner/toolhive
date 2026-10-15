@@ -29,7 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/builder"
+	ctrlbuilder "sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -873,6 +873,8 @@ func (r *MCPServerReconciler) performRestart(ctx context.Context, mcpServer *mcp
 
 // getRunConfigChecksum fetches the RunConfig ConfigMap checksum annotation for this server.
 // Uses the shared RunConfigChecksumFetcher to maintain consistency with MCPRemoteProxy.
+//
+//nolint:unused // dp-stable takes the checksum from ensureRunConfigConfigMap (e88959899)
 func (r *MCPServerReconciler) getRunConfigChecksum(
 	ctx context.Context, mcpServer *mcpv1beta1.MCPServer,
 ) (string, error) {
@@ -1745,7 +1747,7 @@ func (r *MCPServerReconciler) cleanupLegacyMCPServerResources(
 ) (bool, error) {
 	deleted := false
 
-	for _, resource := range []struct {
+	for _, legacy := range []struct {
 		obj  client.Object
 		name string
 		kind string
@@ -1754,7 +1756,7 @@ func (r *MCPServerReconciler) cleanupLegacyMCPServerResources(
 		{obj: &corev1.Service{}, name: fmt.Sprintf("mcp-%s-headless", m.Name), kind: "Service"},
 		{obj: &corev1.Service{}, name: fmt.Sprintf("mcp-%s", m.Name), kind: "Service"},
 	} {
-		removed, err := r.deleteLegacyMCPServerResourceIfOwned(ctx, m, resource.obj, resource.name, resource.kind)
+		removed, err := r.deleteLegacyMCPServerResourceIfOwned(ctx, m, legacy.obj, legacy.name, legacy.kind)
 		if err != nil {
 			return deleted, err
 		}
@@ -3051,7 +3053,7 @@ func (r *MCPServerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	toolConfigHandler := handler.EnqueueRequestsFromMapFunc(r.mapToolConfigToServers)
 
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&mcpv1beta1.MCPServer{}, builder.WithPredicates(predicate.Or(
+		For(&mcpv1beta1.MCPServer{}, ctrlbuilder.WithPredicates(predicate.Or(
 			predicate.GenerationChangedPredicate{},
 			predicate.AnnotationChangedPredicate{},
 		))).
