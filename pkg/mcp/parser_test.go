@@ -1270,6 +1270,7 @@ func TestParseMCPRequestWithInvalidJSON(t *testing.T) {
 			name: "JSON-RPC response instead of request",
 			body: `{"jsonrpc":"2.0","id":1,"result":{"success":true}}`,
 			checkReq: func(t *testing.T, r *ParsedMCPRequest) {
+				t.Helper()
 				assert.False(t, r.IsRequest)
 			},
 		},
@@ -1277,6 +1278,7 @@ func TestParseMCPRequestWithInvalidJSON(t *testing.T) {
 			name: "JSON-RPC error instead of request",
 			body: `{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"error"}}`,
 			checkReq: func(t *testing.T, r *ParsedMCPRequest) {
+				t.Helper()
 				assert.False(t, r.IsRequest)
 			},
 		},

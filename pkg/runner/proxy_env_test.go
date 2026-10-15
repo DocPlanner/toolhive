@@ -15,8 +15,12 @@ import (
 
 func TestApplyProxyProcessEnv(t *testing.T) {
 	t.Run("mirrors proxy session ttl from workload env vars", func(t *testing.T) {
+		// t.Setenv restores the previous values on cleanup; Unsetenv then
+		// removes the variables for the duration of the subtest.
+		t.Setenv(transportsession.ProxySessionTTLEnvVar, "")
+		t.Setenv("SOME_WORKLOAD_ONLY_VAR", "")
 		require.NoError(t, os.Unsetenv(transportsession.ProxySessionTTLEnvVar))
-		t.Cleanup(func() { _ = os.Unsetenv(transportsession.ProxySessionTTLEnvVar) })
+		require.NoError(t, os.Unsetenv("SOME_WORKLOAD_ONLY_VAR"))
 
 		applyProxyProcessEnv(map[string]string{
 			transportsession.ProxySessionTTLEnvVar: "24h",
@@ -38,6 +42,7 @@ func TestApplyProxyProcessEnv(t *testing.T) {
 	})
 
 	t.Run("ignores empty values and nil maps", func(t *testing.T) {
+		t.Setenv("TOOLHIVE_HEALTH_CHECK_FAILURE_THRESHOLD", "")
 		require.NoError(t, os.Unsetenv("TOOLHIVE_HEALTH_CHECK_FAILURE_THRESHOLD"))
 
 		applyProxyProcessEnv(nil)
