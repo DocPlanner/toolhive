@@ -97,7 +97,7 @@ func TestServeSkipsHealthProbeSessions(t *testing.T) {
 	sess := &fakeSDKSession{id: srv.vmcpSessionMgr.Generate(), tools: map[string]server.ServerTool{}}
 
 	srv.handleSessionRegistration(probeCtx, sess)
-	srv.lazyInjectSessionTools(srv.mcpServer.WithContext(probeCtx, sess))
+	srv.lazyInjectSessionTools(srv.mcpServer.WithContext(probeCtx, sess), "")
 
 	assert.False(t, state.makeWithIDCalled.Load(), "a probe must not open backend connections")
 	assert.Zero(t, fc.listToolsCalls.Load(), "a probe must not list capabilities")
