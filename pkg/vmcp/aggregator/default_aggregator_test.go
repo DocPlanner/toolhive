@@ -430,6 +430,35 @@ func TestDefaultAggregator_AggregateCapabilities(t *testing.T) {
 		assert.Equal(t, 2, result.Metadata.BackendCount)
 		assert.Equal(t, 2, result.Metadata.ToolCount)
 		assert.Equal(t, 1, result.Metadata.ResourceCount)
+		assert.False(t, result.Metadata.Partial, "every backend answered")
+	})
+
+	t.Run("a failed backend marks the view partial", func(t *testing.T) {
+		t.Parallel()
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		mockClient := mocks.NewMockBackendClient(ctrl)
+		backends := []vmcp.Backend{
+			newTestBackend(testBackendID1),
+			newTestBackend("backend2", withBackendURL("http://localhost:8081")),
+		}
+		caps1 := newTestCapabilityList(withTools(newTestTool("tool1", testBackendID1)))
+		mockClient.EXPECT().ListCapabilities(gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, target *vmcp.BackendTarget) (*vmcp.CapabilityList, error) {
+				if target.WorkloadID == testBackendID1 {
+					return caps1, nil
+				}
+				return nil, errors.New("connection timeout")
+			}).Times(2)
+
+		agg := NewDefaultAggregator(mockClient, nil, nil, nil)
+		result, err := agg.AggregateCapabilities(context.Background(), backends)
+
+		require.NoError(t, err)
+		assert.Len(t, result.Tools, 1)
+		assert.Equal(t, 2, result.Metadata.BackendCount)
+		assert.True(t, result.Metadata.Partial, "backend2 did not answer, so the view lacks its capabilities")
 	})
 }
 

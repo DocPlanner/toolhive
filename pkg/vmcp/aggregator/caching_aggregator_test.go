@@ -124,3 +124,34 @@ func TestCachingAggregator_ErrorNotCached(t *testing.T) {
 	_, err = c.AggregateCapabilities(ctx, testBackends)
 	require.NoError(t, err, "the error must not have been cached")
 }
+
+// TestCachingAggregator_PartialCachedBriefly: a view built while a backend failed is cached
+// for at most the short partial TTL (never the full TTL), so a later call re-sweeps and can
+// complete it, while calls inside that window do not sweep again.
+func TestCachingAggregator_PartialCachedBriefly(t *testing.T) {
+	t.Parallel()
+	ctrl := gomock.NewController(t)
+	mock := mocks.NewMockAggregator(ctrl)
+	partial := &aggregator.AggregatedCapabilities{Metadata: &aggregator.AggregationMetadata{Partial: true}}
+	complete := &aggregator.AggregatedCapabilities{Metadata: &aggregator.AggregationMetadata{}}
+	gomock.InOrder(
+		mock.EXPECT().AggregateCapabilities(gomock.Any(), gomock.Any()).Return(partial, nil),
+		mock.EXPECT().AggregateCapabilities(gomock.Any(), gomock.Any()).Return(complete, nil),
+	)
+
+	// The TTL is shorter than the partial TTL, so the partial entry expires with it.
+	c := aggregator.NewCachingAggregator(mock, 20*time.Millisecond)
+	ctx := ctxWithSubject("alice")
+
+	first, err := c.AggregateCapabilities(ctx, testBackends)
+	require.NoError(t, err)
+	assert.Same(t, partial, first)
+	again, err := c.AggregateCapabilities(ctx, testBackends)
+	require.NoError(t, err)
+	assert.Same(t, partial, again, "inside the window the partial view is served without a new sweep")
+
+	time.Sleep(40 * time.Millisecond)
+	second, err := c.AggregateCapabilities(ctx, testBackends)
+	require.NoError(t, err)
+	assert.Same(t, complete, second, "after the window the next call sweeps again and completes the view")
+}

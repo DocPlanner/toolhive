@@ -126,7 +126,7 @@ func TestRefreshSessionCapabilitiesClearsAndNotifies(t *testing.T) {
 	}, methods)
 
 	hookCtx := srv.mcpServer.WithContext(context.Background(), sess)
-	srv.lazyInjectSessionTools(hookCtx)
+	srv.lazyInjectSessionTools(hookCtx, "")
 	srv.lazyInjectSessionResources(hookCtx)
 	assert.Contains(t, sess.tools, "t", "the next request must fill the tool store again")
 	assert.Contains(t, sess.resources, uri, "the next request must fill the resource store again")

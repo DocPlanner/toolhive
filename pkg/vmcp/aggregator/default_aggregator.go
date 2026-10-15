@@ -492,6 +492,7 @@ func (a *defaultAggregator) AggregateCapabilities(
 
 	// Update metadata with backend count
 	aggregated.Metadata.BackendCount = len(backends)
+	aggregated.Metadata.Partial = len(capabilities) < len(backends)
 
 	span.SetAttributes(
 		attribute.Int("aggregated.backends", aggregated.Metadata.BackendCount),

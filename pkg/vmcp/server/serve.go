@@ -302,10 +302,10 @@ func Serve(ctx context.Context, v core.VMCP, cfg *ServerConfig) (*Server, error)
 		srv.activeClientSessions.remove(session.SessionID())
 	})
 	hooks.AddBeforeListTools(func(hookCtx context.Context, _ any, _ *mcp.ListToolsRequest) {
-		srv.lazyInjectSessionTools(hookCtx)
+		srv.lazyInjectSessionTools(hookCtx, "")
 	})
-	hooks.AddBeforeCallTool(func(hookCtx context.Context, _ any, _ *mcp.CallToolRequest) {
-		srv.lazyInjectSessionTools(hookCtx)
+	hooks.AddBeforeCallTool(func(hookCtx context.Context, _ any, req *mcp.CallToolRequest) {
+		srv.lazyInjectSessionTools(hookCtx, req.Params.Name)
 	})
 	hooks.AddBeforeListResources(func(hookCtx context.Context, _ any, _ *mcp.ListResourcesRequest) {
 		srv.lazyInjectSessionResources(hookCtx)
