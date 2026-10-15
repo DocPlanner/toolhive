@@ -1844,13 +1844,13 @@ func (*VirtualMCPServerReconciler) podTemplateSpecNeedsUpdate(
 		return true
 	}
 
-	builder, err := ctrlutil.NewPodTemplateSpecBuilder(vmcp.Spec.PodTemplateSpec, "vmcp")
+	specBuilder, err := ctrlutil.NewPodTemplateSpecBuilder(vmcp.Spec.PodTemplateSpec, "vmcp")
 	if err != nil {
 		log.FromContext(ctx).Error(err, "Failed to parse PodTemplateSpec for drift detection, assuming update needed")
 		return true
 	}
 
-	expectedNodeSelector, expectedTolerations, expectedAffinity := builder.SchedulingSpec()
+	expectedNodeSelector, expectedTolerations, expectedAffinity := specBuilder.SchedulingSpec()
 	podSpec := deployment.Spec.Template.Spec
 
 	if len(expectedNodeSelector) > 0 && !equality.Semantic.DeepEqual(podSpec.NodeSelector, expectedNodeSelector) {

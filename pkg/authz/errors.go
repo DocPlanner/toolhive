@@ -25,7 +25,7 @@ func (e *forbiddenAuthorizationError) Error() string {
 	return e.message
 }
 
-func (e *forbiddenAuthorizationError) Unwrap() error {
+func (*forbiddenAuthorizationError) Unwrap() error {
 	return errForbiddenAuthorization
 }
 

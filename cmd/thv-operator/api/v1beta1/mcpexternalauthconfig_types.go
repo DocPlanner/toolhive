@@ -1621,11 +1621,7 @@ func (r *MCPExternalAuthConfig) validateEmbeddedAuthServer() error {
 		}
 	}
 
-	if err := r.validateAuthServerStorage(cfg.Storage); err != nil {
-		return err
-	}
-
-	return nil
+	return r.validateAuthServerStorage(cfg.Storage)
 }
 
 // validateUpstreamProvider validates a single upstream provider configuration.

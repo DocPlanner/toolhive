@@ -34,7 +34,7 @@ func (e *UpstreamAuthenticationRequiredError) Error() string {
 	return fmt.Sprintf("%s for provider %q: %s", errUpstreamAuthenticationRequired, e.Provider, e.Reason)
 }
 
-func (e *UpstreamAuthenticationRequiredError) Unwrap() error {
+func (*UpstreamAuthenticationRequiredError) Unwrap() error {
 	return errUpstreamAuthenticationRequired
 }
 
