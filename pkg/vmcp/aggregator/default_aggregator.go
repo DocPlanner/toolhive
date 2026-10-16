@@ -21,7 +21,13 @@ import (
 	"github.com/stacklok/toolhive/pkg/vmcp/config"
 )
 
-var capabilityQueryTimeout = 3 * time.Second
+// capabilityQueryTimeout bounds one backend's capability query, so a dead backend cannot hold a
+// session's registration. A nested vMCP backend (for example the production `global` vMCP, which
+// aggregates about twenty backends) can take more than 3 s to initialize on a cold pod, and a
+// timeout there leaves the view partial. On 2026-10-15 about a quarter of the production hub
+// aggregations were partial with 3 s. Queries run in parallel, so this is also the longest one
+// aggregation can wait for a backend that never answers.
+var capabilityQueryTimeout = 10 * time.Second
 
 // defaultAggregator implements the Aggregator interface for capability aggregation.
 // It queries backends in parallel, handles failures gracefully, and merges capabilities.

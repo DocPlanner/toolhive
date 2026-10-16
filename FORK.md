@@ -107,11 +107,14 @@ can see a stale tool set there. `startCapabilityRefresh` runs only from `Server.
 that serves `Handler` without `Start` gets no refresh.
 
 **Partial capabilities.** Upstream fills a session's tool store once per pod and caches a partial
-aggregation for 30 s (#5786), so a backend that misses one query (here the fork's 3 s
+aggregation for 30 s (#5786), so a backend that misses one query (here the fork's
 `capabilityQueryTimeout`, or a 502 during a rollout) leaves calls failing with `tool not found`.
 `d6d76710c` (and the follow-up that bounds its cost) is the interim fix. A `tools/list` still never re-derives a filled store: a session
 whose first list was partial gets the rest on the next backend refresh or reconnect. Drop the patch
-once upstream lands the same fix (PAIINFRA-343); the 3 s timeout is a separate decision there.
+once upstream lands the same fix (PAIINFRA-343). `capabilityQueryTimeout` is 10 s: with 3 s, about a
+quarter of the production hub aggregations were partial on 2026-10-15, because the nested `global`
+vMCP backend can take longer than 3 s to initialize on a cold pod. Upstream has no such timeout;
+replace it with the configured backend timeouts (#6411) when the fork reaches v0.45.
 
 **GET guard.** mcp-go v0.55 registers a session again when a GET listen stream reaches a pod that
 does not hold it, and upstream's `CreateSession` would re-bind it to the caller. Upstream stops
