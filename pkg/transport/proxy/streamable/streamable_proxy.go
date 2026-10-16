@@ -471,11 +471,11 @@ func (p *HTTPProxy) handleSingleRequest(
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			//nolint:gosec // G706: method is from parsed JSON-RPC request
 			slog.Warn("timeout waiting for response", "method", req.Method)
-			writeJSONRPCError(w, req.ID, -32603, "Timeout waiting for response from container")
+			writeJSONRPCError(w, req.ID, "Timeout waiting for response from container")
 		} else {
 			//nolint:gosec // G706: method is from parsed JSON-RPC request
 			slog.Error("failed to process request", "method", req.Method, "error", err)
-			writeJSONRPCError(w, req.ID, -32603, "Failed to process request")
+			writeJSONRPCError(w, req.ID, "Failed to process request")
 		}
 		return
 	}

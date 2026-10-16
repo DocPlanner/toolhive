@@ -78,7 +78,6 @@ func deriveServerConfig(
 		SessionTTL:              cfg.SessionTTL,
 		WriteTimeout:            cfg.WriteTimeout,
 		AuthMiddleware:          cfg.AuthMiddleware,
-		RateLimitMiddleware:     cfg.RateLimitMiddleware,
 		AuthInfoHandler:         cfg.AuthInfoHandler,
 		PassthroughHeaders:      cfg.PassthroughHeaders,
 		AuthServer:              cfg.AuthServer,

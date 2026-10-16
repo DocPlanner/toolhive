@@ -125,6 +125,16 @@ type MCPRemoteProxySpec struct {
 	// +optional
 	ServiceAccount *string `json:"serviceAccount,omitempty"`
 
+	// PodTemplateSpec defines the pod template to use for the MCPRemoteProxy
+	// This allows for customizing the pod configuration beyond what is provided by the other fields.
+	// Note that to modify the specific container the remote proxy runs in, you must specify
+	// the `toolhive` container name in the PodTemplateSpec.
+	// This field accepts a PodTemplateSpec object as JSON/YAML.
+	// +optional
+	// +kubebuilder:pruning:PreserveUnknownFields
+	// +kubebuilder:validation:Type=object
+	PodTemplateSpec *runtime.RawExtension `json:"podTemplateSpec,omitempty"`
+
 	// TrustProxyHeaders indicates whether to trust X-Forwarded-* headers from reverse proxies
 	// When enabled, the proxy will use X-Forwarded-Proto, X-Forwarded-Host, X-Forwarded-Port,
 	// and X-Forwarded-Prefix headers to construct endpoint URLs
@@ -137,11 +147,6 @@ type MCPRemoteProxySpec struct {
 	// strips a path prefix before forwarding to the backend.
 	// +optional
 	EndpointPrefix string `json:"endpointPrefix,omitempty"`
-
-	// PodTemplateSpec allows customizing the pod template for the proxy deployment.
-	// Scheduling fields (nodeSelector, tolerations, affinity) are applied to the proxy pods.
-	// +optional
-	PodTemplateSpec *runtime.RawExtension `json:"podTemplateSpec,omitempty"`
 
 	// ResourceOverrides allows overriding annotations and labels for resources created by the operator
 	// +optional
@@ -298,6 +303,9 @@ const (
 	// ConditionTypeMCPRemoteProxyAuthServerRefValidated indicates whether the AuthServerRef is valid
 	ConditionTypeMCPRemoteProxyAuthServerRefValidated = "AuthServerRefValidated"
 
+	// ConditionTypeMCPRemoteProxyPodTemplateValid indicates whether the PodTemplateSpec is valid
+	ConditionTypeMCPRemoteProxyPodTemplateValid = "PodTemplateValid"
+
 	// ConditionTypeMCPRemoteProxyCABundleRefValidated indicates whether the OIDC CA bundle reference is valid
 	ConditionTypeMCPRemoteProxyCABundleRefValidated = "CABundleRefValidated"
 
@@ -388,6 +396,12 @@ const (
 
 	// ConditionReasonMCPRemoteProxyAuthServerRefMultiUpstream indicates multi-upstream is not supported
 	ConditionReasonMCPRemoteProxyAuthServerRefMultiUpstream = "MultiUpstreamNotSupported"
+
+	// ConditionReasonMCPRemoteProxyPodTemplateValid indicates PodTemplateSpec validation succeeded
+	ConditionReasonMCPRemoteProxyPodTemplateValid = "ValidPodTemplateSpec"
+
+	// ConditionReasonMCPRemoteProxyPodTemplateInvalid indicates PodTemplateSpec validation failed
+	ConditionReasonMCPRemoteProxyPodTemplateInvalid = "InvalidPodTemplateSpec"
 
 	// ConditionReasonMCPRemoteProxyCABundleRefValid indicates the CA bundle ref is valid and the ConfigMap exists
 	ConditionReasonMCPRemoteProxyCABundleRefValid = "CABundleRefValid"

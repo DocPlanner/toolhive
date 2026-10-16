@@ -25,15 +25,17 @@ func writeHTTPError(w http.ResponseWriter, status int, msg string) {
 	http.Error(w, msg, status)
 }
 
-// writeJSONRPCError writes a structured JSON-RPC error response.
+// writeJSONRPCError writes a structured JSON-RPC internal error (-32603) response.
 // For notifications (no ID), it returns 202 Accepted instead of
 // synthesizing a response, which would be a protocol violation.
-func writeJSONRPCError(w http.ResponseWriter, id jsonrpc2.ID, code int64, msg string) {
+func writeJSONRPCError(w http.ResponseWriter, id jsonrpc2.ID, msg string) {
+	const internalErrorCode = -32603
+
 	if id.Raw() == nil {
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
-	resp, err := jsonrpc2.NewResponse(id, nil, jsonrpc2.NewError(code, msg))
+	resp, err := jsonrpc2.NewResponse(id, nil, jsonrpc2.NewError(internalErrorCode, msg))
 	if err != nil {
 		slog.Error("failed to create JSON-RPC error response", "error", err)
 		writeHTTPError(w, http.StatusInternalServerError, "Failed to create error response")

@@ -167,7 +167,7 @@ func TestDefaultAggregator_QueryAllCapabilities_SlowBackendFailsFast(t *testing.
 	mockClient := mocks.NewMockBackendClient(ctrl)
 	backends := []vmcp.Backend{
 		newTestBackend(testBackendID1),
-		newTestBackend("backend2", withBackendURL("http://localhost:8081")),
+		newTestBackend("backend2", withBackendURL("http://localhost:8082")),
 	}
 
 	caps1 := newTestCapabilityList(withTools(newTestTool("tool1", testBackendID1)))
@@ -347,6 +347,47 @@ func TestDefaultAggregator_MergeCapabilities(t *testing.T) {
 		assert.Equal(t, 1, aggregated.Metadata.ResourceCount)
 		assert.Equal(t, 1, aggregated.Metadata.PromptCount)
 	})
+}
+
+func TestDefaultAggregator_MergeCapabilities_DeterministicToolOrder(t *testing.T) {
+	t.Parallel()
+
+	names := []string{"zebra_tool", "middle_tool", "alpha_tool", "omega_tool", "delta_tool", "beta_tool", "gamma_tool"}
+	resolvedTools := make(map[string]*ResolvedTool, len(names))
+	for _, name := range names {
+		resolvedTools[name] = &ResolvedTool{
+			ResolvedName: name,
+			OriginalName: name,
+			BackendID:    "backend1",
+		}
+	}
+
+	registry := vmcp.NewImmutableRegistry([]vmcp.Backend{
+		{
+			ID:            "backend1",
+			Name:          "Backend 1",
+			BaseURL:       "http://backend1:8080",
+			TransportType: "streamable-http",
+			HealthStatus:  vmcp.BackendHealthy,
+		},
+	})
+	agg := NewDefaultAggregator(nil, nil, nil, nil)
+
+	want := []string{"alpha_tool", "beta_tool", "delta_tool", "gamma_tool", "middle_tool", "omega_tool", "zebra_tool"}
+
+	// Repeated because map iteration order is re-randomized on every merge.
+	for range 10 {
+		aggregated, err := agg.MergeCapabilities(
+			context.Background(), &ResolvedCapabilities{Tools: resolvedTools}, registry,
+		)
+		require.NoError(t, err)
+
+		got := make([]string, len(aggregated.Tools))
+		for i, tool := range aggregated.Tools {
+			got[i] = tool.Name
+		}
+		require.Equal(t, want, got, "tools should always be sorted by name")
+	}
 }
 
 func TestDefaultAggregator_AggregateCapabilities(t *testing.T) {

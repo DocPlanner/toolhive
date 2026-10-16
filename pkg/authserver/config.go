@@ -14,6 +14,7 @@ import (
 	"time"
 
 	servercrypto "github.com/stacklok/toolhive/pkg/authserver/server/crypto"
+	"github.com/stacklok/toolhive/pkg/authserver/server/handlers"
 	"github.com/stacklok/toolhive/pkg/authserver/server/keys"
 	"github.com/stacklok/toolhive/pkg/authserver/server/registration"
 	"github.com/stacklok/toolhive/pkg/authserver/storage"
@@ -236,6 +237,17 @@ func ResolveUpstreamName(name string) string {
 	return name
 }
 
+// ResolveFirstUpstreamName returns the resolved name of the first element of
+// names, or DefaultUpstreamName when names is empty. It is the single
+// implementation of the "first upstream or default" pattern used wherever a
+// subject-provider name must be derived from a list of configured upstreams.
+func ResolveFirstUpstreamName(names []string) string {
+	if len(names) > 0 {
+		return ResolveUpstreamName(names[0])
+	}
+	return DefaultUpstreamName
+}
+
 // upstreamNameRegex validates upstream provider names.
 // Names must be DNS-label-like to prevent delimiter injection in storage keys.
 var upstreamNameRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
@@ -309,6 +321,13 @@ type OIDCUpstreamRunConfig struct {
 	// HTTP-scheme restrictions are unchanged — HTTPS is still required for
 	// non-localhost hosts. Defaults to false.
 	AllowPrivateIPs bool `json:"allow_private_ips,omitempty" yaml:"allow_private_ips,omitempty"`
+
+	// InsecureAllowHTTP permits a plain-HTTP issuer URL and HTTP discovery
+	// endpoints for this upstream. Only for in-cluster development environments
+	// (e.g. Dex served over HTTP in a kind cluster) where TLS is not available.
+	// Never set this in production.
+	//nolint:lll // field tags require full JSON+YAML names
+	InsecureAllowHTTP bool `json:"insecure_allow_http,omitempty" yaml:"insecure_allow_http,omitempty"`
 }
 
 // OAuth2UpstreamRunConfig contains configuration for pure OAuth 2.0 providers.
@@ -380,6 +399,13 @@ type OAuth2UpstreamRunConfig struct {
 	// restrictions are unchanged — HTTPS is still required for non-localhost hosts.
 	// Defaults to false.
 	AllowPrivateIPs bool `json:"allow_private_ips,omitempty" yaml:"allow_private_ips,omitempty"`
+
+	// InsecureAllowHTTP permits plain-HTTP authorization and token endpoint URLs
+	// for this upstream. Only for in-cluster development environments (e.g. an
+	// OAuth2 provider served over HTTP in a kind cluster) where TLS is not
+	// available. Never set this in production.
+	//nolint:lll // field tags require full JSON+YAML names
+	InsecureAllowHTTP bool `json:"insecure_allow_http,omitempty" yaml:"insecure_allow_http,omitempty"`
 }
 
 // DCRUpstreamConfig configures RFC 7591 Dynamic Client Registration for an
@@ -591,6 +617,14 @@ type Config struct {
 	// Multiple upstreams form a sequential authorization chain.
 	Upstreams []UpstreamConfig
 
+	// UpstreamFilter, when set, narrows the upstream authorization chain after the
+	// first leg resolves (see handlers.WithUpstreamFilter). When nil, all
+	// configured upstreams are walked — the current behavior. Pass nil itself,
+	// not a nil-valued concrete pointer implementing UpstreamFilter — a typed-nil
+	// interface value is non-nil and will still be wired in. Has no effect with
+	// fewer than 2 configured upstreams; Validate rejects that combination.
+	UpstreamFilter handlers.UpstreamFilter
+
 	// ScopesSupported lists the OAuth 2.0 scope values advertised in discovery documents.
 	// If nil or empty, defaults to registration.DefaultScopes (["openid", "profile", "email", "offline_access"]).
 	// This is advertised in /.well-known/openid-configuration and
@@ -662,6 +696,10 @@ func (c *Config) Validate() error {
 	}
 
 	if err := c.validateUpstreams(); err != nil {
+		return err
+	}
+
+	if err := c.validateUpstreamFilter(); err != nil {
 		return err
 	}
 
@@ -829,6 +867,18 @@ func (c *Config) validateUpstreams() error {
 		}
 	}
 
+	return nil
+}
+
+// validateUpstreamFilter rejects an UpstreamFilter configured with fewer than
+// 2 upstreams. handlers.computeChain consults the filter only when there is a
+// non-first upstream to narrow, so with a single upstream the filter would
+// silently never be invoked; this fails loudly instead of letting it no-op
+// without any indication to the caller.
+func (c *Config) validateUpstreamFilter() error {
+	if c.UpstreamFilter != nil && len(c.Upstreams) < 2 {
+		return fmt.Errorf("upstream_filter is configured but has no effect with fewer than 2 upstreams")
+	}
 	return nil
 }
 

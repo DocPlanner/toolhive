@@ -31,6 +31,7 @@ import (
 	"github.com/stacklok/toolhive/pkg/authz"
 	"github.com/stacklok/toolhive/pkg/bodylimit"
 	mcpparser "github.com/stacklok/toolhive/pkg/mcp"
+	baseratelimit "github.com/stacklok/toolhive/pkg/ratelimit"
 	"github.com/stacklok/toolhive/pkg/recovery"
 	"github.com/stacklok/toolhive/pkg/telemetry"
 	transportmiddleware "github.com/stacklok/toolhive/pkg/transport/middleware"
@@ -44,6 +45,7 @@ import (
 	"github.com/stacklok/toolhive/pkg/vmcp/headerforward"
 	"github.com/stacklok/toolhive/pkg/vmcp/health"
 	"github.com/stacklok/toolhive/pkg/vmcp/optimizer"
+	vmcpratelimit "github.com/stacklok/toolhive/pkg/vmcp/ratelimit"
 	"github.com/stacklok/toolhive/pkg/vmcp/router"
 	"github.com/stacklok/toolhive/pkg/vmcp/server/sessionmanager"
 	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
@@ -163,9 +165,10 @@ type Config struct {
 	// capture (no middleware is installed).
 	PassthroughHeaders []string
 
-	// RateLimitMiddleware is the optional rate-limit middleware to apply after
-	// authentication and MCP request parsing.
-	RateLimitMiddleware func(http.Handler) http.Handler
+	// RateLimiter is the optional core-layer limiter applied at CallTool.
+	// It runs below the session optimizer, so tool names are already resolved
+	// to the backend tool name before bucket selection.
+	RateLimiter baseratelimit.Limiter
 
 	// AuthServer is the optional embedded authorization server.
 	// When non-nil, the routes returned by Routes() are registered on the mux
@@ -457,6 +460,10 @@ func New(
 		return nil, err
 	}
 
+	if cfg.RateLimiter != nil {
+		coreVMCP = vmcpratelimit.NewDecorator(coreVMCP, cfg.RateLimiter)
+	}
+
 	// Wrap the core with the code mode decorator when enabled. It sits BELOW any optimizer:
 	// ListTools now advertises execute_tool_script alongside the backend tools, so the
 	// Serve-layer optimizer (if enabled) indexes it like any other tool, and the script's
@@ -626,8 +633,6 @@ func (s *Server) Handler(_ context.Context) (http.Handler, error) {
 	mcpHandler = peerProbeMiddleware(mcpHandler)
 	mcpHandler = s.listenStreamGuardMiddleware(mcpHandler)
 
-	mcpHandler = s.applyRateLimiting(mcpHandler)
-
 	// Apply authentication middleware if configured (runs first in chain)
 	if s.config.AuthMiddleware != nil {
 		mcpHandler = s.config.AuthMiddleware(mcpHandler)
@@ -659,14 +664,6 @@ func (s *Server) Handler(_ context.Context) (http.Handler, error) {
 	mux.Handle("/", mcpHandler)
 
 	return mux, nil
-}
-
-func (s *Server) applyRateLimiting(next http.Handler) http.Handler {
-	if s.config.RateLimitMiddleware == nil {
-		return next
-	}
-	slog.Info("rate limit middleware enabled for MCP endpoints")
-	return s.config.RateLimitMiddleware(next)
 }
 
 // applyForwardedHeaderCapture wraps next with the forwarded-header capture
@@ -1217,7 +1214,7 @@ func (s *Server) handleSessionRegistrationImpl(ctx context.Context, session serv
 	// session from the initialize POST and from a GET listen stream (or SSE
 	// reconnect) on a pod that does not hold the session in memory; the latter
 	// attaches to the bound session or is rejected, and never calls CreateSession.
-	// It keeps the GET's own context, so its wait for the binding ends when the
+	// It keeps the context of the GET request, so its wait for the binding ends when the
 	// client goes away. Checked before the cleanup defer below: rejecting a
 	// re-registration must not terminate the owner's session.
 	if isListenStreamRegistration(ctx) {

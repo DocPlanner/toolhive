@@ -494,15 +494,26 @@ func TestValidateDiscoveryDocument(t *testing.T) {
 	// Note: issuer mismatch is validated by go-oidc's NewProvider() before
 	// validateDiscoveryDocument is called, so we don't test it here.
 	tests := []struct {
-		name    string
-		modify  func(*oauthproto.OIDCDiscoveryDocument)
-		wantErr string
+		name              string
+		insecureAllowHTTP bool
+		modify            func(*oauthproto.OIDCDiscoveryDocument)
+		wantErr           string
 	}{
-		{"valid document", nil, ""},
-		{"missing authorization endpoint", func(d *oauthproto.OIDCDiscoveryDocument) { d.AuthorizationEndpoint = "" }, "missing authorization_endpoint"},
-		{"missing token endpoint", func(d *oauthproto.OIDCDiscoveryDocument) { d.TokenEndpoint = "" }, "missing token_endpoint"},
-		{"missing jwks_uri", func(d *oauthproto.OIDCDiscoveryDocument) { d.JWKSURI = "" }, "missing jwks_uri"},
-		{"missing response_types_supported", func(d *oauthproto.OIDCDiscoveryDocument) { d.ResponseTypesSupported = nil }, "missing response_types_supported"},
+		{"valid document", false, nil, ""},
+		{"missing authorization endpoint", false, func(d *oauthproto.OIDCDiscoveryDocument) { d.AuthorizationEndpoint = "" }, "missing authorization_endpoint"},
+		{"missing token endpoint", false, func(d *oauthproto.OIDCDiscoveryDocument) { d.TokenEndpoint = "" }, "missing token_endpoint"},
+		{"missing jwks_uri", false, func(d *oauthproto.OIDCDiscoveryDocument) { d.JWKSURI = "" }, "missing jwks_uri"},
+		{"missing response_types_supported", false, func(d *oauthproto.OIDCDiscoveryDocument) { d.ResponseTypesSupported = nil }, "missing response_types_supported"},
+		{"HTTP endpoints rejected without insecure flag", false, func(d *oauthproto.OIDCDiscoveryDocument) {
+			d.AuthorizationEndpoint = "http://dex.my-ns.svc.cluster.local:5556/auth"
+			d.TokenEndpoint = "http://dex.my-ns.svc.cluster.local:5556/token"
+			d.JWKSURI = "http://dex.my-ns.svc.cluster.local:5556/keys"
+		}, "scheme mismatch"},
+		{"HTTP endpoints allowed with insecure flag", true, func(d *oauthproto.OIDCDiscoveryDocument) {
+			d.AuthorizationEndpoint = "http://dex.my-ns.svc.cluster.local:5556/auth"
+			d.TokenEndpoint = "http://dex.my-ns.svc.cluster.local:5556/token"
+			d.JWKSURI = "http://dex.my-ns.svc.cluster.local:5556/keys"
+		}, ""},
 	}
 
 	for _, tt := range tests {
@@ -519,7 +530,7 @@ func TestValidateDiscoveryDocument(t *testing.T) {
 			if tt.modify != nil {
 				tt.modify(doc)
 			}
-			err := validateDiscoveryDocument(doc, testIssuer)
+			err := validateDiscoveryDocument(doc, testIssuer, tt.insecureAllowHTTP)
 			if tt.wantErr == "" {
 				require.NoError(t, err)
 			} else {
@@ -534,23 +545,27 @@ func TestValidateEndpointOrigin(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name     string
-		endpoint string
-		issuer   string
-		wantErr  string
+		name              string
+		endpoint          string
+		issuer            string
+		insecureAllowHTTP bool
+		wantErr           string
 	}{
-		{"HTTPS endpoint with same host", "https://example.com/token", "https://example.com", ""},
-		{"HTTPS endpoint with different host", "https://oauth.example.com/token", "https://example.com", ""}, // allowed per OIDC spec
-		{"HTTP endpoint for non-localhost issuer", "http://example.com/token", "https://example.com", "scheme mismatch"},
-		{"localhost allows HTTP", "http://localhost:8080/token", "http://localhost:8080", ""},
-		{"localhost issuer requires localhost endpoint", "http://example.com/token", "http://localhost:8080", "host mismatch"},
-		{"127.0.0.1 treated as localhost", "http://127.0.0.1:8080/token", "http://127.0.0.1:8080", ""},
+		{"HTTPS endpoint with same host", "https://example.com/token", "https://example.com", false, ""},
+		{"HTTPS endpoint with different host", "https://oauth.example.com/token", "https://example.com", false, ""}, // allowed per OIDC spec
+		{"HTTP endpoint for non-localhost issuer", "http://example.com/token", "https://example.com", false, "scheme mismatch"},
+		{"localhost allows HTTP", "http://localhost:8080/token", "http://localhost:8080", false, ""},
+		{"localhost issuer requires localhost endpoint", "http://example.com/token", "http://localhost:8080", false, "host mismatch"},
+		{"127.0.0.1 treated as localhost", "http://127.0.0.1:8080/token", "http://127.0.0.1:8080", false, ""},
+		{"HTTP endpoint allowed with insecure flag", "http://dex.my-ns.svc.cluster.local:5556/token", "http://dex.my-ns.svc.cluster.local:5556", true, ""},
+		{"HTTP endpoint with insecure flag, different host", "http://other.svc.cluster.local/token", "http://dex.my-ns.svc.cluster.local:5556", true, ""},
+		{"HTTPS still valid with insecure flag", "https://example.com/token", "https://example.com", true, ""},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			err := validateEndpointOrigin(tt.endpoint, tt.issuer)
+			err := validateEndpointOrigin(tt.endpoint, tt.issuer, tt.insecureAllowHTTP)
 			if tt.wantErr == "" {
 				require.NoError(t, err)
 			} else {
@@ -603,6 +618,54 @@ func TestOIDCProviderImpl_ExchangeCodeForIdentity(t *testing.T) {
 		assert.Equal(t, "exchanged-access-token", result.Tokens.AccessToken)
 		assert.Equal(t, "exchanged-refresh-token", result.Tokens.RefreshToken)
 		assert.NotEmpty(t, result.Tokens.IDToken)
+	})
+
+	t.Run("captures ID token claims for authorization inputs", func(t *testing.T) {
+		t.Parallel()
+
+		mock := newMockOIDCServer(t)
+		t.Cleanup(mock.Close)
+
+		// Issue an ID token carrying claims a downstream authorization filter would
+		// key on (email, groups) alongside the standard set.
+		mock.tokenHandler = func(w http.ResponseWriter, _ *http.Request) {
+			idToken := mock.signIDTokenWithClaims(
+				testClientID, "user-789", "", time.Now().Add(time.Hour),
+				map[string]any{
+					"email":  "dev@example.com",
+					"groups": []any{"engineering", "admins"},
+				},
+			)
+			resp := testTokenResponse{
+				AccessToken: "access-token",
+				TokenType:   "Bearer",
+				IDToken:     idToken,
+				ExpiresIn:   3600,
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		}
+
+		config := &OIDCConfig{
+			CommonOAuthConfig: CommonOAuthConfig{
+				ClientID:     testClientID,
+				ClientSecret: testClientSecret,
+				RedirectURI:  testRedirectURI,
+			},
+			Issuer: mock.issuer,
+		}
+
+		provider, err := NewOIDCProvider(ctx, config)
+		require.NoError(t, err)
+
+		result, err := provider.ExchangeCodeForIdentity(ctx, "test-code", "", "")
+		require.NoError(t, err)
+
+		require.NotNil(t, result.Claims, "ID token claims must be captured for authorization inputs")
+		assert.Equal(t, "user-789", result.Claims["sub"], "standard sub claim must be captured")
+		assert.Equal(t, "dev@example.com", result.Claims["email"], "custom email claim must be captured")
+		assert.Equal(t, []any{"engineering", "admins"}, result.Claims["groups"],
+			"multi-valued groups claim must be captured verbatim")
 	})
 
 	t.Run("successful exchange without nonce", func(t *testing.T) {

@@ -29,7 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/builder"
+	ctrlbuilder "sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -514,8 +514,11 @@ func (r *MCPServerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		newService := r.serviceForMCPServer(ctx, mcpServer)
 		service.Spec.Ports = newService.Spec.Ports
 		service.Spec.SessionAffinity = newService.Spec.SessionAffinity
-		service.Labels = newService.Labels
-		service.Annotations = newService.Annotations
+		// Merge (not replace) Labels/Annotations so keys written by external controllers
+		// (e.g. GKE NEG's cloud.google.com/* annotations) are preserved while the
+		// operator-owned values are applied.
+		service.Labels = ctrlutil.MergeLabels(newService.Labels, service.Labels)
+		service.Annotations = ctrlutil.MergeAnnotations(newService.Annotations, service.Annotations)
 		err = r.Update(ctx, service)
 		if err != nil {
 			ctxLogger.Error(err, "Failed to update Service", "Service.Namespace", service.Namespace, "Service.Name", service.Name)
@@ -870,6 +873,8 @@ func (r *MCPServerReconciler) performRestart(ctx context.Context, mcpServer *mcp
 
 // getRunConfigChecksum fetches the RunConfig ConfigMap checksum annotation for this server.
 // Uses the shared RunConfigChecksumFetcher to maintain consistency with MCPRemoteProxy.
+//
+//nolint:unused // dp-stable takes the checksum from ensureRunConfigConfigMap (e88959899)
 func (r *MCPServerReconciler) getRunConfigChecksum(
 	ctx context.Context, mcpServer *mcpv1beta1.MCPServer,
 ) (string, error) {
@@ -1742,7 +1747,7 @@ func (r *MCPServerReconciler) cleanupLegacyMCPServerResources(
 ) (bool, error) {
 	deleted := false
 
-	for _, resource := range []struct {
+	for _, legacy := range []struct {
 		obj  client.Object
 		name string
 		kind string
@@ -1751,7 +1756,7 @@ func (r *MCPServerReconciler) cleanupLegacyMCPServerResources(
 		{obj: &corev1.Service{}, name: fmt.Sprintf("mcp-%s-headless", m.Name), kind: "Service"},
 		{obj: &corev1.Service{}, name: fmt.Sprintf("mcp-%s", m.Name), kind: "Service"},
 	} {
-		removed, err := r.deleteLegacyMCPServerResourceIfOwned(ctx, m, resource.obj, resource.name, resource.kind)
+		removed, err := r.deleteLegacyMCPServerResourceIfOwned(ctx, m, legacy.obj, legacy.name, legacy.kind)
 		if err != nil {
 			return deleted, err
 		}
@@ -2189,11 +2194,15 @@ func serviceNeedsUpdate(service *corev1.Service, mcpServer *mcpv1beta1.MCPServer
 		}
 	}
 
-	if !maps.Equal(service.Labels, expectedLabels) {
+	// Subset check rather than exact equality: the Service is co-owned by external
+	// controllers (e.g. GKE NEG/Gateway writes cloud.google.com/* annotations), so only
+	// the operator-owned keys must match. maps.Equal would treat those external
+	// annotations as drift and hot-loop Update against the concurrent writer.
+	if !ctrlutil.MapIsSubset(expectedLabels, service.Labels) {
 		return true
 	}
 
-	if !maps.Equal(service.Annotations, expectedAnnotations) {
+	if !ctrlutil.MapIsSubset(expectedAnnotations, service.Annotations) {
 		return true
 	}
 
@@ -3044,7 +3053,7 @@ func (r *MCPServerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	toolConfigHandler := handler.EnqueueRequestsFromMapFunc(r.mapToolConfigToServers)
 
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&mcpv1beta1.MCPServer{}, builder.WithPredicates(predicate.Or(
+		For(&mcpv1beta1.MCPServer{}, ctrlbuilder.WithPredicates(predicate.Or(
 			predicate.GenerationChangedPredicate{},
 			predicate.AnnotationChangedPredicate{},
 		))).

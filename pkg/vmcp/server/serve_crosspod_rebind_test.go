@@ -467,7 +467,7 @@ func TestCrossPodRehydration(t *testing.T) {
 
 // TestListenStreamGuard covers the HTTP-level check of GET listen streams. mcp-go
 // answers a GET with 200 even when the registration hook rejects it, keeps the
-// GET's session object for later requests on that pod, and on the pod that holds
+// session object of the GET for later requests on that pod, and on the pod that holds
 // the session in memory runs no hook at all, so the check must refuse the request
 // before mcp-go sees it.
 func TestListenStreamGuard(t *testing.T) {

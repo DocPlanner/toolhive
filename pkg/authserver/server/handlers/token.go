@@ -119,6 +119,12 @@ func (h *Handler) TokenHandler(w http.ResponseWriter, req *http.Request) {
 }
 
 func logTokenEndpointError(phase string, req *http.Request, err error) {
+	slog.Error("token endpoint request failed", tokenEndpointErrorAttrs(phase, req, err)...)
+}
+
+// tokenEndpointErrorAttrs builds the structured log attributes for a failed
+// token endpoint request.
+func tokenEndpointErrorAttrs(phase string, req *http.Request, err error) []any {
 	oauthErr := fosite.ErrorToRFC6749Error(err)
 	grantType := req.PostFormValue("grant_type")
 
@@ -143,7 +149,7 @@ func logTokenEndpointError(phase string, req *http.Request, err error) {
 		attrs = append(attrs, "refresh_failure_classification", classifyRefreshTokenFailure(oauthErr))
 	}
 
-	slog.Error("token endpoint request failed", attrs...)
+	return attrs
 }
 
 func classifyRefreshTokenFailure(err *fosite.RFC6749Error) string {

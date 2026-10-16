@@ -954,6 +954,8 @@ func (v *TokenValidator) getKeyFromJWKS(ctx context.Context, token *jwt.Token) (
 }
 
 // validateClaims validates the claims in the token.
+//
+//nolint:gocyclo // one branch per claim; the fork adds the allowedClientIds audience fallback
 func (v *TokenValidator) validateClaims(claims jwt.MapClaims) error {
 	// Validate the issuer if provided
 	if v.issuer != "" {

@@ -99,12 +99,13 @@ func requireRedisNotFoundError(t *testing.T, err error) {
 
 // TestNewRedisStorage_Validation covers the auth-server-specific invariants
 // enforced by NewRedisStorage. Connection-mode topology (Addr XOR Sentinel,
-// cluster requires Addr, sentinel master name and addresses) is validated by
-// the shared toolhive-core redis package and exercised in its own tests.
+// cluster requires Addr, sentinel master name and addresses) and credentials
+// are validated by the shared toolhive-core redis package and exercised in its
+// own tests; NewRedisStorage does not mandate a password.
 func TestNewRedisStorage_Validation(t *testing.T) {
 	t.Parallel()
 
-	validACL := func() tcredis.Config {
+	validCfg := func() tcredis.Config {
 		return tcredis.Config{Addr: "localhost:6379", Username: "user", Password: "pass"}
 	}
 
@@ -115,14 +116,8 @@ func TestNewRedisStorage_Validation(t *testing.T) {
 		wantErr   string
 	}{
 		{
-			name:      "missing ACL password",
-			cfg:       tcredis.Config{Addr: "localhost:6379", Username: "user"},
-			keyPrefix: "test:",
-			wantErr:   "ACL password is required",
-		},
-		{
 			name:      "missing key prefix",
-			cfg:       validACL(),
+			cfg:       validCfg(),
 			keyPrefix: "",
 			wantErr:   "key prefix is required",
 		},
@@ -205,6 +200,24 @@ func TestNewRedisStorage_Standalone_WithMiniredis(t *testing.T) {
 		Username: "testuser",
 		Password: "testpass",
 	}
+
+	ctx := context.Background()
+	s, err := NewRedisStorage(ctx, cfg, "test:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	require.NoError(t, s.Health(ctx))
+}
+
+// TestNewRedisStorage_Standalone_Passwordless verifies that an auth-disabled
+// Redis (no ACL) is accepted, matching toolhive-core's Config contract where
+// Password "may be empty when the server does not require authentication".
+func TestNewRedisStorage_Standalone_Passwordless(t *testing.T) {
+	t.Parallel()
+
+	mr := miniredis.RunT(t) // no RequireUserAuth → auth disabled
+
+	cfg := tcredis.Config{Addr: mr.Addr()}
 
 	ctx := context.Background()
 	s, err := NewRedisStorage(ctx, cfg, "test:")
@@ -1416,7 +1429,8 @@ func TestRedisStorage_PendingAuthorization(t *testing.T) {
 			State: "client-state", PKCEChallenge: "challenge", PKCEMethod: "S256",
 			Scopes: []string{"openid", "profile"}, InternalState: state,
 			UpstreamPKCEVerifier: "verifier", UpstreamNonce: "nonce",
-			SingleLeg: true, CreatedAt: time.Now(),
+			SingleLeg: true, ChainUpstreams: []string{"provider-1", "provider-2"},
+			CreatedAt: time.Now(),
 		}
 	}
 
@@ -1431,6 +1445,43 @@ func TestRedisStorage_PendingAuthorization(t *testing.T) {
 			assert.Equal(t, pending.PKCEChallenge, retrieved.PKCEChallenge)
 			assert.Equal(t, pending.Scopes, retrieved.Scopes)
 			assert.Equal(t, pending.SingleLeg, retrieved.SingleLeg)
+			assert.Equal(t, pending.ChainUpstreams, retrieved.ChainUpstreams)
+		})
+	})
+
+	t.Run("legacy JSON without chain_upstreams decodes with empty ChainUpstreams", func(t *testing.T) {
+		// Pin the wire-shape contract: pre-feature Redis data that has no
+		// "chain_upstreams" key must deserialise to an empty ChainUpstreams, which
+		// the callback treats as "no chain computed yet". A JSON tag rename or a
+		// DisallowUnknownFields flip would break this without failing another test.
+		withRedisStorage(t, func(ctx context.Context, s *RedisStorage, mr *miniredis.Miniredis) {
+			legacyJSON := fmt.Sprintf(`{
+				"client_id": "legacy-client",
+				"redirect_uri": "https://example.com/callback",
+				"state": "client-state",
+				"pkce_challenge": "challenge",
+				"pkce_method": "S256",
+				"scopes": ["openid"],
+				"internal_state": "legacy-internal-state",
+				"upstream_pkce_verifier": "verifier",
+				"upstream_nonce": "nonce",
+				"session_id": "legacy-session",
+				"created_at": %d
+			}`, time.Now().Unix())
+
+			// Inject directly into miniredis, bypassing the Store path, to simulate a
+			// pre-feature row written without "chain_upstreams".
+			key := redisKey(s.keyPrefix, KeyTypePending, "legacy-internal-state")
+			require.NoError(t, mr.Set(key, legacyJSON))
+
+			retrieved, err := s.LoadPendingAuthorization(ctx, "legacy-internal-state")
+			require.NoError(t, err)
+			require.NotNil(t, retrieved)
+
+			assert.Empty(t, retrieved.ChainUpstreams, "legacy record must decode with empty ChainUpstreams")
+			// Sanity-check that unrelated fields still populate from the legacy blob.
+			assert.Equal(t, "legacy-client", retrieved.ClientID)
+			assert.Equal(t, "legacy-session", retrieved.SessionID)
 		})
 	})
 

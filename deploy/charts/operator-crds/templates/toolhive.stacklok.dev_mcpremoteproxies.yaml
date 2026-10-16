@@ -348,8 +348,11 @@ spec:
                 type: object
               podTemplateSpec:
                 description: |-
-                  PodTemplateSpec allows customizing the pod template for the proxy deployment.
-                  Scheduling fields (nodeSelector, tolerations, affinity) are applied to the proxy pods.
+                  PodTemplateSpec defines the pod template to use for the MCPRemoteProxy
+                  This allows for customizing the pod configuration beyond what is provided by the other fields.
+                  Note that to modify the specific container the remote proxy runs in, you must specify
+                  the `toolhive` container name in the PodTemplateSpec.
+                  This field accepts a PodTemplateSpec object as JSON/YAML.
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
               proxyPort:
@@ -1098,8 +1101,11 @@ spec:
                 type: object
               podTemplateSpec:
                 description: |-
-                  PodTemplateSpec allows customizing the pod template for the proxy deployment.
-                  Scheduling fields (nodeSelector, tolerations, affinity) are applied to the proxy pods.
+                  PodTemplateSpec defines the pod template to use for the MCPRemoteProxy
+                  This allows for customizing the pod configuration beyond what is provided by the other fields.
+                  Note that to modify the specific container the remote proxy runs in, you must specify
+                  the `toolhive` container name in the PodTemplateSpec.
+                  This field accepts a PodTemplateSpec object as JSON/YAML.
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
               proxyPort:

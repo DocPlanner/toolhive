@@ -32,7 +32,7 @@ jobs:
           fail-build: false
 
       - name: Upload Grype scan results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        uses: github/codeql-action/upload-sarif@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4
         if: always()
         with:
           sarif_file: ${{ steps.grype-scan.outputs.sarif }}
@@ -80,6 +80,13 @@ jobs:
           # CI's `setup-go: stable` still resolves to go1.26.3 because the
           # actions/go-versions manifest lags the Go release. Temporary
           # exclusion; remove once CI builds on go1.26.4 or later.
+          #
+          # GO-2026-5932: golang.org/x/crypto/openpgp is deprecated-by-design
+          # ("unsafe, not maintained, should not be used"). No fixed version
+          # exists and none is planned. ToolHive does not import openpgp
+          # directly; it is pulled transitively via sigstore (rekor/sigstore-go)
+          # for backward-compatible OpenPGP verification. Remove when sigstore
+          # drops the openpgp dependency.
           IGNORED_VULNS="GO-2026-4514 GO-2026-4883 GO-2026-4887 GO-2026-5617 GO-2026-5668 GO-2026-5746 GO-2026-5932 GO-2026-5037 GO-2026-5038 GO-2026-5039"
 
           # Show the raw output for debugging

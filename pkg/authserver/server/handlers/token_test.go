@@ -21,6 +21,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	servercrypto "github.com/stacklok/toolhive/pkg/authserver/server/crypto"
+	"github.com/stacklok/toolhive/pkg/authserver/server/session"
 	"github.com/stacklok/toolhive/pkg/authserver/storage"
 	"github.com/stacklok/toolhive/pkg/authserver/upstream"
 )
@@ -199,22 +200,36 @@ func TestClassifyRefreshTokenFailure(t *testing.T) {
 }
 
 func TestTokenHandler_InvalidRefreshTokenLogsClassification(t *testing.T) {
+	t.Parallel()
 	handler, _, _ := handlerTestSetup(t)
-	logBuf := setTestLogger(t)
 
-	form := url.Values{
-		"grant_type":    {"refresh_token"},
-		"client_id":     {testAuthClientID},
-		"refresh_token": {"invalid-refresh-token"},
+	newRequest := func() *http.Request {
+		form := url.Values{
+			"grant_type":    {"refresh_token"},
+			"client_id":     {testAuthClientID},
+			"refresh_token": {"invalid-refresh-token"},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		return req
 	}
-	req := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 
-	handler.TokenHandler(rec, req)
+	handler.TokenHandler(rec, newRequest())
 
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 	assert.Contains(t, rec.Body.String(), "invalid_grant")
+
+	// Rebuild the validation error that TokenHandler logs and render its log
+	// attributes with a local logger. The process-wide slog default is not
+	// replaced, so the test can run in parallel with the others.
+	req := newRequest()
+	_, err := handler.provider.NewAccessRequest(req.Context(), req, session.New("", "", "", session.UserClaims{}))
+	require.Error(t, err)
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	logger.Error("token endpoint request failed", tokenEndpointErrorAttrs("request_validation", req, err)...)
 
 	logOutput := logBuf.String()
 	assert.Contains(t, logOutput, "token endpoint request failed")
@@ -512,20 +527,4 @@ func parseTokenResponse(t *testing.T, body string) map[string]interface{} {
 	err := json.Unmarshal([]byte(body), &tokenData)
 	require.NoError(t, err, "token response should be valid JSON")
 	return tokenData
-}
-
-func setTestLogger(t *testing.T) *bytes.Buffer {
-	t.Helper()
-
-	var buf bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-	prev := slog.Default()
-	slog.SetDefault(logger)
-
-	t.Cleanup(func() {
-		slog.SetDefault(prev)
-	})
-
-	return &buf
 }
