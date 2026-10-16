@@ -8,8 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
@@ -17,6 +15,7 @@ import (
 	"github.com/stacklok/toolhive/pkg/vmcp"
 	"github.com/stacklok/toolhive/pkg/vmcp/health"
 	"github.com/stacklok/toolhive/pkg/vmcp/server/sessionmanager"
+	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
 )
 
 func TestScheduleOnExposureChange(t *testing.T) {
@@ -72,29 +71,15 @@ func TestWatchRegistryVersionSchedulesOnChange(t *testing.T) {
 		2*time.Second, 10*time.Millisecond, "a registry change must schedule a refresh")
 }
 
-// notifyingSession is a fake SDK session with tool and resource stores and a
-// notification channel, so a test can observe list_changed notifications.
-type notifyingSession struct {
-	fakeSDKResourceSession
-	notifications chan mcp.JSONRPCNotification
-}
-
-func (n *notifyingSession) NotificationChannel() chan<- mcp.JSONRPCNotification {
-	return n.notifications
-}
-
-// TestRefreshSessionCapabilitiesClearsAndNotifies verifies that a refresh clears
-// the tool and resource store of a session registered on this pod, sends
-// list_changed for both, and that the next request fills the stores again.
-func TestRefreshSessionCapabilitiesClearsAndNotifies(t *testing.T) {
+// TestRefreshSessionCapabilitiesTriggersSinks verifies that a refresh triggers the
+// list_changed sink of each live session registered on this pod for tools,
+// resources and prompts, and drops the sink of a session that ended.
+func TestRefreshSessionCapabilitiesTriggersSinks(t *testing.T) {
 	t.Parallel()
 
-	const uri = "file:///doc.txt"
 	ctrl := gomock.NewController(t)
-	tools := []vmcp.Tool{{Name: "t"}}
-	factory, _ := newToolSessionFactory(t, ctrl, tools)
-	fc := &fakeCore{tools: tools, resources: []vmcp.Resource{{URI: uri, Name: "doc"}}}
-	srv, err := Serve(context.Background(), fc, &ServerConfig{
+	factory, _ := newToolSessionFactory(t, ctrl, nil)
+	srv, err := Serve(context.Background(), &fakeCore{}, &ServerConfig{
 		SessionTTL:           time.Minute,
 		SessionManagerConfig: &sessionmanager.FactoryConfig{Base: factory},
 		BackendRegistry:      vmcp.NewImmutableRegistry([]vmcp.Backend{}),
@@ -102,32 +87,22 @@ func TestRefreshSessionCapabilitiesClearsAndNotifies(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = srv.Stop(context.Background()) })
 
-	sess := &notifyingSession{
-		fakeSDKResourceSession: fakeSDKResourceSession{
-			fakeSDKSession: fakeSDKSession{id: srv.vmcpSessionMgr.Generate(), tools: map[string]server.ServerTool{}},
-			resources:      map[string]server.ServerResource{},
-		},
-		notifications: make(chan mcp.JSONRPCNotification, 10),
-	}
-	require.NoError(t, srv.mcpServer.RegisterSession(context.Background(), sess))
-	require.Contains(t, sess.tools, "t", "registration must inject the tools")
-	require.Contains(t, sess.resources, uri, "registration must inject the resources")
+	live := srv.vmcpSessionMgr.Generate()
+	var kinds []vmcpsession.ChangeKind
+	srv.refreshSinks.Store(live, vmcpsession.ListChangedSink(
+		func(_ context.Context, _ string, kind vmcpsession.ChangeKind) { kinds = append(kinds, kind) }))
+	srv.refreshSinks.Store("ended-session", vmcpsession.ListChangedSink(
+		func(context.Context, string, vmcpsession.ChangeKind) {
+			t.Error("the sink of an ended session must not run")
+		}))
 
 	srv.refreshSessionCapabilities("b", refreshSessionsContainingBackend)
 
-	assert.Empty(t, sess.tools, "refresh must clear the tool store")
-	assert.Empty(t, sess.resources, "refresh must clear the resource store")
-	var methods []string
-	for len(sess.notifications) > 0 {
-		methods = append(methods, (<-sess.notifications).Method)
-	}
-	assert.ElementsMatch(t, []string{
-		mcp.MethodNotificationToolsListChanged, mcp.MethodNotificationResourcesListChanged,
-	}, methods)
-
-	hookCtx := srv.mcpServer.WithContext(context.Background(), sess)
-	srv.lazyInjectSessionTools(hookCtx, "")
-	srv.lazyInjectSessionResources(hookCtx)
-	assert.Contains(t, sess.tools, "t", "the next request must fill the tool store again")
-	assert.Contains(t, sess.resources, uri, "the next request must fill the resource store again")
+	assert.ElementsMatch(t, []vmcpsession.ChangeKind{
+		vmcpsession.KindTools, vmcpsession.KindResources, vmcpsession.KindPrompts,
+	}, kinds)
+	_, kept := srv.refreshSinks.Load(live)
+	assert.True(t, kept, "a live session keeps its sink")
+	_, stillThere := srv.refreshSinks.Load("ended-session")
+	assert.False(t, stillThere, "the sink of an ended session is dropped")
 }

@@ -19,6 +19,8 @@ import (
 	"github.com/stacklok/toolhive/pkg/mcp"
 	"github.com/stacklok/toolhive/pkg/transport/ssecommon"
 	"github.com/stacklok/toolhive/pkg/transport/types"
+	"github.com/stacklok/toolhive/pkg/vmcp/optimizer"
+	"github.com/stacklok/toolhive/pkg/vmcp/schema"
 	"github.com/stacklok/toolhive/pkg/vmcp/session/optimizerdec"
 )
 
@@ -54,6 +56,34 @@ var MCPMethodToFeatureOperation = map[string]featureOperation{
 	"features/list": {Feature: "", Operation: authorizers.MCPOperationList}, // Capability discovery
 	"roots/list":    {Feature: "", Operation: ""},                           // Root directory discovery
 
+	// server/discover, Modern's (2026-07-28) replacement for initialize+capability
+	// negotiation, is always-allowed on THIS path (the single-server pkg/runner HTTP
+	// authz Middleware -- vMCP's Modern dispatcher never consults this map at all, it
+	// re-homes admission through core.Check*/core.List* directly). The always-allowed
+	// choice rests on initialize parity, not on any per-request filtering this map
+	// enforces: DiscoverResult carries the exact same Capabilities *ServerCapabilities
+	// (+ Instructions) shape InitializeResult does, and "initialize" above has always
+	// been always-allowed in this map. discover therefore adds no new exposure class --
+	// note ServerCapabilities.Experimental/.Extensions (arbitrary backend-authored maps)
+	// and Instructions (free text) are already freeform fields a backend can populate on
+	// the always-allowed initialize response today, so "no descriptors" is a property of
+	// how vMCP's dispatcher happens to build the value, not a guarantee this wire shape
+	// makes on its own. Classifying it as MCPOperationList instead would be safe too --
+	// response_filter.go hardcodes an exact 4-method filter list (tools/list,
+	// prompts/list, resources/list, find_tool), so server/discover would just pass
+	// through unfiltered -- but always-allowed is simpler and equally safe here.
+	"server/discover": {Feature: "", Operation: ""},
+
+	// Subscriptions - always allowed for now. This method carries no single resource
+	// identifier the parser extracts (params are a notification-type filter with an
+	// optional resourceSubscriptions array), so routing it through Cedar with an empty
+	// ResourceID would risk matching a broad allow rule. Notification delivery and
+	// per-resource authorization of resourceSubscriptions URIs are future work.
+	//
+	// TODO(#5755): when subscription notification delivery is implemented, replace this
+	// always-allowed entry with real per-resource authorization of resourceSubscriptions URIs.
+	"subscriptions/listen": {Feature: "", Operation: ""},
+
 	// Logging and client preferences - always allowed
 	"logging/setLevel": {Feature: "", Operation: ""}, // Client preference for server logging
 
@@ -82,10 +112,12 @@ var MCPMethodToFeatureOperation = map[string]featureOperation{
 }
 
 // shouldSkipInitialAuthorization checks if the request should skip authorization
-// before reading the request body.
+// before reading the request body. Content-Type is deliberately NOT consulted
+// here: the middleware body refuses non-JSON POSTs with an explicit early
+// return before this function is reached.
 func shouldSkipInitialAuthorization(r *http.Request) bool {
-	// Skip authorization for non-POST requests and non-JSON content types
-	if r.Method != http.MethodPost || !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+	// Skip authorization for non-POST requests
+	if r.Method != http.MethodPost {
 		return true
 	}
 
@@ -108,33 +140,39 @@ func shouldSkipSubsequentAuthorization(method string) bool {
 	return false
 }
 
-// handleUnauthorized handles unauthorized requests.
+// handleUnauthorized handles unauthorized requests. The client always sees the fixed
+// "Unauthorized" message -- err (an authorizer failure) can carry policy detail that
+// security.md forbids returning to callers, so it is logged server-side instead.
+// Cedar's evaluation context can embed decoded JWT claim values (see the claim-keys-
+// only rule in authorizers/cedar/core.go), so err must not be surfaced to the client,
+// nor copied into additional log lines or fields beyond the single Warn below.
 func handleUnauthorized(w http.ResponseWriter, msgID interface{}, err error) {
+	if err != nil {
+		slog.Warn("authorization denied", "error", err)
+	}
+
 	// Create a JSON-RPC error response
-	id, idErr := mcp.ConvertToJSONRPC2ID(msgID)
-	if idErr != nil {
+	id, convErr := mcp.ConvertToJSONRPC2ID(msgID)
+	if convErr != nil {
 		id = jsonrpc2.ID{} // Use empty ID if conversion fails
 	}
 
-	httpStatus, rpcCode, errorMsg, wwwAuthenticate := classifyAuthorizationError(err)
-
 	errorResponse := &jsonrpc2.Response{
 		ID:    id,
-		Error: jsonrpc2.NewError(int64(rpcCode), errorMsg),
+		Error: jsonrpc2.NewError(mcp.JSONRPCCodeDenied, "Unauthorized"),
 	}
 
-	// Set the response headers
-	w.Header().Set("Content-Type", "application/json")
-	if wwwAuthenticate != "" {
-		w.Header().Set("WWW-Authenticate", wwwAuthenticate)
-	}
-	w.WriteHeader(httpStatus)
+	// The helper encodes before writing any header, so a marshal failure never
+	// leaves a half-written response (e.g. a 403 header followed by a second
+	// 500 write). Nothing to do on a write error for a denial body.
+	_ = mcp.WriteJSONRPCError(w, http.StatusForbidden, errorResponse)
+}
 
-	// Write the error response
-	if err := json.NewEncoder(w).Encode(errorResponse); err != nil {
-		// If we can't encode the error response, log it and return a simple error
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-	}
+// rejectInvalidMCPRequest writes the 400 response for requests that arrive
+// without a parsed MCP message: non-JSON POSTs refused by the middleware
+// (the load-bearing security refusal) and malformed JSON POSTs.
+func rejectInvalidMCPRequest(w http.ResponseWriter) {
+	http.Error(w, "Invalid or malformed MCP request", http.StatusBadRequest)
 }
 
 // Middleware creates an HTTP middleware that authorizes MCP requests.
@@ -159,6 +197,22 @@ func Middleware(a authorizers.Authorizer, next http.Handler, passThroughTools ma
 	annotationCache := NewAnnotationCache()
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Non-JSON POSTs are rejected deliberately and must never be passed
+		// through. Such a request is not parsed as MCP, so message-level
+		// authorization cannot run, but the proxy still forwards the body
+		// verbatim and MCP backends parse JSON-RPC without checking
+		// Content-Type. This early return is load-bearing for security: it is
+		// the only point that keeps a JSON-RPC body smuggled under text/plain
+		// from reaching the backend un-authorized. The marker lets the outer
+		// audit middleware record the refusal as a denial, not a 400 failure.
+		if r.Method == http.MethodPost && !mcp.RequestHasJSONContentType(r) {
+			if marker, ok := mcp.AuthzDenialMarkerFromContext(r.Context()); ok {
+				marker.Denied = true
+			}
+			rejectInvalidMCPRequest(w)
+			return
+		}
+
 		// Check if we should skip authorization before checking parsed data
 		if shouldSkipInitialAuthorization(r) {
 			next.ServeHTTP(w, r)
@@ -168,15 +222,17 @@ func Middleware(a authorizers.Authorizer, next http.Handler, passThroughTools ma
 		// Get parsed MCP request from context (set by parsing middleware)
 		parsedRequest := mcp.GetParsedMCPRequest(r.Context())
 		if parsedRequest == nil {
-			// No parsed MCP request available for a request that should have been parsed
-			// This indicates either a malformed request or missing parsing middleware
-			http.Error(w, "Invalid or malformed MCP request", http.StatusBadRequest)
+			// Non-JSON POSTs are already rejected by the early return above,
+			// so a nil parsed request here means a malformed JSON body or a
+			// missing parsing middleware. This branch is now only a
+			// belt-and-braces fallback behind the content-type refusal.
+			rejectInvalidMCPRequest(w)
 			return
 		}
 
 		// Streamable HTTP allows clients to POST JSON-RPC responses back to the server.
 		// These are not authorization subjects and must reach the transport handler.
-		if !parsedRequest.IsRequest {
+		if parsedRequest.IsClientResponse() {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -190,13 +246,13 @@ func Middleware(a authorizers.Authorizer, next http.Handler, passThroughTools ma
 		// Get the feature and operation from the method
 		featureOp, ok := MCPMethodToFeatureOperation[parsedRequest.Method]
 		if !ok {
-			// Unknown method - deny by default for security
-			// Methods must be explicitly added to MCPMethodToFeatureOperation to be allowed
-			handleUnauthorized(w, parsedRequest.ID,
-				newForbiddenAuthorizationError(
-					fmt.Sprintf("unknown MCP method: %s (not configured for authorization)", parsedRequest.Method),
-				),
-			)
+			// Unknown method - deny by default for security. Methods must be
+			// explicitly added to MCPMethodToFeatureOperation to be allowed.
+			// This is expected traffic (e.g. a newer-spec client), not an
+			// operational failure, so it's Debug rather than the Warn
+			// handleUnauthorized logs for an actual authorizer error.
+			slog.Debug("MCP method denied by default", "method", parsedRequest.Method)
+			handleUnauthorized(w, parsedRequest.ID, nil)
 			return
 		}
 
@@ -267,7 +323,9 @@ func authorizeAndServe(
 // It always fully handles the request (authorization, unauthorized response, or serving).
 //
 // For pass-through meta-tools (find_tool, call_tool):
-//   - call_tool: authorizes the real inner tool name from arguments["tool_name"].
+//   - call_tool: authorizes the real inner tool name, decoded from the request
+//     arguments exactly as dispatch decodes them, so the two cannot disagree about
+//     which tool a request names. Arguments that do not decode are denied.
 //   - find_tool (and other pass-through tools without a tool_name): allowed through
 //     as a discovery operation with no policy check.
 //
@@ -283,12 +341,28 @@ func handleToolsCall(
 	next http.Handler,
 ) {
 	if _, isPassThrough := passThroughTools[parsedRequest.ResourceID]; isPassThrough {
-		if toolName, ok := parsedRequest.Arguments[optimizerdec.CallToolArgToolName].(string); ok && toolName != "" {
+		// Decode with the same call the two call_tool dispatch sites use rather than
+		// indexing the arguments map. encoding/json matches struct fields
+		// case-insensitively, so a map index on "tool_name" misses a request carrying
+		// "Tool_Name" that dispatch resolves and runs. Going through CallToolInput
+		// also applies the nested-tool_name hoist, so the name authorized here is the
+		// one that will execute.
+		input, err := schema.Translate[optimizer.CallToolInput](parsedRequest.Arguments)
+		if err != nil {
+			// The arguments are not a decodable call_tool payload, so the tool they
+			// target cannot be established. Deny rather than pass through; dispatch
+			// decodes the same map with the same call and rejects it too, so no
+			// legitimate invocation is lost.
+			slog.Warn("denying pass-through tool call with undecodable arguments",
+				"tool", parsedRequest.ResourceID, "error", err)
+			handleUnauthorized(w, parsedRequest.ID, nil)
+			return
+		}
+		if input.ToolName != "" {
 			// call_tool: authorize the real backend tool name.
-			innerArgs, _ := parsedRequest.Arguments[optimizerdec.CallToolArgParameters].(map[string]interface{})
 			authorizeAndServe(w, r, a, annotationCache,
 				featureOp.Feature, featureOp.Operation,
-				parsedRequest.ID, toolName, innerArgs, next)
+				parsedRequest.ID, input.ToolName, input.Parameters, next)
 			return
 		}
 		// find_tool: allow through but filter the tools list in the response so

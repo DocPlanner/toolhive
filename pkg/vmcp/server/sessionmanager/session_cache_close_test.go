@@ -34,8 +34,8 @@ func newBoundSessionManager(
 
 	factory := sessionfactorymocks.NewMockMultiSessionFactory(ctrl)
 	factory.EXPECT().
-		MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend) (vmcpsession.MultiSession, error) {
+		MakeSessionWithID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, id string, _ *auth.Identity, _ []*vmcp.Backend, _ vmcpsession.ListChangedSink) (vmcpsession.MultiSession, error) {
 			sess := sessionmocks.NewMockMultiSession(ctrl)
 			sess.EXPECT().ID().Return(id).AnyTimes()
 			sess.EXPECT().GetMetadata().Return(meta).AnyTimes()
@@ -58,7 +58,7 @@ func TestTerminate_ClosesCachedSessionWhenStorageIsAlreadyGone(t *testing.T) {
 
 	sm, storage, closed := newBoundSessionManager(t, 0)
 	sessionID := sm.Generate()
-	_, err := sm.CreateSession(context.Background(), sessionID)
+	_, err := sm.CreateSession(context.Background(), sessionID, nil)
 	require.NoError(t, err)
 
 	// Another replica served the DELETE (or the storage TTL expired).
@@ -74,7 +74,7 @@ func TestIdleSweep_ClosesIdleSessionWithoutTouchingStorage(t *testing.T) {
 
 	sm, storage, closed := newBoundSessionManager(t, 50*time.Millisecond)
 	sessionID := sm.Generate()
-	_, err := sm.CreateSession(context.Background(), sessionID)
+	_, err := sm.CreateSession(context.Background(), sessionID, nil)
 	require.NoError(t, err)
 
 	require.Eventually(t, closed.Load, 5*time.Second, 10*time.Millisecond,

@@ -42,6 +42,7 @@ _Appears in:_
 | `includeResponseData` _boolean_ | IncludeResponseData determines whether to include response data in audit logs. | false | Optional: \{\} <br /> |
 | `detectApplicationErrors` _boolean_ | DetectApplicationErrors controls whether the audit middleware inspects<br />JSON-RPC response bodies for application-level errors when the HTTP<br />status code indicates success (2xx). When enabled, a small prefix of<br />the response body is buffered to detect JSON-RPC error fields,<br />independent of the IncludeResponseData setting. | true | Optional: \{\} <br /> |
 | `maxDataSize` _integer_ | MaxDataSize limits the size of request/response data included in audit logs (in bytes). | 1024 | Optional: \{\} <br /> |
+| `maxDelegationDepth` _integer_ | MaxDelegationDepth caps how many nested RFC 8693 "act" entries are<br />recorded in an audit event's delegation chain. Deeper chains are<br />truncated (marked with truncated=true). Defaults to 10 when unset. | 10 | Minimum: 1 <br />Optional: \{\} <br /> |
 | `logFile` _string_ | LogFile specifies the file path for audit logs. If empty, logs to stdout. |  | Optional: \{\} <br /> |
 
 
@@ -262,8 +263,8 @@ _Appears in:_
 AggregationConfig defines tool aggregation, filtering, and conflict resolution strategies.
 
 Tool Visibility vs Routing:
-  - ExcludeAllTools, per-workload ExcludeAll, and Filter control which tools are
-    advertised to MCP clients (visible in tools/list responses).
+  - ExcludeAllTools, DefaultToolVisibility, per-workload ExcludeAll, and Filter control
+    which tools are advertised to MCP clients (visible in tools/list responses).
   - ALL backend tools remain available in the internal routing table, allowing
     composite tools to call hidden backend tools.
   - This enables curated experiences where raw backend tools are hidden from
@@ -280,6 +281,7 @@ _Appears in:_
 | `conflictResolutionConfig` _[vmcp.config.ConflictResolutionConfig](#vmcpconfigconflictresolutionconfig)_ | ConflictResolutionConfig provides configuration for the chosen strategy. |  | Optional: \{\} <br /> |
 | `tools` _[vmcp.config.WorkloadToolConfig](#vmcpconfigworkloadtoolconfig) array_ | Tools defines per-workload tool filtering and overrides. |  | Optional: \{\} <br /> |
 | `excludeAllTools` _boolean_ | ExcludeAllTools hides all backend tools from MCP clients when true.<br />Hidden tools are NOT advertised in tools/list responses, but they ARE<br />available in the routing table for composite tools to use.<br />This enables the use case where you want to hide raw backend tools from<br />direct client access while exposing curated composite tool workflows. |  | Optional: \{\} <br /> |
+| `defaultToolVisibility` _[vmcp.config.DefaultToolVisibility](#vmcpconfigdefaulttoolvisibility)_ | DefaultToolVisibility controls whether a backend with NO entry in Tools has its<br />tools advertised to MCP clients.<br />  - allow (default): every tool from an unlisted backend is advertised, so<br />    adding a workload to the group exposes it without further configuration.<br />  - deny: an unlisted backend contributes no tools, so only backends named in<br />    Tools are advertised. Use this when the set of exposed tools must be<br />    enumerated deliberately rather than inherited from group membership.<br />A backend that DOES have a Tools entry is unaffected by this setting: the<br />entry opts it in, and ExcludeAll/Filter on that entry decide the rest. Like<br />every other visibility setting here, this controls advertising only — hidden<br />tools remain in the routing table for composite tools (see the type doc).<br />This gates TOOLS only. An unlisted backend's resources, resource templates,<br />and prompts are still advertised under deny; mergeResources/mergePrompts have<br />no equivalent check. |  | Enum: [allow deny] <br />Optional: \{\} <br /> |
 
 
 #### vmcp.config.AuthzConfig
@@ -365,6 +367,7 @@ _Appears in:_
 | `timeout` _[vmcp.config.Duration](#vmcpconfigduration)_ | Timeout is the maximum workflow execution time. |  | Pattern: `^([0-9]+(\.[0-9]+)?(ns\|us\|µs\|ms\|s\|m\|h))+$` <br />Type: string <br /> |
 | `steps` _[vmcp.config.WorkflowStepConfig](#vmcpconfigworkflowstepconfig) array_ | Steps are the workflow steps to execute. |  |  |
 | `output` _[vmcp.config.OutputConfig](#vmcpconfigoutputconfig)_ | Output defines the structured output schema for this workflow.<br />If not specified, the workflow returns the last step's output (backward compatible). |  | Optional: \{\} <br /> |
+| `annotations` _[vmcp.config.ToolAnnotationsOverride](#vmcpconfigtoolannotationsoverride)_ | Annotations declares MCP tool annotations for the composite tool.<br />Annotation derivation runs at ADVERTISE TIME (when tools/list is served<br />and the backend tools are aggregated), not at CRD admission — thv vmcp<br />validate does NOT check annotation contradictions. The derived floor is<br />fail-closed: when the workflow has one or more tool steps the floor is<br />always non-nil, and any step whose annotations are nil/unknown taints the<br />floor conservatively (readOnly=false, destructive=true, openWorld=true).<br />A workflow with no tool steps (e.g. only elicitation) has no floor.<br />When nil, annotations are derived from the annotations of the backend tools<br />referenced by the workflow's steps (e.g. readOnlyHint is true only when every<br />step tool is read-only). When set, the values are an explicit author<br />declaration merged over the derived floor — subject to a safety-floor<br />guardrail that drops the composite tool (with a warning naming the offending<br />step tools) if an explicit hint would make the tool look safer than its<br />steps allow. |  | Optional: \{\} <br /> |
 
 
 #### vmcp.config.CompositeToolRef
@@ -414,7 +417,7 @@ _Appears in:_
 | `metadata` _object (keys:string, values:string)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
 | `telemetry` _[pkg.telemetry.Config](#pkgtelemetryconfig)_ | Telemetry configures OpenTelemetry-based observability for the Virtual MCP server<br />including distributed tracing, OTLP metrics export, and Prometheus metrics endpoint.<br />Deprecated (Kubernetes operator only): When deploying via the operator, use<br />VirtualMCPServer.spec.telemetryConfigRef to reference a shared MCPTelemetryConfig<br />resource instead. This field remains valid for standalone (non-operator) deployments. |  | Optional: \{\} <br /> |
 | `audit` _[pkg.audit.Config](#pkgauditconfig)_ | Audit configures audit logging for the Virtual MCP server.<br />When present, audit logs include MCP protocol operations.<br />See audit.Config for available configuration options. |  | Optional: \{\} <br /> |
-| `optimizer` _[vmcp.config.OptimizerConfig](#vmcpconfigoptimizerconfig)_ | Optimizer configures the MCP optimizer for context optimization on large toolsets.<br />When enabled, vMCP exposes only find_tool and call_tool operations to clients<br />instead of all backend tools directly. This reduces token usage by allowing<br />LLMs to discover relevant tools on demand rather than receiving all tool definitions. |  | Optional: \{\} <br /> |
+| `optimizer` _[vmcp.config.OptimizerConfig](#vmcpconfigoptimizerconfig)_ | Optimizer configures the MCP optimizer for context optimization on large toolsets.<br />When enabled, vMCP exposes only find_tool and call_tool operations to clients<br />instead of all backend tools directly. This reduces token usage by allowing<br />LLMs to discover relevant tools on demand rather than receiving all tool definitions.<br />Enabling the optimizer currently pins this instance to MCP 2025-11-25: the<br />find_tool/call_tool meta-tools are session-scoped, so Modern-capable (2026-07-28)<br />clients are negotiated down to the Legacy revision (see<br />pkg/vmcp/server/modern_gate.go; Modern parity is tracked in stacklok/toolhive#6089). |  | Optional: \{\} <br /> |
 | `codeMode` _[vmcp.config.CodeModeConfig](#vmcpconfigcodemodeconfig)_ | CodeMode configures vMCP code mode: server-side execution of Starlark scripts that<br />orchestrate multiple backend tool calls in a single request via the execute_tool_script<br />virtual tool. When enabled, execute_tool_script is advertised alongside the backend<br />tools; a script's inner tool calls are authorized individually, so a script can only<br />reach tools the caller is already permitted to use. Disabled by default. |  | Optional: \{\} <br /> |
 | `sessionStorage` _[vmcp.config.SessionStorageConfig](#vmcpconfigsessionstorageconfig)_ | SessionStorage configures session storage for stateful horizontal scaling.<br />When provider is "redis", the operator injects Redis connection parameters<br />(address, db, keyPrefix) here. The Redis password is provided separately via<br />the THV_SESSION_REDIS_PASSWORD environment variable. |  | Optional: \{\} <br /> |
 | `sessionTTL` _[vmcp.config.Duration](#vmcpconfigduration)_ | SessionTTL configures the idle TTL for vMCP sessions.<br />When omitted, the server default is used. |  | Pattern: `^([0-9]+(\.[0-9]+)?(ns\|us\|µs\|ms\|s\|m\|h))+$` <br />Type: string <br />Optional: \{\} <br /> |
@@ -435,8 +438,27 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `prefixFormat` _string_ | PrefixFormat defines the prefix format for the "prefix" strategy.<br />Supports placeholders: \{workload\}, \{workload\}_, \{workload\}. | \{workload\}_ | Optional: \{\} <br /> |
-| `priorityOrder` _string array_ | PriorityOrder defines the workload priority order for the "priority" strategy. |  | Optional: \{\} <br /> |
+| `prefixFormat` _string_ | PrefixFormat defines the prefix format for the "prefix" tool strategy<br />and for backend-prefixed prompt names (the default for every prompt;<br />under the "priority" strategy, backends listed in priorityOrder keep<br />their own prompt names).<br />Supports placeholders: \{workload\}, \{workload\}_, \{workload\}. | \{workload\}_ | Optional: \{\} <br /> |
+| `priorityOrder` _string array_ | PriorityOrder defines the workload priority order for the "priority" strategy.<br />Listed workloads also keep their own prompt names (unlisted workloads'<br />prompts stay backend-prefixed). |  | Optional: \{\} <br /> |
+
+
+#### vmcp.config.DefaultToolVisibility
+
+_Underlying type:_ _string_
+
+DefaultToolVisibility names the advertising default applied to backends with no
+per-workload Tools entry. The zero value is "" (unset), which behaves as
+DefaultToolVisibilityAllow so existing configs keep today's behavior.
+
+
+
+_Appears in:_
+- [vmcp.config.AggregationConfig](#vmcpconfigaggregationconfig)
+
+| Field | Description |
+| --- | --- |
+| `allow` | DefaultToolVisibilityAllow advertises every tool from a backend with no Tools<br />entry. This is the default and matches pre-DefaultToolVisibility behavior.<br /> |
+| `deny` | DefaultToolVisibilityDeny advertises no tools from a backend with no Tools entry.<br /> |
 
 
 
@@ -557,6 +579,7 @@ _Appears in:_
 | `protectedResourceAllowPrivateIp` _boolean_ | ProtectedResourceAllowPrivateIP allows protected resource endpoint on private IP addresses<br />Use with caution - only enable for trusted internal IDPs or testing |  |  |
 | `jwksAllowPrivateIp` _boolean_ | JwksAllowPrivateIP allows OIDC discovery and JWKS fetches to private IP addresses.<br />Enable when the embedded auth server runs on a loopback address and<br />the OIDC middleware needs to fetch its JWKS from that address.<br />Use with caution - only enable for trusted internal IDPs or testing. |  |  |
 | `insecureAllowHttp` _boolean_ | InsecureAllowHTTP allows HTTP (non-HTTPS) OIDC issuers for development/testing<br />WARNING: This is insecure and should NEVER be used in production |  |  |
+| `caBundlePath` _string_ | CABundlePath is the absolute file path to a PEM-encoded CA certificate bundle<br />used when the OIDC middleware performs HTTPS requests to the issuer<br />(OIDC discovery, JWKS fetch, token introspection). When set, the CA bundle<br />at this path is added to the trust store used for verifying the issuer's<br />TLS certificate. Typically populated by the Kubernetes operator from<br />MCPOIDCConfig.spec.inline.caBundleRef (ConfigMap) or from the in-cluster<br />service-account CA when using Kubernetes service-account auth. |  | Optional: \{\} <br /> |
 
 
 #### vmcp.config.OperationalConfig
@@ -763,7 +786,9 @@ All fields use pointers so nil means "don't override" while zero values
 
 
 _Appears in:_
+- [vmcp.config.CompositeToolConfig](#vmcpconfigcompositetoolconfig)
 - [vmcp.config.ToolOverride](#vmcpconfigtooloverride)
+- [api.v1beta1.VirtualMCPCompositeToolDefinitionSpec](#apiv1beta1virtualmcpcompositetooldefinitionspec)
 
 
 
@@ -2308,7 +2333,7 @@ _Appears in:_
 | `jwksAuthTokenPath` _string_ | JWKSAuthTokenPath is the path to file containing bearer token for JWKS/OIDC requests |  | Optional: \{\} <br /> |
 | `jwksAllowPrivateIP` _boolean_ | JWKSAllowPrivateIP allows JWKS/OIDC endpoints on private IP addresses.<br />Note: at runtime, if either JWKSAllowPrivateIP or ProtectedResourceAllowPrivateIP<br />is true, private IPs are allowed for all OIDC HTTP requests (JWKS, discovery, introspection). | false | Optional: \{\} <br /> |
 | `protectedResourceAllowPrivateIP` _boolean_ | ProtectedResourceAllowPrivateIP allows protected resource endpoint on private IP addresses.<br />Note: at runtime, if either ProtectedResourceAllowPrivateIP or JWKSAllowPrivateIP<br />is true, private IPs are allowed for all OIDC HTTP requests (JWKS, discovery, introspection). | false | Optional: \{\} <br /> |
-| `insecureAllowHTTP` _boolean_ | InsecureAllowHTTP allows HTTP (non-HTTPS) OIDC issuers for development/testing.<br />WARNING: This is insecure and should NEVER be used in production. | false | Optional: \{\} <br /> |
+| `insecureAllowHTTP` _boolean_ | InsecureAllowHTTP allows HTTP (non-HTTPS) OIDC issuer and JWKS URLs for development/testing.<br />WARNING: This is insecure and should NEVER be used in production. | false | Optional: \{\} <br /> |
 
 
 #### api.v1beta1.KubernetesServiceAccountOIDCConfig
@@ -2432,8 +2457,6 @@ _Appears in:_
 | `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.27/#condition-v1-meta) array_ | Conditions represent the latest available observations of the MCPAuthzConfig's state |  | Optional: \{\} <br /> |
 | `observedGeneration` _integer_ | ObservedGeneration is the most recent generation observed for this MCPAuthzConfig. |  | Optional: \{\} <br /> |
 | `configHash` _string_ | ConfigHash is a hash of the current configuration for change detection |  | Optional: \{\} <br /> |
-| `referenceCount` _integer_ | ReferenceCount is the number of workloads referencing this config. |  | Optional: \{\} <br /> |
-| `referencingWorkloads` _[api.v1beta1.WorkloadReference](#apiv1beta1workloadreference) array_ | ReferencingWorkloads is a list of workload resources that reference this MCPAuthzConfig.<br />Each entry identifies the workload by kind and name. The map key is the<br />(kind, name) pair so two workloads of different kinds that share a name<br />(e.g., an MCPServer "foo" and a VirtualMCPServer "foo") are distinct<br />entries rather than colliding under merge-patch semantics. |  | Optional: \{\} <br /> |
 
 
 #### api.v1beta1.MCPExternalAuthConfig
@@ -2523,8 +2546,6 @@ _Appears in:_
 | `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.27/#condition-v1-meta) array_ | Conditions represent the latest available observations of the MCPExternalAuthConfig's state |  | Optional: \{\} <br /> |
 | `observedGeneration` _integer_ | ObservedGeneration is the most recent generation observed for this MCPExternalAuthConfig.<br />It corresponds to the MCPExternalAuthConfig's generation, which is updated on mutation by the API Server. |  | Optional: \{\} <br /> |
 | `configHash` _string_ | ConfigHash is a hash of the current configuration for change detection |  | Optional: \{\} <br /> |
-| `referenceCount` _integer_ | ReferenceCount is the number of workloads referencing this config. |  | Optional: \{\} <br /> |
-| `referencingWorkloads` _[api.v1beta1.WorkloadReference](#apiv1beta1workloadreference) array_ | ReferencingWorkloads is a list of workload resources that reference this MCPExternalAuthConfig.<br />Each entry identifies the workload by kind and name. The map key is the<br />(kind, name) pair so two workloads of different kinds that share a name<br />(e.g., an MCPServer "foo" and a VirtualMCPServer "foo") are distinct<br />entries rather than colliding under merge-patch semantics. |  | Optional: \{\} <br /> |
 
 
 #### api.v1beta1.MCPGroup
@@ -2768,8 +2789,6 @@ _Appears in:_
 | `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.27/#condition-v1-meta) array_ | Conditions represent the latest available observations of the MCPOIDCConfig's state |  | Optional: \{\} <br /> |
 | `observedGeneration` _integer_ | ObservedGeneration is the most recent generation observed for this MCPOIDCConfig. |  | Optional: \{\} <br /> |
 | `configHash` _string_ | ConfigHash is a hash of the current configuration for change detection |  | Optional: \{\} <br /> |
-| `referenceCount` _integer_ | ReferenceCount is the number of workloads referencing this config. |  | Optional: \{\} <br /> |
-| `referencingWorkloads` _[api.v1beta1.WorkloadReference](#apiv1beta1workloadreference) array_ | ReferencingWorkloads is a list of workload resources that reference this MCPOIDCConfig.<br />Each entry identifies the workload by kind and name. The map key is the<br />(kind, name) pair so two workloads of different kinds that share a name<br />(e.g., an MCPServer "foo" and a VirtualMCPServer "foo") are distinct<br />entries rather than colliding under merge-patch semantics. |  | Optional: \{\} <br /> |
 
 
 #### api.v1beta1.MCPRegistry
@@ -3350,7 +3369,6 @@ _Appears in:_
 | `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.27/#condition-v1-meta) array_ | Conditions represent the latest available observations of the MCPTelemetryConfig's state |  | Optional: \{\} <br /> |
 | `observedGeneration` _integer_ | ObservedGeneration is the most recent generation observed for this MCPTelemetryConfig. |  | Optional: \{\} <br /> |
 | `configHash` _string_ | ConfigHash is a hash of the current configuration for change detection |  | Optional: \{\} <br /> |
-| `referencingWorkloads` _[api.v1beta1.WorkloadReference](#apiv1beta1workloadreference) array_ | ReferencingWorkloads lists workloads that reference this MCPTelemetryConfig |  | Optional: \{\} <br /> |
 
 
 #### api.v1beta1.MCPTelemetryOTelConfig
@@ -3463,8 +3481,6 @@ _Appears in:_
 | `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.27/#condition-v1-meta) array_ | Conditions represent the latest available observations of the MCPToolConfig's state |  | Optional: \{\} <br /> |
 | `observedGeneration` _integer_ | ObservedGeneration is the most recent generation observed for this MCPToolConfig.<br />It corresponds to the MCPToolConfig's generation, which is updated on mutation by the API Server. |  | Optional: \{\} <br /> |
 | `configHash` _string_ | ConfigHash is a hash of the current configuration for change detection |  | Optional: \{\} <br /> |
-| `referenceCount` _integer_ | ReferenceCount is the number of workloads referencing this config. |  | Optional: \{\} <br /> |
-| `referencingWorkloads` _[api.v1beta1.WorkloadReference](#apiv1beta1workloadreference) array_ | ReferencingWorkloads is a list of workload resources that reference this MCPToolConfig.<br />Each entry identifies the workload by kind and name. |  | Optional: \{\} <br /> |
 
 
 #### api.v1beta1.MCPWebhookConfigSpec
@@ -3498,7 +3514,6 @@ MCPWebhookConfigStatus defines the observed state of MCPWebhookConfig
 | `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.27/#condition-v1-meta) array_ | Conditions represent the latest available observations |  | Optional: \{\} <br /> |
 | `observedGeneration` _integer_ | ObservedGeneration is the last observed generation corresponding to the current status |  | Optional: \{\} <br /> |
 | `configHash` _string_ | ConfigHash is a hash of the spec, used for detecting changes |  | Optional: \{\} <br /> |
-| `referencingWorkloads` _[api.v1beta1.WorkloadReference](#apiv1beta1workloadreference) array_ | ReferencingWorkloads is a list of workload resources that reference this MCPWebhookConfig.<br />Each entry identifies the workload by kind and name. |  | Optional: \{\} <br /> |
 
 
 #### api.v1beta1.ModelCacheConfig
@@ -4456,6 +4471,7 @@ _Appears in:_
 | `timeout` _[vmcp.config.Duration](#vmcpconfigduration)_ | Timeout is the maximum workflow execution time. |  | Pattern: `^([0-9]+(\.[0-9]+)?(ns\|us\|µs\|ms\|s\|m\|h))+$` <br />Type: string <br /> |
 | `steps` _[vmcp.config.WorkflowStepConfig](#vmcpconfigworkflowstepconfig) array_ | Steps are the workflow steps to execute. |  |  |
 | `output` _[vmcp.config.OutputConfig](#vmcpconfigoutputconfig)_ | Output defines the structured output schema for this workflow.<br />If not specified, the workflow returns the last step's output (backward compatible). |  | Optional: \{\} <br /> |
+| `annotations` _[vmcp.config.ToolAnnotationsOverride](#vmcpconfigtoolannotationsoverride)_ | Annotations declares MCP tool annotations for the composite tool.<br />Annotation derivation runs at ADVERTISE TIME (when tools/list is served<br />and the backend tools are aggregated), not at CRD admission — thv vmcp<br />validate does NOT check annotation contradictions. The derived floor is<br />fail-closed: when the workflow has one or more tool steps the floor is<br />always non-nil, and any step whose annotations are nil/unknown taints the<br />floor conservatively (readOnly=false, destructive=true, openWorld=true).<br />A workflow with no tool steps (e.g. only elicitation) has no floor.<br />When nil, annotations are derived from the annotations of the backend tools<br />referenced by the workflow's steps (e.g. readOnlyHint is true only when every<br />step tool is read-only). When set, the values are an explicit author<br />declaration merged over the derived floor — subject to a safety-floor<br />guardrail that drops the composite tool (with a warning naming the offending<br />step tools) if an explicit hint would make the tool look safer than its<br />steps allow. |  | Optional: \{\} <br /> |
 
 
 #### api.v1beta1.VirtualMCPCompositeToolDefinitionStatus
@@ -4689,27 +4705,6 @@ _Appears in:_
 | `insecureSkipVerify` _boolean_ | InsecureSkipVerify disables server certificate verification.<br />WARNING: This should only be used for development/testing and not in production environments. |  | Optional: \{\} <br /> |
 
 
-#### api.v1beta1.WorkloadReference
-
-
-
-WorkloadReference identifies a workload that references a shared configuration resource.
-Namespace is implicit — cross-namespace references are not supported.
-
-
-
-_Appears in:_
-- [api.v1beta1.MCPAuthzConfigStatus](#apiv1beta1mcpauthzconfigstatus)
-- [api.v1beta1.MCPExternalAuthConfigStatus](#apiv1beta1mcpexternalauthconfigstatus)
-- [api.v1beta1.MCPOIDCConfigStatus](#apiv1beta1mcpoidcconfigstatus)
-- [api.v1beta1.MCPTelemetryConfigStatus](#apiv1beta1mcptelemetryconfigstatus)
-- [api.v1beta1.MCPToolConfigStatus](#apiv1beta1mcptoolconfigstatus)
-- [api.v1beta1.MCPWebhookConfigStatus](#apiv1beta1mcpwebhookconfigstatus)
-
-| Field | Description | Default | Validation |
-| --- | --- | --- | --- |
-| `kind` _string_ | Kind is the type of workload resource |  | Enum: [MCPServer VirtualMCPServer MCPRemoteProxy] <br />Required: \{\} <br /> |
-| `name` _string_ | Name is the name of the workload resource |  | MinLength: 1 <br />Required: \{\} <br /> |
 
 
 #### api.v1beta1.XAASpec
@@ -4745,6 +4740,14 @@ _Appears in:_
 
 
 ## toolhive.stacklok.dev/vmcp
+
+
+
+
+
+
+
+
 
 
 
@@ -4811,6 +4814,31 @@ This type is shared with the Kubernetes operator CRD (VirtualMCPServer.Status.Di
 | `circuitBreakerState` _string_ | CircuitBreakerState is the current circuit breaker state (closed, open, half-open).<br />Empty when circuit breaker is disabled or not configured. |  | Enum: [closed open half-open] <br />Optional: \{\} <br /> |
 | `circuitLastChanged` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.27/#time-v1-meta)_ | CircuitLastChanged is the timestamp when the circuit breaker state last changed.<br />Empty when circuit breaker is disabled or has never changed state. |  | Optional: \{\} <br /> |
 | `consecutiveFailures` _integer_ | ConsecutiveFailures is the current count of consecutive health check failures.<br />Resets to 0 when the backend becomes healthy again. |  | Optional: \{\} <br /> |
+| `mcpRevision` _string_ | MCPRevision is the backend's negotiated MCP protocol revision<br />("2026-07-28" or "2025-11-25"). Empty when the backend has not been probed. |  | Optional: \{\} <br /> |
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

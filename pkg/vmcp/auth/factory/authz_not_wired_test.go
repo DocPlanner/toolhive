@@ -120,8 +120,7 @@ func TestNewIncomingAuthMiddleware_AuthzEnforced(t *testing.T) {
 		// Compose: auth wraps authz wraps handler
 		wrapped := authMw(authzMw(testHandler))
 
-		// Anonymous user has no role. This policy dereferences principal.claim_role
-		// directly, so Cedar raises an evaluation error instead of a clean deny.
+		// Anonymous user has no role, so should be denied
 		mcpRequest := map[string]any{
 			"jsonrpc": "2.0",
 			"method":  "tools/call",
@@ -140,12 +139,11 @@ func TestNewIncomingAuthMiddleware_AuthzEnforced(t *testing.T) {
 
 		wrapped.ServeHTTP(recorder, req)
 
-		// EXPECTED: The request must not reach the handler, and the server should
-		// surface an explicit authz failure instead of silently degrading.
+		// EXPECTED: Anonymous user should be denied (no admin role)
 		assert.False(t, handlerCalled,
 			"handler should NOT be called - anonymous user lacks admin role")
-		assert.Equal(t, http.StatusInternalServerError, recorder.Code,
-			"response should be 500 when policy evaluation fails for missing principal attributes")
+		assert.Equal(t, http.StatusForbidden, recorder.Code,
+			"response should be 403 Forbidden for non-admin user")
 	})
 }
 

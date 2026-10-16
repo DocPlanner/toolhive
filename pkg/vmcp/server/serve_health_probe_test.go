@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mark3labs/mcp-go/server"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
+	"github.com/stacklok/toolhive-core/mcpcompat/server"
 	transportsession "github.com/stacklok/toolhive/pkg/transport/session"
 	"github.com/stacklok/toolhive/pkg/vmcp"
 	"github.com/stacklok/toolhive/pkg/vmcp/health"
@@ -102,7 +102,8 @@ func TestServeSkipsHealthProbeSessions(t *testing.T) {
 	assert.False(t, state.makeWithIDCalled.Load(), "a probe must not open backend connections")
 	assert.Zero(t, fc.listToolsCalls.Load(), "a probe must not list capabilities")
 	assert.Empty(t, sess.tools, "a probe must not get tools injected")
-	assert.Zero(t, srv.activeClientSessionCount(), "a probe must not be counted as an active session")
+	_, registered := srv.refreshSinks.Load(sess.id)
+	assert.False(t, registered, "a probe must not be registered for capability refreshes")
 }
 
 // TestPeerProbeHeaderCannotCall verifies that the client-controlled probe header
@@ -127,7 +128,7 @@ func TestPeerProbeHeaderCannotCall(t *testing.T) {
 			shared, err := transportsession.NewLocalSessionDataStorage(time.Hour)
 			require.NoError(t, err)
 			t.Cleanup(func() { _ = shared.Close() })
-			pod := startCrossPod(t, shared, nil)
+			pod := startCrossPod(t, shared)
 			sessionID := initSession(t, shared, pod, "alice")
 
 			rec := httptest.NewRecorder()

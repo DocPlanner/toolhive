@@ -77,6 +77,7 @@ func deriveServerConfig(
 		EndpointPath:            cfg.EndpointPath,
 		SessionTTL:              cfg.SessionTTL,
 		WriteTimeout:            cfg.WriteTimeout,
+		HeartbeatInterval:       cfg.HeartbeatInterval,
 		AuthMiddleware:          cfg.AuthMiddleware,
 		AuthInfoHandler:         cfg.AuthInfoHandler,
 		PassthroughHeaders:      cfg.PassthroughHeaders,
