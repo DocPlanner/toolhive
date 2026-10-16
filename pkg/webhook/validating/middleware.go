@@ -93,7 +93,7 @@ func createValidatingHandler(executors []clientExecutor, serverName, transport s
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Skip if it's not a parsed MCP request or if this is a client response.
 			parsedMCP := mcp.GetParsedMCPRequest(r.Context())
-			if parsedMCP == nil || !parsedMCP.IsRequest {
+			if parsedMCP == nil || parsedMCP.IsClientResponse() {
 				next.ServeHTTP(w, r)
 				return
 			}

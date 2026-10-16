@@ -43,7 +43,7 @@ commit](#changes-that-live-only-in-a-merge-commit)), so replaying the commits al
 | DCR and CIMD without `scope` default to `scopesSupported` (RFC 7591) | Clients that register without `scope` got no scopes | `16c2fba5e`, `7019ea20c` | Upstream defaults the scope (or `baselineClientScopes` gives the same result for our clients) |
 | Upstream-token writes use WATCH/MULTI instead of Lua | Our Dragonfly does not run the Lua scripts upstream uses | `907d7040d`, merge v0.28.3 | Upstream stops using Lua there, or we leave Dragonfly |
 | Audit user name falls back to the `username` claim | Cognito access tokens have no `name` or `email` | `a40493885` | Upstream reads `username` |
-| Client JSON-RPC responses (replies to elicitation, sampling, roots) pass through authz and the validating webhook. Only a body with no `method` member and a `result` or `error` counts as a reply (`ParsedMCPRequest.IsClientResponse`) | Upstream answers them with 400, so server-to-client requests never complete | `f22ee7fa6`, merge v0.42.1 | Upstream parses responses |
+| Client JSON-RPC responses (replies to elicitation, sampling, roots) pass through authz and the validating webhook. Only a body with no `method` member and a `result` or `error` counts as a reply (`ParsedMCPRequest.IsClientResponse`) | Upstream answers them with 400, so server-to-client requests never complete | `f22ee7fa6`, v0.42.1 follow-up | Upstream parses responses |
 
 ### Proxy runner and transport
 
@@ -52,7 +52,7 @@ commit](#changes-that-live-only-in-a-merge-commit)), so replaying the commits al
 | `TOOLHIVE_PROXY_SESSION_TTL` sets the proxy session TTL | No CRD field exists; we set 24 h (docplanner-helm `mcpservers.yaml`) to match vMCP sessions | `3a0b285c6`, `d104dfc9f` | Upstream adds a TTL field |
 | Proxy tuning env from `spec.env` mirrored into the runner process; on Kubernetes the proxy keeps running after repeated backend health failures (`pkg/runner/proxy_env.go`) | The env reached only the backend container, so the proxy kept a 2 h TTL and backends idle for 2 h answered 404 | `48c702ff2` | Upstream exposes these settings |
 | Shallow `/health` on the transparent proxy | The proxyrunner health check pinged the backend, so a slow backend failed the proxy's own probe | `5d7663669` | Upstream separates liveness from backend health |
-| The Host header stays the configured target host when `backend_url` pins a pod IP; any other Host is rewritten to the URL host, as upstream does | Backends with strict host validation rejected the pod IP | `ce851b471`, merge v0.42.1 | Upstream keeps the target Host |
+| The Host header stays the configured target host when `backend_url` pins a pod IP; any other Host is rewritten to the URL host, as upstream does | Backends with strict host validation rejected the pod IP | `ce851b471`, v0.42.1 follow-up | Upstream keeps the target Host |
 | HTTP 400 "no valid session ID" or "expired session ID" counts as a lost session (re-initialize and replay); only the first 4 KiB of the body are read | TypeScript SDK servers and mcp-for-argocd answer 400, not 404 | `8abac892e`, `16ffb4874`, merge v0.42.1 | Upstream treats these as session loss |
 | Streamable proxy answers a timeout or failure with a JSON-RPC error, not HTTP 504/500 | vMCP got a transport error instead of a call error | `cce5872bd` | Upstream returns JSON-RPC errors |
 | `ValidatingCache.Remove` and `EvictIdle`; entries closed outside the lock | The vMCP session cache needs eviction and close | `036974570`, `51de52641` | Upstream adds eviction |
@@ -137,7 +137,9 @@ the vMCP drift check.
 
 v0.40.0 replaced `mark3labs/mcp-go` with toolhive-core `mcpcompat` over the official go-sdk (#5729).
 mcpcompat has no idle sweep, session-ID-manager resolver, unregister hook, resource hooks or
-`SendNotificationToSpecificClient`, so the fork code built on them was dropped or rewritten:
+`SendNotificationToSpecificClient`, so the fork code built on them was dropped or rewritten. The
+last two rows (client replies, Host header) are in the follow-up commit "Narrow the client-reply and
+Host header patches", on top of the merge:
 
 | Behaviour | How it was re-applied |
 |---|---|

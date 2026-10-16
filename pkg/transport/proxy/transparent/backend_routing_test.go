@@ -334,12 +334,13 @@ func TestRoundTripAllowsInitializeWithUnknownSession(t *testing.T) {
 	_ = resp.Body.Close()
 }
 
-// TestRoundTripPreservesExplicitHost verifies that routing via URL.Host does not
-// overwrite an explicit logical Host header set by the reverse proxy.
+// TestRoundTripPreservesExplicitHost verifies that routing via URL.Host (a pod IP
+// from backend_url) does not overwrite the configured target host in the Host
+// header. Any other Host value is rewritten (TestRegression_TracingTransport_*).
 func TestRoundTripPreservesExplicitHost(t *testing.T) {
 	t.Parallel()
 
-	const logicalHost = "mcp-aws-mcp"
+	const logicalHost = "mcp-aws-mcp:8080"
 	var receivedHost atomic.Value
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedHost.Store(r.Host)
@@ -348,7 +349,7 @@ func TestRoundTripPreservesExplicitHost(t *testing.T) {
 	defer backend.Close()
 
 	proxy := NewTransparentProxyWithOptions(
-		"localhost", 0, backend.URL,
+		"localhost", 0, "http://"+logicalHost,
 		nil, nil, nil,
 		false, false, "sse",
 		nil, nil, "", false,

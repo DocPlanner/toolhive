@@ -331,6 +331,12 @@ func parseMCPRequest(bodyBytes []byte) *ParsedMCPRequest {
 			IsBatch: false,
 		}
 	case *jsonrpc2.Response:
+		// A client reply to a server-initiated request: no "method" member at all and
+		// a "result" or "error". Anything else (a request whose method was removed or
+		// duplicated) is not parsed, so it can never skip authorization as a reply.
+		if !isClientResponse(bodyBytes) {
+			return nil
+		}
 		var id interface{}
 		if msg.ID.IsValid() {
 			id = msg.ID.Raw()
@@ -344,6 +350,25 @@ func parseMCPRequest(bodyBytes []byte) *ParsedMCPRequest {
 	default:
 		return nil
 	}
+}
+
+// IsClientResponse reports whether p is a client reply to a server-initiated
+// request (see isClientResponse); such a message is not an authorization subject.
+func (p *ParsedMCPRequest) IsClientResponse() bool {
+	return p != nil && !p.IsRequest && p.Method == ""
+}
+
+// isClientResponse reports whether body is a JSON object with a "result" or "error"
+// member and no "method" member.
+func isClientResponse(body []byte) bool {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(body, &members); err != nil {
+		return false
+	}
+	_, hasMethod := members["method"]
+	_, hasResult := members["result"]
+	_, hasError := members["error"]
+	return !hasMethod && (hasResult || hasError)
 }
 
 // extractResourceAndArguments extracts the resource ID, arguments, and _meta field from the JSON-RPC params

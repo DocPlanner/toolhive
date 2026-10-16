@@ -541,6 +541,14 @@ type tracingTransport struct {
 	recovery *backendRecovery
 }
 
+// targetHost returns the host of the configured target URI, or "" if it has none.
+func (t *tracingTransport) targetHost() string {
+	if u, err := url.Parse(t.p.targetURI); err == nil {
+		return u.Host
+	}
+	return ""
+}
+
 func newTracingTransport(base http.RoundTripper, p *TransparentProxy) *tracingTransport {
 	return &tracingTransport{
 		p: p,
@@ -566,11 +574,11 @@ func (p *TransparentProxy) serverInitialized() bool {
 
 // nolint:gocyclo // This function handles multiple request types and is complex by design
 func (t *tracingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	// Keep any Host value set by ReverseProxy.SetURL. The request URL host can
-	// be changed later to a routing-only backend_url (for example a Kubernetes
-	// ClusterIP/pod IP); strict backend host validation must still see the
-	// logical target host, not that routing address.
-	if req.Host == "" {
+	// Rewrite the Host header to the URL host, so an injected Host never reaches the
+	// backend, except for the configured target host: backend_url can change the URL
+	// host to a routing-only pod IP, and strict backend host validation must still
+	// see the logical target host.
+	if req.Host != req.URL.Host && req.Host != t.targetHost() {
 		req.Host = req.URL.Host
 	}
 

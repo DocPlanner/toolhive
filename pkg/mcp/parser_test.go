@@ -110,6 +110,7 @@ func TestParsingMiddleware(t *testing.T) {
 			expectedMethod: "server/discover",
 			expectedID:     int64(10),
 			expectedResID:  "discover",
+			expectedIsReq:  true,
 		},
 		{
 			name:         "GET request - not parsed",
