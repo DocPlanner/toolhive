@@ -102,6 +102,10 @@ type RunFlags struct {
 	// Proxy headers
 	TrustProxyHeaders bool
 
+	// StrictProtocolValidation enables strict MCP-Protocol-Version validation
+	// on the streamable HTTP proxy.
+	StrictProtocolValidation bool
+
 	// Endpoint prefix for SSE endpoint URLs
 	EndpointPrefix string
 
@@ -150,6 +154,7 @@ type RunFlags struct {
 	// Runtime configuration
 	RuntimeImage       string
 	RuntimeAddPackages []string
+	BuildWith          []string
 
 	// WebhookConfigs is a list of paths to webhook configuration files.
 	// Each file may define validating and/or mutating webhooks.
@@ -218,6 +223,10 @@ func AddRunFlags(cmd *cobra.Command, config *RunFlags) {
 		"Override the default base image for protocol schemes (e.g., golang:1.24-alpine, node:20-alpine, python:3.11-slim)")
 	cmd.Flags().StringArrayVar(&config.RuntimeAddPackages, "runtime-add-package", []string{},
 		"Add additional packages to install in the builder and runtime stages (can be repeated)")
+	cmd.Flags().StringArrayVar(&config.BuildWith, "build-with", []string{},
+		"Build-time dependency constraint for protocol scheme builds, interpreted per package ecosystem "+
+			"(uvx://: PEP 508 specifier passed to 'uv tool install --with', e.g. --build-with 'mcp<2'); "+
+			"errors on ecosystems without constraint support (can be specified multiple times)")
 	cmd.Flags().StringVar(&config.VerifyImage, "image-verification", retriever.VerifyImageWarn,
 		fmt.Sprintf("Set image verification mode (%s, %s, %s)",
 			retriever.VerifyImageWarn, retriever.VerifyImageEnabled, retriever.VerifyImageDisabled))
@@ -268,7 +277,8 @@ func AddRunFlags(cmd *cobra.Command, config *RunFlags) {
 		"Emit legacy attribute names alongside new OTEL semantic convention names (default true)")
 
 	cmd.Flags().BoolVar(&config.IsolateNetwork, "isolate-network", true,
-		"Isolate the container network from the host. Use --isolate-network=false to opt out.")
+		"Isolate the container network from the host. Use --isolate-network=false to opt out. "+
+			"Not enforced with --network host or --network none (isolation requires bridge networking).")
 	cmd.Flags().BoolVar(&config.AllowDockerGateway, "allow-docker-gateway", false,
 		"Allow outbound connections to Docker gateway addresses (host.docker.internal, gateway.docker.internal, 172.17.0.1). "+
 			"Only applies when --isolate-network is set. These are blocked by default even when insecure_allow_all is enabled. "+
@@ -277,6 +287,9 @@ func AddRunFlags(cmd *cobra.Command, config *RunFlags) {
 	cmd.Flags().BoolVar(&config.TrustProxyHeaders, "trust-proxy-headers", false,
 		"Trust X-Forwarded-* headers from reverse proxies (X-Forwarded-Proto, X-Forwarded-Host, X-Forwarded-Port, X-Forwarded-Prefix) "+
 			"(default false)")
+	cmd.Flags().BoolVar(&config.StrictProtocolValidation, "strict-protocol-validation", false,
+		"Reject client requests whose MCP-Protocol-Version header is an unknown/unsupported MCP revision with HTTP 400 "+
+			"(streamable-HTTP proxy only; an absent header is accepted). Off by default: any version is accepted.")
 	cmd.Flags().BoolVar(&config.Stateless, "stateless", false,
 		"Declare the server as stateless (POST-only, no SSE). "+
 			"Use for MCP servers implementing streamable-HTTP stateless mode.")
@@ -285,7 +298,8 @@ func AddRunFlags(cmd *cobra.Command, config *RunFlags) {
 	cmd.Flags().StringVar(&config.EndpointPrefix, "endpoint-prefix", "",
 		"Path prefix to prepend to SSE endpoint URLs (e.g., /playwright)")
 	cmd.Flags().StringVar(&config.Network, "network", "",
-		"Connect the container to a network (e.g., 'host' for host networking)")
+		"Connect the container to a network (e.g., 'host' for host networking). "+
+			"Note: 'host' and 'none' cannot enforce network isolation, so isolation is dropped for those modes.")
 	cmd.Flags().StringArrayVarP(&config.Labels, "label", "l", []string{}, "Set labels on the container (format: key=value)")
 	cmd.Flags().BoolVarP(&config.Foreground, "foreground", "f", false, "Run in foreground mode (block until container exits) "+
 		"(default false)")
@@ -361,10 +375,15 @@ func BuildRunnerConfig(
 		return nil, err
 	}
 
+	// Whether --isolate-network was explicitly passed (vs. defaulted). This
+	// controls whether an incompatible network mode fails fast or degrades.
+	isolateExplicit := cmd.Flags().Changed("isolate-network")
+
 	if runFlags.RemoteURL != "" {
 		slog.Debug(fmt.Sprintf("Attempting to run remote MCP server: %s", runFlags.RemoteURL))
 		return buildRunnerConfig(ctx, runFlags, cmdArgs, debugMode, validatedHost, rt, runFlags.RemoteURL, nil,
-			nil, envVarValidator, oidcConfig, telemetryConfig, appConfig)
+			nil, envVarValidator, oidcConfig, telemetryConfig, appConfig,
+			runner.WithNetworkIsolationExplicit(isolateExplicit))
 	}
 
 	// Resolve image from registry without pulling (fast registry lookup only).
@@ -392,7 +411,8 @@ func BuildRunnerConfig(
 	runConfig, err := buildRunnerConfig(ctx, runFlags, cmdArgs, debugMode, validatedHost, rt, imageURL, serverMetadata,
 		envVars, envVarValidator, oidcConfig, telemetryConfig, appConfig,
 		runner.WithRegistrySourceURLs(regAPIURL, regURL),
-		runner.WithRegistryServerName(regServerName))
+		runner.WithRegistryServerName(regServerName),
+		runner.WithNetworkIsolationExplicit(isolateExplicit))
 	if err != nil {
 		return nil, err
 	}
@@ -480,10 +500,11 @@ func handleImageResolution(
 	// Validation here is intentionally duplicated with configureRuntimeOptions
 	// so that invalid input is caught early before registry lookups.
 	var runtimeOverride *templates.RuntimeConfig
-	if runFlags.RuntimeImage != "" || len(runFlags.RuntimeAddPackages) > 0 {
+	if runFlags.RuntimeImage != "" || len(runFlags.RuntimeAddPackages) > 0 || len(runFlags.BuildWith) > 0 {
 		runtimeOverride = &templates.RuntimeConfig{
 			BuilderImage:       runFlags.RuntimeImage,
 			AdditionalPackages: runFlags.RuntimeAddPackages,
+			BuildWith:          runFlags.BuildWith,
 		}
 		if err := runtimeOverride.Validate(); err != nil {
 			return "", nil, fmt.Errorf("invalid runtime configuration: %w", err)
@@ -615,13 +636,14 @@ func configureRemoteHeaderOptions(runFlags *RunFlags) ([]runner.RunConfigBuilder
 // It validates the configuration to prevent shell injection when values
 // are interpolated into Dockerfile templates.
 func configureRuntimeOptions(runFlags *RunFlags) ([]runner.RunConfigBuilderOption, error) {
-	if runFlags.RuntimeImage == "" && len(runFlags.RuntimeAddPackages) == 0 {
+	if runFlags.RuntimeImage == "" && len(runFlags.RuntimeAddPackages) == 0 && len(runFlags.BuildWith) == 0 {
 		return nil, nil
 	}
 
 	runtimeConfig := &templates.RuntimeConfig{
 		BuilderImage:       runFlags.RuntimeImage,
 		AdditionalPackages: runFlags.RuntimeAddPackages,
+		BuildWith:          runFlags.BuildWith,
 	}
 	if err := runtimeConfig.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid runtime configuration: %w", err)
@@ -682,6 +704,7 @@ func buildRunnerConfig(
 		runner.WithNetworkIsolation(runFlags.IsolateNetwork),
 		runner.WithAllowDockerGateway(runFlags.AllowDockerGateway),
 		runner.WithTrustProxyHeaders(runFlags.TrustProxyHeaders),
+		runner.WithStrictProtocolValidation(runFlags.StrictProtocolValidation),
 		runner.WithStateless(runFlags.Stateless),
 		runner.WithSessionTTL(runFlags.SessionTTL),
 		runner.WithEndpointPrefix(runFlags.EndpointPrefix),

@@ -1020,16 +1020,43 @@ spec:
                           prefixFormat:
                             default: '{workload}_'
                             description: |-
-                              PrefixFormat defines the prefix format for the "prefix" strategy.
+                              PrefixFormat defines the prefix format for the "prefix" tool strategy
+                              and for backend-prefixed prompt names (the default for every prompt;
+                              under the "priority" strategy, backends listed in priorityOrder keep
+                              their own prompt names).
                               Supports placeholders: {workload}, {workload}_, {workload}.
                             type: string
                           priorityOrder:
-                            description: PriorityOrder defines the workload priority
-                              order for the "priority" strategy.
+                            description: |-
+                              PriorityOrder defines the workload priority order for the "priority" strategy.
+                              Listed workloads also keep their own prompt names (unlisted workloads'
+                              prompts stay backend-prefixed).
                             items:
                               type: string
                             type: array
                         type: object
+                      defaultToolVisibility:
+                        description: |-
+                          DefaultToolVisibility controls whether a backend with NO entry in Tools has its
+                          tools advertised to MCP clients.
+                            - allow (default): every tool from an unlisted backend is advertised, so
+                              adding a workload to the group exposes it without further configuration.
+                            - deny: an unlisted backend contributes no tools, so only backends named in
+                              Tools are advertised. Use this when the set of exposed tools must be
+                              enumerated deliberately rather than inherited from group membership.
+
+                          A backend that DOES have a Tools entry is unaffected by this setting: the
+                          entry opts it in, and ExcludeAll/Filter on that entry decide the rest. Like
+                          every other visibility setting here, this controls advertising only — hidden
+                          tools remain in the routing table for composite tools (see the type doc).
+
+                          This gates TOOLS only. An unlisted backend's resources, resource templates,
+                          and prompts are still advertised under deny; mergeResources/mergePrompts have
+                          no equivalent check.
+                        enum:
+                        - allow
+                        - deny
+                        type: string
                       excludeAllTools:
                         description: |-
                           ExcludeAllTools hides all backend tools from MCP clients when true.
@@ -1075,24 +1102,34 @@ spec:
                                       Only specified fields are overridden; others pass through from the backend.
                                     properties:
                                       destructiveHint:
-                                        description: DestructiveHint overrides the
-                                          destructive hint annotation.
+                                        description: |-
+                                          DestructiveHint sets the destructive hint annotation.
+                                          For tool overrides this replaces the backend value; for composite tools
+                                          it is an explicit declaration merged over the derived safety floor.
                                         type: boolean
                                       idempotentHint:
-                                        description: IdempotentHint overrides the
-                                          idempotent hint annotation.
+                                        description: |-
+                                          IdempotentHint sets the idempotent hint annotation.
+                                          For tool overrides this replaces the backend value; for composite tools
+                                          it is an explicit declaration merged over the derived safety floor.
                                         type: boolean
                                       openWorldHint:
-                                        description: OpenWorldHint overrides the open-world
-                                          hint annotation.
+                                        description: |-
+                                          OpenWorldHint sets the open-world hint annotation.
+                                          For tool overrides this replaces the backend value; for composite tools
+                                          it is an explicit declaration merged over the derived safety floor.
                                         type: boolean
                                       readOnlyHint:
-                                        description: ReadOnlyHint overrides the read-only
-                                          hint annotation.
+                                        description: |-
+                                          ReadOnlyHint sets the read-only hint annotation.
+                                          For tool overrides this replaces the backend value; for composite tools
+                                          it is an explicit declaration merged over the derived safety floor.
                                         type: boolean
                                       title:
-                                        description: Title overrides the human-readable
-                                          title annotation.
+                                        description: |-
+                                          Title sets the human-readable title annotation.
+                                          For tool overrides this replaces the backend value; for composite tools
+                                          it is an explicit declaration merged over the derived safety floor.
                                         type: string
                                     type: object
                                   description:
@@ -1186,6 +1223,14 @@ spec:
                         default: 1024
                         description: MaxDataSize limits the size of request/response
                           data included in audit logs (in bytes).
+                        type: integer
+                      maxDelegationDepth:
+                        default: 10
+                        description: |-
+                          MaxDelegationDepth caps how many nested RFC 8693 "act" entries are
+                          recorded in an audit event's delegation chain. Deeper chains are
+                          truncated (marked with truncated=true). Defaults to 10 when unset.
+                        minimum: 1
                         type: integer
                     type: object
                   backends:
@@ -1312,6 +1357,57 @@ spec:
                         CompositeToolConfig defines a composite tool workflow.
                         This matches the YAML structure from the proposal (lines 173-255).
                       properties:
+                        annotations:
+                          description: |-
+                            Annotations declares MCP tool annotations for the composite tool.
+
+                            Annotation derivation runs at ADVERTISE TIME (when tools/list is served
+                            and the backend tools are aggregated), not at CRD admission — thv vmcp
+                            validate does NOT check annotation contradictions. The derived floor is
+                            fail-closed: when the workflow has one or more tool steps the floor is
+                            always non-nil, and any step whose annotations are nil/unknown taints the
+                            floor conservatively (readOnly=false, destructive=true, openWorld=true).
+                            A workflow with no tool steps (e.g. only elicitation) has no floor.
+
+                            When nil, annotations are derived from the annotations of the backend tools
+                            referenced by the workflow's steps (e.g. readOnlyHint is true only when every
+                            step tool is read-only). When set, the values are an explicit author
+                            declaration merged over the derived floor — subject to a safety-floor
+                            guardrail that drops the composite tool (with a warning naming the offending
+                            step tools) if an explicit hint would make the tool look safer than its
+                            steps allow.
+                          properties:
+                            destructiveHint:
+                              description: |-
+                                DestructiveHint sets the destructive hint annotation.
+                                For tool overrides this replaces the backend value; for composite tools
+                                it is an explicit declaration merged over the derived safety floor.
+                              type: boolean
+                            idempotentHint:
+                              description: |-
+                                IdempotentHint sets the idempotent hint annotation.
+                                For tool overrides this replaces the backend value; for composite tools
+                                it is an explicit declaration merged over the derived safety floor.
+                              type: boolean
+                            openWorldHint:
+                              description: |-
+                                OpenWorldHint sets the open-world hint annotation.
+                                For tool overrides this replaces the backend value; for composite tools
+                                it is an explicit declaration merged over the derived safety floor.
+                              type: boolean
+                            readOnlyHint:
+                              description: |-
+                                ReadOnlyHint sets the read-only hint annotation.
+                                For tool overrides this replaces the backend value; for composite tools
+                                it is an explicit declaration merged over the derived safety floor.
+                              type: boolean
+                            title:
+                              description: |-
+                                Title sets the human-readable title annotation.
+                                For tool overrides this replaces the backend value; for composite tools
+                                it is an explicit declaration merged over the derived safety floor.
+                              type: string
+                          type: object
                         description:
                           description: Description describes what the workflow does.
                           type: string
@@ -1645,6 +1741,16 @@ spec:
                           audience:
                             description: Audience is the required token audience.
                             type: string
+                          caBundlePath:
+                            description: |-
+                              CABundlePath is the absolute file path to a PEM-encoded CA certificate bundle
+                              used when the OIDC middleware performs HTTPS requests to the issuer
+                              (OIDC discovery, JWKS fetch, token introspection). When set, the CA bundle
+                              at this path is added to the trust store used for verifying the issuer's
+                              TLS certificate. Typically populated by the Kubernetes operator from
+                              MCPOIDCConfig.spec.inline.caBundleRef (ConfigMap) or from the in-cluster
+                              service-account CA when using Kubernetes service-account auth.
+                            type: string
                           clientId:
                             description: ClientID is the OAuth client ID.
                             type: string
@@ -1819,6 +1925,10 @@ spec:
                       When enabled, vMCP exposes only find_tool and call_tool operations to clients
                       instead of all backend tools directly. This reduces token usage by allowing
                       LLMs to discover relevant tools on demand rather than receiving all tool definitions.
+                      Enabling the optimizer currently pins this instance to MCP 2025-11-25: the
+                      find_tool/call_tool meta-tools are session-scoped, so Modern-capable (2026-07-28)
+                      clients are negotiated down to the Legacy revision (see
+                      pkg/vmcp/server/modern_gate.go; Modern parity is tracked in stacklok/toolhive#6089).
                     properties:
                       embeddingHeaders:
                         additionalProperties:
@@ -3425,6 +3535,11 @@ spec:
                       description: LastHealthCheck is the timestamp of the last health
                         check
                       format: date-time
+                      type: string
+                    mcpRevision:
+                      description: |-
+                        MCPRevision is the backend's negotiated MCP protocol revision
+                        ("2026-07-28" or "2025-11-25"). Empty when the backend has not been probed.
                       type: string
                     message:
                       description: Message provides additional information about the
@@ -4480,16 +4595,43 @@ spec:
                           prefixFormat:
                             default: '{workload}_'
                             description: |-
-                              PrefixFormat defines the prefix format for the "prefix" strategy.
+                              PrefixFormat defines the prefix format for the "prefix" tool strategy
+                              and for backend-prefixed prompt names (the default for every prompt;
+                              under the "priority" strategy, backends listed in priorityOrder keep
+                              their own prompt names).
                               Supports placeholders: {workload}, {workload}_, {workload}.
                             type: string
                           priorityOrder:
-                            description: PriorityOrder defines the workload priority
-                              order for the "priority" strategy.
+                            description: |-
+                              PriorityOrder defines the workload priority order for the "priority" strategy.
+                              Listed workloads also keep their own prompt names (unlisted workloads'
+                              prompts stay backend-prefixed).
                             items:
                               type: string
                             type: array
                         type: object
+                      defaultToolVisibility:
+                        description: |-
+                          DefaultToolVisibility controls whether a backend with NO entry in Tools has its
+                          tools advertised to MCP clients.
+                            - allow (default): every tool from an unlisted backend is advertised, so
+                              adding a workload to the group exposes it without further configuration.
+                            - deny: an unlisted backend contributes no tools, so only backends named in
+                              Tools are advertised. Use this when the set of exposed tools must be
+                              enumerated deliberately rather than inherited from group membership.
+
+                          A backend that DOES have a Tools entry is unaffected by this setting: the
+                          entry opts it in, and ExcludeAll/Filter on that entry decide the rest. Like
+                          every other visibility setting here, this controls advertising only — hidden
+                          tools remain in the routing table for composite tools (see the type doc).
+
+                          This gates TOOLS only. An unlisted backend's resources, resource templates,
+                          and prompts are still advertised under deny; mergeResources/mergePrompts have
+                          no equivalent check.
+                        enum:
+                        - allow
+                        - deny
+                        type: string
                       excludeAllTools:
                         description: |-
                           ExcludeAllTools hides all backend tools from MCP clients when true.
@@ -4535,24 +4677,34 @@ spec:
                                       Only specified fields are overridden; others pass through from the backend.
                                     properties:
                                       destructiveHint:
-                                        description: DestructiveHint overrides the
-                                          destructive hint annotation.
+                                        description: |-
+                                          DestructiveHint sets the destructive hint annotation.
+                                          For tool overrides this replaces the backend value; for composite tools
+                                          it is an explicit declaration merged over the derived safety floor.
                                         type: boolean
                                       idempotentHint:
-                                        description: IdempotentHint overrides the
-                                          idempotent hint annotation.
+                                        description: |-
+                                          IdempotentHint sets the idempotent hint annotation.
+                                          For tool overrides this replaces the backend value; for composite tools
+                                          it is an explicit declaration merged over the derived safety floor.
                                         type: boolean
                                       openWorldHint:
-                                        description: OpenWorldHint overrides the open-world
-                                          hint annotation.
+                                        description: |-
+                                          OpenWorldHint sets the open-world hint annotation.
+                                          For tool overrides this replaces the backend value; for composite tools
+                                          it is an explicit declaration merged over the derived safety floor.
                                         type: boolean
                                       readOnlyHint:
-                                        description: ReadOnlyHint overrides the read-only
-                                          hint annotation.
+                                        description: |-
+                                          ReadOnlyHint sets the read-only hint annotation.
+                                          For tool overrides this replaces the backend value; for composite tools
+                                          it is an explicit declaration merged over the derived safety floor.
                                         type: boolean
                                       title:
-                                        description: Title overrides the human-readable
-                                          title annotation.
+                                        description: |-
+                                          Title sets the human-readable title annotation.
+                                          For tool overrides this replaces the backend value; for composite tools
+                                          it is an explicit declaration merged over the derived safety floor.
                                         type: string
                                     type: object
                                   description:
@@ -4646,6 +4798,14 @@ spec:
                         default: 1024
                         description: MaxDataSize limits the size of request/response
                           data included in audit logs (in bytes).
+                        type: integer
+                      maxDelegationDepth:
+                        default: 10
+                        description: |-
+                          MaxDelegationDepth caps how many nested RFC 8693 "act" entries are
+                          recorded in an audit event's delegation chain. Deeper chains are
+                          truncated (marked with truncated=true). Defaults to 10 when unset.
+                        minimum: 1
                         type: integer
                     type: object
                   backends:
@@ -4772,6 +4932,57 @@ spec:
                         CompositeToolConfig defines a composite tool workflow.
                         This matches the YAML structure from the proposal (lines 173-255).
                       properties:
+                        annotations:
+                          description: |-
+                            Annotations declares MCP tool annotations for the composite tool.
+
+                            Annotation derivation runs at ADVERTISE TIME (when tools/list is served
+                            and the backend tools are aggregated), not at CRD admission — thv vmcp
+                            validate does NOT check annotation contradictions. The derived floor is
+                            fail-closed: when the workflow has one or more tool steps the floor is
+                            always non-nil, and any step whose annotations are nil/unknown taints the
+                            floor conservatively (readOnly=false, destructive=true, openWorld=true).
+                            A workflow with no tool steps (e.g. only elicitation) has no floor.
+
+                            When nil, annotations are derived from the annotations of the backend tools
+                            referenced by the workflow's steps (e.g. readOnlyHint is true only when every
+                            step tool is read-only). When set, the values are an explicit author
+                            declaration merged over the derived floor — subject to a safety-floor
+                            guardrail that drops the composite tool (with a warning naming the offending
+                            step tools) if an explicit hint would make the tool look safer than its
+                            steps allow.
+                          properties:
+                            destructiveHint:
+                              description: |-
+                                DestructiveHint sets the destructive hint annotation.
+                                For tool overrides this replaces the backend value; for composite tools
+                                it is an explicit declaration merged over the derived safety floor.
+                              type: boolean
+                            idempotentHint:
+                              description: |-
+                                IdempotentHint sets the idempotent hint annotation.
+                                For tool overrides this replaces the backend value; for composite tools
+                                it is an explicit declaration merged over the derived safety floor.
+                              type: boolean
+                            openWorldHint:
+                              description: |-
+                                OpenWorldHint sets the open-world hint annotation.
+                                For tool overrides this replaces the backend value; for composite tools
+                                it is an explicit declaration merged over the derived safety floor.
+                              type: boolean
+                            readOnlyHint:
+                              description: |-
+                                ReadOnlyHint sets the read-only hint annotation.
+                                For tool overrides this replaces the backend value; for composite tools
+                                it is an explicit declaration merged over the derived safety floor.
+                              type: boolean
+                            title:
+                              description: |-
+                                Title sets the human-readable title annotation.
+                                For tool overrides this replaces the backend value; for composite tools
+                                it is an explicit declaration merged over the derived safety floor.
+                              type: string
+                          type: object
                         description:
                           description: Description describes what the workflow does.
                           type: string
@@ -5105,6 +5316,16 @@ spec:
                           audience:
                             description: Audience is the required token audience.
                             type: string
+                          caBundlePath:
+                            description: |-
+                              CABundlePath is the absolute file path to a PEM-encoded CA certificate bundle
+                              used when the OIDC middleware performs HTTPS requests to the issuer
+                              (OIDC discovery, JWKS fetch, token introspection). When set, the CA bundle
+                              at this path is added to the trust store used for verifying the issuer's
+                              TLS certificate. Typically populated by the Kubernetes operator from
+                              MCPOIDCConfig.spec.inline.caBundleRef (ConfigMap) or from the in-cluster
+                              service-account CA when using Kubernetes service-account auth.
+                            type: string
                           clientId:
                             description: ClientID is the OAuth client ID.
                             type: string
@@ -5279,6 +5500,10 @@ spec:
                       When enabled, vMCP exposes only find_tool and call_tool operations to clients
                       instead of all backend tools directly. This reduces token usage by allowing
                       LLMs to discover relevant tools on demand rather than receiving all tool definitions.
+                      Enabling the optimizer currently pins this instance to MCP 2025-11-25: the
+                      find_tool/call_tool meta-tools are session-scoped, so Modern-capable (2026-07-28)
+                      clients are negotiated down to the Legacy revision (see
+                      pkg/vmcp/server/modern_gate.go; Modern parity is tracked in stacklok/toolhive#6089).
                     properties:
                       embeddingHeaders:
                         additionalProperties:
@@ -6885,6 +7110,11 @@ spec:
                       description: LastHealthCheck is the timestamp of the last health
                         check
                       format: date-time
+                      type: string
+                    mcpRevision:
+                      description: |-
+                        MCPRevision is the backend's negotiated MCP protocol revision
+                        ("2026-07-28" or "2025-11-25"). Empty when the backend has not been probed.
                       type: string
                     message:
                       description: Message provides additional information about the

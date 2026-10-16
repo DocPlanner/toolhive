@@ -351,8 +351,13 @@ func Serve(ctx context.Context, cfg ServeConfig) error {
 	// The factory never aggregates — the core is the single source of capability
 	// aggregation (agg feeds it via Config.Aggregator below). The backend init
 	// timeout follows the operational config (non-positive keeps the default).
-	sessionFactory := vmcpsession.NewSessionFactory(outgoingRegistry,
-		vmcpsession.WithBackendInitTimeout(backendInitTimeoutFromConfig(vmcpCfg)))
+	sessionFactoryOpts := []vmcpsession.MultiSessionFactoryOption{
+		vmcpsession.WithBackendInitTimeout(backendInitTimeoutFromConfig(vmcpCfg)),
+	}
+	if revisions, ok := backendClient.(vmcp.RevisionReporter); ok {
+		sessionFactoryOpts = append(sessionFactoryOpts, vmcpsession.WithRevisionLookup(revisions.CachedRevision))
+	}
+	sessionFactory := vmcpsession.NewSessionFactory(outgoingRegistry, sessionFactoryOpts...)
 
 	// When the optimizer is enabled, its meta-tools are pass-through tools.
 	// Authz uses this for optimizer-aware authorization/filtering.

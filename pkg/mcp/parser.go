@@ -8,7 +8,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
@@ -41,9 +43,27 @@ type ParsedMCPRequest struct {
 	// Meta contains the _meta field from the request params for protocol-level metadata
 	// such as progress tokens, trace IDs, or custom namespaced metadata
 	Meta map[string]interface{}
+	// MCPMethodHeader is the value of the Modern (stateless MCP) "Mcp-Method"
+	// request header, if present. Mandatory on every Modern POST per the draft spec.
+	MCPMethodHeader string
+	// MCPNameHeader is the raw, as-received value of the Modern (stateless MCP)
+	// "Mcp-Name" request header, if present. Required for tools/call,
+	// resources/read, prompts/get. Stored undecoded: the spec allows the header
+	// value to be sentinel-encoded (=?base64?...?=), and a caller comparing it to
+	// the plain body name/uri during validation must decode the header first.
+	MCPNameHeader string
+	// ClientInfo is the client implementation info surfaced via _meta for Modern
+	// (stateless) requests, sourced from _meta["io.modelcontextprotocol/clientInfo"].
+	ClientInfo map[string]interface{}
+	// ProtocolVersion is the per-request protocol version surfaced via _meta for
+	// Modern (stateless) requests, sourced from _meta["io.modelcontextprotocol/protocolVersion"].
+	ProtocolVersion string
 	// IsRequest indicates if this is a JSON-RPC request (vs response or notification)
 	IsRequest bool
-	// IsBatch indicates if this is a batch request
+	// IsBatch indicates if this is a batch request. It is always false: JSON-RPC
+	// batches are rejected by ParsingMiddleware before a ParsedMCPRequest is ever
+	// constructed (batching was removed in MCP 2025-06-18; see batch.go). The
+	// field is retained for wire/telemetry compatibility.
 	IsBatch bool
 }
 
@@ -61,10 +81,10 @@ type ParsedMCPRequest struct {
 // Example usage:
 //
 //	middlewares := []types.Middleware{
-//	    authMiddleware,        // Authentication first
+//	    auditMiddleware,       // Audit wraps the chain; parsed data flows back via ParsedRequestHolder
+//	    authMiddleware,        // Authentication
 //	    mcp.ParsingMiddleware, // MCP parsing after auth
 //	    authzMiddleware,       // Authorization uses parsed data
-//	    auditMiddleware,       // Audit uses parsed data
 //	}
 func ParsingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -92,9 +112,28 @@ func ParsingMiddleware(next http.Handler) http.Handler {
 		// Restore the request body for downstream handlers
 		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
+		// Reject JSON-RPC batches before any downstream middleware or the
+		// transport proxy's batch executor can act on them. Batching was
+		// removed in MCP revision 2025-06-18; ToolHive serves only 2025-11-25
+		// and 2026-07-28. Authz, audit, and tool filtering each inspect a
+		// single parsed request per call, so a batch reaching the backend would
+		// smuggle every nested call past those controls (see #5745).
+		if IsBatchRequest(bodyBytes) {
+			WriteBatchUnsupportedError(w)
+			return
+		}
+
 		// Parse the MCP request and store in context
 		parsedRequest := parseMCPRequest(bodyBytes)
 		if parsedRequest != nil {
+			parsedRequest.MCPMethodHeader = r.Header.Get("Mcp-Method")
+			parsedRequest.MCPNameHeader = r.Header.Get("Mcp-Name")
+			// Publish to a ParsedRequestHolder if one is present, so middleware
+			// wrapping the parser (e.g. audit) can observe the parsed request
+			// even though the derived context only flows downstream.
+			if holder, ok := ParsedRequestHolderFromContext(r.Context()); ok {
+				holder.Parsed = parsedRequest
+			}
 			ctx := context.WithValue(r.Context(), MCPRequestContextKey, parsedRequest)
 			r = r.WithContext(ctx)
 		}
@@ -102,6 +141,121 @@ func ParsingMiddleware(next http.Handler) http.Handler {
 		// Call the next handler
 		next.ServeHTTP(w, r)
 	})
+}
+
+// RepublishParsedMCPRequest refreshes the cached parse after middleware has
+// rewritten the request body, returning the request to pass downstream.
+// ParsingMiddleware deliberately parses only once, so any middleware that
+// replaces r.Body MUST call this or downstream consumers (authorization,
+// audit, telemetry) will decide on the bytes that arrived rather than the
+// bytes the backend executes.
+//
+// On error, the returned request is nil and must not be passed downstream:
+// the caller is responsible for terminating the request (e.g. writing an
+// error response) instead of proceeding with a stale or absent parse.
+//
+// This only refreshes consumers that read the parse from the request context or
+// from a ParsedRequestHolder. Middleware that inspects the raw body from OUTSIDE
+// ParsingMiddleware — the tool-call filter and the rate limiter — has already
+// decided against the pre-rewrite body and is not corrected by republishing.
+//
+// The caller must also refresh r.ContentLength when it replaces r.Body, or the
+// reverse proxy will reject the forwarded request.
+func RepublishParsedMCPRequest(r *http.Request, body []byte) (*http.Request, error) {
+	// Batch-reject before parsing, using the same guard ParsingMiddleware uses,
+	// so a mutation can never smuggle a batch past authz/audit by rewriting a
+	// single request into an array (see IsBatchRequest's doc comment).
+	if IsBatchRequest(body) {
+		return nil, &BatchUnsupportedError{}
+	}
+
+	parsed := parseMCPRequest(body)
+	if parsed == nil {
+		return nil, errors.New("republished body is not a valid JSON-RPC request")
+	}
+	parsed.MCPMethodHeader = r.Header.Get("Mcp-Method")
+	parsed.MCPNameHeader = r.Header.Get("Mcp-Name")
+
+	if holder, ok := ParsedRequestHolderFromContext(r.Context()); ok {
+		holder.Parsed = parsed
+	}
+
+	return r.WithContext(context.WithValue(r.Context(), MCPRequestContextKey, parsed)), nil
+}
+
+// parsedRequestHolderContextKey is the context key for ParsedRequestHolder.
+type parsedRequestHolderContextKey struct{}
+
+// ParsedRequestHolder is a mutable carrier that lets middleware running
+// OUTSIDE the parsing middleware observe the parsed MCP request. Context
+// values only flow downstream, so a wrapper such as the audit middleware
+// cannot read the parsed request that the parser attaches for inner handlers.
+// The wrapper injects an empty holder via WithParsedRequestHolder before
+// calling the inner chain; ParsingMiddleware fills it; the wrapper reads it
+// after the inner chain returns.
+//
+// The holder is written and read by the single request goroutine (writes
+// happen-before the wrapper's post-ServeHTTP read), so no synchronization is
+// needed.
+type ParsedRequestHolder struct {
+	Parsed *ParsedMCPRequest
+}
+
+// WithParsedRequestHolder returns a new context carrying the given holder.
+func WithParsedRequestHolder(ctx context.Context, holder *ParsedRequestHolder) context.Context {
+	return context.WithValue(ctx, parsedRequestHolderContextKey{}, holder)
+}
+
+// ParsedRequestHolderFromContext retrieves the ParsedRequestHolder from the
+// context. Returns (nil, false) if no holder is present.
+func ParsedRequestHolderFromContext(ctx context.Context) (*ParsedRequestHolder, bool) {
+	holder, ok := ctx.Value(parsedRequestHolderContextKey{}).(*ParsedRequestHolder)
+	return holder, ok && holder != nil
+}
+
+// authzDenialMarkerContextKey is the context key for AuthzDenialMarker.
+type authzDenialMarkerContextKey struct{}
+
+// AuthzDenialMarker is a mutable carrier that lets the authorization
+// middleware (pkg/authz), which runs INSIDE the audit middleware, flag a
+// request it refused before message-level authorization could run, such as a
+// non-JSON POST carrying a smuggled JSON-RPC body. It follows the same
+// propagation pattern as ParsedRequestHolder: the audit wrapper injects an
+// empty marker via WithAuthzDenialMarker, the inner middleware fills it, and
+// the wrapper reads it back after the inner chain returns so the refusal is
+// audited as a denial rather than a generic 400 failure. The type lives in
+// this package because pkg/authz already depends on pkg/audit transitively,
+// so the carrier cannot live in either of those two packages.
+//
+// Like ParsedRequestHolder, the marker is written and read by the single
+// request goroutine, so no synchronization is needed.
+type AuthzDenialMarker struct {
+	Denied bool
+}
+
+// WithAuthzDenialMarker returns a new context carrying the given marker.
+func WithAuthzDenialMarker(ctx context.Context, marker *AuthzDenialMarker) context.Context {
+	return context.WithValue(ctx, authzDenialMarkerContextKey{}, marker)
+}
+
+// AuthzDenialMarkerFromContext retrieves the AuthzDenialMarker from the
+// context. Returns (nil, false) if no marker is present.
+func AuthzDenialMarkerFromContext(ctx context.Context) (*AuthzDenialMarker, bool) {
+	marker, ok := ctx.Value(authzDenialMarkerContextKey{}).(*AuthzDenialMarker)
+	return marker, ok && marker != nil
+}
+
+// RequestHasJSONContentType reports whether r declares an application/json
+// Content-Type. Media types are case-insensitive per RFC 9110 8.3.1, so the
+// header is parsed with mime.ParseMediaType and compared with EqualFold; the
+// case-sensitive prefix match this replaces also wrongly accepted longer
+// types such as "application/jsonx".
+func RequestHasJSONContentType(r *http.Request) bool {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(mediaType, "application/json")
 }
 
 // GetParsedMCPRequest retrieves the parsed MCP request from the request context.
@@ -120,8 +274,7 @@ func shouldParseMCPRequest(r *http.Request) bool {
 		return false
 	}
 
-	contentType := r.Header.Get("Content-Type")
-	if !strings.HasPrefix(contentType, "application/json") {
+	if !RequestHasJSONContentType(r) {
 		return false
 	}
 
@@ -155,6 +308,7 @@ func parseMCPRequest(bodyBytes []byte) *ParsedMCPRequest {
 	case *jsonrpc2.Request:
 		// Extract resource ID, arguments, and meta based on the method
 		resourceID, arguments, meta := extractResourceAndArguments(msg.Method, msg.Params)
+		clientInfo, protocolVersion := extractModernMeta(meta)
 
 		// Determine the ID - will be nil for notifications
 		var id interface{}
@@ -163,14 +317,18 @@ func parseMCPRequest(bodyBytes []byte) *ParsedMCPRequest {
 		}
 
 		return &ParsedMCPRequest{
-			Method:     msg.Method,
-			ID:         id,
-			Params:     msg.Params,
-			ResourceID: resourceID,
-			Arguments:  arguments,
-			Meta:       meta,
-			IsRequest:  true,
-			IsBatch:    false, // TODO: Add batch request support if needed
+			Method:          msg.Method,
+			ID:              id,
+			Params:          msg.Params,
+			ResourceID:      resourceID,
+			Arguments:       arguments,
+			Meta:            meta,
+			ClientInfo:      clientInfo,
+			ProtocolVersion: protocolVersion,
+			IsRequest:       true,
+			// Batches are rejected in ParsingMiddleware before reaching here, so a
+			// parsed request is always a single, non-batch message.
+			IsBatch: false,
 		}
 	case *jsonrpc2.Response:
 		var id interface{}
@@ -230,6 +388,7 @@ var staticResourceIDs = map[string]string{
 	"notifications/resources/list_changed": "resources",
 	"notifications/resources/updated":      "resources",
 	"notifications/tools/list_changed":     "tools",
+	"server/discover":                      "discover",
 }
 
 func extractResourceAndArguments(method string, params json.RawMessage) (string, map[string]interface{}, map[string]interface{}) {
@@ -242,16 +401,21 @@ func extractResourceAndArguments(method string, params json.RawMessage) (string,
 		return getStaticResourceID(method), nil, nil
 	}
 
-	// Extract _meta field if present
-	var meta map[string]interface{}
-	if metaRaw, ok := paramsMap["_meta"]; ok {
-		if metaMap, ok := metaRaw.(map[string]interface{}); ok {
-			meta = metaMap
-		}
-	}
+	meta := metaFromParamsMap(paramsMap)
 
 	resourceID, arguments := processMethodWithHandler(method, paramsMap)
 	return resourceID, arguments, meta
+}
+
+// extractModernMeta surfaces the Modern (stateless MCP) clientInfo and
+// protocolVersion fields from a parsed _meta map, if present. It delegates to
+// the reserved-key helpers in revision.go so the guarded type assertions live
+// in one place; a wrong-shaped value is treated as absent rather than causing
+// an error.
+func extractModernMeta(meta map[string]interface{}) (clientInfo map[string]interface{}, protocolVersion string) {
+	clientInfo, _ = objectMetaValue(meta, metaKeyClientInfo)
+	protocolVersion, _ = stringMetaValue(meta, metaKeyProtocolVersion)
+	return clientInfo, protocolVersion
 }
 
 // getStaticResourceID returns the static resource ID for methods that don't need parameter parsing
@@ -505,4 +669,24 @@ func GetMCPMeta(ctx context.Context) map[string]interface{} {
 		return parsed.Meta
 	}
 	return nil
+}
+
+// GetMCPClientInfo is a convenience function to get the Modern (stateless MCP)
+// per-request clientInfo from the context.
+// Returns nil if no parsed request is available or clientInfo is not present.
+func GetMCPClientInfo(ctx context.Context) map[string]interface{} {
+	if parsed := GetParsedMCPRequest(ctx); parsed != nil {
+		return parsed.ClientInfo
+	}
+	return nil
+}
+
+// GetMCPProtocolVersion is a convenience function to get the Modern (stateless
+// MCP) per-request protocol version from the context.
+// Returns "" if no parsed request is available or protocolVersion is not present.
+func GetMCPProtocolVersion(ctx context.Context) string {
+	if parsed := GetParsedMCPRequest(ctx); parsed != nil {
+		return parsed.ProtocolVersion
+	}
+	return ""
 }

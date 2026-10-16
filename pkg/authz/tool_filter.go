@@ -7,8 +7,7 @@ import (
 	"context"
 	"log/slog"
 
-	"github.com/mark3labs/mcp-go/mcp"
-
+	"github.com/stacklok/toolhive-core/mcpcompat/mcp"
 	"github.com/stacklok/toolhive/pkg/authz/authorizers"
 )
 
@@ -16,11 +15,9 @@ import (
 // For each tool, it checks whether the caller (identified by JWT claims in ctx)
 // is authorized to call that tool. Only authorized tools are returned.
 // If authorizer is nil, all tools are returned unmodified.
-// Returns an error when policy evaluation itself fails; denials still filter
-// normally without failing the whole list operation.
-func filterToolsByPolicy(ctx context.Context, a authorizers.Authorizer, tools []mcp.Tool) ([]mcp.Tool, error) {
+func filterToolsByPolicy(ctx context.Context, a authorizers.Authorizer, tools []mcp.Tool) []mcp.Tool {
 	if a == nil {
-		return tools, nil
+		return tools
 	}
 
 	// Note: instantiating the list ensures that no null value is sent over the wire.
@@ -39,7 +36,9 @@ func filterToolsByPolicy(ctx context.Context, a authorizers.Authorizer, tools []
 
 		authorized, err := authorizeToolCall(toolCtx, a, tool.Name, nil)
 		if err != nil {
-			return nil, err
+			slog.Warn("Authorization check failed for tool, skipping",
+				"tool", tool.Name, "error", err)
+			continue
 		}
 
 		if authorized {
@@ -55,7 +54,7 @@ func filterToolsByPolicy(ctx context.Context, a authorizers.Authorizer, tools []
 			"total", len(tools), "allowed", len(filtered), "denied", denied)
 	}
 
-	return filtered, nil
+	return filtered
 }
 
 // authorizeToolCall checks whether the caller is authorized to call a specific tool

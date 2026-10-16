@@ -177,6 +177,16 @@ func (v *DefaultValidator) validateIncomingAuth(auth *IncomingAuthConfig) error 
 		// - PKCE flows (public clients)
 		// - Token validation without introspection
 		// - Kubernetes service account token validation
+
+		// Validate CA bundle path: reject null bytes, path traversal, and relative paths.
+		if auth.OIDC.CABundlePath != "" {
+			if strings.ContainsRune(auth.OIDC.CABundlePath, 0) || strings.Contains(auth.OIDC.CABundlePath, "..") {
+				return fmt.Errorf("incomingAuth.oidc.caBundlePath contains invalid path characters")
+			}
+			if !filepath.IsAbs(auth.OIDC.CABundlePath) {
+				return fmt.Errorf("incomingAuth.oidc.caBundlePath must be an absolute path")
+			}
+		}
 	}
 
 	// Validate authorization configuration
@@ -344,7 +354,61 @@ func (v *DefaultValidator) validateAggregation(agg *AggregationConfig) error {
 		return err
 	}
 
+	// Mirrors the CRD's enum for the CLI path, which has no API-server admission
+	// to reject a bad value. "" is accepted and means allow, so configs written
+	// before this setting existed stay valid.
+	switch agg.DefaultToolVisibility {
+	case "", DefaultToolVisibilityAllow, DefaultToolVisibilityDeny:
+	default:
+		return fmt.Errorf("defaultToolVisibility must be one of: allow, deny")
+	}
+
+	if err := validateDenyVisibilityPriorityOrder(agg); err != nil {
+		return err
+	}
+
 	return v.validateToolConfigurations(agg.Tools)
+}
+
+// validateDenyVisibilityPriorityOrder rejects a priorityOrder entry that has no
+// corresponding Tools entry when DefaultToolVisibility is deny.
+//
+// Conflict resolution runs BEFORE the advertising filter, and priorityOrder is
+// independent of Tools. So an unlisted backend can win a name conflict — dropping
+// the listed backend's version of that tool at resolution — and then be withheld
+// by deny, leaving the tool advertised by nobody. That is strictly worse than
+// allow, where the winner at least stays visible.
+//
+// Rejecting the combination up front is cheaper than reordering the pipeline,
+// which would mean resolving conflicts twice: once over the visible candidates
+// and once over the complete set that composite tools route against.
+//
+// validateAggregation guarantees ConflictResolutionConfig is non-nil before
+// calling this, so it is safe to dereference below.
+func validateDenyVisibilityPriorityOrder(agg *AggregationConfig) error {
+	if agg.DefaultToolVisibility != DefaultToolVisibilityDeny ||
+		agg.ConflictResolution != vmcp.ConflictStrategyPriority {
+		return nil
+	}
+
+	listed := make(map[string]struct{}, len(agg.Tools))
+	for _, wl := range agg.Tools {
+		if wl != nil {
+			listed[wl.Workload] = struct{}{}
+		}
+	}
+
+	for _, workload := range agg.ConflictResolutionConfig.PriorityOrder {
+		if _, ok := listed[workload]; !ok {
+			return fmt.Errorf(
+				"defaultToolVisibility deny with priority strategy: priorityOrder entry %q has no tools entry; "+
+					"it could win a name conflict and then be withheld, hiding the tool entirely. "+
+					"Add a tools entry for %q or remove it from priorityOrder",
+				workload, workload)
+		}
+	}
+
+	return nil
 }
 
 // validateConflictStrategy validates strategy-specific configuration

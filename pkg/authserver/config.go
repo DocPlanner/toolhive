@@ -10,13 +10,16 @@ import (
 	"log/slog"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
+	oauthserver "github.com/stacklok/toolhive/pkg/authserver/server"
 	servercrypto "github.com/stacklok/toolhive/pkg/authserver/server/crypto"
 	"github.com/stacklok/toolhive/pkg/authserver/server/handlers"
 	"github.com/stacklok/toolhive/pkg/authserver/server/keys"
 	"github.com/stacklok/toolhive/pkg/authserver/server/registration"
+	"github.com/stacklok/toolhive/pkg/authserver/server/tokenexchange"
 	"github.com/stacklok/toolhive/pkg/authserver/storage"
 	"github.com/stacklok/toolhive/pkg/authserver/upstream"
 	"github.com/stacklok/toolhive/pkg/networking"
@@ -62,6 +65,11 @@ type RunConfig struct {
 	// TokenLifespans configures the duration that various tokens are valid.
 	// If nil, defaults are applied (access: 1h, refresh: 7d, authCode: 10m).
 	TokenLifespans *TokenLifespanRunConfig `json:"token_lifespans,omitempty" yaml:"token_lifespans,omitempty"`
+
+	// DelegationTokenLifespan is the maximum lifetime for delegated tokens issued
+	// via RFC 8693 token exchange. Specified as a Go duration string (e.g., "15m").
+	// If empty, defaults to 15 minutes.
+	DelegationTokenLifespan string `json:"delegation_token_lifespan,omitempty" yaml:"delegation_token_lifespan,omitempty"`
 
 	// Upstreams configures connections to upstream Identity Providers.
 	// At least one upstream is required - the server delegates authentication to these providers.
@@ -111,6 +119,25 @@ type RunConfig struct {
 	// Production deployments reachable outside the cluster MUST use https://.
 	//nolint:lll // field tags require full JSON+YAML names
 	InsecureAllowHTTP bool `json:"insecure_allow_http,omitempty" yaml:"insecure_allow_http,omitempty"`
+
+	// TrustedIssuers lists external OIDC issuers whose tokens are accepted as
+	// subject tokens during RFC 8693 token exchange. Empty (the default) means
+	// only self-issued subject tokens are accepted.
+	//
+	// Prerequisite: the token-exchange grant requires a confidential client,
+	// and no supported deployment path provisions one today (DCR and CIMD
+	// clients are both public-only, and there is no client-seeding field on
+	// this RunConfig), so this grant is not yet usable end to end for
+	// self-issued or external subject tokens alike. Tracked in
+	// https://github.com/stacklok/toolhive/issues/6082.
+	//
+	// See tokenexchange.TrustedIssuer for the per-issuer field reference, and
+	// docs/arch/17-token-exchange-delegation.md for the trust model, consent
+	// signals, and operator-facing constraints (audience/scope bounding,
+	// subject namespace qualification, required client binding) that aren't
+	// visible from the config shape alone.
+	//nolint:lll // field tags require full JSON+YAML names
+	TrustedIssuers []tokenexchange.TrustedIssuer `json:"trusted_issuers,omitempty" yaml:"trusted_issuers,omitempty"`
 }
 
 // Validate checks that the on-disk RunConfig is internally consistent. Called
@@ -122,6 +149,16 @@ func (c *RunConfig) Validate() error {
 		if err := c.CIMD.Validate(); err != nil {
 			return fmt.Errorf("cimd: %w", err)
 		}
+	}
+	// Also checked by Config.Validate() (same reasoning as
+	// validateBaselineClientScopes below): buildUpstreamConfigs performs live
+	// RFC 7591 registration against upstream IdPs before authserver.New ever
+	// reaches Config.Validate(), so a malformed trusted-issuer config must
+	// fail here, before that side-effecting work runs — not on a crash loop
+	// after it, which would also orphan an upstream registration on every
+	// restart with the default in-memory DCR store.
+	if err := validateTrustedIssuers(c.TrustedIssuers, c.Issuer); err != nil {
+		return err
 	}
 	return c.validateBaselineClientScopes()
 }
@@ -394,10 +431,14 @@ type OAuth2UpstreamRunConfig struct {
 	DCRConfig *DCRUpstreamConfig `json:"dcr_config,omitempty" yaml:"dcr_config,omitempty"`
 
 	// AllowPrivateIPs permits the upstream provider's HTTP client to connect to
-	// private IP ranges (RFC-1918, link-local). Use only when the upstream is
-	// hosted inside the same cluster and has no public endpoint. HTTP-scheme
-	// restrictions are unchanged — HTTPS is still required for non-localhost hosts.
-	// Defaults to false.
+	// private IP ranges (RFC-1918, link-local). When DCRConfig is set, this
+	// also gates the DCR discovery and registration calls made on this
+	// upstream's behalf (see pkg/authserver/runner/dcr_adapter.go), so a
+	// single flag covers the whole upstream rather than needing a separate
+	// DCR-specific setting. Use only when the upstream is hosted inside the
+	// same cluster and has no public endpoint. HTTP-scheme restrictions are
+	// unchanged — HTTPS is still required for non-localhost hosts. Defaults
+	// to false.
 	AllowPrivateIPs bool `json:"allow_private_ips,omitempty" yaml:"allow_private_ips,omitempty"`
 
 	// InsecureAllowHTTP permits plain-HTTP authorization and token endpoint URLs
@@ -612,6 +653,11 @@ type Config struct {
 	// If zero, defaults to 10 minutes.
 	AuthCodeLifespan time.Duration
 
+	// DelegationTokenLifespan is the maximum lifetime for delegated tokens issued
+	// via RFC 8693 token exchange. The actual lifetime is the minimum of this value
+	// and the subject token's remaining lifetime. If zero, defaults to 15 minutes.
+	DelegationTokenLifespan time.Duration
+
 	// Upstreams contains configurations for connecting to upstream IDPs.
 	// At least one upstream is required - the server delegates authentication to the upstream IDP.
 	// Multiple upstreams form a sequential authorization chain.
@@ -670,6 +716,13 @@ type Config struct {
 	// Only set this for in-cluster Kubernetes deployments on a trusted network.
 	// Production deployments reachable outside the cluster MUST use https://.
 	InsecureAllowHTTP bool
+
+	// TrustedIssuers lists external OIDC issuers whose tokens are accepted as
+	// subject tokens during RFC 8693 token exchange. See the identically
+	// named field on RunConfig for the full doc comment, including the
+	// fail-closed AllowedActors semantics and the audience/scope constraints
+	// operators must account for.
+	TrustedIssuers []tokenexchange.TrustedIssuer
 }
 
 // Validate checks that the Config is valid.
@@ -726,18 +779,154 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if c.CIMDEnabled && c.CIMDCacheMaxSize < 1 {
-		return fmt.Errorf("cimd.cache_max_size must be >= 1 when CIMD is enabled")
+	if err := c.validateCIMDBounds(); err != nil {
+		return err
 	}
-	if c.CIMDEnabled && c.CIMDCacheFallbackTTL < 0 {
-		return fmt.Errorf("cimd.cache_fallback_ttl must be non-negative when CIMD is enabled")
+
+	if err := c.validateDelegationTokenLifespan(); err != nil {
+		return err
 	}
+
+	// RunConfig.Validate() also runs this (see the comment there for why:
+	// buildUpstreamConfigs's live DCR registration happens before this method
+	// is reached), but a caller that constructs Config directly bypasses that,
+	// same as the BaselineClientScopes check above.
+	if err := validateTrustedIssuers(c.TrustedIssuers, c.Issuer); err != nil {
+		return err
+	}
+	c.warnTrustedIssuerAudiences()
 
 	slog.Debug("authserver config validation passed",
 		"issuer", c.Issuer,
 		"upstream_count", len(c.Upstreams),
 	)
 	return nil
+}
+
+// validateCIMDBounds rejects invalid CIMD cache bounds when CIMD is enabled.
+// When CIMD is disabled the cache fields are ignored.
+func (c *Config) validateCIMDBounds() error {
+	if !c.CIMDEnabled {
+		return nil
+	}
+	if c.CIMDCacheMaxSize < 1 {
+		return fmt.Errorf("cimd.cache_max_size must be >= 1 when CIMD is enabled")
+	}
+	if c.CIMDCacheFallbackTTL < 0 {
+		return fmt.Errorf("cimd.cache_fallback_ttl must be non-negative when CIMD is enabled")
+	}
+	return nil
+}
+
+// validateDelegationTokenLifespan rejects negative or excessively long delegation
+// token lifespans. Capped at oauthserver.MaxAccessTokenLifespan (the same ceiling
+// the token-exchange Factory enforces) so validation and construction agree on a
+// single source of truth — delegated tokens should be short-lived. Zero is
+// accepted; applyDefaults substitutes the default.
+func (c *Config) validateDelegationTokenLifespan() error {
+	if c.DelegationTokenLifespan < 0 {
+		return fmt.Errorf("delegation token lifespan must not be negative")
+	}
+	if c.DelegationTokenLifespan > oauthserver.MaxAccessTokenLifespan {
+		return fmt.Errorf("delegation token lifespan must not exceed %v", oauthserver.MaxAccessTokenLifespan)
+	}
+	return nil
+}
+
+// validateTrustedIssuers checks every configured TrustedIssuer as early as
+// RunConfig.Validate can catch it, so a bad actor_claim or duplicate
+// issuer_url fails before buildUpstreamConfigs performs live RFC 7591
+// registration against upstream IdPs — not after it, on a crash loop that
+// orphans an upstream registration on every restart. Shared by
+// RunConfig.Validate() and Config.Validate() (mirrors
+// validateBaselineClientScopes); NewMultiIssuerTokenValidator repeats these
+// checks again at server startup as defence in depth.
+//
+// issuer_url is checked by validateTrustedIssuerURL, jwks_url (when set) by
+// validateJWKSEndpointURL — see their doc comments for the URL rules each
+// enforces. The remaining structural checks (required fields, self-issuer
+// collision, duplicate issuers, ActorClaim reachability) run via
+// tokenexchange.ValidateTrustedIssuers.
+func validateTrustedIssuers(issuers []tokenexchange.TrustedIssuer, selfIssuer string) error {
+	for _, ti := range issuers {
+		if err := validateTrustedIssuerURL(ti.IssuerURL, ti.InsecureAllowHTTP); err != nil {
+			return fmt.Errorf("trusted_issuers: issuer_url %q: %w", ti.IssuerURL, err)
+		}
+		// AllowPrivateIPs without a hand-configured jwks_url would let OIDC
+		// discovery — a document fetched from, and thus influenceable by,
+		// the external issuer itself — choose the private target the dial
+		// is allowed to reach. Requiring jwks_url pins that target to
+		// operator-supplied config instead.
+		//
+		// This is the fail-fast layer, not the only one: validateTrustedIssuer
+		// (multi_issuer_validator.go) enforces the same invariant inside
+		// NewMultiIssuerTokenValidator, so a caller constructing a validator
+		// without routing through Config.Validate is still covered. Note that
+		// ensureRegistered's ValidateJWKSURL does NOT cover it — that check is
+		// gated on net.ParseIP, so it only rejects private IP *literals*, and a
+		// discovery document advertising a private *hostname* passes it
+		// cleanly. Checking here and in the constructor is deliberate
+		// duplication, not redundancy.
+		if ti.AllowPrivateIPs && ti.JWKSURL == "" {
+			return fmt.Errorf(
+				"trusted_issuers: issuer_url %q: allow_private_ips requires jwks_url to be set explicitly; "+
+					"otherwise OIDC discovery — fetched from the external issuer — would choose the private target",
+				ti.IssuerURL)
+		}
+		if ti.JWKSURL != "" {
+			if err := validateJWKSEndpointURL(ti.JWKSURL, ti.InsecureAllowHTTP, ti.AllowPrivateIPs); err != nil {
+				return fmt.Errorf("trusted_issuers: jwks_url %q: %w", ti.JWKSURL, err)
+			}
+		}
+	}
+	if err := tokenexchange.ValidateTrustedIssuers(issuers, selfIssuer); err != nil {
+		return fmt.Errorf("trusted_issuers: %w", err)
+	}
+	return nil
+}
+
+// validateJWKSEndpointURL checks that rawURL parses, has a host, uses the
+// "https" scheme (or "http" when insecureAllowHTTP is set), and — when the
+// host is an IP literal — is not a private or loopback address unless
+// allowPrivateIPs permits it. Unlike validateIssuerURL, it does not enforce
+// OIDC issuer-identifier rules (no query/fragment/trailing-slash) since a
+// JWKS endpoint legitimately carries those.
+//
+// Delegates to tokenexchange.ValidateJWKSURL, the same predicate the runtime
+// choke point (ensureRegistered, called on every JWKS fetch) enforces — the two
+// were previously separate implementations that had drifted apart (a
+// runtime check laxer than this one would silently defeat this config-time
+// guard), so this is now the single source of truth for both.
+//
+// Deliberately not networking.ValidateEndpointURL /
+// ValidateEndpointURLWithInsecure: both also honor the
+// INSECURE_DISABLE_URL_VALIDATION environment variable, which would let an
+// unrelated env var silently disable this SSRF-relevant scheme check; the
+// insecure variant also skips the parse/host check entirely rather than
+// only relaxing the scheme. This helper takes its "insecure" bits solely
+// from the issuer's own explicit InsecureAllowHTTP/AllowPrivateIPs fields.
+func validateJWKSEndpointURL(rawURL string, insecureAllowHTTP, allowPrivateIPs bool) error {
+	return tokenexchange.ValidateJWKSURL(rawURL, insecureAllowHTTP, allowPrivateIPs)
+}
+
+// warnTrustedIssuerAudiences logs a warning for each TrustedIssuer whose
+// ExpectedAudience is absent from AllowedAudiences. This is not a hard
+// error: a subject token may carry additional audiences beyond
+// ExpectedAudience, so the mismatch is sufficient-but-not-necessary for
+// every exchange from that issuer to fail — an operator may know a specific
+// subject token will present a matching aud even though ExpectedAudience
+// itself is not in AllowedAudiences. But when it's not intentional, this is
+// the invalid_target footgun documented on the TrustedIssuers field: warn so
+// it surfaces at startup instead of at the first exchange attempt.
+func (c *Config) warnTrustedIssuerAudiences() {
+	for _, ti := range c.TrustedIssuers {
+		if !slices.Contains(c.AllowedAudiences, ti.ExpectedAudience) {
+			slog.Warn("trusted issuer's expected_audience is not in allowed_audiences; "+
+				"token exchange will fail with invalid_target unless subject tokens from it "+
+				"carry an additional audience matching one",
+				"issuer", ti.IssuerURL, "expected_audience", ti.ExpectedAudience)
+		}
+	}
 }
 
 // Validate checks that the OAuth2UpstreamRunConfig is internally consistent.
@@ -957,6 +1146,10 @@ func (c *Config) applyDefaults() error {
 		c.AuthCodeLifespan = 10 * time.Minute
 		slog.Debug("applied default auth code lifespan", "duration", c.AuthCodeLifespan)
 	}
+	if c.DelegationTokenLifespan == 0 {
+		c.DelegationTokenLifespan = 15 * time.Minute
+		slog.Debug("applied default delegation token lifespan", "duration", c.DelegationTokenLifespan)
+	}
 	if c.HMACSecrets == nil {
 		secret := make([]byte, servercrypto.MinSecretLength)
 		if _, err := rand.Read(secret); err != nil {
@@ -991,7 +1184,45 @@ func (c *Config) applyDefaults() error {
 // MUST use the "https" scheme, except for localhost during development.
 // When insecureAllowHTTP is true, http:// is also permitted for non-localhost
 // hosts (for in-cluster Kubernetes deployments on trusted networks).
+//
+// This server's own issuer is additionally held to a no-trailing-slash rule
+// that OIDC itself does not require (see validateIssuerURLCore's
+// allowTrailingSlash parameter) — defensible here only because we control
+// this value, unlike a trusted external issuer (validateTrustedIssuerURL).
 func validateIssuerURL(issuer string, insecureAllowHTTP bool) error {
+	return validateIssuerURLCore(issuer, insecureAllowHTTP, true, false)
+}
+
+// validateTrustedIssuerURL is like validateIssuerURL but never exempts
+// localhost from the HTTPS requirement: a trusted external issuer is not
+// this server's own issuer, so it must not inherit the same-host
+// development convenience validateIssuerURL grants the server's own issuer
+// and AuthorizationEndpointBaseURL. Without this, "issuer_url:
+// http://localhost:9000" with insecure_allow_http: false would pass config
+// validation here yet fail at runtime, since the per-issuer HTTP client is
+// still built with InsecureAllowHTTP=false (see NewMultiIssuerTokenValidator)
+// — jwks_url has no such exemption, so the two would otherwise disagree.
+//
+// Unlike validateIssuerURL, a trailing slash is accepted: OIDC Discovery §3
+// forbids query and fragment components on an issuer identifier, but not a
+// trailing slash — §4.1 only requires one be trimmed before the well-known
+// discovery path is appended, which presupposes a trailing-slash issuer is
+// legal in the first place, and §4.3 requires the discovery document's
+// "issuer" to match the token's "iss" verbatim. Microsoft Entra ID v1 — the
+// default for a newly registered API — issues
+// "iss": "https://sts.windows.net/{tenant}/" with a trailing slash, so
+// rejecting it here would make v1 tokens impossible to configure at all.
+func validateTrustedIssuerURL(issuer string, insecureAllowHTTP bool) error {
+	return validateIssuerURLCore(issuer, insecureAllowHTTP, false, true)
+}
+
+// validateIssuerURLCore is the shared implementation behind validateIssuerURL
+// and validateTrustedIssuerURL. localhostExempt controls whether a loopback
+// host is treated as HTTPS-exempt regardless of insecureAllowHTTP.
+// allowTrailingSlash controls whether a trailing slash on the issuer is
+// accepted — see validateTrustedIssuerURL's doc comment for why the trusted-
+// issuer path must allow it while this server's own issuer does not.
+func validateIssuerURLCore(issuer string, insecureAllowHTTP, localhostExempt, allowTrailingSlash bool) error {
 	if issuer == "" {
 		return fmt.Errorf("issuer is required")
 	}
@@ -1016,20 +1247,34 @@ func validateIssuerURL(issuer string, insecureAllowHTTP bool) error {
 	if parsed.Fragment != "" {
 		return fmt.Errorf("must not contain fragment component")
 	}
+	// Userinfo is rejected on two independent grounds. It cannot work: OIDC
+	// Discovery 1.0 Section 4.3 compares the discovery document's "issuer"
+	// against this value by exact string match, and no provider echoes back
+	// embedded credentials, so such an issuer always fails discovery. And it
+	// must not be stored: a password here would sit in the RunConfig and be
+	// echoed by the validation errors and startup warnings that quote the
+	// issuer URL. Rejecting it outright beats redacting it at every use.
+	// Note that parsed.User is non-nil even for "https://user@host" with no
+	// password, which is equally unusable as an issuer identifier.
+	if parsed.User != nil {
+		return fmt.Errorf("must not contain userinfo (credentials in the URL)")
+	}
 
-	// HTTPS is required unless it's a loopback address (for development) or
-	// insecureAllowHTTP is explicitly set for trusted in-cluster deployments.
+	// HTTPS is required unless it's a loopback address (for development, and
+	// only when localhostExempt) or insecureAllowHTTP is explicitly set.
 	if parsed.Scheme != "https" {
 		if parsed.Scheme != "http" {
 			return fmt.Errorf("scheme must be https (or http for localhost)")
 		}
-		if !networking.IsLocalhost(parsed.Host) && !insecureAllowHTTP {
+		if !insecureAllowHTTP && (!localhostExempt || !networking.IsLocalhost(parsed.Host)) {
 			return fmt.Errorf("http scheme is only allowed for localhost, use https for %s", parsed.Hostname())
 		}
 	}
 
-	// Issuer must not have trailing slash per OIDC spec
-	if strings.HasSuffix(issuer, "/") {
+	// Not an OIDC requirement — see validateTrustedIssuerURL's doc comment.
+	// ToolHive's own issuer is held to this stricter, self-imposed rule
+	// since we control the value; a trusted external issuer is not.
+	if !allowTrailingSlash && strings.HasSuffix(issuer, "/") {
 		return fmt.Errorf("must not have trailing slash")
 	}
 
