@@ -69,6 +69,10 @@ type WorkflowDefinition struct {
 	// If nil, the workflow returns the last step's output (backward compatible).
 	Output *config.OutputConfig
 
+	// Annotations declares MCP tool annotations for the composite tool.
+	// If nil, annotations are derived from the step tools at advertise time.
+	Annotations *config.ToolAnnotationsOverride
+
 	// Metadata stores additional workflow information.
 	Metadata map[string]string
 }
@@ -428,7 +432,7 @@ type WorkflowStateStore interface {
 // ElicitationProtocolHandler handles MCP elicitation protocol interactions.
 //
 // This interface provides an SDK-agnostic abstraction for elicitation requests,
-// enabling migration from mark3labs SDK to official SDK without changing workflow code.
+// enabling migration from mcpcompat SDK to official SDK without changing workflow code.
 //
 // Per MCP 2025-06-18 spec: Elicitation is a synchronous request/response protocol
 // where the server sends a request and blocks until the client responds.

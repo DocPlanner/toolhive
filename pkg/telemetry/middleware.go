@@ -15,7 +15,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mark3labs/mcp-go/mcp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -23,6 +22,8 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/stacklok/toolhive-core/mcpcompat/mcp"
+	"github.com/stacklok/toolhive-core/telemetry/metrics"
 	mcpparser "github.com/stacklok/toolhive/pkg/mcp"
 	"github.com/stacklok/toolhive/pkg/transport/types"
 )
@@ -41,7 +42,7 @@ const (
 // MCPHistogramBuckets are the bucket boundaries defined by the MCP OTEL semantic conventions
 // for MCP server histograms (e.g. mcp.server.operation.duration).
 // See https://github.com/open-telemetry/semantic-conventions/blob/main/docs/gen-ai/mcp.md
-var MCPHistogramBuckets = []float64{0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 30, 60, 120, 300}
+var MCPHistogramBuckets = metrics.BucketsMCPSemconv()
 
 // HTTPMiddleware provides OpenTelemetry instrumentation for HTTP requests.
 type HTTPMiddleware struct {
@@ -396,7 +397,16 @@ func (*HTTPMiddleware) addNetworkAttributes(span trace.Span, r *http.Request, ba
 }
 
 // addMethodSpecificAttributes adds attributes specific to certain MCP methods.
+// Despite the name, the mcp.client.name block below runs for every method: under
+// the Modern (stateless) MCP revision there is no initialize request, so per-request
+// _meta.clientInfo is the only source of client attribution. It is a no-op for
+// Legacy requests, which carry no _meta.clientInfo and still get mcp.client.name
+// from the "initialize" case below.
 func (m *HTTPMiddleware) addMethodSpecificAttributes(span trace.Span, parsedMCP *mcpparser.ParsedMCPRequest) {
+	if name, ok := parsedMCP.ClientInfo["name"].(string); ok && name != "" {
+		span.SetAttributes(attribute.String("mcp.client.name", name))
+	}
+
 	switch parsedMCP.Method {
 	case string(mcp.MethodToolsCall):
 		// New gen_ai namespace attributes (always emitted)

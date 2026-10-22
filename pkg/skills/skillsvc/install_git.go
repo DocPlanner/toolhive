@@ -22,7 +22,7 @@ import (
 // same-commit no-op and upgrade detection.
 func (s *service) installFromGit(
 	ctx context.Context,
-	opts skills.InstallOptions,
+	opts *skills.InstallOptions,
 	scope skills.Scope,
 ) (*skills.InstallResult, error) {
 	if s.gitResolver == nil {
@@ -70,6 +70,7 @@ func (s *service) installFromGit(
 	opts.Name = resolved.SkillConfig.Name
 	opts.Reference = gitURL
 	opts.Digest = resolved.CommitHash
+
 	if opts.Version == "" && resolved.SkillConfig.Version != "" {
 		opts.Version = resolved.SkillConfig.Version
 	}
@@ -77,12 +78,25 @@ func (s *service) installFromGit(
 	unlock := s.locks.lock(opts.Name, scope, opts.ProjectRoot)
 	defer unlock()
 
-	clientTypes, clientDirs, err := s.resolveAndValidateClients(opts, opts.Name, scope, opts.ProjectRoot)
+	// Verify the commit signature before anything is written or recorded.
+	// This runs under the per-skill lock so concurrent first installs
+	// cannot both read an absent lock entry and race their TOFU anchors.
+	if shouldVerifyInstall(*opts, scope) {
+		decision, verifyErr := s.verifyGitInstall(
+			ctx, *opts, resolved.SkillConfig.Name, resolved.CommitPayload, resolved.CommitSignature,
+		)
+		if verifyErr != nil {
+			return nil, verifyErr
+		}
+		applyDecisionToOpts(opts, decision)
+	}
+
+	clientTypes, clientDirs, err := s.resolveAndValidateClients(*opts, opts.Name, scope, opts.ProjectRoot)
 	if err != nil {
 		return nil, err
 	}
 
-	return s.applyGitInstall(ctx, opts, scope, clientTypes, clientDirs, resolved.Files)
+	return s.applyGitInstall(ctx, *opts, scope, clientTypes, clientDirs, resolved.Files)
 }
 
 // applyGitInstall handles the create/upgrade/no-op logic for a git-based skill
@@ -102,7 +116,15 @@ func (s *service) applyGitInstall(
 		return nil, fmt.Errorf("checking existing skill: %w", storeErr)
 	}
 	if !isNotFound {
-		return s.applyGitInstallExisting(ctx, opts, scope, existing, clientTypes, clientDirs, files)
+		result, err := s.applyGitInstallExisting(ctx, opts, scope, existing, clientTypes, clientDirs, files)
+		if err == nil {
+			// Preserve the pre-install record so a later rollback (e.g. a
+			// failed dependency materialization) can restore it rather than
+			// delete it.
+			pre := existing
+			result.PreExisting = &pre
+		}
+		return result, err
 	}
 	return s.applyGitInstallFresh(ctx, opts, scope, clientTypes, clientDirs, files)
 }
@@ -116,7 +138,11 @@ func (s *service) applyGitInstallExisting(
 	clientDirs map[string]string,
 	files []gitresolver.FileEntry,
 ) (*skills.InstallResult, error) {
-	if existing.Digest != opts.Digest {
+	// SyncRestore forces the same full re-extraction path as a digest
+	// change: sync repairs on-disk drift that happened without the pinned
+	// digest changing, so the "same digest means content is already
+	// correct" no-op/skip branches below must not apply.
+	if existing.Digest != opts.Digest || opts.SyncRestore {
 		allClients, allDirs, err := s.expandToExistingClients(
 			existing.Clients, clientTypes, clientDirs, opts.Name, scope, opts.ProjectRoot)
 		if err != nil {

@@ -89,7 +89,7 @@ func TestWithRequestTimeouts_CutsSlowBackendCall(t *testing.T) {
 	}
 
 	start := time.Now()
-	_, err = bc.CallTool(t.Context(), target, "any", nil, nil)
+	_, err = bc.CallTool(t.Context(), target, "any", nil, nil, nil)
 	require.Error(t, err)
 	assert.Less(t, time.Since(start), 10*time.Second, "call must end at the per-workload timeout")
 }

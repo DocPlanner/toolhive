@@ -8,24 +8,22 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
-
 	"github.com/stacklok/toolhive/pkg/vmcp"
 	"github.com/stacklok/toolhive/pkg/vmcp/health"
+	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
 )
 
-// This file refreshes the tools and resources of the sessions registered on this
-// pod when the set of exposed backends changes. Each session's tool and resource
-// store is filled once (at registration or by lazy injection), so without a
-// refresh a session keeps the tool set it saw first. A refresh clears the stores
-// and sends list_changed; the next tools/list or resources/list fills them again
-// from the core with the live request identity (lazyInjectSessionTools /
-// lazyInjectSessionResources).
+// This file refreshes the capabilities of the sessions registered on this pod
+// when the set of exposed backends changes (a backend's health crosses the
+// advertise boundary, or a dynamic registry adds or removes a backend). Upstream
+// resyncs a session only when a connected backend sends list_changed
+// (serve_list_changed.go); a backend that comes back or joins the group sends
+// nothing, so without this a session keeps the capabilities it saw first.
 //
-// Scope: only sessions registered on this pod (activeClientSessions) are
-// refreshed, as they are the only ones that can hold a listen stream here. Every
-// pod runs its own health monitor and refreshes its own sessions.
+// A refresh triggers each session's list_changed sink for tools, resources and
+// prompts, the same coalesced resync a backend notification starts. Scope: only
+// sessions registered on this pod (refreshSinks). Every pod runs its own health
+// monitor and refreshes its own sessions.
 
 const (
 	// registryVersionCheckInterval is how often a dynamic backend registry is
@@ -59,10 +57,10 @@ func (s *Server) startCapabilityRefresh() func(context.Context) error {
 }
 
 // scheduleOnExposureChange schedules a refresh when a backend crosses the
-// exposure boundary (see health.IsStatusEligibleForExposure).
+// advertise boundary (see health.ShouldAdvertise).
 func scheduleOnExposureChange(sched *refreshScheduler, event health.StatusChangeEvent) {
-	wasEligible := health.IsStatusEligibleForExposure(event.PreviousStatus)
-	isEligible := health.IsStatusEligibleForExposure(event.Status)
+	wasEligible := health.ShouldAdvertise(event.PreviousStatus)
+	isEligible := health.ShouldAdvertise(event.Status)
 	if wasEligible == isEligible {
 		return
 	}
@@ -96,31 +94,28 @@ func watchRegistryVersion(
 	}
 }
 
-// refreshSessionCapabilities clears the tool and resource store of every session
-// registered on this pod and tells its client to list them again. It is the
-// refreshScheduler run function; the mode is only logged, because each store is
-// refilled from the core, which already reflects the change.
+// refreshSessionCapabilities triggers the list_changed sink of every session
+// registered on this pod, and drops the sinks of sessions that ended. It is the
+// refreshScheduler run function; the mode is only logged, because each resync
+// re-derives the set from the core, which already reflects the change.
 func (s *Server) refreshSessionCapabilities(trigger string, mode refreshTargetMode) {
+	ctx := context.Background()
 	refreshed := 0
-	for _, sess := range s.activeClientSessions.snapshot() {
-		sessionID := sess.SessionID()
-		if withTools, ok := sess.(server.SessionWithTools); ok {
-			withTools.SetSessionTools(nil)
-			s.notifySession(sessionID, mcp.MethodNotificationToolsListChanged)
+	s.refreshSinks.Range(func(key, value any) bool {
+		sessionID, _ := key.(string)
+		sink, _ := value.(vmcpsession.ListChangedSink)
+		if terminated, err := s.vmcpSessionMgr.Validate(sessionID); terminated || err != nil || sink == nil {
+			s.refreshSinks.Delete(sessionID)
+			return true
 		}
-		if withResources, ok := sess.(server.SessionWithResources); ok {
-			withResources.SetSessionResources(nil)
-			s.notifySession(sessionID, mcp.MethodNotificationResourcesListChanged)
+		for _, kind := range []vmcpsession.ChangeKind{
+			vmcpsession.KindTools, vmcpsession.KindResources, vmcpsession.KindPrompts,
+		} {
+			sink(ctx, trigger, kind)
 		}
 		refreshed++
-	}
+		return true
+	})
 	slog.Info("refreshed session capabilities after backend change",
 		"trigger", trigger, "mode", mode.String(), "session_count", refreshed)
-}
-
-func (s *Server) notifySession(sessionID, method string) {
-	if err := s.mcpServer.SendNotificationToSpecificClient(sessionID, method, nil); err != nil {
-		slog.Debug("failed to send list_changed notification",
-			"session_id", sessionID, "method", method, "error", err)
-	}
 }

@@ -33,6 +33,7 @@ import (
 	"github.com/stacklok/toolhive/pkg/bodylimit"
 	rt "github.com/stacklok/toolhive/pkg/container/runtime"
 	"github.com/stacklok/toolhive/pkg/healthcheck"
+	"github.com/stacklok/toolhive/pkg/mcp"
 	"github.com/stacklok/toolhive/pkg/transport/proxy/socket"
 	"github.com/stacklok/toolhive/pkg/transport/session"
 	"github.com/stacklok/toolhive/pkg/transport/types"
@@ -267,7 +268,7 @@ func WithRemoteRawQuery(rawQuery string) Option {
 }
 
 // WithStateless configures the proxy for stateless streamable-HTTP servers.
-// In stateless mode, incoming GET and DELETE requests receive 405 Method Not Allowed
+// In stateless mode, incoming GET, HEAD, and DELETE requests receive 405 Method Not Allowed
 // instead of being forwarded, and health checks use POST ping instead of GET.
 func WithStateless() Option {
 	return func(p *TransparentProxy) {
@@ -540,6 +541,14 @@ type tracingTransport struct {
 	recovery *backendRecovery
 }
 
+// targetHost returns the host of the configured target URI, or "" if it has none.
+func (t *tracingTransport) targetHost() string {
+	if u, err := url.Parse(t.p.targetURI); err == nil {
+		return u.Host
+	}
+	return ""
+}
+
 func newTracingTransport(base http.RoundTripper, p *TransparentProxy) *tracingTransport {
 	return &tracingTransport{
 		p: p,
@@ -565,11 +574,11 @@ func (p *TransparentProxy) serverInitialized() bool {
 
 // nolint:gocyclo // This function handles multiple request types and is complex by design
 func (t *tracingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	// Keep any Host value set by ReverseProxy.SetURL. The request URL host can
-	// be changed later to a routing-only backend_url (for example a Kubernetes
-	// ClusterIP/pod IP); strict backend host validation must still see the
-	// logical target host, not that routing address.
-	if req.Host == "" {
+	// Rewrite the Host header to the URL host, so an injected Host never reaches the
+	// backend, except for the configured target host: backend_url can change the URL
+	// host to a routing-only pod IP, and strict backend host validation must still
+	// see the logical target host.
+	if req.Host != req.URL.Host && req.Host != t.targetHost() {
 		req.Host = req.URL.Host
 	}
 
@@ -588,17 +597,50 @@ func (t *tracingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		return plainResponse(req, http.StatusRequestEntityTooLarge, "Request Entity Too Large"), nil
 	}
 
+	// Reject JSON-RPC batches before forwarding to the backend. This runs
+	// independently of Content-Type (unlike ParsingMiddleware), so a batch
+	// smuggled under a non-JSON content type cannot reach the backend where its
+	// nested calls would bypass authz/audit/tool-filtering. Batching was removed
+	// in MCP revision 2025-06-18; ToolHive serves only 2025-11-25 and 2026-07-28
+	// (see #5745).
+	if mcp.IsBatchRequest(reqBody) {
+		return mcp.BatchUnsupportedResponse(req), nil
+	}
+
 	// thv proxy does not provide the transport type, so we need to detect it from the request
 	path := req.URL.Path
 	isMCP := strings.HasPrefix(path, "/mcp")
 	isJSON := strings.Contains(req.Header.Get("Content-Type"), "application/json")
 	sawInitialize := false
+	revision := mcp.RevisionLegacy
+	// requestID carries the incoming JSON-RPC id so an error response built below
+	// can echo it, letting a client correlate the error with its request. It is set
+	// only when parseRPCRequest reports a single request, which by construction
+	// means the id is present and non-null; it stays nil for a notification, a
+	// batch, or a bodiless GET/DELETE. session.NotFoundResponse (via NotFoundBody)
+	// omits the "id" key entirely for a nil requestID rather than emitting a null
+	// id — MCP narrows base JSON-RPC to make that omission the correct encoding
+	// of "no id" (see session.HasJSONRPCID).
+	var requestID any
 
 	if len(reqBody) > 0 &&
 		((isMCP && isJSON) ||
 			t.p.transportType == types.TransportTypeStreamableHTTP.String()) {
-		sawInitialize = t.detectInitialize(reqBody)
+		method, params, id, singleRequest, isInit := t.parseRPCRequest(reqBody)
+		sawInitialize = isInit
+		if singleRequest {
+			requestID = id
+			meta := mcp.ExtractMeta(params)
+			rev, cerr := mcp.ClassifyRevision(method, meta, req.Header.Get("MCP-Protocol-Version"))
+			if cerr != nil {
+				// Malformed Modern request: reject before the backend is ever contacted.
+				return mcp.ClassificationErrorResponse(req, id, cerr), nil
+			}
+			revision = rev
+		}
 	}
+	//nolint:gosec // G706: logging target URI from config
+	slog.Debug("classified request revision", "modern", revision == mcp.RevisionModern, "target", t.p.targetURI)
 
 	// Guard: reject non-initialize requests with unknown session IDs.
 	// When multiple proxyrunner replicas share a Redis session store,
@@ -611,20 +653,35 @@ func (t *tracingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 				slog.Error("session store lookup failed", "error", err)
 				return plainResponse(req, http.StatusServiceUnavailable, "session store unavailable"), nil
 			}
-			return session.NotFoundResponse(req), nil
+			return session.NotFoundResponse(req, requestID), nil
 		}
 	}
 
-	// Capture the client-facing session ID before the backend SID rewrite below.
-	// Recovery and session cleanup paths must look up sessions by the client SID
-	// (the store key), not the backend SID that is written into the header.
+	// Capture the client-facing session ID before the header is rewritten or
+	// stripped below. Recovery and session cleanup paths must look up sessions by
+	// the client SID (the store key), not the backend SID that is written into the
+	// header.
 	clientSID := req.Header.Get("Mcp-Session-Id")
 
-	// Rewrite the outbound Mcp-Session-Id to the backend's assigned session ID when
-	// the proxy transparently re-initialized the backend session. This is done here
-	// (after the guard check above) so the guard always sees the original client
-	// session ID and can look it up correctly in the session store.
-	if clientSID != "" {
+	switch {
+	case sawInitialize:
+		// An initialize request must never carry a session ID. MCP requires a
+		// client that is re-initializing to "start a new session by sending a new
+		// InitializeRequest without a session ID attached", and a backend session
+		// that has already completed its handshake rejects a second initialize on
+		// it -- go-sdk v1.7+ answers `duplicate "initialize" received`. Forwarding
+		// the client's stale SID -- or, worse, the backend SID mapped from it --
+		// turns a client-side handshake retry into a hard failure. Strip it so the
+		// backend mints a fresh session instead; the response's Mcp-Session-Id is
+		// then adopted as a new session below. reinitializeAndReplay already does
+		// the same on the recovery path.
+		req.Header.Del("Mcp-Session-Id")
+	case clientSID != "":
+		// Rewrite the outbound Mcp-Session-Id to the backend's assigned session ID
+		// when the proxy transparently re-initialized the backend session. This is
+		// done here (after the guard check above) so the guard always sees the
+		// original client session ID and can look it up correctly in the session
+		// store.
 		if sess, ok := t.p.sessionManager.Get(normalizeSessionID(clientSID)); ok {
 			if backendSID, exists := sess.GetMetadataValue(sessionMetadataBackendSID); exists && backendSID != "" {
 				req.Header.Set("Mcp-Session-Id", backendSID)
@@ -654,10 +711,22 @@ func (t *tracingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		}
 		// Dial error against a stored pod IP means the pod has been replaced.
 		// Attempt transparent re-initialization so the client sees no error.
+		//
+		// An initialize request is excluded, as it already is on the 404 path
+		// below: reinitializeAndReplay sends its own initialize and then replays
+		// the original request, which for an initialize would hand the freshly
+		// created backend session a second handshake -- the very failure this
+		// function strips the session ID to avoid. The client is already starting
+		// a new session, so instead unpin it from the dead pod and let the error
+		// surface; the client's retry is then routed via the target service.
 		if isDialError(err) {
-			req.Header.Set("Mcp-Session-Id", clientSID)
-			if reInitResp, reInitErr := t.recovery.reinitializeAndReplay(req, reqBody); reInitResp != nil || reInitErr != nil {
-				return reInitResp, reInitErr
+			if sawInitialize {
+				t.recovery.unpinSession(clientSID)
+			} else {
+				req.Header.Set("Mcp-Session-Id", clientSID)
+				if reInitResp, reInitErr := t.recovery.reinitializeAndReplay(req, reqBody); reInitResp != nil || reInitErr != nil {
+					return reInitResp, reInitErr
+				}
 			}
 		}
 		slog.Error("failed to forward request", "error", err)
@@ -743,6 +812,14 @@ func (t *tracingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 			t.p.setServerInitialized()
 			return resp, nil
 		}
+
+		// Modern (2026-07-28, stateless) has no initialize handshake, so use the
+		// first successful (HTTP 200) Modern request as the readiness signal: it
+		// lets the background health monitor begin probing this backend, which
+		// otherwise never starts for a pure-Modern server. See #5831.
+		if revision == mcp.RevisionModern && !t.p.serverInitialized() {
+			t.p.setServerInitialized()
+		}
 	}
 
 	return resp, nil
@@ -756,14 +833,17 @@ func isBackendSessionLostResponse(resp *http.Response) bool {
 		return false
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	// Read only the start of the body (the error text is short); the client
+	// still gets the whole body.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(bytes.NewReader(body), resp.Body), resp.Body}
 	if err != nil {
 		slog.Debug("failed to inspect bad request response body for backend session loss", "error", err)
-		resp.Body = io.NopCloser(bytes.NewReader(nil))
 		return false
 	}
-	_ = resp.Body.Close()
-	resp.Body = io.NopCloser(bytes.NewReader(body))
 
 	lower := strings.ToLower(string(body))
 	// TypeScript SDK servers answer a sessionless request with "no valid session
@@ -811,36 +891,56 @@ func readRequestBody(req *http.Request) ([]byte, error) {
 	return reqBody, nil
 }
 
-func (t *tracingTransport) detectInitialize(body []byte) bool {
+// parseRPCRequest parses a POST body as a JSON-RPC request in a single pass.
+//
+// If the body is a single JSON-RPC object, method/params/id are populated
+// from it and singleRequest reports whether it is a real request (has both a
+// method and a valid, non-null id) as opposed to a notification (no id) or a
+// response-shaped body (no method) — either of which is not eligible for
+// mcp.ClassifyRevision. sawInitialize reports whether method == "initialize".
+//
+// If the body is not a single JSON object (e.g. a JSON-RPC batch), method,
+// params and id are zero and singleRequest is false: batches are never
+// classified. sawInitialize is still computed by scanning the batch for any
+// member whose method is "initialize", preserving prior behavior.
+func (t *tracingTransport) parseRPCRequest(
+	body []byte,
+) (method string, params, id json.RawMessage, singleRequest, sawInitialize bool) {
+	type rpcRequest struct {
+		Method string          `json:"method"`
+		Params json.RawMessage `json:"params"`
+		ID     json.RawMessage `json:"id"`
+	}
+
+	var single rpcRequest
+	if err := json.Unmarshal(body, &single); err == nil {
+		sawInitialize = single.Method == "initialize"
+		if sawInitialize {
+			//nolint:gosec // G706: logging target URI from config
+			slog.Debug("detected initialize method call", "target", t.p.targetURI)
+		}
+		singleRequest = single.Method != "" && len(single.ID) > 0 && string(single.ID) != "null"
+		return single.Method, single.Params, single.ID, singleRequest, sawInitialize
+	}
+
+	// JSON-RPC batch: array of objects. Only sawInitialize is computed; a
+	// batch is never eligible for revision classification.
 	type rpcMethod struct {
 		Method string `json:"method"`
 	}
-
-	// Single JSON-RPC object.
-	var single rpcMethod
-	if err := json.Unmarshal(body, &single); err == nil {
-		if single.Method == "initialize" {
-			//nolint:gosec // G706: logging target URI from config
-			slog.Debug("detected initialize method call", "target", t.p.targetURI)
-			return true
-		}
-		return false
-	}
-
-	// JSON-RPC batch: array of objects. Return true if any member is initialize.
 	var batch []rpcMethod
 	if err := json.Unmarshal(body, &batch); err != nil {
 		slog.Debug("failed to parse JSON-RPC body", "error", err)
-		return false
+		return "", nil, nil, false, false
 	}
 	for _, rpc := range batch {
 		if rpc.Method == "initialize" {
 			//nolint:gosec // G706: logging target URI from config
 			slog.Debug("detected initialize method call in batch", "target", t.p.targetURI)
-			return true
+			return "", nil, nil, false, true
 		}
 	}
-	return false
+	return "", nil, nil, false, false
 }
 
 // podBackendURL constructs a backend URL that targets the specific pod IP captured
@@ -959,6 +1059,29 @@ func isRedirectStatus(code int) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// unpinSession clears the backend_url pin on the session identified by
+// clientSID so the next request carrying it is routed to the target service
+// rather than to a pod address that is no longer reachable. It is a no-op for
+// an empty or unknown session ID.
+//
+// This is the same fallback reinitializeAndReplay applies when it has no stored
+// initialize body to replay, reused for the initialize case where issuing the
+// new handshake is the client's job, not the proxy's.
+func (r *backendRecovery) unpinSession(clientSID string) {
+	if clientSID == "" {
+		return
+	}
+	sess, ok := r.sessions.Get(normalizeSessionID(clientSID))
+	if !ok {
+		return
+	}
+	sess.SetMetadata(sessionMetadataBackendURL, r.targetURI)
+	if err := r.sessions.UpsertSession(sess); err != nil {
+		slog.Debug("failed to unpin session after dial error on initialize",
+			"session_id", clientSID, "error", err)
 	}
 }
 
@@ -1262,10 +1385,7 @@ func (p *TransparentProxy) Start(ctx context.Context) error {
 	// 5. Catch-all proxy handler (least specific - ServeMux routing handles precedence)
 	// Note: No manual path checking needed - ServeMux longest-match routing ensures
 	// more specific paths registered above take precedence over this catch-all.
-	// In stateless mode, wrap with a method gate that rejects GET/DELETE with 405.
-	if p.stateless {
-		finalHandler = statelessMethodGate(finalHandler)
-	}
+	finalHandler = p.methodGate(finalHandler)
 	mux.Handle("/", finalHandler)
 
 	// Use ListenConfig with SO_REUSEADDR to allow port reuse after unclean shutdown
@@ -1546,15 +1666,27 @@ func (*TransparentProxy) ForwardResponseToClients(_ context.Context, _ jsonrpc2.
 	return fmt.Errorf("ForwardResponseToClients not implemented for TransparentProxy")
 }
 
-// statelessMethodGate wraps a handler to reject GET, HEAD, and DELETE requests with 405.
-// Used in stateless mode where the server only supports POST.
-// HEAD is blocked alongside GET because HEAD is semantically a GET without a response body;
-// a server that cannot handle GET will not handle HEAD either.
-func statelessMethodGate(next http.Handler) http.Handler {
+// methodGate wraps a handler to reject GET, HEAD, and DELETE requests with 405
+// when the proxy is running stateless (--stateless) or the request is tagged
+// with the Modern (stateless-only) MCP-Protocol-Version: neither has any
+// protocol use for GET/HEAD/DELETE, since Modern is unary request/response
+// over POST only.
+//
+// This check runs outermost, before auth and any other middleware: a method
+// rejection needs no identity and reveals nothing auth-gated. It is
+// deliberately header-only and never reads or otherwise touches r.Body, so it
+// must not call mcp.ClassifyRevision (which requires a body) or consume the
+// body in any way — doing so would break the body for downstream handlers.
+//
+// HEAD is blocked alongside GET because HEAD is semantically a GET without a
+// response body; a server that cannot handle GET will not handle HEAD either.
+func (p *TransparentProxy) methodGate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodDelete {
+		isGateableMethod := r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodDelete
+		isModern := r.Header.Get("MCP-Protocol-Version") == mcp.MCPVersionModern
+		if isGateableMethod && (p.stateless || isModern) {
 			w.Header().Set("Allow", "POST, OPTIONS")
-			http.Error(w, "method not allowed: server is stateless (POST only)", http.StatusMethodNotAllowed)
+			http.Error(w, "method not allowed: server is stateless / stateless MCP revision (POST only)", http.StatusMethodNotAllowed)
 			return
 		}
 		next.ServeHTTP(w, r)

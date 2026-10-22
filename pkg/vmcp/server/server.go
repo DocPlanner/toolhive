@@ -19,11 +19,9 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/mark3labs/mcp-go/server"
-
+	"github.com/stacklok/toolhive-core/mcpcompat/server"
 	tcredis "github.com/stacklok/toolhive-core/redis"
 	"github.com/stacklok/toolhive/pkg/audit"
 	"github.com/stacklok/toolhive/pkg/auth"
@@ -95,12 +93,16 @@ const (
 	// per tool call; a short TTL collapses bursts of calls into ~one sweep while keeping
 	// staleness tighter than the legacy once-per-session refresh.
 	capabilityCacheTTL = 30 * time.Second
-
-	// defaultSessionRegistrationTimeout bounds the post-initialize session
-	// registration (opening backend connections and injecting capabilities),
-	// which runs detached from the initialize request's cancellation.
-	defaultSessionRegistrationTimeout = 45 * time.Second
 )
+
+// heartbeatInterval returns the configured heartbeat interval, or the default
+// when the configured value is zero or negative (unset or invalid).
+func heartbeatInterval(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultHeartbeatInterval
+	}
+	return d
+}
 
 //go:generate mockgen -destination=mocks/mock_watcher.go -package=mocks -source=server.go Watcher
 
@@ -142,6 +144,16 @@ type Config struct {
 	// defaultWriteTimeout are raised to it; larger values let configured backend
 	// request timeouts finish and leave time to write the MCP response.
 	WriteTimeout time.Duration
+	// HeartbeatInterval configures the SSE keep-alive ping interval on GET
+	// connections. When zero, the Handler defaults to defaultHeartbeatInterval (30s).
+	// Prevents proxies/load balancers from closing idle SSE connections.
+	//
+	// This is intentionally plumbed end-to-end (ServerConfig → Config → Handler →
+	// WithHeartbeatInterval) ahead of any CLI-flag or CRD wiring. No external entry
+	// point sets it yet, so in practice it is always the default unless an embedder
+	// assigns it programmatically; the plumbing exists so surfacing a flag/field
+	// later is a one-line change rather than a re-thread through the server.
+	HeartbeatInterval time.Duration
 
 	// AuthMiddleware is the optional authentication middleware to apply to MCP routes.
 	// If nil, no authentication is required.
@@ -268,6 +280,14 @@ type Server struct {
 	// server (BackendHealth keeps a defensive nil guard regardless).
 	core core.VMCP
 
+	// authzGateEnabled installs the pre-dispatch authorization CallGate in Handler.
+	// Authz is core-owned and stripped from the transport ServerConfig (see
+	// deriveServerConfig / buildServeConfig), so it never reaches s.config; New —
+	// the only composition path that knows the authz config — sets this flag from
+	// cfg.Authz != nil after Serve builds the Server. It stays false for direct-Serve
+	// callers, which have no way to configure authorization and run allow-all cores.
+	authzGateEnabled bool
+
 	// optimizerFactory builds a per-session optimizer over the core's advertised
 	// tools. Set only when the optimizer is enabled (nil otherwise). When non-nil,
 	// session registration advertises find_tool/
@@ -276,7 +296,7 @@ type Server struct {
 	// session manager; this is the resolved factory surfaced via Manager.OptimizerFactory.
 	optimizerFactory func(context.Context, []server.ServerTool) (optimizer.Optimizer, error)
 
-	// MCP protocol server (mark3labs/mcp-go)
+	// MCP protocol server (stacklok/toolhive-core/mcpcompat)
 	mcpServer *server.MCPServer
 
 	// HTTP server for Streamable HTTP transport
@@ -322,14 +342,19 @@ type Server struct {
 	// returns (or, for an embedded Handler, after the caller stops serving it).
 	shutdownFuncs []func(context.Context) error
 
-	// activeClientSessions holds the SDK sessions registered on this replica; it
-	// feeds the session cardinality gauges and selects the sessions a capability
-	// refresh clears (serve_refresh.go).
-	activeClientSessions clientSessionSet
+	// refreshSinks maps each session registered on this replica to its
+	// list_changed sink, so a backend health or registry change can resync the
+	// session's capabilities (serve_refresh.go). The next refresh drops the
+	// entries of sessions that ended.
+	refreshSinks sync.Map
 
-	// inFlightRegistrations counts session registrations currently running the
-	// post-initialize hook; it feeds the session cardinality gauges.
-	inFlightRegistrations atomic.Int64
+	// resyncBaseCtx is the server-lifetime parent context for asynchronous
+	// tools/resources/prompts list_changed resync work (#5748, #5969). It is
+	// cancelled by a shutdownFunc on Stop, so an in-flight backend
+	// re-aggregation triggered by a late notification cannot outlive the
+	// server. Set by Serve; nil for direct-Serve callers that never register a
+	// list_changed sink.
+	resyncBaseCtx context.Context
 }
 
 // buildSessionDataStorage constructs the DataStorage backend from cfg.
@@ -496,9 +521,21 @@ func New(
 		OptimizerFactory:  cfg.OptimizerFactory,
 		TelemetryProvider: cfg.TelemetryProvider,
 		AdvertiseFromCore: true,
-		// New sessions connect only to the backends the core's health monitor
-		// reports as eligible (nil when health monitoring is disabled).
-		HealthStatusProvider: coreVMCP.BackendHealth(),
+		// Gate new-session backend connects on health status (#5861). Without this a
+		// backend the monitor already knows is bad is still re-attempted by every new
+		// session, and session creation blocks on it — so one bad backend sets the
+		// floor for the whole tenant's initialize latency. BackendHealth() returns a
+		// true nil interface when monitoring is disabled, which the session manager
+		// reads as "attempt every backend" (the prior behaviour).
+		//
+		// A skipped backend's tools stay advertised and callable, but only because
+		// AdvertiseFromCore is set just above: tools/call then routes through
+		// core.CallTool over the core's aggregated view rather than the session's own
+		// routing table, which is built solely from backends that connected. The
+		// session does lose list_changed propagation for a skipped backend, partly
+		// offset by InvalidateCapabilityCache being global (serve_list_changed.go) —
+		// so any other backend's notification opportunistically sweeps in its changes.
+		BackendHealth: coreVMCP.BackendHealth(),
 		// Close cached sessions idle on this replica for a full session TTL.
 		IdleTTL: resolved.SessionTTL,
 	}
@@ -508,9 +545,29 @@ func New(
 		return nil, err
 	}
 
+	// Enable the pre-dispatch authorization gate when Cedar policies are configured.
+	// Authz is core-owned and not carried on the transport ServerConfig Serve builds
+	// from, so New — which holds cfg.Authz — sets the flag here (see Server.authzGateEnabled).
+	srv.authzGateEnabled = cfg.Authz != nil
+
 	// Bind the elicitation adapter to the SDK server Serve built so composite-workflow
 	// elicitation reaches the same mcp-go server that serves client traffic.
-	elicitation.bind(NewSDKElicitationAdapter(srv.MCPServer()))
+	elicitAdapter := NewSDKElicitationAdapter(srv.MCPServer())
+	elicitation.bind(elicitAdapter)
+
+	// Bind the server->client forwarders onto the concrete backend client so a
+	// backend's mid-call elicitation, sampling, and progress/logging traffic is
+	// relayed to the downstream client on the same session. This mirrors the
+	// elicitation late-binding above (the SDK adapters wrap the mcp-go server Serve
+	// just built, so they cannot exist before this point); a backend client that
+	// does not implement the binder simply does not forward server->client traffic.
+	if binder, ok := backendClient.(vmcp.ClientForwarderBinder); ok {
+		binder.BindForwarders(
+			elicitAdapter,
+			NewSDKSamplingAdapter(srv.MCPServer()),
+			NewSDKNotifierAdapter(srv.MCPServer()),
+		)
+	}
 
 	closeCoreOnErr = false // Serve succeeded; srv.Stop now owns the core's lifecycle.
 	return srv, nil
@@ -520,28 +577,28 @@ func New(
 // This enables embedding the vmcp server inside another HTTP server or framework.
 //
 // The returned handler includes all routes (health, metrics, well-known, MCP)
-// and the full middleware chain (recovery, body limit, header validation, auth,
-// rate limit, audit, MCP parsing, telemetry).
+// and the full middleware chain (recovery, body limit, header validation,
+// audit, auth, MCP parsing, telemetry).
 //
 // Each call builds a fresh handler. The method is safe to call multiple times.
 // All returned handlers share the same underlying MCPServer and SessionManager,
 // so callers should not serve concurrent traffic through multiple handlers.
 func (s *Server) Handler(_ context.Context) (http.Handler, error) {
-	// Create Streamable HTTP server with ToolHive session management
-	streamableServer := server.NewStreamableHTTPServer(
-		s.mcpServer,
+	// Create Streamable HTTP server with ToolHive session management.
+	streamableOpts := []server.StreamableHTTPOption{
 		server.WithEndpointPath(s.config.EndpointPath),
-		server.WithSessionIdManagerResolver(sessionIDManagerResolver{manager: s.vmcpSessionMgr}),
-		server.WithHeartbeatInterval(defaultHeartbeatInterval),
-		// Sweep the SDK's per-session tool/resource stores for sessions that go idle
-		// on this replica without a DELETE, using the same TTL as the session
-		// storage. The sweep clears only this replica's state (see
-		// sessionIDManagerResolver); the storage TTL expires the shared record.
-		server.WithSessionIdleTTL(s.config.SessionTTL),
-	)
-	// Stop the idle sweeper's goroutine on Stop. Shutdown only cancels the sweeper
-	// here: the StreamableHTTPServer is used as a handler and owns no listener.
-	s.shutdownFuncs = append(s.shutdownFuncs, streamableServer.Shutdown)
+		server.WithSessionIdManager(s.vmcpSessionMgr),
+		server.WithHeartbeatInterval(heartbeatInterval(s.config.HeartbeatInterval)),
+	}
+	// Install the pre-dispatch authorization gate only when authz is configured
+	// (allow-all otherwise, matching the core admission seam's guard). The gate
+	// re-runs the core admission decision for gated methods so a denied tools/call,
+	// resources/read, or prompts/get is rejected as HTTP 403 + JSON-RPC 403 before
+	// the SDK dispatches it, instead of the SDK's 200 result.
+	if s.authzGateEnabled {
+		streamableOpts = append(streamableOpts, server.WithCallGate(s.authzCallGate()))
+	}
+	streamableServer := server.NewStreamableHTTPServer(s.mcpServer, streamableOpts...)
 
 	// Create HTTP mux with separated authenticated and unauthenticated routes
 	mux := http.NewServeMux()
@@ -581,21 +638,40 @@ func (s *Server) Handler(_ context.Context) (http.Handler, error) {
 	}
 
 	// MCP endpoint - apply middleware chain (wrapping order, execution happens in reverse):
-	// Code wraps: auth → rate-limit → audit → MCP-parsing → telemetry
-	// Execution order: recovery → body-limit → header-val → auth →
-	//   rate-limit → audit → MCP-parsing → telemetry → handler
+	// Code wraps: audit → auth → MCP-parsing → telemetry → classification
+	// Execution order: recovery → body-limit → header-val → audit → auth →
+	//   MCP-parsing → telemetry → classification → handler
 	//
 	// Upstream token refresh failures are detected inside AuthMiddleware itself:
 	// GetAllUpstreamCredentials returns a non-empty failed-provider slice when
 	// any upstream refresh fails, and the middleware short-circuits with
-	// HTTP 401 + WWW-Authenticate before the request reaches any inner layer.
+	// HTTP 401 + WWW-Authenticate. Audit wraps auth, so those 401s (and every
+	// other rejection from the inner chain) still produce an audit event; the
+	// authenticated identity and parsed MCP data are read back through the
+	// holder carriers (auth.IdentityHolder, mcp.ParsedRequestHolder) that the
+	// inner auth/parser middlewares fill.
 	//
 	// The legacy HTTP authz, annotation-enrichment, and discovery layers have all been
 	// removed: every caller now routes through Serve, so authorization is enforced by the
 	// core admission seam (#5438) and capability/health filtering by the core, rather than
 	// by HTTP middleware.
+	//
+	// Authorization additionally runs a pre-dispatch CallGate INSIDE the streamable
+	// server (installed above only when Authz is configured): it re-runs the core
+	// admission decision for tools/call, resources/read, and prompts/get and rejects a
+	// denial as HTTP 403 + JSON-RPC 403 before dispatch. The gate sits before session
+	// validation (403-before-404) and inside the audit middleware, so a denied call is
+	// audited with outcome "denied". See call_gate.go.
 
 	var mcpHandler http.Handler = streamableServer
+
+	// Classify Modern (2026-07-28) vs Legacy at the decode seam, reject
+	// malformed Modern requests before dispatch, and route well-formed Modern
+	// requests to the vMCP core (dispatchModern) instead of the SDK. Applied
+	// before telemetry (i.e. it runs closer to the handler) so a rejection or a
+	// dispatcher 403 is still recorded by the telemetry middleware instead of
+	// bypassing it entirely.
+	mcpHandler = s.classifyingHandler(mcpHandler)
 
 	if s.config.TelemetryProvider != nil {
 		mcpHandler = s.config.TelemetryProvider.Middleware(s.config.Name, "streamable-http")(mcpHandler)
@@ -611,7 +687,21 @@ func (s *Server) Handler(_ context.Context) (http.Handler, error) {
 	// when auth middleware is nil.
 	mcpHandler = mcpparser.ParsingMiddleware(mcpHandler)
 
-	// Apply audit middleware if configured (runs after auth, before discovery)
+	// Mark health probes from a peer vMCP (peer_probe.go), so session registration
+	// and lazy injection skip them, and refuse any probe request beyond the
+	// handshake and capability lists. Runs after authentication.
+	mcpHandler = peerProbeMiddleware(mcpHandler)
+	mcpHandler = s.listenStreamGuardMiddleware(mcpHandler)
+
+	// Apply authentication middleware if configured
+	if s.config.AuthMiddleware != nil {
+		mcpHandler = s.config.AuthMiddleware(mcpHandler)
+		slog.Info("authentication middleware enabled for MCP endpoints")
+	}
+
+	// Apply audit middleware if configured. It wraps authentication so auth
+	// failures (401) are audited too; the identity for successful requests is
+	// read back via the auth.IdentityHolder carrier.
 	if s.config.AuditConfig != nil {
 		if err := s.config.AuditConfig.Validate(); err != nil {
 			return nil, fmt.Errorf("invalid audit configuration: %w", err)
@@ -625,18 +715,6 @@ func (s *Server) Handler(_ context.Context) (http.Handler, error) {
 		}
 		mcpHandler = auditor.Middleware(mcpHandler)
 		slog.Info("audit middleware enabled for MCP endpoints")
-	}
-
-	// Mark health probes from a peer vMCP (peer_probe.go), so session registration
-	// and lazy injection skip them, and refuse any probe request beyond the
-	// handshake and capability lists. Runs after authentication.
-	mcpHandler = peerProbeMiddleware(mcpHandler)
-	mcpHandler = s.listenStreamGuardMiddleware(mcpHandler)
-
-	// Apply authentication middleware if configured (runs first in chain)
-	if s.config.AuthMiddleware != nil {
-		mcpHandler = s.config.AuthMiddleware(mcpHandler)
-		slog.Info("authentication middleware enabled for MCP endpoints")
 	}
 
 	mcpHandler = s.applyForwardedHeaderCapture(mcpHandler)
@@ -960,7 +1038,7 @@ func (s *Server) SessionManager() *transportsession.Manager {
 	return s.sessionManager
 }
 
-// MCPServer returns the underlying mark3labs *server.MCPServer instance
+// MCPServer returns the underlying mcpcompat *server.MCPServer instance
 // servicing this vMCP server's /mcp endpoint.
 //
 // Intended for embedders that wrap the vMCP composer in their own pipeline and
@@ -971,7 +1049,7 @@ func (s *Server) SessionManager() *transportsession.Manager {
 //
 // Trust boundary: this accessor is in-process only; the returned pointer is
 // the same instance for the lifetime of the Server and is safe for concurrent
-// use per mark3labs guarantees.
+// use per mcpcompat guarantees.
 //
 // Safe operations include RequestElicitation against an active session,
 // registering observability hooks, and reading registered
@@ -1020,6 +1098,47 @@ func setSessionResourcesDirect(session server.ClientSession, resources []server.
 		resourceMap[res.Resource.URI] = res
 	}
 	sessionWithResources.SetSessionResources(resourceMap)
+	return nil
+}
+
+// setSessionResourceTemplatesDirect sets resource templates directly on the session via
+// the SessionWithResourceTemplates interface, analogous to setSessionResourcesDirect for
+// resource templates. Keyed by URI template string.
+func setSessionResourceTemplatesDirect(session server.ClientSession, templates []server.ServerResourceTemplate) error {
+	sessionWithTemplates, ok := session.(server.SessionWithResourceTemplates)
+	if !ok {
+		return fmt.Errorf("session does not support per-session resource templates")
+	}
+
+	existing := sessionWithTemplates.GetSessionResourceTemplates()
+	templateMap := make(map[string]server.ServerResourceTemplate, len(existing)+len(templates))
+	for k, v := range existing {
+		templateMap[k] = v
+	}
+	for _, tmpl := range templates {
+		templateMap[tmpl.Template.URITemplate] = tmpl
+	}
+	sessionWithTemplates.SetSessionResourceTemplates(templateMap)
+	return nil
+}
+
+// setSessionPromptsDirect sets prompts directly on the session via the SessionWithPrompts
+// interface, analogous to setSessionResourcesDirect for prompts.
+func setSessionPromptsDirect(session server.ClientSession, prompts []server.ServerPrompt) error {
+	sessionWithPrompts, ok := session.(server.SessionWithPrompts)
+	if !ok {
+		return fmt.Errorf("session does not support per-session prompts")
+	}
+
+	existing := sessionWithPrompts.GetSessionPrompts()
+	promptMap := make(map[string]server.ServerPrompt, len(existing)+len(prompts))
+	for k, v := range existing {
+		promptMap[k] = v
+	}
+	for _, p := range prompts {
+		promptMap[p.Prompt.Name] = p
+	}
+	sessionWithPrompts.SetSessionPrompts(promptMap)
 	return nil
 }
 
@@ -1127,65 +1246,27 @@ func (s *Server) lazyInjectSessionTools(ctx context.Context, wantTool string) {
 	}
 }
 
-// callerOwnsSession reports whether the caller in ctx matches the identity binding stored for
-// sessionID. A missing, terminated or unbound session does not match.
+// callerOwnsSession reports whether the caller in ctx matches the identity binding of
+// sessionID (enforceSessionBinding, the check every call runs).
 func (s *Server) callerOwnsSession(ctx context.Context, sessionID string) bool {
-	binding, err := s.storedBinding(ctx, sessionID)
-	if err != nil {
-		return false
-	}
 	caller, _ := auth.IdentityFromContext(ctx)
-	return vmcpsession.ValidateCaller(binding, caller) == nil
-}
-
-// lazyInjectSessionResources is the resources counterpart of
-// lazyInjectSessionTools: it fills an empty per-session resource store (a session
-// that was registered on another pod) from core.ListResources for the request
-// identity. The call-time binding check in coreResourceHandler stays the backstop.
-func (s *Server) lazyInjectSessionResources(ctx context.Context) {
-	sess := server.ClientSessionFromContext(ctx)
-	if sess == nil || isPeerProbe(ctx) {
-		return
-	}
-	sessionWithResources, ok := sess.(server.SessionWithResources)
-	if !ok || len(sessionWithResources.GetSessionResources()) > 0 {
-		return
-	}
-	sessionID := sess.SessionID()
-	identity, _ := auth.IdentityFromContext(ctx)
-	resources, err := s.coreSessionResources(ctx, sessionID, identity)
-	if err != nil || len(resources) == 0 {
-		slog.Debug("lazyInjectSessionResources: no resources available for session", "session_id", sessionID)
-		return
-	}
-	if err := setSessionResourcesDirect(sess, resources); err != nil {
-		slog.Warn("lazyInjectSessionResources: failed to inject resources", "session_id", sessionID, "error", err)
-	}
+	return s.enforceSessionBinding(ctx, sessionID, caller) == nil
 }
 
 // handleSessionRegistration processes a new MCP session registration.
 // It fires AFTER the session is registered in the SDK.
-//
-// A health probe from a peer vMCP only checks that the MCP handshake works, so
-// it neither opens backend connections nor lists capabilities, and it is not
-// counted as an active session. A GET registration is never skipped as a probe:
-// it always goes through the identity check in attachToBoundSession.
 func (s *Server) handleSessionRegistration(
 	ctx context.Context,
 	session server.ClientSession,
 ) {
-	if isPeerProbe(ctx) && !isListenStreamRegistration(ctx) {
+	// A health probe from a peer vMCP only checks that the MCP handshake works, so
+	// it neither opens backend connections nor lists capabilities.
+	if isPeerProbe(ctx) {
 		return
 	}
 	// Error is logged and handled within handleSessionRegistrationImpl.
 	// The session is terminated on failure; no further action needed here.
-	// An unregistration while this runs cancels the commit (clientSessionSet).
-	s.activeClientSessions.begin(session.SessionID())
-	if err := s.handleSessionRegistrationImpl(ctx, session); err != nil {
-		s.activeClientSessions.abort(session.SessionID())
-		return
-	}
-	s.activeClientSessions.commit(session)
+	_ = s.handleSessionRegistrationImpl(ctx, session)
 }
 
 // handleSessionRegistrationImpl handles session registration.
@@ -1205,31 +1286,10 @@ func (s *Server) handleSessionRegistration(
 //     indexed into the optimizer and only find_tool/call_tool are exposed,
 //     using session-scoped tool handlers.
 //
-//   - Prompts: not supported until the SDK adds AddSessionPrompts.
+//   - Prompts: injected per session via SessionWithPrompts, mirroring resources;
+//     see injectCoreSessionCapabilities.
 func (s *Server) handleSessionRegistrationImpl(ctx context.Context, session server.ClientSession) (retErr error) {
-	s.inFlightRegistrations.Add(1)
-	defer s.inFlightRegistrations.Add(-1)
-
-	// Only the session's own initialize may create it. mcp-go v0.55 registers a
-	// session from the initialize POST and from a GET listen stream (or SSE
-	// reconnect) on a pod that does not hold the session in memory; the latter
-	// attaches to the bound session or is rejected, and never calls CreateSession.
-	// It keeps the context of the GET request, so its wait for the binding ends when the
-	// client goes away. Checked before the cleanup defer below: rejecting a
-	// re-registration must not terminate the owner's session.
-	if isListenStreamRegistration(ctx) {
-		return s.attachToBoundSession(ctx, session)
-	}
-
-	// The SDK runs this hook with the initialize request's context, whose response
-	// is already written. A client that closes the connection fast would cancel
-	// backend initialization half-way. Keep the request values (identity, session),
-	// drop the cancellation, and bound the work with a server-side timeout.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultSessionRegistrationTimeout)
-	defer cancel()
-
 	sessionID := session.SessionID()
-
 	slog.Debug("creating session-scoped backends", "session_id", sessionID)
 
 	// Defer cleanup: if any error occurs, terminate the session and log failures.
@@ -1252,15 +1312,29 @@ func (s *Server) handleSessionRegistrationImpl(ctx context.Context, session serv
 	// is no way to retract the session ID after it has been sent.
 	//
 	// NOTE: there is a brief race window between the client receiving the session
-	// ID and this hook completing. A tools/call that arrives in it gets its tools
-	// from lazyInjectSessionTools, and enforceSessionBinding waits until
-	// CreateSession below has written the identity binding.
-	if _, retErr = s.vmcpSessionMgr.CreateSession(ctx, sessionID); retErr != nil {
+	// ID and this hook completing. A client that pipelines a tools/call immediately
+	// after initialize may receive a "tool not found" error before AddSessionTools
+	// completes. Conforming MCP clients call tools/list before tools/call, so this
+	// window is expected to be harmless in practice.
+	//
+	// The list_changed sink is built here, before CreateSession, so it can be
+	// threaded through to every backend connector this session opens (#5748).
+	// Capture BOTH the caller identity AND the per-request forwarded headers from
+	// the registration context: the asynchronous resync re-enumerates backends
+	// through the same identity+header-keyed path a live request uses (cache key
+	// and outbound backend auth are derived from the context, not passed
+	// explicitly), so it must reconstruct a faithful context or it would
+	// enumerate unauthenticated. See buildListChangedSink.
+	identity, _ := auth.IdentityFromContext(ctx)
+	forwardedHeaders := headerforward.ForwardedHeadersFromContext(ctx)
+	sink := s.buildListChangedSink(sessionID, session, identity, forwardedHeaders)
+	if _, retErr = s.vmcpSessionMgr.CreateSession(ctx, sessionID, sink); retErr != nil {
 		slog.Error("failed to create session-scoped backends",
 			"session_id", sessionID,
 			"error", retErr)
 		return retErr
 	}
+	s.refreshSinks.Store(sessionID, sink)
 
 	// The core is the single authoritative aggregation: source the advertised tool/resource
 	// set from core.ListTools/ListResources (called once per session here) and install
@@ -1268,65 +1342,6 @@ func (s *Server) handleSessionRegistrationImpl(ctx context.Context, session serv
 	// session record (identity binding, TTL, Validate). The returned error becomes retErr
 	// (named return), so the defer terminates the session on failure.
 	return s.injectCoreSessionCapabilities(ctx, session)
-}
-
-// attachToBoundSession handles a registration that does not come from the
-// session's own initialize. mcp-go registers a session again when a GET listen
-// stream (or an SSE reconnect) reaches a pod that does not hold it in memory, and
-// CreateSession would then build a new session with the caller's identity and
-// overwrite the stored binding. Instead, this never creates a session: it gives a
-// caller that passes checkListenStreamCaller the session's capabilities. Any
-// other caller is rejected and unregistered from this pod; the stored session is
-// not changed in any case.
-//
-// listenStreamGuardMiddleware already runs the same check before mcp-go sees the
-// GET, and rejects the request with an HTTP error; this is the fallback for a
-// registration that reaches the hook anyway.
-//
-// Upstream stops the re-bind only from v0.40.0, as a side effect of #5729. Drop
-// this guard once the fork is on v0.40 or later and TestCrossPodSessionRebind and
-// TestCrossPodGETDuringRegistration pass without it.
-func (s *Server) attachToBoundSession(ctx context.Context, session server.ClientSession) error {
-	sessionID := session.SessionID()
-	if _, err := s.checkListenStreamCaller(ctx, sessionID); err != nil {
-		slog.Warn("rejected re-registration of a session", "session_id", sessionID, "error", err)
-		s.mcpServer.UnregisterSession(ctx, sessionID)
-		return err
-	}
-	return s.injectCoreSessionCapabilities(ctx, session)
-}
-
-// checkListenStreamCaller decides whether the caller in ctx may open a listen
-// stream on sessionID. It waits while the creating pod's registration is still
-// pending (see waitWhileRegistrationPending), then requires a live session with
-// an identity binding (else it returns 404) that matches the caller (else 403).
-func (s *Server) checkListenStreamCaller(ctx context.Context, sessionID string) (int, error) {
-	s.waitWhileRegistrationPending(ctx, sessionID)
-	binding, err := s.storedBinding(ctx, sessionID)
-	if err != nil {
-		return http.StatusNotFound, err
-	}
-	caller, _ := auth.IdentityFromContext(ctx)
-	if err := vmcpsession.ValidateCaller(binding, caller); err != nil {
-		return http.StatusForbidden, err
-	}
-	return http.StatusOK, nil
-}
-
-// storedBinding returns the identity binding of a live stored session record.
-func (s *Server) storedBinding(ctx context.Context, sessionID string) (string, error) {
-	metadata, err := s.sessionDataStorage.Load(ctx, sessionID)
-	if err != nil {
-		return "", fmt.Errorf("load session %s: %w", sessionID, err)
-	}
-	if metadata[sessionmanager.MetadataKeyTerminated] == sessionmanager.MetadataValTrue {
-		return "", fmt.Errorf("session %s is terminated", sessionID)
-	}
-	binding, bound := metadata[vmcpsession.MetadataKeyIdentityBinding]
-	if !bound {
-		return "", errSessionNotRegistered
-	}
-	return binding, nil
 }
 
 // backendHealth returns the core-owned backend health reporter, or nil when health
@@ -1437,101 +1452,27 @@ var notAcceptableBody = []byte(
 		`{"code":-32600,"message":"Not Acceptable: Client must accept text/event-stream"}}`,
 )
 
-// sessionIDManagerResolver gives mcp-go the vMCP session manager for every
-// request. mcp-go's idle sweeper (WithSessionIdleTTL) resolves the manager with a
-// nil request and calls Terminate for each session that is idle on this replica;
-// the vMCP manager's Terminate would delete the shared session record for every
-// replica, including one where the session is still in use. For the sweeper the
-// resolver returns localSweepSessionIDManager, whose Terminate keeps the shared
-// record; mcp-go then clears only this replica's SDK state. The node-local
-// MultiSession is closed by the session manager's own idle sweep
-// (sessionmanager.FactoryConfig.IdleTTL), and the storage TTL expires the shared
-// record once no replica uses the session.
-type sessionIDManagerResolver struct {
-	manager server.SessionIdManager
-}
-
-// ResolveSessionIdManager implements server.SessionIdManagerResolver.
-func (r sessionIDManagerResolver) ResolveSessionIdManager(req *http.Request) server.SessionIdManager {
-	if req == nil {
-		return localSweepSessionIDManager{SessionIdManager: r.manager}
-	}
-	return r.manager
-}
-
-// localSweepSessionIDManager is the session ID manager mcp-go's idle sweeper
-// uses: Terminate is a no-op, so the sweep never touches the shared session record.
-type localSweepSessionIDManager struct {
-	server.SessionIdManager
-}
-
-// Terminate keeps the shared session record; see sessionIDManagerResolver.
-func (localSweepSessionIDManager) Terminate(string) (bool, error) {
-	return false, nil
-}
-
-// listenStreamKey marks the context of a GET request (the Streamable HTTP listen
-// stream) that passed listenStreamGuardMiddleware, for handleSessionRegistrationImpl.
-type listenStreamKey struct{}
-
-// listenStreamGuardMiddleware checks every GET (the Streamable HTTP listen
-// stream) before mcp-go sees it. mcp-go's handleGet attaches the GET to the
-// session object it holds in memory, or registers a new one for the session ID,
-// and then always answers 200: a registration hook cannot fail the request, and
-// on a pod that already holds the session no hook runs at all. Without this
-// check a caller with someone else's session ID would receive that session's
-// notifications and elicitation requests, and on a pod that did not hold the
-// session the caller's object would stay in mcp-go for later requests.
-//
-// A GET without Mcp-Session-Id gets 400: a vMCP session starts with initialize,
-// and mcp-go would otherwise generate a session ID that nothing ever binds. A GET
-// with a session ID must pass checkListenStreamCaller (404 for a session that is
-// missing, terminated or never bound, 403 for a different caller). A GET that
-// passes is marked for handleSessionRegistrationImpl, so a registration that
-// mcp-go runs for it never creates the session. Runs after authentication.
+// listenStreamGuardMiddleware refuses (403) a GET listen stream for a session bound
+// to another identity. The SDK opens the stream for any caller that holds the
+// session ID, on any pod, and routes the session's server-to-client requests
+// (elicitation, sampling) to it. A GET for a missing or ended session is left to
+// the SDK, which answers 404 so the client initializes again.
 func (s *Server) listenStreamGuardMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			next.ServeHTTP(w, r)
-			return
+		sessionID := r.Header.Get("Mcp-Session-Id")
+		if r.Method == http.MethodGet && sessionID != "" {
+			if sess, ok := s.vmcpSessionMgr.GetMultiSession(r.Context(), sessionID); ok {
+				binding, _ := sess.GetMetadataValue(vmcpsession.MetadataKeyIdentityBinding)
+				caller, _ := auth.IdentityFromContext(r.Context())
+				if err := vmcpsession.ValidateCaller(binding, caller); err != nil {
+					slog.Warn("refused a listen stream for a session bound to another caller", "session_id", sessionID)
+					http.Error(w, "Forbidden", http.StatusForbidden)
+					return
+				}
+			}
 		}
-		sessionID := r.Header.Get(server.HeaderKeySessionID)
-		if sessionID == "" {
-			writeJSONRPCHTTPError(w, http.StatusBadRequest, "Bad Request: Mcp-Session-Id header is required")
-			return
-		}
-		if status, err := s.checkListenStreamCaller(r.Context(), sessionID); err != nil {
-			slog.Warn("rejected listen stream", "session_id", sessionID, "status", status, "error", err)
-			writeJSONRPCHTTPError(w, status, http.StatusText(status))
-			return
-		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), listenStreamKey{}, true)))
+		next.ServeHTTP(w, r)
 	})
-}
-
-// writeJSONRPCHTTPError writes an HTTP error status with a JSON-RPC error body,
-// in the same shape as notAcceptableBody.
-func writeJSONRPCHTTPError(w http.ResponseWriter, status int, message string) {
-	body, err := json.Marshal(map[string]any{
-		"jsonrpc": "2.0",
-		"id":      "server-error",
-		"error":   map[string]any{"code": -32600, "message": message},
-	})
-	if err != nil {
-		http.Error(w, message, status)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if _, err := w.Write(body); err != nil {
-		slog.Debug("failed to write error response", "error", err)
-	}
-}
-
-// isListenStreamRegistration reports whether ctx belongs to a GET request.
-func isListenStreamRegistration(ctx context.Context) bool {
-	marked, _ := ctx.Value(listenStreamKey{}).(bool)
-	return marked
 }
 
 // headerValidatingMiddleware rejects GET requests that do not include

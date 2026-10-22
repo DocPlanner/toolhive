@@ -4,7 +4,106 @@
 fork patches we carry. Upstream releases are brought in with a merge commit
 (`Merge upstream vX.Y.Z into dp-stable`), never a rebase.
 
-Merge base: upstream **v0.39.0** (`4ebb610f2`), merged in `75ba8d1d5` (PAIINFRA-233).
+Merge base: upstream **v0.42.1** (`06940e81d`), merged in `3f02521c8` (PAIINFRA-209).
+
+Goal: carry as few patches as possible. Each row below says what the patch does, why DocPlanner
+needs it, and when it can go. Check the "Drop when" column on every upstream merge.
+
+## Patch inventory
+
+Commits are the fork commits that introduced the behaviour. Where a row says "merge", the behaviour
+was re-applied by hand in a merge commit (see [Changes that live only in a merge
+commit](#changes-that-live-only-in-a-merge-commit)), so replaying the commits alone loses it.
+
+### Operator
+
+| Change | Why | Commit(s) | Drop when |
+|---|---|---|---|
+| `GenerationChangedPredicate` on every primary watch; vMCP `MaxConcurrentReconciles=3` | Status-only updates started full reconciles, and one slow vMCP blocked the others | `2c68591f2` | Upstream filters status-only events |
+| Follow-ups the predicate needs: MCPRegistry keeps reconciling after adding its finalizer, MCPRemoteProxy requeues and watches MCPGroup, EmbeddingServer stays Failed on an invalid PodTemplateSpec, MCPServer reconciles on annotation changes (restart annotation) | The predicate hides these changes | `c7660fbb4`, `1960086e7`, `b3b0da4b1`, `198b61950` | Together with the predicate |
+| vMCP env compared with `equality.Semantic`, labels and annotations as a subset, status setters skip unchanged values | False diffs caused an endless vMCP reconcile loop | `8071da52d` | Upstream compares semantically |
+| vMCP Service/Deployment AlreadyExists and Conflict errors requeue | Create/update races marked the vMCP as failed | `0532bd27f` | Upstream requeues on these errors |
+| vMCP drift check also compares nodeSelector, tolerations and affinity; StatefulSet-era objects of a migrated MCPServer are deleted on reconcile | Scheduling changes did not roll the vMCP; old StatefulSets and Services stayed after the migration | `3a8e50139` | Upstream checks scheduling drift (cleanup part: once no cluster has StatefulSet-era objects) |
+| Explicit `spec.config.backends` merged with the discovered backends (explicit wins on the same name) | Hubs declare remote backends there; upstream overwrites the list | `8e474c8b2` | Upstream merges static backends |
+| MCPServer Service reconciled before the Deployment; `status.URL` follows port changes; `targetPort` drift detected | A port change left vMCP routing to a stale port | `5df636980` | Upstream updates the URL and targetPort |
+| RunConfig checksum taken from the ConfigMap writer | A stale cache read meant config changes did not roll the pods | `e88959899` | Upstream stops reading the checksum back |
+| Proxyrunner and vMCP pods take nodeSelector, tolerations and affinity from `spec.podTemplateSpec`; operator PodDisruptionBudget | Proxies must run on the backend's node pool; HA for the operator | `5b6448a0d` | Upstream schedules the proxyrunner from the template |
+| Proxyrunner deletes a stuck old-revision pod when a StatefulSet rollout stalls (`pods: delete` in the roles) | Rollouts hung on a crash-looping old pod | `baa5927f2`, `9c8b62f61` | Upstream handles stalled rollouts |
+| Operator ClusterRole and RoleBinding names from `operator.rbacName` | The prod and stg operators run in the same cluster | `808a8a693` | Upstream templates the names |
+| `sessionStorage.usernameRef`: Redis ACL username for MCPServer, MCPRemoteProxy and vMCP | Our Dragonfly uses ACL users, not only a password | `8d09330f5`, merge v0.28.3 | Upstream adds a username field |
+| MCPOIDCConfig `allowedClientIds`, optional `oidcConfigRef.audience`, `client_id` fallback in the token validator | Cognito `client_credentials` tokens have no `aud` | `6d9eee4c1`, `78034a265`, `106deb1b5` | Upstream validates by client ID |
+| `MCPServer.spec.secrets` list key is `name` + `key` | One Secret supplies several keys | `b736c5bbb` | Upstream changes the list key |
+
+### Auth, auth server, authz, audit
+
+| Change | Why | Commit(s) | Drop when |
+|---|---|---|---|
+| 401 with `WWW-Authenticate` when `authz.primaryUpstreamProvider` has no token (empty provider names ignored) | Clients log in again on 401, not on 403 | `44b70f6a5`, `f387a57f2` | Upstream returns 401 for a missing upstream token |
+| `upstreamInject` with `providerName: caller` forwards the already-validated caller bearer token to the backend | Lets a backend authenticate the hub caller with the same token, without the embedded auth server | `c333920ac` | Upstream supports forwarding the caller token |
+| DCR and CIMD without `scope` default to `scopesSupported` (RFC 7591) | Clients that register without `scope` got no scopes | `16c2fba5e`, `7019ea20c` | Upstream defaults the scope (or `baselineClientScopes` gives the same result for our clients) |
+| Upstream-token writes use WATCH/MULTI instead of Lua | Our Dragonfly does not run the Lua scripts upstream uses | `907d7040d`, merge v0.28.3 | Upstream stops using Lua there, or we leave Dragonfly |
+| Audit user name falls back to the `username` claim | Cognito access tokens have no `name` or `email` | `a40493885` | Upstream reads `username` |
+| Client JSON-RPC responses (replies to elicitation, sampling, roots) pass through authz and the validating webhook. Only a body with no `method` member and a `result` or `error` counts as a reply (`ParsedMCPRequest.IsClientResponse`) | Upstream answers them with 400, so server-to-client requests never complete | `f22ee7fa6`, v0.42.1 follow-up | Upstream parses responses |
+
+### Proxy runner and transport
+
+| Change | Why | Commit(s) | Drop when |
+|---|---|---|---|
+| `TOOLHIVE_PROXY_SESSION_TTL` sets the proxy session TTL | No CRD field exists; we set 24 h (docplanner-helm `mcpservers.yaml`) to match vMCP sessions | `3a0b285c6`, `d104dfc9f` | Upstream adds a TTL field |
+| Proxy tuning env from `spec.env` mirrored into the runner process; on Kubernetes the proxy keeps running after repeated backend health failures (`pkg/runner/proxy_env.go`) | The env reached only the backend container, so the proxy kept a 2 h TTL and backends idle for 2 h answered 404 | `48c702ff2` | Upstream exposes these settings |
+| Shallow `/health` on the transparent proxy | The proxyrunner health check pinged the backend, so a slow backend failed the proxy's own probe | `5d7663669` | Upstream separates liveness from backend health |
+| The Host header stays the configured target host when `backend_url` pins a pod IP; any other Host is rewritten to the URL host, as upstream does | Backends with strict host validation rejected the pod IP | `ce851b471`, v0.42.1 follow-up | Upstream keeps the target Host |
+| HTTP 400 "no valid session ID" or "expired session ID" counts as a lost session (re-initialize and replay); only the first 4 KiB of the body are read | TypeScript SDK servers and mcp-for-argocd answer 400, not 404 | `8abac892e`, `16ffb4874`, merge v0.42.1 | Upstream treats these as session loss |
+| Streamable proxy answers a timeout or failure with a JSON-RPC error, not HTTP 504/500 | vMCP got a transport error instead of a call error | `cce5872bd` | Upstream returns JSON-RPC errors |
+| `ValidatingCache.Remove` and `EvictIdle`; entries closed outside the lock | The vMCP session cache needs eviction and close | `036974570`, `51de52641` | Upstream adds eviction |
+
+### Virtual MCP server
+
+| Change | Why | Commit(s) | Drop when |
+|---|---|---|---|
+| Backend init timeout from `failureHandling.healthCheckTimeout`, else `timeouts.default` (`serve_timeouts.go`) | The configured timeouts were not wired to backend initialization | `5feb1b1c9`, merge v0.23.1 | Upstream makes it configurable |
+| `timeouts.default` / `timeouts.perWorkload` applied to each backend call (keyed by `WorkloadID`, 90 s fallback), on the Legacy and the Modern client; the HTTP write timeout covers the longest of them | Upstream uses a fixed 30 s per call | `3533730ce`, `4cf28e14c`, `703e8e849`, merge v0.42.1 | Upstream uses the configured timeouts (#6411, v0.45) |
+| Session TTL from the config file, the `--session-ttl` flag winning | Session lifetime must match the 24 h of the proxies | `d104dfc9f` | Upstream wires `sessionTTL` |
+| Session Redis ACL username and HTTP write timeout wired on the Serve path | See `usernameRef` above; long backend calls outlived the 30 s write timeout | `bafe4d46a` | With the rows above |
+| Cached sessions closed on DELETE and after one session TTL idle on this replica (`FactoryConfig.IdleTTL`) | Upstream evicts only on the next Get, which never comes after a DELETE, so backend connections leaked | `036974570`, `51de52641`, merge v0.42.1 | Upstream closes on Terminate |
+| Health probes between vMCPs neither create sessions nor list capabilities; the probe header never sets the `healthcontext` marker; a probe may only initialize, ping and list (else 403) | A hub probing peer vMCPs opened a session with backend connections per probe; the header must not switch outgoing auth to service credentials | `46dd7a465`, `37d40cf78`, `43623c120` | Upstream has a lightweight peer probe |
+| Health checks of Kubernetes-managed MCPServer backends use the reconciled workload status; others keep the MCP probe | Each periodic check opened a full MCP session to every backend | `5d7663669` | Upstream reads workload status |
+| No `structuredContent` synthesized for tools without an output schema, on errors too | Strict clients (Cursor) reject a result whose structured content does not match the schema | `a22a3fb96` | Upstream stops synthesizing it |
+| Backend call errors wrapped with their class (`wrapBackendError`) on call, read and prompt | A backend timeout reached the client as a generic error, so the timeout chain could not be told apart | `cce5872bd` | Upstream classifies backend errors on every path |
+| Capability refresh: a backend that crosses the advertise boundary (`health.ShouldAdvertise`) or a registry change triggers each local session's `list_changed` sink (15 s debounce, 60 s cooldown) | Upstream resyncs only when a connected backend sends `list_changed`; a backend that comes back or joins sends nothing | `c4984e59c`, merge v0.42.1 | Upstream reacts to health and registry changes |
+| Partial capabilities: a query that misses a backend is marked partial and cached at most 5 s; a `tools/call` for a tool the session lacks tops the store up (own caller, not optimizer, add-only); `capabilityQueryTimeout` 10 s | Upstream caches a partial view 30 s and fills a store once, so calls failed with "tool not found" (PAIINFRA-343) | `d6d76710c`, `e2393c8d7`, `96a25efd3` | Upstream fixes #5786; replace the timeout with #6411 (v0.45) |
+| A GET listen stream for a session bound to another identity gets 403 (`listenStreamGuardMiddleware`) | The SDK opens the stream for anyone with the session ID, on any pod, and routes the session's elicitation and sampling requests to it | merge v0.42.1 (replaces `ab1b5b667`, `fccda6842`, `854448185`) | Upstream checks the caller on GET |
+
+### CI, tests, dependencies
+
+| Change | Why | Commit(s) | Drop when |
+|---|---|---|---|
+| Jobs on `ubuntu-latest`; golangci-lint v2.14.0 with `only-new-issues` | The public repo gets no large runners; upstream's lint debt must not block fork PRs | `b387fe750` | Never (fork CI) |
+| Lifecycle e2e with 4 ginkgo processes; optimizer e2e timeout 90 s; managed-backend health assertion skipped | Smaller runners; managed backends are checked from workload status | `22368126a`, `05373f634`, `560253e96` | With the runner and health rows |
+| Module versions above upstream (x/net, x/crypto, x/sys, x/mod, x/text, x/tools, x/sync, x/term, grpc, zipkin) | govulncheck findings | `fd8d45c58`, `f90409530`, `b3929efa7` | Upstream reaches the same versions |
+
+## Notes
+
+**Capability refresh scope.** Only sessions registered on this pod (`refreshSinks`) are refreshed:
+sessions a pod serves only through rehydration (registered on another pod) keep their stores until
+the client lists again or reconnects. Resources and prompts resync add-only (upstream limitation).
+Sinks of ended sessions are dropped at the next refresh. `startCapabilityRefresh` runs only from
+`Server.Start`.
+
+**Partial capabilities.** Upstream fills a session's tool store once per pod and caches a partial
+aggregation for 30 s (#5786). Since #6216 the core also checks calls against the cached advertised
+view, so the 5 s partial TTL matters on both paths. With a 3 s `capabilityQueryTimeout` about a
+quarter of the production hub aggregations were partial on 2026-10-15.
+
+**Sessions across pods (v0.42.1).** mcpcompat registers a session (and runs `OnRegisterSession`)
+only while it serves `initialize`, before the client gets the session ID. Any other pod rehydrates
+the session without the hook, and go-sdk refuses a second `initialize`. So the binding can no longer
+be rewritten by a GET or a repeated initialize (`TestCrossPodSessionRebind`), and a call can no
+longer arrive before the binding exists. mcpcompat runs before-hooks for tools only, so a pod that
+rehydrates a session serves no resources or prompts for it (upstream gap; `TestCrossPodRehydration`
+covers tools only). Accepted for PAIINFRA-209: in Datadog APM from 2026-09-16 to 2026-10-16 the hub
+backends got no `resources/read`, `resources/templates/list`, `prompts/list` or `prompts/get`; every
+`resources/list` was the hubs' own capability discovery.
 
 ## Changes that live only in a merge commit
 
@@ -15,115 +114,44 @@ silently lose it. Port these explicitly.
 ### `74e7a003a` — Merge upstream v0.23.1
 
 Upstream moved the vMCP server wiring from `cmd/vmcp/app/commands.go` to `pkg/vmcp/cli`. The fork's
-changes to the old file were re-applied in the new package:
-
-| Behaviour | Where it lives now | Original commit |
-|---|---|---|
-| Backend init timeout from `failureHandling.healthCheckTimeout`, falling back to `timeouts.default` | `pkg/vmcp/cli/serve_timeouts.go` (`backendInitTimeoutFromConfig`) | `5feb1b1c9` |
-| Backend request timeouts (`timeouts.default` / `timeouts.perWorkload`) and the HTTP write timeout derived from them | `pkg/vmcp/cli/serve_timeouts.go` (`backendRequestTimeoutsFromConfig`, `serverWriteTimeoutFromConfig`) | `3533730ce` |
-| Session TTL passed to the server | `pkg/vmcp/cli/serve.go` (`SessionTTL`) | `d104dfc9f` |
-
-Tests: `pkg/vmcp/cli/serve_timeouts_test.go`.
-
-The same merge also carried a groupRef transition shim (string-form `MCPServer.spec.groupRef`,
-optional `VirtualMCPServer.spec.groupRef`). It was removed in `d0a48cbe3`; nothing to port.
+changes to the old file were re-applied in the new package: backend init timeout
+(`backendInitTimeoutFromConfig`, `5feb1b1c9`), backend request and write timeouts
+(`backendRequestTimeoutsFromConfig`, `serverWriteTimeoutFromConfig`, `3533730ce`) and the session TTL
+(`d104dfc9f`), all in `pkg/vmcp/cli/serve_timeouts.go`.
 
 ### Merge upstream v0.28.3
 
-Upstream moved the auth-server and session Redis clients onto toolhive-core's `redis` package and
-renamed `address` to `addr`. Fork behaviour re-applied while resolving:
-
-| Behaviour | Where it lives now | Original commit |
-|---|---|---|
-| Upstream-token writes use WATCH/MULTI instead of Lua (Dragonfly), with upstream's #5092 index-TTL rules | `pkg/authserver/storage/redis.go` (`queueUpstreamIndexTTL`) | `907d7040d` |
-| Session Redis ACL username from `sessionStorage.usernameRef` passed to the toolhive-core client | `pkg/runner/runner.go`, `pkg/vmcp/server/server.go` (`buildSessionDataStorage`, re-ported in `bafe4d46a`) | `8d09330f5` |
-| Redis credential env injected once, after `resourceOverrides` (upstream's password-only builder removed) | `cmd/thv-operator/controllers/mcpserver_controller.go` (`buildSessionRedisCredentialEnvVars`) | `8d09330f5` |
-| `TOOLHIVE_PROXY_SESSION_TTL` is the fallback when RunConfig `session_ttl` is unset | `pkg/runner/runner.go`, proxy constructors | `d104dfc9f` |
-| vMCP `--session-ttl` flag wins over the config-file `sessionTTL` | `pkg/vmcp/cli/serve_timeouts.go` (`sessionTTLFromConfig`) | `d104dfc9f` |
-
-### Merge upstream v0.29.3
-
-Upstream replaced HMAC token/subject session binding with an `(iss, sub)` identity binding
-(#5306/#5378). The fork's subject binding (`e492cbfad`) is dropped; the binding is upstream's.
-Fork behaviour re-applied on top (the vMCP session rows were dropped or re-ported in the v0.32.0
-merge, see below):
-
-| Behaviour | Where it lives now | Original commit |
-|---|---|---|
-| DCR without `scope` defaults to the server's supported scopes | `pkg/authserver/server/registration/dcr.go` | `16c2fba5e` |
-| Digest-pinned image pulls go through the Docker daemon (upstream #5978, after v0.29.3) | `pkg/container/images/registry.go` | `09c117c56` |
-
-`VMCP_SESSION_HMAC_SECRET` is no longer used (upstream logs and ignores it). Sessions stored with the
-old token-hash key are invalidated on read, so clients re-initialize once after the upgrade.
+Upstream moved the auth-server and session Redis clients onto toolhive-core's `redis` package.
+Re-applied: WATCH/MULTI upstream-token writes (`queueUpstreamIndexTTL`, `907d7040d`), the session
+Redis ACL username (`buildSessionDataStorage`, `8d09330f5`), Redis credential env injected once after
+`resourceOverrides` (`buildSessionRedisCredentialEnvVars`), `TOOLHIVE_PROXY_SESSION_TTL` as the
+RunConfig fallback and `--session-ttl` winning over `sessionTTL` (`d104dfc9f`).
 
 ### `75ba8d1d5` — Merge upstream v0.39.0
 
-Fork behaviour kept while resolving:
+Kept: Service before Deployment with merged labels and annotations (`5df636980`, `e88959899`) and
+`mergeStaticBackends` (`8e474c8b2`). `PodTemplateSpecBuilder.SchedulingSpec()` stays for MCPServer and
+the vMCP drift check.
 
-| Behaviour | Where it lives now | Original commit |
-|---|---|---|
-| The MCPServer Service is updated before the Deployment, so Deployment drift cannot starve a port fix; labels and annotations are now merged, as upstream #5731 does | `cmd/thv-operator/controllers/mcpserver_controller.go` (`Reconcile`) | `5df636980`, `e88959899` |
-| Explicit `spec.config.backends` (hub remote backends) are merged with the discovered backends, an explicit backend winning on the same name; upstream's `excludedBackends` filters only the discovered ones | `cmd/thv-operator/controllers/virtualmcpserver_vmcpconfig.go` (`mergeStaticBackends`) | `8e474c8b2` |
+### `3f02521c8` — Merge upstream v0.42.1
 
-`PodTemplateSpecBuilder.SchedulingSpec()` stays: MCPServer and the vMCP drift check still use it.
+v0.40.0 replaced `mark3labs/mcp-go` with toolhive-core `mcpcompat` over the official go-sdk (#5729).
+mcpcompat has no idle sweep, session-ID-manager resolver, unregister hook, resource hooks or
+`SendNotificationToSpecificClient`, so the fork code built on them was dropped or rewritten. The
+last two rows (client replies, Host header) are in the follow-up commit "Narrow the client-reply and
+Host header patches", on top of the merge:
 
-## Fork behaviour re-ported after the v0.32.0 merge
-
-In v0.32.0 every vMCP caller goes through `server.Serve`: tool, resource and prompt calls go
-through the core with a new backend client per call, and any pod restores a session from Redis
-(#5650). The merge commit `38edac4e3` resolved every conflict to upstream's behaviour; the fork
-behaviour still needed came back in standalone commits on top of it (plan:
-`docs/fork/v0.32-merge-plan.md`, PAIINFRA-227, DocPlanner/toolhive#21). Unlike the sections
-above, a replay keeps these, as long as each commit is replayed.
-
-| Behaviour | Where it lives now | Commit | Original commit |
-|---|---|---|---|
-| Session Redis ACL username, `WithSessionIdleTTL`, HTTP write timeout and backend init timeout wired on the Serve path; mcp-go's idle sweep clears only this pod's SDK state (`sessionIDManagerResolver`) and `Stop` stops it | `pkg/vmcp/server/server.go` (`buildSessionDataStorage`, `Handler`), `pkg/vmcp/cli/serve.go`, `pkg/vmcp/server/derive.go` | `bafe4d46a`, `7f57d1f6f` | `8d09330f5`, `d104dfc9f`, `3533730ce`, `5feb1b1c9` |
-| Session registration runs on a detached context (request values kept, 45 s timeout) | `pkg/vmcp/server/server.go` (`handleSessionRegistrationImpl`) | `0d62ea671` | `596f6ccf8` |
-| Session-cardinality gauges (transport sessions, SDK sessions, in-flight registrations) | `pkg/vmcp/server/session_telemetry.go`, `client_sessions.go` | `0d62ea671`, `f387a57f2` | `560c1d023` |
-| New sessions connect only to backends eligible for exposure | `pkg/vmcp/server/sessionmanager/session_manager.go` (`FactoryConfig.HealthStatusProvider`) | `ee875852d` | `currentEligibleBackends` |
-| `timeouts.default` / `timeouts.perWorkload` applied to each backend call (keyed by `WorkloadID`, 90 s fallback); the HTTP write timeout covers the longest of them, fallback included | `pkg/vmcp/client/client.go` (`WithRequestTimeouts`, `DefaultBackendRequestTimeout`), `pkg/vmcp/cli/serve_timeouts.go` (`serverWriteTimeoutFromConfig`) | `4cf28e14c`, `703e8e849` | `3533730ce` |
-| `Terminate` closes the node-local cached session; idle sweep closes cached sessions after the session TTL; `Close` runs outside the cache lock | `pkg/vmcp/server/sessionmanager/session_manager.go`, `pkg/cache/validating_cache.go` (`Remove`, `EvictIdle`) | `036974570`, `51de52641` | `596f6ccf8`, `c9ab3ccbc` |
-| A call that arrives before the registration wrote the identity binding waits (one store read per step, 25 ms doubling to 500 ms, 10 s) instead of failing | `pkg/vmcp/server/serve_handlers.go` (`waitForRegisteredSession`, `waitWhileRegistrationPending`) | `c94881448`, `7d04b4957` | `d6a23fcda` |
-| Health probes between vMCPs neither create sessions nor list capabilities. The probe header sets a package-private context key, never the `healthcontext` marker (which switches outgoing auth to the vMCP's service credentials), and a probe may only initialize, ping and list (else 403) | `pkg/vmcp/server/peer_probe.go` (`peerProbeMiddleware`) | `37d40cf78`, `43623c120` | `46dd7a465` |
-| Resources filled on a pod that did not register the session | `pkg/vmcp/server/server.go` (`lazyInjectSessionResources`), `serve.go` hooks | `536c603b4` | `d6a23fcda` |
-| Backend health or registry change clears the sessions' tool and resource stores and sends `list_changed` (15 s debounce, 60 s cooldown) | `pkg/vmcp/server/serve_refresh.go`, `refresh_scheduler.go` | `c4984e59c` | `560c1d023`, `35680e28c`, `e755493fe` |
-| GET re-registration of a bound session attaches a matching caller and rejects any other; it never rewrites the binding | `pkg/vmcp/server/server.go` (`attachToBoundSession`) | `ab1b5b667` | — (new, plan D5) |
-| A GET registration never creates a session: it waits for the creating pod's binding, then attaches or rejects | `pkg/vmcp/server/server.go` (`attachToBoundSession`) | `fccda6842` | — (new) |
-| Every GET is checked before mcp-go sees it: 400 without `Mcp-Session-Id`, 404 for a missing, terminated or never-bound session, 403 for a different caller (mcp-go answers 200 whatever the hook does) | `pkg/vmcp/server/server.go` (`listenStreamGuardMiddleware`, `checkListenStreamCaller`) | `854448185` | — (new) |
-| A capability query that misses a backend is marked partial (`AggregationMetadata.Partial`) and cached for at most 5 s (`partialCapabilityTTL`); a `tools/call` for a tool the session store lacks tops the store up from a fresh query (own caller only, not in optimizer mode, add-only) | `pkg/vmcp/aggregator/caching_aggregator.go`, `default_aggregator.go`, `pkg/vmcp/server/server.go` (`lazyInjectSessionTools`) | `d6d76710c` | — (new, PAIINFRA-343) |
-| Missing credentials for `authz.primaryUpstreamProvider` return 401 with `WWW-Authenticate` (empty provider names ignored) | `pkg/auth/token.go` (`WithRequiredUpstreamProviders`), `pkg/vmcp/auth/factory/incoming.go` | `44b70f6a5`, `f387a57f2` | `c2cb472a2` |
-
-Tests: `pkg/vmcp/server/serve_*_test.go`, `session_registration_context_test.go`,
-`session_telemetry_test.go`, `sessionmanager/session_cache_close_test.go`,
-`pkg/vmcp/client/request_timeout_test.go`, `pkg/vmcp/cli/serve_timeouts_test.go`,
-`pkg/cache/validating_cache_test.go`, `pkg/auth/token_test.go`.
-
-**Capability refresh scope.** The refresh (`c4984e59c`) clears only the sessions in
-`activeClientSessions`: sessions registered on this pod by initialize or a GET listen stream. A
-session that a pod only serves through POSTs (registered on another pod, tools filled by lazy
-injection) keeps that pod's tool and resource stores until mcp-go's idle sweep clears them, so it
-can see a stale tool set there. `startCapabilityRefresh` runs only from `Server.Start`; an embedder
-that serves `Handler` without `Start` gets no refresh.
-
-**Partial capabilities.** Upstream fills a session's tool store once per pod and caches a partial
-aggregation for 30 s (#5786), so a backend that misses one query (here the fork's
-`capabilityQueryTimeout`, or a 502 during a rollout) leaves calls failing with `tool not found`.
-`d6d76710c` (and the follow-up that bounds its cost) is the interim fix. A `tools/list` still never re-derives a filled store: a session
-whose first list was partial gets the rest on the next backend refresh or reconnect. Drop the patch
-once upstream lands the same fix (PAIINFRA-343). `capabilityQueryTimeout` is 10 s: with 3 s, about a
-quarter of the production hub aggregations were partial on 2026-10-15, because the nested `global`
-vMCP backend can take longer than 3 s to initialize on a cold pod. Upstream has no such timeout;
-replace it with the configured backend timeouts (#6411) when the fork reaches v0.45.
-
-**GET guard.** mcp-go v0.55 registers a session again when a GET listen stream reaches a pod that
-does not hold it, and upstream's `CreateSession` would re-bind it to the caller. Upstream stops
-this only in v0.40.0, as a side effect of #5729 (mcp-go replaced by toolhive-core `mcpcompat`).
-mcp-go also answers the GET with 200 whatever the hook does, so `854448185` checks the GET in an
-HTTP middleware first; the hook check stays as a fallback. Drop `ab1b5b667`, `fccda6842` and the
-middleware of `854448185` once the fork is on v0.40 or later, if `TestCrossPodSessionRebind`,
-`TestCrossPodGETDuringRegistration` and `TestListenStreamGuard`
-(`pkg/vmcp/server/serve_crosspod_rebind_test.go`) pass without them.
+| Behaviour | How it was re-applied |
+|---|---|
+| Capability refresh | `serve_refresh.go` triggers upstream's per-session `list_changed` sink (`buildListChangedSink`) stored in `Server.refreshSinks`, instead of clearing stores and notifying through mcp-go |
+| Listen-stream guard | One HTTP middleware (`listenStreamGuardMiddleware`) using the stored binding: 403 for another identity, everything else left to the SDK |
+| Per-backend timeouts | `requestTimeout(WorkloadID)` in upstream's `newStreamableHTTPClient` and `buildModernHTTPClient` instead of the fixed 30 s |
+| No synthesized `structuredContent` | `toolResultFromMCP` takes `hasOutputSchema` |
+| Peer probe | `peerProbeMiddleware` placed inside upstream's auth middleware (upstream now wraps auth in audit) |
+| Idle close of cached sessions | `FactoryConfig.IdleTTL` kept next to upstream's `BackendHealth` gate |
+| Partial-capabilities top-up | The call hook passes the tool name; the owner check reuses `enforceSessionBinding` |
+| Client JSON-RPC responses | Narrowed: a reply needs no `method` member and a `result` or `error` (a webhook patch that removes `method` must fail closed, upstream test); one `IsClientResponse` check in authz and the validating webhook |
+| Host header | `RoundTrip` keeps only the configured target host and rewrites any other value (upstream's host-injection regression test) |
 
 ## Dropped patches
 
@@ -132,19 +160,29 @@ They stay in history; don't re-apply them on a replay.
 
 | Commit | Patch | Why it was dropped |
 |---|---|---|
-| `a75f5027b` | Preserve OIDC config ref resource URL | Upstream has the same `ResourceURL` field and fallback since v0.23.1. No net diff. |
-| `66be6ebe9` | Accept `best_effort` partial failure mode | Upstream accepts `best_effort` since v0.22.0 (#4865). The fork's extra `bestEffort` alias was removed; no DocPlanner config uses it. |
-| `87be189f6` | Restore embedding config resolution | Upstream's `populateOptimizerEmbeddingService` resolves `embeddingServerRef` (with `Validate()` defaulting the optimizer). Upstream's version is used. |
-| `690846dd8` | `InlineAuthzConfig.primaryUpstreamProvider` on `VirtualMCPServer` | Upstream added it in v0.27.1 and moved it to `spec.authServerConfig.primaryUpstreamProvider`; the inline location is still read (deprecated). Dropped in the v0.28.3 merge. |
-| `4cca58224` | Prefer the caller's live identity on backend requests | Upstream #5335 (v0.28.0) does the same in `identityRoundTripper`. Dropped in the v0.28.3 merge. |
-| `e492cbfad` | Bind sessions to the `sub` claim instead of the bearer token | Upstream #5378 (v0.29.x) binds to `(iss, sub)`. Dropped in the v0.29.3 merge. |
-| `ee63a49a8`, `fd01fce88`, `f690bcd97`, `6ab79d0b9` | Session-owner advertise URL (`THV_VMCP_SESSION_OWNER_URL`, `POD_IP`), forwarding to the owner pod, claim of orphaned sessions, handover, dial fail-fast | v0.32.0 has no session owner: any pod restores a session from Redis (#5650). Dropped in the v0.32.0 merge. |
-| `f7d033ff9`, `704a5c162`, `16ffb4874` (vMCP part), `c40943a83` | Reconnect expired backend sessions; live-session lookup and rebuild in the tool handlers | Each backend call uses a new client (`httpBackendClient`); the handlers were removed upstream (#5622). Dropped in the v0.32.0 merge. |
-| `c9ab3ccbc` (stripe locks, `ReplaceSession`, `CompareAndSwap`), `560c1d023` (`CreatorIdentity`), `517f94007`, `e755493fe` (`HasBoundIdentity`) | Safe publication of refreshed sessions, rebuilt with the creator's identity | No session rebuild any more; the refresh clears and notifies instead (`c4984e59c`). Dropped in the v0.32.0 merge. |
-| `517f94007` (`keepStoredBackendIDs`) | Stop token-less restores from killing bound sessions | The stored backend list no longer affects calls. Dropped in the v0.32.0 merge. |
-| `b2dbce4b7` | Refresh on a backend `list_changed` notification | Covered by the health and registry refresh (`c4984e59c`). Dropped in the v0.32.0 merge. |
-| `7a6c9a2f3` | Restore with the owner's live identity (`ownsStoredSession`) | Upstream #5650 restores with the request identity; `enforceSessionBinding` rejects other callers. Dropped in the v0.32.0 merge. |
-| `c2cb472a2` (status map) | Upstream-token status map (`UpstreamCredentialStatus`, `UpstreamTokenStatuses`) | Upstream #5651 returns 401 when a refresh fails; the missing-token case is `44b70f6a5`. No Cedar policy read the status. Dropped in the v0.32.0 merge. |
-| `8d09330f5` (alias) | Redis `address` alias of `addr` on `MCPExternalAuthConfig` (CRD, `EffectiveAddr`) and `LegacyAddress` in the auth-server RunConfig | All values and live objects use `addr` (PAIINFRA-219). Dropped in the v0.32.0 merge. |
-| `5b6448a0d` (remote proxy part) | `MCPRemoteProxy.spec.podTemplateSpec`, applying only nodeSelector, tolerations and affinity | Upstream #5531 (v0.37.0) adds the same field with a full strategic-merge patch, a `PodTemplateValid` condition and drift detection by hash. No live MCPRemoteProxy exists. Dropped in the v0.39.0 merge. |
-| `8e474c8b2` (env sort) | `sortEnvVarsByName` on the vMCP env, plus sorted workload and backend loops | Upstream already sorts each discovered and inline secret env group; the rest of the list has a fixed order. Dropping it changes the env order once, inside the rollout the new image causes anyway. Dropped in the v0.39.0 merge. |
+| `a75f5027b` | Preserve OIDC config ref resource URL | Upstream has the same field and fallback since v0.23.1. |
+| `66be6ebe9` | Accept `best_effort` partial failure mode | Upstream accepts it since v0.22.0 (#4865). |
+| `87be189f6` | Restore embedding config resolution | Upstream's `populateOptimizerEmbeddingService` resolves it. |
+| `690846dd8` | `InlineAuthzConfig.primaryUpstreamProvider` on `VirtualMCPServer` | Upstream added it in v0.27.1. Dropped in the v0.28.3 merge. |
+| `4cca58224` | Prefer the caller's live identity on backend requests | Upstream #5335 (v0.28.0). Dropped in the v0.28.3 merge. |
+| `e492cbfad` | Bind sessions to the `sub` claim | Upstream #5378 binds to `(iss, sub)`. Dropped in the v0.29.3 merge. |
+| `ee63a49a8`, `fd01fce88`, `f690bcd97`, `6ab79d0b9` | Session owner URL, forwarding to the owner pod, claim, handover, dial fail-fast | v0.32.0 restores a session on any pod (#5650). Dropped in the v0.32.0 merge. |
+| `f7d033ff9`, `704a5c162`, `16ffb4874` (vMCP part), `c40943a83` | Reconnect expired backend sessions; live-session rebuild in the tool handlers | Each backend call uses a new client (#5622). Dropped in the v0.32.0 merge. |
+| `c9ab3ccbc`, `560c1d023` (`CreatorIdentity`), `517f94007`, `e755493fe` | Safe publication of refreshed sessions | No session rebuild any more. Dropped in the v0.32.0 merge. |
+| `b2dbce4b7` | Refresh on a backend `list_changed` | Upstream #5965/#5971 do it. Dropped in the v0.32.0 merge. |
+| `7a6c9a2f3` | Restore with the owner's live identity | Upstream #5650. Dropped in the v0.32.0 merge. |
+| `8d09330f5` (alias) | Redis `address` alias of `addr` | All values use `addr` (PAIINFRA-219). Dropped in the v0.32.0 merge. |
+| `5b6448a0d` (remote proxy part) | `MCPRemoteProxy.spec.podTemplateSpec` | Upstream #5531 (v0.37.0). Dropped in the v0.39.0 merge. |
+| `8e474c8b2` (env sort) | Sorted vMCP env, workload and backend loops | Upstream sorts each env group. Dropped in the v0.39.0 merge. |
+| `09c117c56` | Digest-pinned image pulls through the Docker daemon | Upstream #5978 does the same. Dropped in the v0.42.1 merge. |
+| `c2cb472a2` (what was left), `f387a57f2` (authz part) | Typed upstream-auth error in Cedar, 401 classification in authz middleware and response filter, list filtering failing on an authorizer error | `44b70f6a5` already answers 401 before authz runs, and upstream #5651 answers 401 on a failed refresh. Upstream now denies with a fixed 403 (#5841, #5850, #6066). Dropped in the v0.42.1 merge. |
+| `497da99ae` | Default the sole allowed audience on every grant; require `resource` with several audiences | Upstream defaults the sole audience for `authorization_code`, and fosite carries it into refresh grants. Dropped in the v0.42.1 merge. |
+| `9db565784`, `08d687ac6` | Structured token-endpoint error logs with refresh-failure classification | Upstream logs the error; `oauth_debug` could carry request fragments. Dropped in the v0.42.1 merge. |
+| `8d09330f5` (validation) | Go validation of the auth-server Redis storage block | CEL rules and `controllerutil` cover it (only the `sentinelTls` with `addr` check is gone). Dropped in the v0.42.1 merge. |
+| `ee875852d`, `afc71f865` | `health/exposure.go`: new sessions connect only to backends eligible for exposure | Upstream #6162 (`BackendHealth`, `health.ShouldAdvertise`); upstream also tries `Unknown` backends. Dropped in the v0.42.1 merge. |
+| `ab1b5b667`, `fccda6842`, `854448185` | GET re-registration guard: attach or reject in the registration hook, wait for the creating pod, HTTP checks | mcpcompat never runs the hook outside `initialize`, so a GET cannot re-bind (`TestCrossPodSessionRebind`). The caller check lives on in `listenStreamGuardMiddleware`. Dropped in the v0.42.1 merge. |
+| `bafe4d46a`, `7f57d1f6f` (SDK sweep) | `sessionIDManagerResolver`, `WithSessionIdleTTL`, `Shutdown` of the SDK sweeper | mcpcompat has no idle sweep. Dropped in the v0.42.1 merge. |
+| `c94881448`, `7d04b4957` | Calls wait for the registration to write the binding | Registration finishes inside `initialize`. Dropped in the v0.42.1 merge. |
+| `0d62ea671` (context), `560c1d023` / `0d62ea671` / `f387a57f2` (gauges) | Registration on a detached context; session-cardinality gauges | The hook runs before the initialize response; mcpcompat has no unregister hook to count sessions. Dropped in the v0.42.1 merge. |
+| `536c603b4` | Resources filled on a pod that did not register the session | mcpcompat has no resource hooks (upstream gap, see Notes). Dropped in the v0.42.1 merge. |
+| `525718fee`, `3d2af3d90`, `085637aa5`, `b387fe750` (swag pin) | e2e image pins, swag pin | Upstream pins them. Dropped in the v0.42.1 merge. |

@@ -6,9 +6,6 @@ package handlers
 import (
 	"log/slog"
 	"net/http"
-	"strings"
-
-	"github.com/ory/fosite"
 
 	"github.com/stacklok/toolhive/pkg/authserver/server"
 	"github.com/stacklok/toolhive/pkg/authserver/server/session"
@@ -30,7 +27,9 @@ func (h *Handler) TokenHandler(w http.ResponseWriter, req *http.Request) {
 	// Parse and validate the access request
 	accessRequest, err := h.provider.NewAccessRequest(ctx, req, sess)
 	if err != nil {
-		logTokenEndpointError("request_validation", req, err)
+		slog.Error("failed to create access request",
+			"error", err,
+		)
 		h.provider.WriteAccessError(ctx, w, accessRequest, err)
 		return
 	}
@@ -50,8 +49,7 @@ func (h *Handler) TokenHandler(w http.ResponseWriter, req *http.Request) {
 			server.ErrInvalidTarget.WithHint("Multiple resource parameters are not supported"))
 		return
 	}
-	switch {
-	case len(resources) == 1 && resources[0] != "":
+	if len(resources) == 1 && resources[0] != "" {
 		resource := resources[0]
 		// Validate URI format per RFC 8707
 		if err := server.ValidateAudienceURI(resource); err != nil {
@@ -77,25 +75,25 @@ func (h *Handler) TokenHandler(w http.ResponseWriter, req *http.Request) {
 			"resource", resource,
 		)
 		accessRequest.GrantAudience(resource)
-	case len(h.config.AllowedAudiences) == 1:
-		defaultAudience := h.config.AllowedAudiences[0]
-		slog.Debug("granting default audience for token request without resource", //nolint:gosec // G706: configured audience URI
-			"audience", defaultAudience,
+	} else if accessRequest.GetGrantTypes().ExactOne("authorization_code") && len(h.config.AllowedAudiences) == 1 {
+		// No resource parameter provided (or provided as empty) during an authorization_code
+		// exchange; default to the sole allowed audience. The len == 1 guard makes the
+		// intended audience unambiguous and the index access safe. We restrict this defaulting
+		// to authorization_code grants: for refresh_token grants, fosite already carries the
+		// originally-granted audience forward through the session, so re-granting here would
+		// conflict with fosite's audience matching strategy.
+		slog.Debug("no resource parameter, defaulting to sole allowed audience",
+			"audience", h.config.AllowedAudiences[0],
 		)
-		accessRequest.GrantAudience(defaultAudience)
-	case len(h.config.AllowedAudiences) > 1:
-		slog.Debug("resource parameter required when multiple audiences are configured", //nolint:gosec // G706: count is an integer
-			"count", len(h.config.AllowedAudiences),
-		)
-		h.provider.WriteAccessError(ctx, w, accessRequest,
-			server.ErrInvalidTarget.WithHint("Token request must include resource when multiple audiences are configured"))
-		return
+		accessRequest.GrantAudience(h.config.AllowedAudiences[0])
 	}
 
 	// Generate the access response (tokens)
 	response, err := h.provider.NewAccessResponse(ctx, accessRequest)
 	if err != nil {
-		logTokenEndpointError("response_generation", req, err)
+		slog.Error("failed to create access response",
+			"error", err,
+		)
 		h.provider.WriteAccessError(ctx, w, accessRequest, err)
 		return
 	}
@@ -116,64 +114,4 @@ func (h *Handler) TokenHandler(w http.ResponseWriter, req *http.Request) {
 
 	// Write the token response
 	h.provider.WriteAccessResponse(ctx, w, accessRequest, response)
-}
-
-func logTokenEndpointError(phase string, req *http.Request, err error) {
-	slog.Error("token endpoint request failed", tokenEndpointErrorAttrs(phase, req, err)...)
-}
-
-// tokenEndpointErrorAttrs builds the structured log attributes for a failed
-// token endpoint request.
-func tokenEndpointErrorAttrs(phase string, req *http.Request, err error) []any {
-	oauthErr := fosite.ErrorToRFC6749Error(err)
-	grantType := req.PostFormValue("grant_type")
-
-	attrs := []any{
-		"phase", phase,
-		"error", err,
-		"oauth_error", oauthErr.ErrorField,
-	}
-	if grantType != "" {
-		attrs = append(attrs, "grant_type", grantType)
-	}
-	if clientID := req.PostFormValue("client_id"); clientID != "" {
-		attrs = append(attrs, "client_id", clientID)
-	}
-	if oauthErr.HintField != "" {
-		attrs = append(attrs, "oauth_hint", oauthErr.HintField)
-	}
-	if oauthErr.DebugField != "" {
-		attrs = append(attrs, "oauth_debug", oauthErr.DebugField)
-	}
-	if grantType == "refresh_token" {
-		attrs = append(attrs, "refresh_failure_classification", classifyRefreshTokenFailure(oauthErr))
-	}
-
-	return attrs
-}
-
-func classifyRefreshTokenFailure(err *fosite.RFC6749Error) string {
-	if err == nil {
-		return "unknown"
-	}
-
-	hint := strings.ToLower(err.HintField)
-	switch {
-	case strings.Contains(hint, "already used"):
-		return "rotated_or_replayed"
-	case strings.Contains(hint, "malformed or not valid"):
-		return "storage_lookup_miss"
-	case strings.Contains(hint, "expired"):
-		return "expired"
-	case strings.Contains(hint, "does not match the id during the initial token issuance"):
-		return "client_mismatch"
-	case strings.Contains(hint, "multiple concurrent requests"):
-		return "concurrent_refresh_race"
-	case strings.Contains(hint, "failed to refresh token"):
-		return "refresh_rotation_retryable_failure"
-	case err.ErrorField != "":
-		return err.ErrorField
-	default:
-		return "unknown"
-	}
 }

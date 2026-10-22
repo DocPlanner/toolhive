@@ -1810,10 +1810,12 @@ func (r *VirtualMCPServerReconciler) podTemplateMetadataNeedsUpdate(
 	return false
 }
 
-// podTemplateSpecNeedsUpdate checks if the user-provided PodTemplateSpec has changed.
-// Instead of comparing full rendered templates (which always differ due to Kubernetes-defaulted
-// fields like terminationGracePeriodSeconds, dnsPolicy, etc.), this compares a SHA256 hash of
-// the raw PodTemplateSpec input stored as a deployment annotation.
+// podTemplateSpecNeedsUpdate checks if the user-provided PodTemplateSpec has changed, by
+// comparing a SHA256 hash of the raw input against the stored annotation rather than the
+// full rendered template (which always differs due to Kubernetes-defaulted fields).
+// Symmetric by design (#5818): an absent PodTemplateSpec expects an empty hash, so a stale
+// annotation left over after the field is cleared is treated as drift and gets pruned by
+// mergeDeploymentAnnotations on the next write, instead of being flagged forever.
 func (*VirtualMCPServerReconciler) podTemplateSpecNeedsUpdate(
 	ctx context.Context,
 	deployment *appsv1.Deployment,
@@ -1824,21 +1826,14 @@ func (*VirtualMCPServerReconciler) podTemplateSpecNeedsUpdate(
 		return true
 	}
 
-	// If no PodTemplateSpec is provided, update is only needed if one was previously applied
-	if vmcp.Spec.PodTemplateSpec == nil || vmcp.Spec.PodTemplateSpec.Raw == nil {
-		_, hadPrevious := deployment.Annotations[podTemplateSpecHashAnnotation]
-		return hadPrevious
-	}
-
-	// Compare hash of the raw PodTemplateSpec input against the stored annotation.
-	// Avoids comparing full rendered templates which always differ due to
-	// Kubernetes-defaulted fields (terminationGracePeriodSeconds, dnsPolicy, etc.).
-	// Uses HashRawJSON to ensure deterministic hashing regardless of JSON field ordering.
-	expectedHash, err := checksum.HashRawJSON(vmcp.Spec.PodTemplateSpec.Raw)
-	if err != nil {
-		// If we can't hash, assume update is needed
-		log.FromContext(ctx).Error(err, "Failed to hash PodTemplateSpec, assuming update needed")
-		return true
+	expectedHash := ""
+	if vmcp.Spec.PodTemplateSpec != nil && len(vmcp.Spec.PodTemplateSpec.Raw) > 0 {
+		hash, err := checksum.HashRawJSON(vmcp.Spec.PodTemplateSpec.Raw)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "Failed to hash PodTemplateSpec, assuming update needed")
+			return true
+		}
+		expectedHash = hash
 	}
 	if deployment.Annotations[podTemplateSpecHashAnnotation] != expectedHash {
 		return true
@@ -1866,18 +1861,16 @@ func (*VirtualMCPServerReconciler) podTemplateSpecNeedsUpdate(
 	return false
 }
 
-// mergeDeploymentAnnotations merges desired Deployment annotations onto the
-// live ones via ctrlutil.MergeAnnotations, then prunes imagePullRefsHashAnnotation
-// from the result if desired no longer wants it. MergeAnnotations preserves any
-// live key absent from desired so externally-managed annotations survive, but
-// imagePullRefsHashAnnotation is operator-owned: when the desired imagePullSecrets
-// list is empty, desired carries no annotation for it, and a stale value left by
-// a prior reconcile must be pruned explicitly or it survives forever and
-// imagePullSecretsNeedsUpdate flags drift on every reconcile (#5817).
+// mergeDeploymentAnnotations merges desired annotations onto the live ones via
+// ctrlutil.MergeAnnotations, then prunes the operator-owned hash annotations
+// (imagePullRefsHashAnnotation, podTemplateSpecHashAnnotation) that desired no longer wants —
+// MergeAnnotations otherwise preserves them forever once their source field goes empty (#5817, #5818).
 func mergeDeploymentAnnotations(desired, live map[string]string) map[string]string {
 	merged := ctrlutil.MergeAnnotations(desired, live)
-	if _, wantHash := desired[imagePullRefsHashAnnotation]; !wantHash {
-		delete(merged, imagePullRefsHashAnnotation)
+	for _, key := range []string{imagePullRefsHashAnnotation, podTemplateSpecHashAnnotation} {
+		if _, want := desired[key]; !want {
+			delete(merged, key)
+		}
 	}
 	return merged
 }
@@ -3538,8 +3531,8 @@ func (r *VirtualMCPServerReconciler) handleConfigRefs(
 // (spec.incomingAuth.authzConfigRef), tracks its hash on the VirtualMCPServer
 // status, and sets the AuthzConfigRefValidated condition. When the ref is
 // cleared it removes both the hash and the condition so a stale "valid" signal
-// does not linger. ReferencingWorkloads on the MCPAuthzConfig is owned by the
-// MCPAuthzConfig controller (#5511); this controller never writes it.
+// does not linger. The MCPAuthzConfig's status is owned by the MCPAuthzConfig
+// controller (#5511); this controller never writes it.
 //
 // Revocation semantics (fail-stale, not fail-open): if a previously-valid ref
 // later becomes invalid or missing, this returns an error and Reconcile stops
@@ -3724,13 +3717,11 @@ func (r *VirtualMCPServerReconciler) handleOIDCConfig(
 		return fmt.Errorf("%s", msg)
 	}
 
-	// ReferencingWorkloads on the MCPOIDCConfig is maintained solely by the
-	// MCPOIDCConfig controller, which watches MCPServer/VirtualMCPServer/
-	// MCPRemoteProxy and recomputes the full list (additions and removals). The
-	// VirtualMCPServer controller must not write the config's status: a full
-	// r.Status().Update here would clobber conditions the config controller
-	// owns, and the previous append-only write never removed stale entries.
-	// See #5511.
+	// The VirtualMCPServer controller must not write the MCPOIDCConfig's status:
+	// that status is owned by the MCPOIDCConfig controller, and a full
+	// r.Status().Update here would clobber conditions it owns. The config
+	// controller no longer tracks referencing workloads in its status; deletion
+	// protection recomputes referrers on demand in its finalizer. See #5511.
 
 	// Set valid condition
 	statusManager.SetCondition(

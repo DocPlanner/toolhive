@@ -4,9 +4,7 @@
 package handlers
 
 import (
-	"bytes"
 	"encoding/json"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -15,15 +13,12 @@ import (
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
-	"github.com/go-jose/go-jose/v4/jwt"
-	"github.com/ory/fosite"
+	josejwt "github.com/go-jose/go-jose/v4/jwt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	servercrypto "github.com/stacklok/toolhive/pkg/authserver/server/crypto"
-	"github.com/stacklok/toolhive/pkg/authserver/server/session"
 	"github.com/stacklok/toolhive/pkg/authserver/storage"
-	"github.com/stacklok/toolhive/pkg/authserver/upstream"
 )
 
 func TestTokenHandler_MissingGrantType(t *testing.T) {
@@ -150,95 +145,6 @@ func TestTokenHandler_InvalidClient(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), "invalid_client")
 }
 
-func TestClassifyRefreshTokenFailure(t *testing.T) {
-	t.Parallel()
-
-	testCases := []struct {
-		name     string
-		err      *fosite.RFC6749Error
-		expected string
-	}{
-		{
-			name:     "reuse detected",
-			err:      fosite.ErrInvalidGrant.WithHint("The refresh token was already used."),
-			expected: "rotated_or_replayed",
-		},
-		{
-			name:     "lookup miss",
-			err:      fosite.ErrInvalidGrant.WithHint("The refresh token is malformed or not valid."),
-			expected: "storage_lookup_miss",
-		},
-		{
-			name:     "expired",
-			err:      fosite.ErrInvalidGrant.WithHint("The refresh token expired."),
-			expected: "expired",
-		},
-		{
-			name:     "client mismatch",
-			err:      fosite.ErrInvalidGrant.WithHint("The OAuth 2.0 Client ID from this request does not match the ID during the initial token issuance."),
-			expected: "client_mismatch",
-		},
-		{
-			name:     "concurrent race",
-			err:      fosite.ErrInvalidRequest.WithHint("Failed to refresh token because of multiple concurrent requests using the same token. Please retry the request."),
-			expected: "concurrent_refresh_race",
-		},
-		{
-			name:     "generic fallback",
-			err:      fosite.ErrUnauthorizedClient.WithHint("The OAuth 2.0 Client is not allowed to use authorization grant 'refresh_token'."),
-			expected: "unauthorized_client",
-		},
-	}
-
-	for _, tc := range testCases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			assert.Equal(t, tc.expected, classifyRefreshTokenFailure(tc.err))
-		})
-	}
-}
-
-func TestTokenHandler_InvalidRefreshTokenLogsClassification(t *testing.T) {
-	t.Parallel()
-	handler, _, _ := handlerTestSetup(t)
-
-	newRequest := func() *http.Request {
-		form := url.Values{
-			"grant_type":    {"refresh_token"},
-			"client_id":     {testAuthClientID},
-			"refresh_token": {"invalid-refresh-token"},
-		}
-		req := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(form.Encode()))
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		return req
-	}
-	rec := httptest.NewRecorder()
-
-	handler.TokenHandler(rec, newRequest())
-
-	assert.Equal(t, http.StatusBadRequest, rec.Code)
-	assert.Contains(t, rec.Body.String(), "invalid_grant")
-
-	// Rebuild the validation error that TokenHandler logs and render its log
-	// attributes with a local logger. The process-wide slog default is not
-	// replaced, so the test can run in parallel with the others.
-	req := newRequest()
-	_, err := handler.provider.NewAccessRequest(req.Context(), req, session.New("", "", "", session.UserClaims{}))
-	require.Error(t, err)
-
-	var logBuf bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	logger.Error("token endpoint request failed", tokenEndpointErrorAttrs("request_validation", req, err)...)
-
-	logOutput := logBuf.String()
-	assert.Contains(t, logOutput, "token endpoint request failed")
-	assert.Contains(t, logOutput, "phase=request_validation")
-	assert.Contains(t, logOutput, "grant_type=refresh_token")
-	assert.Contains(t, logOutput, "oauth_error=invalid_grant")
-	assert.Contains(t, logOutput, "refresh_failure_classification=storage_lookup_miss")
-}
-
 func TestTokenHandler_Success(t *testing.T) {
 	t.Parallel()
 	handler, storState, _ := handlerTestSetup(t)
@@ -359,7 +265,7 @@ func TestTokenHandler_AudienceClaim(t *testing.T) {
 			require.True(t, ok, "access_token should be a string")
 			require.NotEmpty(t, accessToken)
 
-			parsedToken, err := jwt.ParseSigned(accessToken, []jose.SignatureAlgorithm{jose.RS256})
+			parsedToken, err := josejwt.ParseSigned(accessToken, []jose.SignatureAlgorithm{jose.RS256})
 			require.NoError(t, err)
 
 			var claims map[string]any
@@ -371,87 +277,6 @@ func TestTokenHandler_AudienceClaim(t *testing.T) {
 			assert.Equal(t, tc.wantAud, aud[0])
 		})
 	}
-}
-
-func TestTokenHandler_DefaultsSingleAudienceWhenResourceOmitted(t *testing.T) {
-	t.Parallel()
-	handler, storState, _ := handlerTestSetup(t)
-
-	authorizeCode := simulateAuthorizeFlow(t, handler, storState)
-
-	form := url.Values{
-		"grant_type":    {"authorization_code"},
-		"client_id":     {testAuthClientID},
-		"redirect_uri":  {testAuthRedirectURI},
-		"code":          {authorizeCode},
-		"code_verifier": {testPKCEVerifier},
-	}
-	req := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	rec := httptest.NewRecorder()
-
-	handler.TokenHandler(rec, req)
-
-	require.Equal(t, http.StatusOK, rec.Code, "expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
-
-	tokenData := parseTokenResponse(t, rec.Body.String())
-	accessToken, ok := tokenData["access_token"].(string)
-	require.True(t, ok, "access_token should be a string")
-	require.NotEmpty(t, accessToken, "access_token should not be empty")
-
-	parsedToken, err := jwt.ParseSigned(accessToken, []jose.SignatureAlgorithm{jose.RS256})
-	require.NoError(t, err, "should be able to parse JWT")
-
-	var claims map[string]interface{}
-	err = parsedToken.Claims(handler.config.SigningKey.Public(), &claims)
-	require.NoError(t, err, "JWT signature should be valid")
-
-	aud, ok := claims["aud"].([]interface{})
-	require.True(t, ok, "aud claim should be an array")
-	require.Len(t, aud, 1, "aud should have exactly one audience")
-	assert.Equal(t, "https://api.example.com", aud[0], "default audience should match the sole allowed audience")
-}
-
-func TestTokenHandler_RequiresResourceWhenMultipleAudiencesConfigured(t *testing.T) {
-	t.Parallel()
-
-	provider, oauth2Config, stor, storState := baseTestSetup(t)
-	oauth2Config.AllowedAudiences = []string{"https://api.example.com", "https://mcp.example.com"}
-
-	mockUpstream := &mockIDPProvider{
-		providerType:     upstream.ProviderTypeOAuth2,
-		authorizationURL: "https://idp.example.com/authorize",
-		exchangeResult: &upstream.Identity{
-			Tokens: &upstream.Tokens{
-				AccessToken:  "upstream-access-token",
-				RefreshToken: "upstream-refresh-token",
-				IDToken:      "upstream-id-token",
-				ExpiresAt:    time.Now().Add(time.Hour),
-			},
-			Subject: "user-123",
-		},
-	}
-	handler, err := NewHandler(provider, oauth2Config, stor, []NamedUpstream{{Name: "test-upstream", Provider: mockUpstream}})
-	require.NoError(t, err)
-
-	authorizeCode := simulateAuthorizeFlow(t, handler, storState)
-
-	form := url.Values{
-		"grant_type":    {"authorization_code"},
-		"client_id":     {testAuthClientID},
-		"redirect_uri":  {testAuthRedirectURI},
-		"code":          {authorizeCode},
-		"code_verifier": {testPKCEVerifier},
-	}
-	req := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	rec := httptest.NewRecorder()
-
-	handler.TokenHandler(rec, req)
-
-	assert.Equal(t, http.StatusBadRequest, rec.Code)
-	assert.Contains(t, rec.Body.String(), "invalid_target")
-	assert.Contains(t, rec.Body.String(), "Token request must include resource")
 }
 
 func TestTokenHandler_RouteRegistered(t *testing.T) {
@@ -518,13 +343,4 @@ func simulateAuthorizeFlow(t *testing.T, handler *Handler, storState *testStorag
 	require.NotEmpty(t, code, "callback redirect should include authorization code")
 
 	return code
-}
-
-func parseTokenResponse(t *testing.T, body string) map[string]interface{} {
-	t.Helper()
-
-	var tokenData map[string]interface{}
-	err := json.Unmarshal([]byte(body), &tokenData)
-	require.NoError(t, err, "token response should be valid JSON")
-	return tokenData
 }

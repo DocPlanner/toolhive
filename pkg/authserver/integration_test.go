@@ -36,8 +36,10 @@ import (
 	"github.com/stacklok/toolhive/pkg/authserver/server/keys"
 	"github.com/stacklok/toolhive/pkg/authserver/server/registration"
 	"github.com/stacklok/toolhive/pkg/authserver/server/session"
+	"github.com/stacklok/toolhive/pkg/authserver/server/tokenexchange"
 	"github.com/stacklok/toolhive/pkg/authserver/storage"
 	"github.com/stacklok/toolhive/pkg/authserver/upstream"
+	"github.com/stacklok/toolhive/pkg/oauthproto"
 )
 
 const (
@@ -95,6 +97,15 @@ type testServerOptions struct {
 	// which delegates to setupTestServer. setupTestServerWithRTProxy does not
 	// accept testServerOption at all, so this field does not apply to it.
 	upstreamFilter handlers.UpstreamFilter
+	// extraClients, when non-empty, are registered in storage in addition to the
+	// default public PKCE test client. Used to install a confidential client for
+	// flows the default public client cannot exercise (e.g. RFC 8693 token
+	// exchange, which requires a confidential acting client).
+	extraClients []fosite.Client
+	// trustedIssuers, when non-empty, is passed through to Config.TrustedIssuers,
+	// enabling RFC 8693 token exchange with subject tokens from external OIDC
+	// issuers in addition to self-issued ones.
+	trustedIssuers []tokenexchange.TrustedIssuer
 }
 
 // testServerOption is a functional option for test server setup.
@@ -127,6 +138,23 @@ func withAccessTokenLifespan(d time.Duration) testServerOption {
 func withUpstreamFilter(f handlers.UpstreamFilter) testServerOption {
 	return func(opts *testServerOptions) {
 		opts.upstreamFilter = f
+	}
+}
+
+// withExtraClient registers an additional client in storage alongside the
+// default public PKCE test client.
+func withExtraClient(c fosite.Client) testServerOption {
+	return func(opts *testServerOptions) {
+		opts.extraClients = append(opts.extraClients, c)
+	}
+}
+
+// withTrustedIssuers configures Config.TrustedIssuers, enabling token
+// exchange with subject tokens from the given external OIDC issuers in
+// addition to self-issued ones.
+func withTrustedIssuers(issuers []tokenexchange.TrustedIssuer) testServerOption {
+	return func(opts *testServerOptions) {
+		opts.trustedIssuers = issuers
 	}
 }
 
@@ -226,6 +254,11 @@ func setupTestServer(t *testing.T, opts ...testServerOption) *testServer {
 	})
 	require.NoError(t, err)
 
+	// Register any extra clients (e.g. a confidential client for token exchange).
+	for _, c := range options.extraClients {
+		require.NoError(t, stor.RegisterClient(ctx, c))
+	}
+
 	// 5. Build upstream config for newServer
 	// When no upstream is provided, use a dummy config that satisfies validation
 	// Note: Uses HTTPS to pass config validation
@@ -255,6 +288,7 @@ func setupTestServer(t *testing.T, opts ...testServerOption) *testServer {
 		Upstreams:            []UpstreamConfig{{Name: "default", Type: UpstreamProviderTypeOAuth2, OAuth2Config: upstreamCfg}},
 		UpstreamFilter:       options.upstreamFilter,
 		AllowedAudiences:     []string{"https://mcp.example.com"},
+		TrustedIssuers:       options.trustedIssuers,
 	}
 
 	// 7. Create server using newServer with test options
@@ -583,6 +617,971 @@ func TestIntegration_TokenEndpoint_RefreshToken(t *testing.T) {
 	replayResp := makeTokenRequest(t, ts.Server.URL, replayParams)
 	defer replayResp.Body.Close()
 	require.GreaterOrEqual(t, replayResp.StatusCode, 400, "old refresh token must be rejected after rotation")
+}
+
+// ============================================================================
+// RFC 8693 Token Exchange Wiring Tests
+// ============================================================================
+
+// TestIntegration_TokenExchange_PublicClientRejected proves that public clients
+// are barred from the RFC 8693 token-exchange grant (only confidential clients
+// may act on a user's behalf), and that the grant is wired into the fosite
+// provider and reachable at the token endpoint.
+//
+// It does not assert a full delegated-token issuance: the handler requires a
+// confidential client (RFC 8693 §2.1) and the shared test harness only
+// registers a public client. Instead it relies on a decisive dispatch
+// discriminator observable at the token endpoint:
+//
+//   - With the token-exchange factory registered, a token-exchange request is
+//     routed to the handler, whose first guard rejects the public client with
+//     error=invalid_grant and a "token-exchange"-specific hint.
+//   - Without the factory, no handler claims grant_type=token-exchange and
+//     fosite returns error=invalid_request (see fosite NewAccessRequest: an
+//     unmatched grant yields ErrInvalidRequest).
+//
+// So invalid_grant with a token-exchange hint proves the handler is registered
+// and executed — exactly the regression a dropped factory would introduce.
+func TestIntegration_TokenExchange_PublicClientRejected(t *testing.T) {
+	t.Parallel()
+
+	m := startMockOIDC(t)
+	ts := setupTestServerWithMockOIDC(t, m)
+
+	verifier := servercrypto.GeneratePKCEVerifier()
+	challenge := servercrypto.ComputePKCEChallenge(verifier)
+
+	// Mint a genuine server-issued access token to use as the subject_token, so
+	// the request is a well-formed RFC 8693 exchange up to the client-type gate.
+	authCode, _ := completeAuthorizationFlow(t, ts.Server.URL, authorizationParams{
+		ClientID:     testClientID,
+		RedirectURI:  testRedirectURI,
+		State:        "token-exchange-dispatch",
+		Challenge:    challenge,
+		Scope:        "openid profile",
+		ResponseType: "code",
+	})
+	tokenData := exchangeCodeForTokens(t, ts.Server.URL, authCode, verifier, testAudience)
+	subjectToken, ok := tokenData["access_token"].(string)
+	require.True(t, ok, "access_token should be a string")
+	require.NotEmpty(t, subjectToken)
+
+	resp := makeTokenRequest(t, ts.Server.URL, url.Values{
+		"grant_type":         {oauthproto.GrantTypeTokenExchange},
+		"subject_token":      {subjectToken},
+		"subject_token_type": {oauthproto.TokenTypeAccessToken},
+		"client_id":          {testClientID},
+	})
+	defer resp.Body.Close()
+
+	body := parseTokenResponse(t, resp)
+	errCode, _ := body["error"].(string)
+	errDesc, _ := body["error_description"].(string)
+
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode,
+		"token-exchange from a public client should be a 400, got %d (body: %v)", resp.StatusCode, body)
+	// The decisive assertion: the token-exchange handler ran and rejected the
+	// public client (invalid_grant), rather than the request falling through
+	// unhandled (invalid_request), which is what a missing factory would produce.
+	require.Equal(t, "invalid_grant", errCode,
+		"expected invalid_grant from the token-exchange handler; invalid_request would mean "+
+			"the token-exchange factory is not wired into the provider")
+	assert.Contains(t, errDesc, "token-exchange",
+		"the rejection must originate from the token-exchange handler specifically")
+}
+
+// TestIntegration_TokenExchange_ConfidentialClientHappyPath drives a full RFC 8693
+// delegation exchange over HTTP through the real fosite provider: a confidential
+// acting client authenticates with client_secret_post, presents a server-signed
+// subject token, and receives a delegated access token.
+//
+// Unlike the unit tests in the tokenexchange package (which call the handler
+// directly with mock strategy/storage), this exercises the complete glued path —
+// fosite NewAccessRequest -> client authentication -> handler dispatch ->
+// PopulateTokenEndpointResponse JSON issuance — proving the token exchange is not
+// just registered but functional end-to-end.
+func TestIntegration_TokenExchange_ConfidentialClientHappyPath(t *testing.T) {
+	t.Parallel()
+
+	const (
+		agentClientID     = "test-agent-client"
+		agentClientSecret = "test-agent-secret"
+		delegatedUserSub  = "delegated-user-sub"
+	)
+
+	// A confidential client registered for the token-exchange grant is the acting
+	// agent. The handler rejects public clients, so this must be confidential.
+	agentClient, err := registration.New(registration.Config{
+		ID:         agentClientID,
+		Secret:     agentClientSecret,
+		Public:     false,
+		GrantTypes: []string{oauthproto.GrantTypeTokenExchange},
+		Scopes:     registration.DefaultScopes,
+		Audience:   []string{testAudience},
+	})
+	require.NoError(t, err)
+
+	m := startMockOIDC(t)
+	ts := setupTestServerWithMockOIDC(t, m, withExtraClient(agentClient))
+
+	// Mint a subject token signed by the server's own key (the validator verifies
+	// against the server's JWKS). client_id must equal the acting client so the
+	// RFC 8693 §4.4 delegation-consent check (client_id binding) passes.
+	signer, err := jose.NewSigner(
+		jose.SigningKey{Algorithm: jose.RS256, Key: ts.PrivateKey},
+		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", "test-key"),
+	)
+	require.NoError(t, err)
+
+	now := time.Now()
+	subjectToken, err := jwt.Signed(signer).
+		Claims(jwt.Claims{
+			Issuer:   testIssuer,
+			Subject:  delegatedUserSub,
+			Audience: jwt.Audience{testAudience},
+			Expiry:   jwt.NewNumericDate(now.Add(30 * time.Minute)),
+			IssuedAt: jwt.NewNumericDate(now),
+		}).
+		Claims(map[string]any{
+			"client_id": agentClientID,
+			"name":      "Delegated User",
+			"email":     "deleg@example.com",
+		}).
+		Serialize()
+	require.NoError(t, err)
+
+	// No resource/audience is sent: the server defaults to its sole allowed
+	// audience (testAudience), which the agent client is registered for.
+	resp := makeTokenRequest(t, ts.Server.URL, url.Values{
+		"grant_type":         {oauthproto.GrantTypeTokenExchange},
+		"subject_token":      {subjectToken},
+		"subject_token_type": {oauthproto.TokenTypeAccessToken},
+		"client_id":          {agentClientID},
+		"client_secret":      {agentClientSecret},
+	})
+	defer resp.Body.Close()
+
+	body := parseTokenResponse(t, resp)
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"token exchange should succeed, got %d (body: %v)", resp.StatusCode, body)
+
+	// RFC 8693 §2.2.1 requires issued_token_type in the response.
+	assert.Equal(t, oauthproto.TokenTypeAccessToken, body["issued_token_type"],
+		"response must advertise the issued token type")
+
+	delegated, ok := body["access_token"].(string)
+	require.True(t, ok, "access_token should be a string")
+	require.NotEmpty(t, delegated)
+
+	// The delegated token is a JWT signed by the server; verify and inspect claims.
+	parsed, err := jwt.ParseSigned(delegated, []jose.SignatureAlgorithm{jose.RS256})
+	require.NoError(t, err)
+	var claims map[string]any
+	require.NoError(t, parsed.Claims(ts.PrivateKey.Public(), &claims))
+
+	// The delegated token carries the USER as subject and the AGENT as the
+	// RFC 8693 §4.1 "act" (acting party).
+	assert.Equal(t, delegatedUserSub, claims["sub"], "delegated token subject must be the user")
+	assert.Equal(t, testIssuer, claims["iss"])
+	act, ok := claims["act"].(map[string]any)
+	require.True(t, ok, "delegated token must carry an 'act' claim")
+	assert.Equal(t, agentClientID, act["sub"], "act.sub must identify the acting agent client")
+
+	// Audience: no resource/audience was requested, so grantDefaultAudience must
+	// bind the token to the server's sole allowed audience.
+	aud, ok := claims["aud"].([]interface{})
+	require.True(t, ok, "aud claim should be an array")
+	require.Len(t, aud, 1, "aud should have exactly one audience")
+	assert.Equal(t, testAudience, aud[0], "delegated token audience should default to the sole allowed audience")
+
+	// Lifetime cap: the delegated token's exp must be min(subject_remaining=30m,
+	// delegationLifespan=15m default) ≈ 15m — NOT the subject token's 30m. This
+	// verifies the handler's min() cap and rules out a "subject token echoed
+	// back" regression, which would otherwise satisfy sub/iss/signature.
+	exp, ok := claims["exp"].(float64)
+	require.True(t, ok, "exp claim should be a number")
+	assert.WithinDuration(t, now.Add(15*time.Minute), time.Unix(int64(exp), 0), 2*time.Minute,
+		"delegated token exp must be capped at the 15m delegation lifespan, not the subject token's 30m")
+}
+
+// TestIntegration_TokenExchange_SelfIssuedSubjectTokenScopeFromScp proves
+// that a token-exchange request carrying a requested scope succeeds against
+// a subject token minted by the server's own authorization_code grant, not
+// just a hand-built JWT.
+//
+// ToolHive's own issued access tokens carry granted scopes as a "scp" array
+// claim, not the RFC 9068 "scope" string claim — fosite's default JWT claims
+// strategy writes "scp" unless ScopeField is explicitly String or Both, which
+// this server does not set (see TestIntegration_FullPKCEFlow's own "scp"
+// assertion). Every other token-exchange test in this file hand-mints its
+// subject token with an explicit "scope" claim, which masks this: assignClaim
+// previously only read "scope", so a genuine self-issued access token used as
+// subject_token always resolved to Scopes == "", and grantScopes rejected any
+// requested scope with invalid_scope.
+func TestIntegration_TokenExchange_SelfIssuedSubjectTokenScopeFromScp(t *testing.T) {
+	t.Parallel()
+
+	const (
+		agentClientID     = "test-agent-client-scp"
+		agentClientSecret = "test-agent-secret-scp"
+	)
+
+	// The acting agent is also the client that logs in and obtains the
+	// subject token: it must be confidential (token exchange requires it) and
+	// registered for both authorization_code (to mint a genuine access token)
+	// and token-exchange (to perform the exchange as itself).
+	agentClient, err := registration.New(registration.Config{
+		ID:           agentClientID,
+		Secret:       agentClientSecret,
+		Public:       false,
+		RedirectURIs: []string{testRedirectURI},
+		GrantTypes:   []string{"authorization_code", oauthproto.GrantTypeTokenExchange},
+		Scopes:       registration.DefaultScopes,
+		Audience:     []string{testAudience},
+	})
+	require.NoError(t, err)
+
+	m := startMockOIDC(t)
+	ts := setupTestServerWithMockOIDC(t, m, withExtraClient(agentClient))
+
+	verifier := servercrypto.GeneratePKCEVerifier()
+	challenge := servercrypto.ComputePKCEChallenge(verifier)
+
+	authCode, _ := completeAuthorizationFlow(t, ts.Server.URL, authorizationParams{
+		ClientID:     agentClientID,
+		RedirectURI:  testRedirectURI,
+		State:        "scp-scope-state",
+		Challenge:    challenge,
+		Scope:        "openid profile",
+		ResponseType: "code",
+	})
+
+	// Mint the subject token via the real authorization_code grant (a
+	// confidential client, so client_secret is required), rather than
+	// hand-building a JWT — this is what makes the resulting token carry
+	// "scp", not "scope".
+	tokenResp := makeTokenRequest(t, ts.Server.URL, url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {authCode},
+		"redirect_uri":  {testRedirectURI},
+		"client_id":     {agentClientID},
+		"client_secret": {agentClientSecret},
+		"code_verifier": {verifier},
+	})
+	defer tokenResp.Body.Close()
+	tokenBody := parseTokenResponse(t, tokenResp)
+	require.Equal(t, http.StatusOK, tokenResp.StatusCode,
+		"authorization_code exchange should succeed, got %d (body: %v)", tokenResp.StatusCode, tokenBody)
+	subjectToken, ok := tokenBody["access_token"].(string)
+	require.True(t, ok, "access_token should be a string")
+	require.NotEmpty(t, subjectToken)
+
+	// Exchange the genuine access token for a delegated token, requesting a
+	// scope that was granted to it ("profile"). Before the assignClaim fix,
+	// this fails with invalid_scope because Scopes never picks up "scp".
+	resp := makeTokenRequest(t, ts.Server.URL, url.Values{
+		"grant_type":         {oauthproto.GrantTypeTokenExchange},
+		"subject_token":      {subjectToken},
+		"subject_token_type": {oauthproto.TokenTypeAccessToken},
+		"client_id":          {agentClientID},
+		"client_secret":      {agentClientSecret},
+		"scope":              {"profile"},
+	})
+	defer resp.Body.Close()
+
+	body := parseTokenResponse(t, resp)
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"token exchange requesting a scope carried by the subject token's 'scp' claim should succeed, "+
+			"got %d (body: %v)", resp.StatusCode, body)
+	assert.Equal(t, "profile", body["scope"], "delegated token should be granted the requested scope")
+}
+
+// ============================================================================
+// RFC 8693 Token Exchange: Trusted External Issuer Integration Tests
+// ============================================================================
+
+// externalIdPKeyID is the "kid" advertised in the test-local external IdP's JWKS.
+const externalIdPKeyID = "external-idp-key"
+
+// startExternalIdPServer starts a test-local external OIDC issuer serving
+// both a discovery document and a JWKS endpoint, signed by key — deliberately
+// NOT the authorization server's own key. The discovery document echoes
+// r.Host as its own issuer so it stays self-consistent regardless of which
+// random port httptest.NewServer binds to.
+//
+// The returned counter increments on every discovery-document hit, so a
+// subtest configuring an explicit jwks_url (which should skip discovery
+// entirely) can assert it stayed at zero, and a subtest relying on discovery
+// can assert it didn't.
+func startExternalIdPServer(t *testing.T, key *rsa.PrivateKey) (*httptest.Server, *atomic.Int64) {
+	t.Helper()
+
+	jwks := jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{
+		Key:       key.Public(),
+		KeyID:     externalIdPKeyID,
+		Algorithm: string(jose.RS256),
+		Use:       "sig",
+	}}}
+
+	var discoveryHits atomic.Int64
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		discoveryHits.Add(1)
+		base := "http://" + r.Host
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"issuer":   base,
+			"jwks_uri": base + "/jwks",
+		})
+	})
+	mux.HandleFunc("/jwks", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(jwks)
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, &discoveryHits
+}
+
+// signExternalToken signs a JWT with key — the external IdP's key, distinct
+// from the authorization server's own signing key — for use as a subject
+// token presented during token exchange.
+func signExternalToken(t *testing.T, key *rsa.PrivateKey, claims jwt.Claims, extra map[string]any) string {
+	t.Helper()
+
+	signer, err := jose.NewSigner(
+		jose.SigningKey{Algorithm: jose.RS256, Key: key},
+		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", externalIdPKeyID),
+	)
+	require.NoError(t, err)
+
+	builder := jwt.Signed(signer).Claims(claims)
+	if extra != nil {
+		builder = builder.Claims(extra)
+	}
+	raw, err := builder.Serialize()
+	require.NoError(t, err)
+	return raw
+}
+
+// TestIntegration_TokenExchange_TrustedExternalIssuer drives RFC 8693 token
+// exchange over HTTP with subject tokens from a trusted external OIDC
+// issuer — proving the fail-closed consent policy (an allowlisted actor
+// claim, or an authoritative may_act, or rejection) at the HTTP level, not
+// just in the tokenexchange package's own unit tests.
+func TestIntegration_TokenExchange_TrustedExternalIssuer(t *testing.T) {
+	t.Parallel()
+
+	const (
+		agentClientID     = "external-agent-client"
+		agentClientSecret = "external-agent-secret"
+		allowedActor      = "external-agent-azp"
+		externalUserSub   = "external-user-sub"
+	)
+
+	// The acting agent is a confidential ToolHive client registered for the
+	// token-exchange grant. Its value is safe to reuse across parallel
+	// subtests: each subtest registers it into its own storage instance.
+	newAgentClient := func(t *testing.T) fosite.Client {
+		t.Helper()
+		c, err := registration.New(registration.Config{
+			ID:         agentClientID,
+			Secret:     agentClientSecret,
+			Public:     false,
+			GrantTypes: []string{oauthproto.GrantTypeTokenExchange},
+			Scopes:     registration.DefaultScopes,
+			Audience:   []string{testAudience},
+		})
+		require.NoError(t, err)
+		return c
+	}
+
+	// externalClaims returns standard claims for a subject token from the
+	// external IdP. The audience must equal testAudience — the server's sole
+	// AllowedAudience — because ensureAudienceSubsetOfSubject bounds the
+	// granted (default) audience by the subject token's own "aud".
+	externalClaims := func(issuer string) jwt.Claims {
+		now := time.Now()
+		return jwt.Claims{
+			Subject:  externalUserSub,
+			Issuer:   issuer,
+			Audience: jwt.Audience{testAudience},
+			Expiry:   jwt.NewNumericDate(now.Add(30 * time.Minute)),
+			IssuedAt: jwt.NewNumericDate(now),
+		}
+	}
+
+	t.Run("allowlisted actor happy path", func(t *testing.T) {
+		t.Parallel()
+
+		externalKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		require.NoError(t, err)
+		idpServer, _ := startExternalIdPServer(t, externalKey)
+
+		m := startMockOIDC(t)
+		ts := setupTestServerWithMockOIDC(t, m,
+			withExtraClient(newAgentClient(t)),
+			withTrustedIssuers([]tokenexchange.TrustedIssuer{{
+				IssuerURL:        idpServer.URL,
+				ExpectedAudience: testAudience,
+				// JWKSURL is required whenever AllowPrivateIPs is set (see
+				// validateTrustedIssuers in pkg/authserver/config.go): the
+				// private dial target must come from operator config, not an
+				// OIDC discovery document. idpServer is loopback, so
+				// AllowPrivateIPs is unavoidable here; "explicit jwks_url
+				// resolution path" below is the dedicated test for the
+				// discovery-vs-explicit distinction this used to also cover.
+				JWKSURL:                idpServer.URL + "/jwks",
+				AllowedActors:          []string{allowedActor},
+				InsecureAllowHTTP:      true,
+				AllowPrivateIPs:        true,
+				AllowedDelegateClients: []string{"*"},
+			}}),
+		)
+
+		subjectToken := signExternalToken(t, externalKey, externalClaims(idpServer.URL), map[string]any{
+			"azp": allowedActor,
+		})
+
+		resp := makeTokenRequest(t, ts.Server.URL, url.Values{
+			"grant_type":         {oauthproto.GrantTypeTokenExchange},
+			"subject_token":      {subjectToken},
+			"subject_token_type": {oauthproto.TokenTypeAccessToken},
+			"client_id":          {agentClientID},
+			"client_secret":      {agentClientSecret},
+		})
+		defer resp.Body.Close()
+
+		body := parseTokenResponse(t, resp)
+		require.Equal(t, http.StatusOK, resp.StatusCode,
+			"token exchange should succeed, got %d (body: %v)", resp.StatusCode, body)
+		assert.Equal(t, oauthproto.TokenTypeAccessToken, body["issued_token_type"])
+
+		tokenType, ok := body["token_type"].(string)
+		require.True(t, ok, "token_type should be a string")
+		assert.Equal(t, "bearer", strings.ToLower(tokenType))
+
+		delegated, ok := body["access_token"].(string)
+		require.True(t, ok, "access_token should be a string")
+		require.NotEmpty(t, delegated)
+
+		parsed, err := jwt.ParseSigned(delegated, []jose.SignatureAlgorithm{jose.RS256})
+		require.NoError(t, err)
+		var claims map[string]any
+		require.NoError(t, parsed.Claims(ts.PrivateKey.Public(), &claims))
+
+		assert.Equal(t, idpServer.URL+"#"+externalUserSub, claims["sub"],
+			"delegated token subject must be the external issuer's URL, qualifying the external user's "+
+				"subject so it can never collide with a native ToolHive user's UUID")
+		assert.Equal(t, testIssuer, claims["iss"],
+			"delegated token must carry ToolHive's own issuer, never the external one")
+
+		aud, ok := claims["aud"].([]interface{})
+		require.True(t, ok, "aud claim should be an array")
+		require.Len(t, aud, 1)
+		assert.Equal(t, testAudience, aud[0])
+
+		act, ok := claims["act"].(map[string]any)
+		require.True(t, ok, "delegated token must carry an 'act' claim")
+		assert.Equal(t, agentClientID, act["sub"], "outermost act.sub must be the ToolHive acting client")
+
+		nested, ok := act["act"].(map[string]any)
+		require.True(t, ok, "external delegation must nest the issuer/actor provenance record")
+		assert.Equal(t, allowedActor, nested["sub"], "nested act.sub is the external actor claim value")
+		assert.Equal(t, idpServer.URL, nested["iss"], "nested act.iss is the external issuer")
+	})
+
+	t.Run("non-allowlisted actor rejected", func(t *testing.T) {
+		t.Parallel()
+
+		externalKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		require.NoError(t, err)
+		idpServer, _ := startExternalIdPServer(t, externalKey)
+
+		m := startMockOIDC(t)
+		ts := setupTestServerWithMockOIDC(t, m,
+			withExtraClient(newAgentClient(t)),
+			withTrustedIssuers([]tokenexchange.TrustedIssuer{{
+				IssuerURL:              idpServer.URL,
+				ExpectedAudience:       testAudience,
+				JWKSURL:                idpServer.URL + "/jwks",
+				AllowedActors:          []string{allowedActor},
+				InsecureAllowHTTP:      true,
+				AllowPrivateIPs:        true,
+				AllowedDelegateClients: []string{"*"},
+			}}),
+		)
+
+		const rejectedActor = "some-other-client"
+		subjectToken := signExternalToken(t, externalKey, externalClaims(idpServer.URL), map[string]any{
+			"azp": rejectedActor,
+		})
+
+		resp := makeTokenRequest(t, ts.Server.URL, url.Values{
+			"grant_type":         {oauthproto.GrantTypeTokenExchange},
+			"subject_token":      {subjectToken},
+			"subject_token_type": {oauthproto.TokenTypeAccessToken},
+			"client_id":          {agentClientID},
+			"client_secret":      {agentClientSecret},
+		})
+		defer resp.Body.Close()
+
+		body := parseTokenResponse(t, resp)
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode,
+			"token exchange with a non-allowlisted actor should be a 400, got %d (body: %v)", resp.StatusCode, body)
+		// The validator rejects the token before checkDelegationConsent runs, so
+		// RFC 8693 §2.2.2's invalid_request applies — not invalid_grant.
+		assert.Equal(t, "invalid_request", body["error"])
+
+		errDesc, _ := body["error_description"].(string)
+		assert.Contains(t, errDesc, "invalid or could not be verified",
+			"the handler's fixed hint must not be replaced by a more specific — and leakier — message")
+		assert.NotContains(t, errDesc, rejectedActor,
+			"the error must not leak the rejected actor claim value")
+	})
+
+	t.Run("may_act path skips the allowlist", func(t *testing.T) {
+		t.Parallel()
+
+		externalKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		require.NoError(t, err)
+		idpServer, _ := startExternalIdPServer(t, externalKey)
+
+		m := startMockOIDC(t)
+		ts := setupTestServerWithMockOIDC(t, m,
+			withExtraClient(newAgentClient(t)),
+			withTrustedIssuers([]tokenexchange.TrustedIssuer{{
+				IssuerURL:         idpServer.URL,
+				ExpectedAudience:  testAudience,
+				JWKSURL:           idpServer.URL + "/jwks",
+				InsecureAllowHTTP: true,
+				AllowPrivateIPs:   true,
+				// AllowedActors deliberately empty: may_act must be honored
+				// without any actor being allowlisted.
+				AllowedDelegateClients: []string{"*"},
+			}}),
+		)
+
+		// No "azp" claim at all — only may_act, naming the ToolHive agent
+		// client directly as the party authorized to act.
+		subjectToken := signExternalToken(t, externalKey, externalClaims(idpServer.URL), map[string]any{
+			"may_act": map[string]any{"sub": agentClientID, "iss": testIssuer},
+		})
+
+		resp := makeTokenRequest(t, ts.Server.URL, url.Values{
+			"grant_type":         {oauthproto.GrantTypeTokenExchange},
+			"subject_token":      {subjectToken},
+			"subject_token_type": {oauthproto.TokenTypeAccessToken},
+			"client_id":          {agentClientID},
+			"client_secret":      {agentClientSecret},
+		})
+		defer resp.Body.Close()
+
+		body := parseTokenResponse(t, resp)
+		require.Equal(t, http.StatusOK, resp.StatusCode,
+			"token exchange via may_act should succeed, got %d (body: %v)", resp.StatusCode, body)
+
+		delegated, ok := body["access_token"].(string)
+		require.True(t, ok)
+		require.NotEmpty(t, delegated)
+
+		parsed, err := jwt.ParseSigned(delegated, []jose.SignatureAlgorithm{jose.RS256})
+		require.NoError(t, err)
+		var claims map[string]any
+		require.NoError(t, parsed.Claims(ts.PrivateKey.Public(), &claims))
+
+		act, ok := claims["act"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, agentClientID, act["sub"])
+
+		// may_act carries no ExternalActor (see ValidatedClaims.ExternalActor's
+		// doc comment), but the external issuer must still be recorded — this
+		// is the path that bypasses the allowlist entirely, so it needs the
+		// audit trail at least as much as the allowlist path does.
+		nested, ok := act["act"].(map[string]any)
+		require.True(t, ok, "external issuer must still be nested even without an allowlisted actor")
+		assert.Equal(t, idpServer.URL, nested["iss"])
+		_, hasSub := nested["sub"]
+		assert.False(t, hasSub, "no client-namespace actor claim exists to report on the may_act path")
+	})
+
+	t.Run("allowed delegate clients binds the allowlisted actor to a specific ToolHive client", func(t *testing.T) {
+		t.Parallel()
+
+		const (
+			otherAgentClientID     = "other-external-agent-client"
+			otherAgentClientSecret = "other-external-agent-secret"
+		)
+
+		// A second confidential client, also registered for the token-exchange
+		// grant and otherwise identical to the primary agent client — the only
+		// difference the test exercises is that it is NOT in this issuer's
+		// AllowedDelegateClients. Without that field (or if the binding check
+		// were removed), this client would succeed exactly like the primary
+		// one, since both hold the grant and both present the same
+		// allowlisted external actor claim.
+		otherAgentClient, err := registration.New(registration.Config{
+			ID:         otherAgentClientID,
+			Secret:     otherAgentClientSecret,
+			Public:     false,
+			GrantTypes: []string{oauthproto.GrantTypeTokenExchange},
+			Scopes:     registration.DefaultScopes,
+			Audience:   []string{testAudience},
+		})
+		require.NoError(t, err)
+
+		externalKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		require.NoError(t, err)
+		idpServer, _ := startExternalIdPServer(t, externalKey)
+
+		m := startMockOIDC(t)
+		ts := setupTestServerWithMockOIDC(t, m,
+			withExtraClient(newAgentClient(t)),
+			withExtraClient(otherAgentClient),
+			withTrustedIssuers([]tokenexchange.TrustedIssuer{{
+				IssuerURL:              idpServer.URL,
+				ExpectedAudience:       testAudience,
+				JWKSURL:                idpServer.URL + "/jwks",
+				AllowedActors:          []string{allowedActor},
+				AllowedDelegateClients: []string{agentClientID},
+				InsecureAllowHTTP:      true,
+				AllowPrivateIPs:        true,
+			}}),
+		)
+
+		subjectToken := signExternalToken(t, externalKey, externalClaims(idpServer.URL), map[string]any{
+			"azp": allowedActor,
+		})
+
+		exchange := func(clientID, clientSecret string) *http.Response {
+			return makeTokenRequest(t, ts.Server.URL, url.Values{
+				"grant_type":         {oauthproto.GrantTypeTokenExchange},
+				"subject_token":      {subjectToken},
+				"subject_token_type": {oauthproto.TokenTypeAccessToken},
+				"client_id":          {clientID},
+				"client_secret":      {clientSecret},
+			})
+		}
+
+		permittedResp := exchange(agentClientID, agentClientSecret)
+		defer permittedResp.Body.Close()
+		permittedBody := parseTokenResponse(t, permittedResp)
+		require.Equal(t, http.StatusOK, permittedResp.StatusCode,
+			"the allowlisted delegate client should succeed, got %d (body: %v)",
+			permittedResp.StatusCode, permittedBody)
+
+		rejectedResp := exchange(otherAgentClientID, otherAgentClientSecret)
+		defer rejectedResp.Body.Close()
+		rejectedBody := parseTokenResponse(t, rejectedResp)
+		require.Equal(t, http.StatusBadRequest, rejectedResp.StatusCode,
+			"a client absent from AllowedDelegateClients should be a 400, got %d (body: %v)",
+			rejectedResp.StatusCode, rejectedBody)
+		assert.Equal(t, "invalid_grant", rejectedBody["error"])
+		errDesc, _ := rejectedBody["error_description"].(string)
+		assert.Contains(t, errDesc, "not authorized to exchange subject tokens")
+	})
+
+	t.Run("untrusted issuer rejected before any JWKS fetch", func(t *testing.T) {
+		t.Parallel()
+
+		const untrustedIssuer = "https://untrusted-issuer.example.com"
+
+		externalKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		require.NoError(t, err)
+		idpServer, discoveryHits := startExternalIdPServer(t, externalKey)
+
+		m := startMockOIDC(t)
+		// The sole registered trusted issuer is idpServer.URL — a live,
+		// fetchable JWKS signed with the SAME key the subject token below
+		// uses. This makes the rejection discriminating rather than
+		// coincidental: the subject token's signature WOULD verify
+		// successfully against this real JWKS if the issuer-map lookup were
+		// ever bypassed (a fallback to the sole configured issuer, a wildcard
+		// match, or deleted "iss"-based routing) — so a 400 here can only be
+		// explained by the "iss" string itself failing to match idpServer.URL,
+		// not by an unverifiable signature or a validator that was never
+		// constructed in the first place.
+		ts := setupTestServerWithMockOIDC(t, m,
+			withExtraClient(newAgentClient(t)),
+			withTrustedIssuers([]tokenexchange.TrustedIssuer{{
+				IssuerURL:              idpServer.URL,
+				ExpectedAudience:       testAudience,
+				JWKSURL:                idpServer.URL + "/jwks",
+				AllowedActors:          []string{allowedActor},
+				InsecureAllowHTTP:      true,
+				AllowPrivateIPs:        true,
+				AllowedDelegateClients: []string{"*"},
+			}}),
+		)
+
+		// Signed with idpServer's real key, but claims an issuer that was
+		// never registered in TrustedIssuers.
+		subjectToken := signExternalToken(t, externalKey, externalClaims(untrustedIssuer), map[string]any{
+			"azp": allowedActor,
+		})
+
+		resp := makeTokenRequest(t, ts.Server.URL, url.Values{
+			"grant_type":         {oauthproto.GrantTypeTokenExchange},
+			"subject_token":      {subjectToken},
+			"subject_token_type": {oauthproto.TokenTypeAccessToken},
+			"client_id":          {agentClientID},
+			"client_secret":      {agentClientSecret},
+		})
+		defer resp.Body.Close()
+
+		body := parseTokenResponse(t, resp)
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode,
+			"token exchange from an untrusted issuer should be a 400, got %d (body: %v)", resp.StatusCode, body)
+		assert.Equal(t, "invalid_request", body["error"])
+
+		errDesc, _ := body["error_description"].(string)
+		assert.Contains(t, errDesc, "invalid or could not be verified",
+			"the handler's fixed hint must not be replaced by a more specific — and leakier — message")
+		assert.NotContains(t, errDesc, untrustedIssuer,
+			"the error must not leak the untrusted issuer URL")
+
+		// The issuer-map miss must short-circuit before any JWKS fetch.
+		// Note: JWKSURL is now preconfigured above (see comment on the
+		// "allowlisted actor happy path" subtest), which already skips
+		// discovery on its own — so this assertion holding is necessary but
+		// not on its own sufficient proof of the short-circuit; the 400
+		// response and error content below are the discriminating checks.
+		assert.Zero(t, discoveryHits.Load(), "issuer-map miss must precede any JWKS discovery fetch")
+	})
+
+	t.Run("self-issued subject token still works alongside trusted issuers", func(t *testing.T) {
+		t.Parallel()
+
+		externalKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		require.NoError(t, err)
+		idpServer, _ := startExternalIdPServer(t, externalKey)
+
+		m := startMockOIDC(t)
+		ts := setupTestServerWithMockOIDC(t, m,
+			withExtraClient(newAgentClient(t)),
+			withTrustedIssuers([]tokenexchange.TrustedIssuer{{
+				IssuerURL:              idpServer.URL,
+				ExpectedAudience:       testAudience,
+				JWKSURL:                idpServer.URL + "/jwks",
+				AllowedActors:          []string{allowedActor},
+				InsecureAllowHTTP:      true,
+				AllowPrivateIPs:        true,
+				AllowedDelegateClients: []string{"*"},
+			}}),
+		)
+
+		signer, err := jose.NewSigner(
+			jose.SigningKey{Algorithm: jose.RS256, Key: ts.PrivateKey},
+			(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", "test-key"),
+		)
+		require.NoError(t, err)
+
+		now := time.Now()
+		subjectToken, err := jwt.Signed(signer).
+			Claims(jwt.Claims{
+				Issuer:   testIssuer,
+				Subject:  "self-issued-delegated-user",
+				Audience: jwt.Audience{testAudience},
+				Expiry:   jwt.NewNumericDate(now.Add(30 * time.Minute)),
+				IssuedAt: jwt.NewNumericDate(now),
+			}).
+			Claims(map[string]any{"client_id": agentClientID}).
+			Serialize()
+		require.NoError(t, err)
+
+		resp := makeTokenRequest(t, ts.Server.URL, url.Values{
+			"grant_type":         {oauthproto.GrantTypeTokenExchange},
+			"subject_token":      {subjectToken},
+			"subject_token_type": {oauthproto.TokenTypeAccessToken},
+			"client_id":          {agentClientID},
+			"client_secret":      {agentClientSecret},
+		})
+		defer resp.Body.Close()
+
+		body := parseTokenResponse(t, resp)
+		require.Equal(t, http.StatusOK, resp.StatusCode,
+			"self-issued token exchange should still succeed with trusted issuers configured, "+
+				"got %d (body: %v)", resp.StatusCode, body)
+		assert.Equal(t, oauthproto.TokenTypeAccessToken, body["issued_token_type"])
+	})
+
+	t.Run("explicit jwks_url resolution path", func(t *testing.T) {
+		t.Parallel()
+
+		externalKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		require.NoError(t, err)
+		idpServer, discoveryHits := startExternalIdPServer(t, externalKey)
+
+		// Prove the counter actually increments before relying on its
+		// zero-ness below — otherwise a discovery handler that silently
+		// stopped counting would make the "must skip discovery" assertion
+		// vacuously true.
+		discResp, err := http.Get(idpServer.URL + "/.well-known/openid-configuration") //nolint:noctx
+		require.NoError(t, err)
+		discResp.Body.Close()
+		require.Equal(t, int64(1), discoveryHits.Load(), "discovery counter must be live")
+		discoveryHits.Store(0)
+
+		m := startMockOIDC(t)
+		ts := setupTestServerWithMockOIDC(t, m,
+			withExtraClient(newAgentClient(t)),
+			withTrustedIssuers([]tokenexchange.TrustedIssuer{{
+				IssuerURL: idpServer.URL,
+				// Set directly rather than relying on discovery: this exercises
+				// ensureRegistered's pre-configured-URL branch instead of
+				// discoverJWKSURL.
+				JWKSURL:                idpServer.URL + "/jwks",
+				ExpectedAudience:       testAudience,
+				AllowedActors:          []string{allowedActor},
+				InsecureAllowHTTP:      true,
+				AllowPrivateIPs:        true,
+				AllowedDelegateClients: []string{"*"},
+			}}),
+		)
+
+		subjectToken := signExternalToken(t, externalKey, externalClaims(idpServer.URL), map[string]any{
+			"azp": allowedActor,
+		})
+
+		resp := makeTokenRequest(t, ts.Server.URL, url.Values{
+			"grant_type":         {oauthproto.GrantTypeTokenExchange},
+			"subject_token":      {subjectToken},
+			"subject_token_type": {oauthproto.TokenTypeAccessToken},
+			"client_id":          {agentClientID},
+			"client_secret":      {agentClientSecret},
+		})
+		defer resp.Body.Close()
+
+		body := parseTokenResponse(t, resp)
+		require.Equal(t, http.StatusOK, resp.StatusCode,
+			"token exchange with an explicit jwks_url should succeed, got %d (body: %v)", resp.StatusCode, body)
+		assert.Equal(t, oauthproto.TokenTypeAccessToken, body["issued_token_type"])
+
+		assert.Zero(t, discoveryHits.Load(),
+			"a preconfigured jwks_url must skip OIDC discovery entirely")
+	})
+
+	t.Run("external token's exp bounds the delegated token's lifetime", func(t *testing.T) {
+		t.Parallel()
+
+		externalKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		require.NoError(t, err)
+		idpServer, _ := startExternalIdPServer(t, externalKey)
+
+		m := startMockOIDC(t)
+		ts := setupTestServerWithMockOIDC(t, m,
+			withExtraClient(newAgentClient(t)),
+			withTrustedIssuers([]tokenexchange.TrustedIssuer{{
+				IssuerURL:              idpServer.URL,
+				ExpectedAudience:       testAudience,
+				JWKSURL:                idpServer.URL + "/jwks",
+				AllowedActors:          []string{allowedActor},
+				InsecureAllowHTTP:      true,
+				AllowPrivateIPs:        true,
+				AllowedDelegateClients: []string{"*"},
+			}}),
+		)
+
+		// 5m remaining lifetime, well under the 15m default delegation
+		// lifespan — so the delegated token's exp must track the subject
+		// token, not the (longer) configured cap.
+		now := time.Now()
+		subjClaims := jwt.Claims{
+			Subject:  externalUserSub,
+			Issuer:   idpServer.URL,
+			Audience: jwt.Audience{testAudience},
+			Expiry:   jwt.NewNumericDate(now.Add(5 * time.Minute)),
+			IssuedAt: jwt.NewNumericDate(now),
+		}
+		subjectToken := signExternalToken(t, externalKey, subjClaims, map[string]any{"azp": allowedActor})
+
+		resp := makeTokenRequest(t, ts.Server.URL, url.Values{
+			"grant_type":         {oauthproto.GrantTypeTokenExchange},
+			"subject_token":      {subjectToken},
+			"subject_token_type": {oauthproto.TokenTypeAccessToken},
+			"client_id":          {agentClientID},
+			"client_secret":      {agentClientSecret},
+		})
+		defer resp.Body.Close()
+
+		body := parseTokenResponse(t, resp)
+		require.Equal(t, http.StatusOK, resp.StatusCode,
+			"token exchange should succeed, got %d (body: %v)", resp.StatusCode, body)
+
+		delegated, ok := body["access_token"].(string)
+		require.True(t, ok)
+		require.NotEmpty(t, delegated)
+
+		parsed, err := jwt.ParseSigned(delegated, []jose.SignatureAlgorithm{jose.RS256})
+		require.NoError(t, err)
+		var claims map[string]any
+		require.NoError(t, parsed.Claims(ts.PrivateKey.Public(), &claims))
+
+		exp, ok := claims["exp"].(float64)
+		require.True(t, ok, "exp claim should be a number")
+		assert.WithinDuration(t, now.Add(5*time.Minute), time.Unix(int64(exp), 0), 2*time.Minute,
+			"delegated token exp must track the external subject token's 5m remaining lifetime, "+
+				"not the 15m default delegation lifespan")
+	})
+
+	t.Run("invalid_target when the external aud isn't a ToolHive-allowed audience", func(t *testing.T) {
+		t.Parallel()
+
+		// A realistic Entra-style app-ID audience: legitimate as the trusted
+		// issuer's own ExpectedAudience, but not one of ToolHive's
+		// AllowedAudiences — the footgun documented on RunConfig.TrustedIssuers.
+		const foreignAudience = "api://some-app-id"
+
+		externalKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		require.NoError(t, err)
+		idpServer, _ := startExternalIdPServer(t, externalKey)
+
+		m := startMockOIDC(t)
+		ts := setupTestServerWithMockOIDC(t, m,
+			withExtraClient(newAgentClient(t)),
+			withTrustedIssuers([]tokenexchange.TrustedIssuer{{
+				IssuerURL:              idpServer.URL,
+				ExpectedAudience:       foreignAudience,
+				JWKSURL:                idpServer.URL + "/jwks",
+				AllowedActors:          []string{allowedActor},
+				InsecureAllowHTTP:      true,
+				AllowPrivateIPs:        true,
+				AllowedDelegateClients: []string{"*"},
+			}}),
+		)
+
+		now := time.Now()
+		subjClaims := jwt.Claims{
+			Subject:  externalUserSub,
+			Issuer:   idpServer.URL,
+			Audience: jwt.Audience{foreignAudience},
+			Expiry:   jwt.NewNumericDate(now.Add(30 * time.Minute)),
+			IssuedAt: jwt.NewNumericDate(now),
+		}
+		subjectToken := signExternalToken(t, externalKey, subjClaims, map[string]any{"azp": allowedActor})
+
+		// No resource/audience requested: the handler defaults to ToolHive's
+		// sole AllowedAudience (testAudience), which this subject token's aud
+		// does not cover.
+		resp := makeTokenRequest(t, ts.Server.URL, url.Values{
+			"grant_type":         {oauthproto.GrantTypeTokenExchange},
+			"subject_token":      {subjectToken},
+			"subject_token_type": {oauthproto.TokenTypeAccessToken},
+			"client_id":          {agentClientID},
+			"client_secret":      {agentClientSecret},
+		})
+		defer resp.Body.Close()
+
+		body := parseTokenResponse(t, resp)
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode,
+			"an external aud outside ToolHive's AllowedAudiences must be rejected, got %d (body: %v)",
+			resp.StatusCode, body)
+		assert.Equal(t, "invalid_target", body["error"])
+		errDesc, _ := body["error_description"].(string)
+		assert.Contains(t, errDesc, "not covered by the subject token")
+	})
 }
 
 // ============================================================================
