@@ -27,8 +27,14 @@ type peerProbeKey struct{}
 // peerProbeMethods are the MCP methods a peer probe may send: the handshake and
 // the capability lists that the health checker's ListCapabilities runs. A probe
 // never calls a tool, reads a resource or gets a prompt.
+//
+// server/discover is the Modern (2026-07-28) handshake. Once the peer has
+// cached a backend as Modern, its health checker opens with it instead of
+// initialize. Refusing it makes the peer read a 403 as an auth failure, mark
+// the backend unauthenticated and open its circuit breaker.
 var peerProbeMethods = map[string]bool{
 	"initialize":                true,
+	"server/discover":           true,
 	"notifications/initialized": true,
 	"ping":                      true,
 	"tools/list":                true,
