@@ -30,6 +30,14 @@ func TestPeerProbeMiddleware(t *testing.T) {
 		listBody = `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`
 		callBody = `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo"}}`
 		getBody  = `{"jsonrpc":"2.0","id":4,"method":"prompts/get","params":{"name":"p"}}`
+		// The Modern (2026-07-28) health probe opens with server/discover
+		// instead of initialize (pkg/vmcp/client probeRevision and
+		// modernListCapabilities).
+		discoverBody = `{"jsonrpc":"2.0","id":5,"method":"server/discover","params":{"_meta":{` +
+			`"io.modelcontextprotocol/protocolVersion":"2026-07-28",` +
+			`"io.modelcontextprotocol/clientCapabilities":{},` +
+			`"io.modelcontextprotocol/clientInfo":{"name":"toolhive-vmcp","version":"test"}}}}`
+		listenBody = `{"jsonrpc":"2.0","id":6,"method":"subscriptions/listen","params":{}}`
 	)
 	tests := []struct {
 		name       string
@@ -41,6 +49,8 @@ func TestPeerProbeMiddleware(t *testing.T) {
 	}{
 		{"probe initialize is marked", http.MethodPost, health.ProbeHeaderValue, initBody, true, true},
 		{"probe tools/list is marked", http.MethodPost, health.ProbeHeaderValue, listBody, true, true},
+		{"probe server/discover is marked", http.MethodPost, health.ProbeHeaderValue, discoverBody, true, true},
+		{"probe subscriptions/listen is refused", http.MethodPost, health.ProbeHeaderValue, listenBody, false, false},
 		{"probe tools/call is refused", http.MethodPost, health.ProbeHeaderValue, callBody, false, false},
 		{"probe prompts/get is refused", http.MethodPost, health.ProbeHeaderValue, getBody, false, false},
 		{"probe with an unparsable body is refused", http.MethodPost, health.ProbeHeaderValue, `not json`, false, false},
