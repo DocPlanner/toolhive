@@ -1,0 +1,33 @@
+name: Dependency Review
+# DocPlanner only (SECUR-2148): required check on dp-stable, set in this repository's own ruleset.
+# The organisation Dependency Review ruleset cannot cover this repository: its workflow lives in a
+# private repository, and GitHub only requires a private repository's workflow on private repositories.
+# Same settings as the organisation workflow: block critical vulnerabilities only.
+on:
+  pull_request:
+    branches: [dp-stable]
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+
+permissions: {}
+
+concurrency:
+  group: dp-dependency-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write # review summary comment
+    steps:
+      - name: Dependency Review
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: critical
+          fail-on-scopes: runtime, development, unknown
+          license-check: false
+          comment-summary-in-pr: on-failure
+          warn-only: false
+          show-openssf-scorecard: false
