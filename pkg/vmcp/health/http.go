@@ -3,15 +3,19 @@
 
 package health
 
-import "net/http"
+import (
+	"net/http"
+
+	healthcontext "github.com/stacklok/toolhive/pkg/vmcp/health/context"
+)
 
 const (
 	// ProbeHeader marks wire-level health probe requests between vMCPs so the
 	// receiving spoke can skip heavyweight session creation.
-	ProbeHeader = "X-ToolHive-Health-Check"
+	ProbeHeader = healthcontext.ProbeHeader
 
 	// ProbeHeaderValue is the canonical truthy value for ProbeHeader.
-	ProbeHeaderValue = "1"
+	ProbeHeaderValue = healthcontext.ProbeHeaderValue
 )
 
 // HasProbeHeader reports whether the incoming HTTP request is marked as an

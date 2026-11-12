@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -43,7 +42,6 @@ import (
 	authtypes "github.com/stacklok/toolhive/pkg/vmcp/auth/types"
 	"github.com/stacklok/toolhive/pkg/vmcp/conversion"
 	"github.com/stacklok/toolhive/pkg/vmcp/headerforward"
-	"github.com/stacklok/toolhive/pkg/vmcp/health"
 	healthcontext "github.com/stacklok/toolhive/pkg/vmcp/health/context"
 	"github.com/stacklok/toolhive/pkg/vmcp/internal/backendtelemetry"
 	"github.com/stacklok/toolhive/pkg/vmcp/internal/pagination"
@@ -66,6 +64,10 @@ const (
 	// Note: This limit is enforced per HTTP response, not per MCP request.
 	// A tools/list response with 1000 tools would be limited to 100MB total.
 	maxResponseSize = 100 * 1024 * 1024 // 100 MB
+
+	// defaultBackendRequestTimeout bounds individual backend operations when no
+	// workload-specific timeout is configured.
+	defaultBackendRequestTimeout = 30 * time.Second
 
 	// defaultRefutationTTL is the default lifetime of a modernHintRefuted
 	// entry. Chosen to be long enough that a persistently hint-lying backend
@@ -119,22 +121,6 @@ func WithDialControl(control func(network, address string, c syscall.RawConn) er
 	}
 }
 
-// DefaultBackendRequestTimeout bounds each streamable-HTTP backend request when
-// WithRequestTimeouts sets no value for the backend. The vMCP's HTTP write
-// timeout must cover it (see serverWriteTimeoutFromConfig in pkg/vmcp/cli).
-const DefaultBackendRequestTimeout = 90 * time.Second
-
-// WithRequestTimeouts sets the timeout of each streamable-HTTP backend request.
-// An entry in perWorkload (keyed by BackendTarget.WorkloadID) wins over
-// defaultTimeout; non-positive values fall back to the 90 s default. SSE
-// backends are not affected: a timeout would cut their long-lived stream.
-func WithRequestTimeouts(defaultTimeout time.Duration, perWorkload map[string]time.Duration) Option {
-	return func(h *httpBackendClient) {
-		h.defaultRequestTimeout = defaultTimeout
-		h.perWorkloadRequestTimeouts = maps.Clone(perWorkload)
-	}
-}
-
 // WithRefutationTTL overrides how long a refuted Modern-handshake hint
 // suppresses the confirming server/discover probe in legacyInit. Zero or
 // negative restores the default. Production callers should not set this; it
@@ -143,6 +129,22 @@ func WithRefutationTTL(d time.Duration) Option {
 	return func(h *httpBackendClient) {
 		if d > 0 {
 			h.refutationTTL = d
+		}
+	}
+}
+
+// WithRequestTimeoutResolver configures the timeout used for each backend
+// operation. The resolver receives the backend workload ID and may return a
+// workload-specific duration. A nil resolver, or a non-positive result, uses
+// the 30-second default.
+//
+// The resolver may be called concurrently and must therefore be safe for
+// concurrent use. SSE connection lifetimes remain unbounded, but individual
+// operations on those connections are bounded through request contexts.
+func WithRequestTimeoutResolver(resolver func(workloadID string) time.Duration) Option {
+	return func(h *httpBackendClient) {
+		if resolver != nil {
+			h.requestTimeoutResolver = resolver
 		}
 	}
 }
@@ -174,11 +176,6 @@ type httpBackendClient struct {
 	// receiving the resolved peer IP before the TCP handshake. Nil reproduces the
 	// default dialer behavior with no hook.
 	dialControl func(network, address string, c syscall.RawConn) error
-
-	// defaultRequestTimeout and perWorkloadRequestTimeouts are set by
-	// WithRequestTimeouts; see requestTimeout.
-	defaultRequestTimeout      time.Duration
-	perWorkloadRequestTimeouts map[string]time.Duration
 
 	// forwarders holds the server->client forwarding requesters (elicitation,
 	// sampling, notifications) bound by server.New via BindForwarders. When set,
@@ -232,6 +229,11 @@ type httpBackendClient struct {
 	// confirming probe in legacyInit. Defaults to defaultRefutationTTL;
 	// configurable via WithRefutationTTL (tests).
 	refutationTTL time.Duration
+
+	// requestTimeoutResolver returns the wall-clock timeout for an individual
+	// backend operation by workload ID. It is immutable after construction and
+	// may be read concurrently.
+	requestTimeoutResolver func(workloadID string) time.Duration
 }
 
 // NewHTTPBackendClient creates a new HTTP-based backend client.
@@ -261,6 +263,24 @@ func NewHTTPBackendClient(registry vmcpauth.OutgoingAuthRegistry, opts ...Option
 	}
 	c.clientFactory = c.defaultClientFactory
 	return c, nil
+}
+
+// requestTimeout returns the configured request timeout for workloadID,
+// falling back to the historical 30-second default when no positive override
+// is available.
+func (h *httpBackendClient) requestTimeout(workloadID string) time.Duration {
+	if h.requestTimeoutResolver != nil {
+		if timeout := h.requestTimeoutResolver(workloadID); timeout > 0 {
+			return timeout
+		}
+	}
+	return defaultBackendRequestTimeout
+}
+
+func (h *httpBackendClient) requestContext(
+	ctx context.Context, target *vmcp.BackendTarget,
+) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, h.requestTimeout(target.WorkloadID))
 }
 
 // backendDialer returns a net.Dialer with the standard backend timeouts and an
@@ -451,9 +471,7 @@ func (i *identityPropagatingRoundTripper) RoundTrip(req *http.Request) (*http.Re
 // CloseIdleConnections forwards to the wrapped RoundTripper so it reaches the
 // concrete *http.Transport at the bottom of the chain.
 func (i *identityPropagatingRoundTripper) CloseIdleConnections() {
-	if c, ok := i.base.(interface{ CloseIdleConnections() }); ok {
-		c.CloseIdleConnections()
-	}
+	networking.ForwardCloseIdle(i.base)
 }
 
 // tracePropagatingRoundTripper injects W3C Trace Context (traceparent/tracestate) and
@@ -482,8 +500,8 @@ type healthProbePropagatingRoundTripper struct {
 // requests whose contexts were marked by the health checker.
 func (h *healthProbePropagatingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	clonedReq := req.Clone(req.Context())
-	if health.IsHealthCheck(clonedReq.Context()) {
-		clonedReq.Header.Set(health.ProbeHeader, health.ProbeHeaderValue)
+	if healthcontext.IsHealthCheck(clonedReq.Context()) {
+		clonedReq.Header.Set(healthcontext.ProbeHeader, healthcontext.ProbeHeaderValue)
 	}
 	return h.base.RoundTrip(clonedReq)
 }
@@ -491,9 +509,7 @@ func (h *healthProbePropagatingRoundTripper) RoundTrip(req *http.Request) (*http
 // CloseIdleConnections forwards to the wrapped RoundTripper so it reaches the
 // concrete *http.Transport at the bottom of the chain.
 func (t *tracePropagatingRoundTripper) CloseIdleConnections() {
-	if c, ok := t.base.(interface{ CloseIdleConnections() }); ok {
-		c.CloseIdleConnections()
-	}
+	networking.ForwardCloseIdle(t.base)
 }
 
 // authRoundTripper is an http.RoundTripper that adds authentication to backend requests.
@@ -524,10 +540,17 @@ func (a *authRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 // CloseIdleConnections forwards to the wrapped RoundTripper so it reaches the
 // concrete *http.Transport at the bottom of the chain.
 func (a *authRoundTripper) CloseIdleConnections() {
-	if c, ok := a.base.(interface{ CloseIdleConnections() }); ok {
-		c.CloseIdleConnections()
-	}
+	networking.ForwardCloseIdle(a.base)
 }
+
+// Compile-time assertions: a rename or typo of CloseIdleConnections on any of
+// these wrappers would silently re-hide the pool at the bottom of the chain
+// (see networking.IdleConnectionCloser).
+var (
+	_ networking.IdleConnectionCloser = (*identityPropagatingRoundTripper)(nil)
+	_ networking.IdleConnectionCloser = (*tracePropagatingRoundTripper)(nil)
+	_ networking.IdleConnectionCloser = (*authRoundTripper)(nil)
+)
 
 // resolveAuthStrategy resolves the authentication strategy for a backend target.
 // It handles defaulting to "unauthenticated" when no auth config is specified.
@@ -801,18 +824,6 @@ func (h *httpBackendClient) defaultClientFactory(
 	// Note: Initialization is deferred to the caller (e.g., ListCapabilities)
 	// so that ServerCapabilities can be captured and used for conditional querying
 	return c, nil
-}
-
-// requestTimeout returns the streamable-HTTP request timeout for a workload:
-// its per-workload value, else the configured default, else 90 s.
-func (h *httpBackendClient) requestTimeout(workloadID string) time.Duration {
-	if timeout := h.perWorkloadRequestTimeouts[workloadID]; timeout > 0 {
-		return timeout
-	}
-	if h.defaultRequestTimeout > 0 {
-		return h.defaultRequestTimeout
-	}
-	return DefaultBackendRequestTimeout
 }
 
 // isAuthorizationRequired reports whether err is one of the mcp-go authorization-required
@@ -1110,8 +1121,8 @@ func (h *httpBackendClient) CachedRevision(workloadID string) (mcpparser.Revisio
 // identity, header-forward, trace, TLS/SSRF — see buildBackendRoundTripper) in an
 // *http.Client for the raw Modern shim. This is a LIVE production path: the
 // discover probe must carry the same security controls as every other backend
-// call, so it must NOT use a bare http.Client. A 30s timeout matches the
-// streamable-HTTP client; the response body is bounded inside modernCall
+// call, so it must NOT use a bare http.Client. Its workload-aware timeout
+// matches the streamable-HTTP client; the response body is bounded inside modernCall
 // (io.LimitReader), so no size-limit transport wrapper is needed here.
 func (h *httpBackendClient) buildModernHTTPClient(ctx context.Context, target *vmcp.BackendTarget) (*http.Client, error) {
 	rt, err := h.buildBackendRoundTripper(ctx, target)
@@ -1299,7 +1310,9 @@ func (h *httpBackendClient) modernEnumerate(
 	var resources []mcp.Resource
 	var templates []mcp.ResourceTemplate
 	if caps != nil && caps.Resources != nil {
-		resources, err = modernListAll[mcp.Resource](ctx, hc, endpoint, "resources/list", "resources")
+		resources, err = modernListOptional[mcp.Resource](
+			ctx, hc, endpoint, "resources/list", "resources", target.WorkloadName, false,
+		)
 		if err != nil {
 			return nil, wrapBackendError(err, target.WorkloadID, "list resources")
 		}
@@ -1307,18 +1320,19 @@ func (h *httpBackendClient) modernEnumerate(
 		// Resource templates share the resources capability flag. A backend that
 		// does not implement resources/templates/list (-32601) degrades to an
 		// empty template list, mirroring the Legacy queryResourceTemplates path.
-		templates, err = modernListAll[mcp.ResourceTemplate](ctx, hc, endpoint, "resources/templates/list", "resourceTemplates")
-		switch {
-		case errors.Is(err, mcp.ErrMethodNotFound):
-			templates = nil
-		case err != nil:
+		templates, err = modernListOptional[mcp.ResourceTemplate](
+			ctx, hc, endpoint, "resources/templates/list", "resourceTemplates", target.WorkloadName, true,
+		)
+		if err != nil {
 			return nil, wrapBackendError(err, target.WorkloadID, "list resource templates")
 		}
 	}
 
 	var prompts []mcp.Prompt
 	if caps != nil && caps.Prompts != nil {
-		prompts, err = modernListAll[mcp.Prompt](ctx, hc, endpoint, "prompts/list", "prompts")
+		prompts, err = modernListOptional[mcp.Prompt](
+			ctx, hc, endpoint, "prompts/list", "prompts", target.WorkloadName, false,
+		)
 		if err != nil {
 			return nil, wrapBackendError(err, target.WorkloadID, "list prompts")
 		}
@@ -1329,6 +1343,35 @@ func (h *httpBackendClient) modernEnumerate(
 		"tools", len(tools), "resources", len(resources),
 		"resource_templates", len(templates), "prompts", len(prompts))
 	return newCapabilityListFromMCP(target.WorkloadID, tools, resources, templates, prompts), nil
+}
+
+// modernListOptional enumerates an optional capability list via modernListAll.
+// Unlike tools/list — where a failure means the backend is genuinely unusable —
+// an optional list degrades instead of failing the whole enumeration:
+//
+//   - a transient failure (errModernTransient: HTTP 408/429/5xx, a mid-stream
+//     read failure, or a transport/network error), after the mandatory
+//     tools/list has already succeeded, yields an empty list with a WARN;
+//   - a -32601 not-implemented (mcp.ErrMethodNotFound) yields an empty list
+//     when degradeNotFound is set, mirroring the Legacy resources/templates/list
+//     path; resources/list and prompts/list treat it as fatal.
+//
+// Any other error is returned to the caller, which fails the enumeration.
+func modernListOptional[T any](
+	ctx context.Context, hc *http.Client, endpoint, method, itemsField, backend string, degradeNotFound bool,
+) ([]T, error) {
+	items, err := modernListAll[T](ctx, hc, endpoint, method, itemsField)
+	switch {
+	case errors.Is(err, errModernTransient):
+		slog.Warn(method+" transiently unavailable; degrading to empty list",
+			"backend", backend, "error", err)
+		return nil, nil
+	case errors.Is(err, mcp.ErrMethodNotFound) && degradeNotFound:
+		return nil, nil
+	case err != nil:
+		return nil, err
+	}
+	return items, nil
 }
 
 // cursorParams builds the Modern list request params carrying a pagination
@@ -1457,6 +1500,9 @@ func newCapabilityListFromMCP(
 // first-probe blip that pinned Legacy) self-corrects: the failing path triggers a
 // re-probe and one retry under the corrected revision.
 func (h *httpBackendClient) ListCapabilities(ctx context.Context, target *vmcp.BackendTarget) (*vmcp.CapabilityList, error) {
+	ctx, cancel := h.requestContext(ctx, target)
+	defer cancel()
+
 	slog.Debug("querying capabilities from backend", "backend", target.WorkloadName, "url", target.BaseURL)
 	var out *vmcp.CapabilityList
 	err := h.dispatch(ctx, target, func(ctx context.Context, rev mcpparser.Revision) error {
@@ -1772,6 +1818,9 @@ func (h *httpBackendClient) CallTool(
 	meta map[string]any,
 	paramHeaders map[string]string,
 ) (*vmcp.ToolCallResult, error) {
+	ctx, cancel := h.requestContext(ctx, target)
+	defer cancel()
+
 	slog.Debug("calling tool on backend", "tool", toolName, "backend", target.WorkloadName)
 	var out *vmcp.ToolCallResult
 	err := h.dispatch(ctx, target, func(ctx context.Context, rev mcpparser.Revision) error {
@@ -1967,6 +2016,9 @@ func toolResultFromMCP(
 func (h *httpBackendClient) ReadResource(
 	ctx context.Context, target *vmcp.BackendTarget, uri string,
 ) (*vmcp.ResourceReadResult, error) {
+	ctx, cancel := h.requestContext(ctx, target)
+	defer cancel()
+
 	slog.Debug("reading resource from backend", "resource", uri, "backend", target.WorkloadName)
 	var out *vmcp.ResourceReadResult
 	err := h.dispatch(ctx, target, func(ctx context.Context, rev mcpparser.Revision) error {
@@ -2084,6 +2136,9 @@ func (h *httpBackendClient) GetPrompt(
 	name string,
 	arguments map[string]any,
 ) (*vmcp.PromptGetResult, error) {
+	ctx, cancel := h.requestContext(ctx, target)
+	defer cancel()
+
 	slog.Debug("getting prompt from backend", "prompt", name, "backend", target.WorkloadName)
 	var out *vmcp.PromptGetResult
 	err := h.dispatch(ctx, target, func(ctx context.Context, rev mcpparser.Revision) error {
@@ -2204,6 +2259,9 @@ func (h *httpBackendClient) Complete(
 	argName, argValue string,
 	contextArgs map[string]string,
 ) (*vmcp.CompletionResult, error) {
+	ctx, cancel := h.requestContext(ctx, target)
+	defer cancel()
+
 	slog.Debug("requesting completion from backend", "ref_type", ref.Type, "backend", target.WorkloadName)
 	var out *vmcp.CompletionResult
 	err := h.dispatch(ctx, target, func(ctx context.Context, rev mcpparser.Revision) error {

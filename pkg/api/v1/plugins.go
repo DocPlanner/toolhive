@@ -5,6 +5,7 @@ package v1
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -19,12 +20,19 @@ import (
 // PluginsRoutes defines the routes for plugin management.
 type PluginsRoutes struct {
 	pluginService plugins.PluginService
+	lockService   plugins.PluginLockService
 }
 
-// PluginsRouter creates a new router for plugin management endpoints.
+// PluginsRouter creates a new router for plugin management endpoints. If
+// pluginService's concrete implementation also satisfies plugins.PluginLockService
+// (as pluginsvc.New's does), /sync and /upgrade are served; otherwise both
+// return 501.
 func PluginsRouter(pluginService plugins.PluginService) http.Handler {
 	routes := PluginsRoutes{
 		pluginService: pluginService,
+	}
+	if lockSvc, ok := pluginService.(plugins.PluginLockService); ok {
+		routes.lockService = lockSvc
 	}
 
 	// Mirrors WorkloadRouter and SkillsRouter: routes that move OCI artifacts
@@ -45,6 +53,8 @@ func PluginsRouter(pluginService plugins.PluginService) http.Handler {
 	r.With(stdTimeout).Get("/builds", apierrors.ErrorHandler(routes.listBuilds))
 	r.With(stdTimeout).Delete("/builds/{tag}", apierrors.ErrorHandler(routes.deleteBuild))
 	r.With(stdTimeout).Get("/content", apierrors.ErrorHandler(routes.getPluginContent))
+	r.With(longTimeout).Post("/sync", apierrors.ErrorHandler(routes.syncPlugins))
+	r.With(longTimeout).Post("/upgrade", apierrors.ErrorHandler(routes.upgradePlugins))
 
 	return r
 }
@@ -98,6 +108,7 @@ func (s *PluginsRoutes) listPlugins(w http.ResponseWriter, r *http.Request) erro
 //	@Header			201		{string}	Location	"URI of the installed plugin resource"
 //	@Failure		400		{string}	string		"Bad Request"
 //	@Failure		401		{string}	string		"Unauthorized (registry refused credentials)"
+//	@Failure		403		{string}	string		"Forbidden (signature verification or trust check failed)"
 //	@Failure		404		{string}	string		"Not Found (artifact not present in registry)"
 //	@Failure		409		{string}	string		"Conflict"
 //	@Failure		429		{string}	string		"Too Many Requests (registry rate limit)"
@@ -115,13 +126,15 @@ func (s *PluginsRoutes) installPlugin(w http.ResponseWriter, r *http.Request) er
 	}
 
 	result, err := s.pluginService.Install(r.Context(), plugins.InstallOptions{
-		Name:        req.Name,
-		Version:     req.Version,
-		Scope:       req.Scope,
-		ProjectRoot: req.ProjectRoot,
-		Clients:     req.Clients,
-		Force:       req.Force,
-		Group:       req.Group,
+		Name:          req.Name,
+		Version:       req.Version,
+		Scope:         req.Scope,
+		ProjectRoot:   req.ProjectRoot,
+		Clients:       req.Clients,
+		Force:         req.Force,
+		Group:         req.Group,
+		AllowUnsigned: req.AllowUnsigned,
+		PublicKey:     req.PublicKey,
 	})
 	if err != nil {
 		return err
@@ -130,7 +143,11 @@ func (s *PluginsRoutes) installPlugin(w http.ResponseWriter, r *http.Request) er
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Location", fmt.Sprintf("/api/v1beta/plugins/%s", result.Plugin.Metadata.Name))
 	w.WriteHeader(http.StatusCreated)
-	return json.NewEncoder(w).Encode(installPluginResponse{Plugin: result.Plugin})
+	return json.NewEncoder(w).Encode(installPluginResponse{
+		Plugin:     result.Plugin,
+		Provenance: result.Provenance,
+		Unsigned:   result.Unsigned,
+	})
 }
 
 // uninstallPlugin removes an installed plugin.
@@ -296,7 +313,14 @@ func (s *PluginsRoutes) buildPlugin(w http.ResponseWriter, r *http.Request) erro
 //	@Router			/api/v1beta/plugins/push [post]
 func (s *PluginsRoutes) pushPlugin(w http.ResponseWriter, r *http.Request) error {
 	var req pushPluginRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	// Unknown fields are rejected on this endpoint specifically. Push is the
+	// only credential-bearing plugin request, and the field most likely to
+	// arrive unrecognized is "key": plugin signing is keyless-only (#6442),
+	// so silently discarding a key would answer "please sign this with my
+	// key" with an unsigned publish. A 400 naming the field says no.
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
 		return httperr.WithCode(
 			fmt.Errorf("invalid request body: %w", err),
 			http.StatusBadRequest,
@@ -311,7 +335,9 @@ func (s *PluginsRoutes) pushPlugin(w http.ResponseWriter, r *http.Request) error
 	}
 
 	if err := s.pluginService.Push(r.Context(), plugins.PushOptions{
-		Reference: req.Reference,
+		Reference:     req.Reference,
+		IdentityToken: req.IdentityToken,
+		NoSign:        req.NoSign,
 	}); err != nil {
 		return err
 	}
@@ -397,4 +423,95 @@ func (s *PluginsRoutes) getPluginContent(w http.ResponseWriter, r *http.Request)
 
 	w.Header().Set("Content-Type", "application/json")
 	return json.NewEncoder(w).Encode(content)
+}
+
+// syncPlugins restores a project's installed plugins to match its lock file.
+//
+//	@Summary		Sync project plugins from the lock file
+//	@Description	Restore a project's installed plugins to match toolhive.lock.yaml
+//	@Tags			plugins
+//	@Accept			json
+//	@Produce		json
+//	@Param			request	body		syncPluginsRequest	true	"Sync request"
+//	@Success		200		{object}	plugins.SyncResult
+//	@Failure		400		{string}	string	"Bad Request"
+//	@Failure		403		{string}	string	"Forbidden (feature not enabled)"
+//	@Failure		500		{string}	string	"Internal Server Error"
+//	@Failure		501		{string}	string	"Not Implemented"
+//	@Router			/api/v1beta/plugins/sync [post]
+func (s *PluginsRoutes) syncPlugins(w http.ResponseWriter, r *http.Request) error {
+	if s.lockService == nil {
+		return httperr.WithCode(errors.New("plugin sync is not supported by this server"), http.StatusNotImplemented)
+	}
+
+	var req syncPluginsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		return httperr.WithCode(
+			fmt.Errorf("invalid request body: %w", err),
+			http.StatusBadRequest,
+		)
+	}
+
+	result, err := s.lockService.Sync(r.Context(), plugins.SyncOptions{
+		ProjectRoot:   req.ProjectRoot,
+		Clients:       req.Clients,
+		Prune:         req.Prune,
+		Check:         req.Check,
+		Adopt:         req.Adopt,
+		AllowUnsigned: req.AllowUnsigned,
+	})
+	if err != nil {
+		return err
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	return json.NewEncoder(w).Encode(result)
+}
+
+// upgradePlugins re-resolves a project's lock entries and installs newer
+// content where available. With fail_on_changes set, it evaluates the plan
+// and returns the outcomes without installing anything — clients derive the
+// freshness verdict from the outcome statuses, mirroring sync's check mode.
+//
+//	@Summary		Upgrade project plugins
+//	@Description	Re-resolve a project's lock entries and install newer content where available
+//	@Tags			plugins
+//	@Accept			json
+//	@Produce		json
+//	@Param			request	body		upgradePluginsRequest	true	"Upgrade request"
+//	@Success		200		{object}	plugins.UpgradeResult
+//	@Failure		400		{string}	string	"Bad Request"
+//	@Failure		403		{string}	string	"Forbidden (feature not enabled)"
+//	@Failure		404		{string}	string	"Not Found (a requested name is not in the lock file)"
+//	@Failure		500		{string}	string	"Internal Server Error"
+//	@Failure		501		{string}	string	"Not Implemented"
+//	@Router			/api/v1beta/plugins/upgrade [post]
+func (s *PluginsRoutes) upgradePlugins(w http.ResponseWriter, r *http.Request) error {
+	if s.lockService == nil {
+		return httperr.WithCode(errors.New("plugin upgrade is not supported by this server"), http.StatusNotImplemented)
+	}
+
+	var req upgradePluginsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		return httperr.WithCode(
+			fmt.Errorf("invalid request body: %w", err),
+			http.StatusBadRequest,
+		)
+	}
+
+	result, err := s.lockService.Upgrade(r.Context(), plugins.UpgradeOptions{
+		ProjectRoot:       req.ProjectRoot,
+		Names:             req.Names,
+		Preview:           req.Preview,
+		FailOnChanges:     req.FailOnChanges,
+		AllowRefChange:    req.AllowRefChange,
+		AllowSignerChange: req.AllowSignerChange,
+		Clients:           req.Clients,
+	})
+	if err != nil {
+		return err
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	return json.NewEncoder(w).Encode(result)
 }

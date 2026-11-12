@@ -14,11 +14,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-jose/go-jose/v3"
 	"github.com/ory/fosite"
 	"github.com/redis/go-redis/v9"
 
 	tcredis "github.com/stacklok/toolhive-core/redis"
+	"github.com/stacklok/toolhive/pkg/authserver/server"
+	"github.com/stacklok/toolhive/pkg/authserver/server/registration"
 	"github.com/stacklok/toolhive/pkg/authserver/server/session"
+	"github.com/stacklok/toolhive/pkg/oauthproto"
 )
 
 // nullMarker is used to store nil upstream tokens in Redis.
@@ -34,6 +38,16 @@ const nullMarker = "null"
 // the broadly-tested path), and short enough that operational metrics do not
 // confuse this row with a healthy long-lived registration.
 const pastExpiryDCRTTL = time.Second
+
+// maxDCRClaimRetries bounds StoreDCRCredentialsIfAbsent's WATCH/MULTI retry
+// loop. go-redis does not retry Watch internally: a concurrent write to the
+// watched key (another replica claiming, refreshing, or evicting the same
+// row) aborts the pipelined EXEC with redis.TxFailedErr, which Watch returns
+// to the caller unwrapped. Retrying a small, fixed number of times lets a
+// real concurrent write during the exact race this method exists to close
+// resolve on its own rather than failing the caller with a spurious error.
+// Mirrors maxConfiguredClientReconcileRetries above for the same reason.
+const maxDCRClaimRetries = 3
 
 // warnOnCleanupErr logs a warning when a best-effort cleanup operation fails.
 //
@@ -107,7 +121,9 @@ type storedSession struct {
 
 // NewRedisStorage creates Redis-backed storage. Connection-mode topology,
 // timeouts, TLS, and credentials are configured through cfg; keyPrefix is the
-// per-tenant key prefix (e.g. "thv:auth:{ns}:{name}:") and must be non-empty.
+// per-tenant key prefix (a single Redis Cluster hash tag combining namespace
+// and name — see DeriveKeyPrefix, e.g. "thv:auth:{ns:name}:") and must be
+// non-empty.
 //
 // Connection-mode validation, timeout defaults, client construction (standalone,
 // cluster, or sentinel), TLS plumbing, and connectivity verification are
@@ -172,27 +188,188 @@ type storedClient struct {
 	ResponseTypes []string `json:"response_types"`
 	Scopes        []string `json:"scopes"`
 	Audience      []string `json:"audience"`
-	Public        bool     `json:"public"`
+	// Resources is the RFC 8707 resource allowlist, populated only for a
+	// Reserved client that implements resourceScopedClient (today, always the
+	// SPIFFE static-client placeholder). Gated on Reserved rather than the
+	// interface check alone so buildStoredClient's write and clientFromStored's
+	// read stay symmetric by construction. Nil for every other client shape,
+	// and omitted from the JSON encoding in that case.
+	Resources           []string `json:"resources,omitempty"`
+	IdentityFingerprint string   `json:"identity_fingerprint,omitempty"`
+	Public              bool     `json:"public"`
+	// TokenEndpointAuthMethod is the auth method registered for the client
+	// ("none", "client_secret_basic", "client_secret_post"). Empty means the
+	// row predates confidential-client support; see GetClient for how legacy
+	// rows are interpreted.
+	TokenEndpointAuthMethod string `json:"token_endpoint_auth_method,omitempty"`
+	// DCRIssued is true when the row was written from a dynamically registered
+	// client. It is persisted rather than inferred from the auth method: a
+	// pre-provisioned confidential client also carries a method, and inferring
+	// from it would hand that permanent client an anti-bloat TTL on its first
+	// token request. Rows predating this field unmarshal with DCRIssued=false.
+	// DCR mints a new client_id per registration and never rewrites an existing
+	// row, so a pre-existing row with no DCRIssued value is itself DCR-issued —
+	// it just reads back unmarked. clientFromStored compensates for this on
+	// read using the Redis key's TTL as a discriminator: a legacy row with no
+	// auth method, Public=true, AND a live TTL on its key is treated as
+	// DCR-issued even though the persisted field says otherwise, because
+	// RegisterClient only ever wrote that TTL for DCR-issued rows — a
+	// pre-provisioned public client (a bare *fosite.DefaultClient) was always
+	// written with no TTL. A legacy confidential row (no method, Public=false)
+	// is not compensated for — it predates confidential DCR support entirely,
+	// so it cannot be DCR-issued.
+	DCRIssued bool `json:"dcr_issued,omitempty"`
+	// Reserved is true when the row is a SPIFFE static-client durable
+	// placeholder (see staticClientPlaceholder in spiffe_decorator.go) —
+	// never a real, authenticatable client. It is checked before GrantTypes/
+	// ResponseTypes/Secret/Public are trusted on read: clientFromStored
+	// re-wraps a Reserved row in the same inert type the placeholder was
+	// built with, regardless of what those other fields happen to contain,
+	// so the row cannot become issuable via fosite's own zero-value
+	// defaulting (see clientFromStored and inertPlaceholderClient).
+	Reserved bool `json:"reserved,omitempty"`
+	// JSONWebKeys stores only the inline public keys used by private_key_jwt.
+	// JSONWebKeysURI and other assertion material are intentionally not stored.
+	JSONWebKeys                       *jose.JSONWebKeySet `json:"jwks,omitempty"`
+	TokenEndpointAuthSigningAlgorithm string              `json:"token_endpoint_auth_signing_alg,omitempty"`
 }
 
-// redisClient implements fosite.Client for deserialization.
-type redisClient struct {
-	storedClient
+// publicJSONWebKeySet copies an inline JWKS while removing private and
+// symmetric key material before it is persisted.
+func publicJSONWebKeySet(jwks *jose.JSONWebKeySet) *jose.JSONWebKeySet {
+	if jwks == nil {
+		return nil
+	}
+
+	publicKeys := make([]jose.JSONWebKey, 0, len(jwks.Keys))
+	for _, key := range jwks.Keys {
+		publicKey := key
+		if !key.IsPublic() {
+			publicKey = key.Public()
+		}
+		if publicKey.Key != nil && publicKey.IsPublic() {
+			publicKeys = append(publicKeys, publicKey)
+		}
+	}
+	return &jose.JSONWebKeySet{Keys: publicKeys}
 }
 
-func (c *redisClient) GetID() string                      { return c.ID }
-func (c *redisClient) GetHashedSecret() []byte            { return c.Secret }
-func (c *redisClient) GetRedirectURIs() []string          { return c.RedirectURIs }
-func (c *redisClient) GetGrantTypes() fosite.Arguments    { return c.GrantTypes }
-func (c *redisClient) GetResponseTypes() fosite.Arguments { return c.ResponseTypes }
-func (c *redisClient) GetScopes() fosite.Arguments        { return c.Scopes }
-func (c *redisClient) GetAudience() fosite.Arguments      { return c.Audience }
-func (c *redisClient) IsPublic() bool                     { return c.Public }
+// clientFromStored rebuilds a fosite.Client from its persisted form. hasTTL
+// reports whether the Redis key currently carries an expiry (TTL >= 0); it is
+// the discriminator used to compensate for the legacy public shape below, and
+// is meaningless for rows that carry an explicit DCRIssued marker.
+//
+// The read logic is two-way so that drift between the Public flag and the
+// auth method can only ever *add* secret verification, never remove it:
+//
+//   - A row with no method recorded covers two populations, both rebuilt as a
+//     bare *fosite.DefaultClient: a pre-provisioned non-OIDC client
+//     (permanent — RegisterClient only populates the column for
+//     fosite.OpenIDConnectClient implementations, so a non-OIDC client will
+//     never carry one, by design, not by omission) and a row written before
+//     confidential-client support existed (transitional). Neither shape was
+//     ever assigned a pinned method — the public one no more than the
+//     confidential one — so neither should acquire method enforcement on
+//     read-back: fosite only enforces token_endpoint_auth_method on
+//     fosite.OpenIDConnectClient implementations, and a bare
+//     *fosite.DefaultClient does not satisfy that interface. IsPublic still
+//     reports correctly because it reads the Public field directly
+//     (fosite.DefaultClient.IsPublic() returns c.Public, uninfluenced by the
+//     auth method).
+//   - A row with a method was written by registration.New (the only path
+//     that populates the column), so it is rebuilt as a
+//     *fosite.DefaultOpenIDConnectClient — fosite enforces the pinned method
+//     at the token endpoint. IsPublic is derived as
+//     (Public && method == "none"): a row that somehow carries both
+//     Public=true and a secret-based method reads back confidential, forcing
+//     secret verification rather than dropping it.
+//
+// DCR-issued marking: a row is treated as DCR-issued when it was persisted as
+// such (stored.DCRIssued — the primary signal, always honored regardless of
+// TTL), OR when it has the legacy public shape (no method, Public=true) AND
+// the key currently carries a TTL. That second clause exists because rows
+// written before the DCRIssued field existed have neither field set, and the
+// legacy public shape is ambiguous on its own: it matches both a pre-existing
+// DCR-issued public client (which must keep renewing its TTL) and a
+// pre-provisioned public client registered as a bare *fosite.DefaultClient
+// (which must never acquire one — Redis EXPIRE on a key with no TTL creates
+// one). The two are distinguishable by how RegisterClient originally wrote
+// the key: DCR-issued rows always got DefaultDCRClientTTL, pre-provisioned
+// rows always got none. Gating the legacy-shape compensation on "the key
+// currently has a TTL" reproduces that distinction without needing to touch
+// the stored JSON. A legacy confidential row (no method, Public=false) is
+// never marked regardless of TTL: it predates confidential DCR support
+// entirely and cannot be DCR-issued.
+func clientFromStored(stored storedClient, hasTTL bool) fosite.Client {
+	// A reserved SPIFFE placeholder is re-wrapped in the exact inert type it
+	// was built with, ignoring whatever GrantTypes/ResponseTypes/Secret/
+	// Public happen to be on the row: a bare *fosite.DefaultClient would
+	// otherwise satisfy fosite's own zero-value defaulting for
+	// GetGrantTypes/GetResponseTypes (["authorization_code"] / ["code"]) on
+	// this exact reconstruction path, undoing the guarantee the placeholder
+	// exists to provide. This check must run before the method-based branch
+	// below: a reserved row never carries a TokenEndpointAuthMethod, but even
+	// if it somehow did, Reserved must still win.
+	if stored.Reserved {
+		return inertPlaceholderClient{
+			DefaultClient: &fosite.DefaultClient{
+				ID:       stored.ID,
+				Scopes:   stored.Scopes,
+				Audience: stored.Audience,
+				Public:   false,
+			},
+			resources:           stored.Resources,
+			identityFingerprint: stored.IdentityFingerprint,
+		}
+	}
 
-// RegisterClient adds or updates a client in the storage.
-func (s *RedisStorage) RegisterClient(ctx context.Context, client fosite.Client) error {
-	key := redisKey(s.keyPrefix, KeyTypeClient, client.GetID())
+	method := stored.TokenEndpointAuthMethod
+	if method == "" {
+		client := &fosite.DefaultClient{
+			ID:            stored.ID,
+			Secret:        stored.Secret,
+			RedirectURIs:  stored.RedirectURIs,
+			GrantTypes:    stored.GrantTypes,
+			ResponseTypes: stored.ResponseTypes,
+			Scopes:        stored.Scopes,
+			Audience:      stored.Audience,
+			Public:        stored.Public,
+		}
+		if stored.DCRIssued || (stored.Public && hasTTL) {
+			return registration.MarkDCRIssued(client)
+		}
+		return client
+	}
+	oidcClient := &fosite.DefaultOpenIDConnectClient{
+		DefaultClient: &fosite.DefaultClient{
+			ID:            stored.ID,
+			Secret:        stored.Secret,
+			RedirectURIs:  stored.RedirectURIs,
+			GrantTypes:    stored.GrantTypes,
+			ResponseTypes: stored.ResponseTypes,
+			Scopes:        stored.Scopes,
+			Audience:      stored.Audience,
+			Public:        stored.Public && method == oauthproto.TokenEndpointAuthMethodNone,
+		},
+		TokenEndpointAuthMethod:           method,
+		JSONWebKeys:                       stored.JSONWebKeys,
+		TokenEndpointAuthSigningAlgorithm: stored.TokenEndpointAuthSigningAlgorithm,
+	}
+	if stored.DCRIssued {
+		return registration.MarkDCRIssued(oidcClient)
+	}
+	return oidcClient
+}
 
+// buildStoredClient converts client to its serializable form. Record the
+// registered auth method when the client exposes one. Clients that don't
+// implement fosite.OpenIDConnectClient (e.g. pre-provisioned confidential
+// clients built as bare *fosite.DefaultClient) leave the field empty on
+// purpose: Public alone carries the meaning it already carries, and
+// clientFromStored treats the empty method as a legacy row. Do NOT substitute
+// a "none" fallback here — that would silently reclassify a confidential row
+// as public on read-back.
+func buildStoredClient(client fosite.Client) storedClient {
 	stored := storedClient{
 		ID:            client.GetID(),
 		Secret:        client.GetHashedSecret(),
@@ -203,28 +380,282 @@ func (s *RedisStorage) RegisterClient(ctx context.Context, client fosite.Client)
 		Audience:      client.GetAudience(),
 		Public:        client.IsPublic(),
 	}
+	stored.Reserved = isReservedPlaceholder(client)
+	// Resources and IdentityFingerprint are only ever restored on read for a
+	// Reserved row (see clientFromStored); gating the write the same way
+	// keeps the two symmetric by construction instead of relying on every
+	// resourceScopedClient/spiffeIdentityClient implementation always being
+	// Reserved.
+	if stored.Reserved {
+		if rc, ok := client.(resourceScopedClient); ok {
+			stored.Resources = rc.Resources()
+		}
+		if identity, ok := client.(spiffeIdentityClient); ok {
+			stored.IdentityFingerprint = identity.IdentityFingerprint()
+		}
+	}
+	if oidcClient, ok := client.(fosite.OpenIDConnectClient); ok {
+		stored.TokenEndpointAuthMethod = oidcClient.GetTokenEndpointAuthMethod()
+		stored.JSONWebKeys = publicJSONWebKeySet(oidcClient.GetJSONWebKeys())
+		stored.TokenEndpointAuthSigningAlgorithm = oidcClient.GetTokenEndpointAuthSigningAlgorithm()
+	}
+	stored.DCRIssued = registration.DCRIssued(client)
+	return stored
+}
+
+// RegisterClient creates a client in storage. Always create-only via SetNX:
+// it atomically returns ErrAlreadyExists when a client with the same ID is
+// already registered, regardless of the new client's origin. /oauth/register
+// is unauthenticated, so this must never clobber an existing client;
+// operator-declared clients reconcile through ReconcileConfiguredClient
+// instead.
+func (s *RedisStorage) RegisterClient(ctx context.Context, client fosite.Client) error {
+	if err := ValidateRegisterableClientID(client.GetID()); err != nil {
+		return err
+	}
+
+	key := redisKey(s.keyPrefix, KeyTypeClient, client.GetID())
+	stored := buildStoredClient(client)
 
 	data, err := json.Marshal(stored) //nolint:gosec // G117 - internal Redis storage serialization, not exposed to users
 	if err != nil {
 		return fmt.Errorf("failed to marshal client: %w", err)
 	}
 
-	// Public clients (from DCR) expire to prevent unbounded growth; RenewClientTTL
-	// refreshes this on proven use so actively-used clients are not evicted.
-	// Confidential clients don't expire.
+	// DCR-issued clients (public and confidential) expire to prevent unbounded
+	// growth from unauthenticated dynamic registration; RenewClientTTL refreshes
+	// this on proven use so actively-used clients are not evicted. The TTL is
+	// keyed on the registration.DCRIssued marker, not IsPublic: a confidential
+	// client minted via DCR is exactly the registration an attacker would pile
+	// up, while a pre-provisioned confidential client (no marker) must never
+	// acquire a TTL — Redis EXPIRE on a key with no TTL creates one, so gating
+	// on IsPublic would give an existing permanent client an expiry on its
+	// first token request after upgrade.
 	ttl := time.Duration(0)
-	if client.IsPublic() {
-		ttl = DefaultPublicClientTTL
+	if registration.DCRIssued(client) {
+		ttl = DefaultDCRClientTTL
 	}
 
-	return s.client.Set(ctx, key, data, ttl).Err()
+	created, err := s.client.SetNX(ctx, key, data, ttl).Result()
+	if err != nil {
+		return fmt.Errorf("failed to register client: %w", err)
+	}
+	if !created {
+		return fmt.Errorf("%w: client %q", ErrAlreadyExists, client.GetID())
+	}
+	return nil
+}
+
+// UpsertDCRIssuedClient creates or replaces a DCR-issued client at
+// client.GetID(). Unlike RegisterClient (create-only via SetNX), an existing
+// row is replaced -- and its TTL refreshed to DefaultDCRClientTTL -- when the
+// existing row is itself DCR-issued; it refuses with ErrAlreadyExists when the
+// existing row is NOT DCR-issued, protecting a configured/SPIFFE-reconciled
+// client from being clobbered. See the ClientRegistry interface doc for the
+// full contract.
+//
+// The read-check-write sequence for an existing key runs inside a Redis
+// WATCH/MULTI transaction, mirroring ReconcileConfiguredClient, so a
+// concurrent writer cannot interleave between the DCR-issued check and the
+// write; see maxConfiguredClientReconcileRetries for why this method retries
+// redis.TxFailedErr itself, up to the same bounded count. Unlike
+// ReconcileConfiguredClient (ttl=0, permanent), the write here always uses
+// DefaultDCRClientTTL: this row is TTL-bounded like any other DCR-issued
+// client.
+func (s *RedisStorage) UpsertDCRIssuedClient(ctx context.Context, client fosite.Client) error {
+	if !registration.DCRIssued(client) {
+		return fmt.Errorf("client %q must carry the DCR-issued marker to use UpsertDCRIssuedClient", client.GetID())
+	}
+	if err := ValidateRegisterableClientID(client.GetID()); err != nil {
+		return err
+	}
+
+	key := redisKey(s.keyPrefix, KeyTypeClient, client.GetID())
+	stored := buildStoredClient(client)
+	data, err := json.Marshal(stored) //nolint:gosec // G117 - internal Redis storage serialization, not exposed to users
+	if err != nil {
+		return fmt.Errorf("failed to marshal client: %w", err)
+	}
+
+	setPipelined := func(tx *redis.Tx) error {
+		_, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.Set(ctx, key, data, DefaultDCRClientTTL)
+			return nil
+		})
+		return err
+	}
+
+	txFn := func(tx *redis.Tx) error {
+		existingData, getErr := tx.Get(ctx, key).Bytes()
+		if errors.Is(getErr, redis.Nil) {
+			return setPipelined(tx)
+		}
+		if getErr != nil {
+			return fmt.Errorf("failed to get existing client: %w", getErr)
+		}
+
+		ttl, ttlErr := tx.TTL(ctx, key).Result()
+		if ttlErr != nil {
+			return fmt.Errorf("failed to get existing client TTL: %w", ttlErr)
+		}
+
+		var existingStored storedClient
+		if unmarshalErr := json.Unmarshal(existingData, &existingStored); unmarshalErr != nil {
+			return fmt.Errorf("failed to unmarshal existing client: %w", unmarshalErr)
+		}
+
+		if !registration.DCRIssued(clientFromStored(existingStored, ttl >= 0)) {
+			return fmt.Errorf("%w: client %q", ErrAlreadyExists, client.GetID())
+		}
+
+		return setPipelined(tx)
+	}
+
+	var watchErr error
+	for attempt := 0; attempt < maxConfiguredClientReconcileRetries; attempt++ {
+		watchErr = s.client.Watch(ctx, txFn, key)
+		if !errors.Is(watchErr, redis.TxFailedErr) {
+			return watchErr
+		}
+	}
+	return watchErr
+}
+
+// fingerprint reads the persisted fields directly rather than going through
+// clientFromStored. This matters because fosite.DefaultClient.GetGrantTypes
+// and GetResponseTypes each silently substitute a single-element default
+// (["authorization_code"] / ["code"]) whenever the underlying field is empty
+// (see clientFromStored) — comparing through the reconstructed client would
+// report a false mismatch between two rows that both deliberately carry no
+// grant/response types, such as the SPIFFE static-client placeholder in
+// spiffe_decorator.go reconciling against itself. Reading the stored fields
+// directly sidesteps that defaulting entirely.
+func (s storedClient) fingerprint() clientFingerprint {
+	return clientFingerprint{
+		scopes:              s.Scopes,
+		audience:            s.Audience,
+		grantTypes:          s.GrantTypes,
+		responseTypes:       s.ResponseTypes,
+		resources:           s.Resources,
+		identityFingerprint: s.IdentityFingerprint,
+		public:              s.Public,
+	}
+}
+
+// maxConfiguredClientReconcileRetries bounds the retry loop
+// ReconcileConfiguredClient runs around its WATCH/MULTI transaction. go-redis
+// does not retry Watch internally: a concurrent write to the watched key aborts
+// the pipelined EXEC with redis.TxFailedErr, which Watch returns to the caller
+// unwrapped (see $GOMODCACHE/github.com/redis/go-redis/v9@*/tx.go). Retrying a
+// small, fixed number of times lets a real concurrent write during the exact
+// race this feature exists to close (see preflightDurableCollisions in
+// spiffe_decorator.go) resolve on its own rather than failing the caller's
+// startup path with a spurious error.
+const maxConfiguredClientReconcileRetries = 5
+
+// ReconcileConfiguredClient applies an operator-declared client: creates it
+// if absent, idempotently replaces a matching-fingerprint configured client
+// (the restart-with-unchanged-config case), or refuses with ErrAlreadyExists
+// when the existing record is DCR-issued or a different configured client.
+// See the ClientRegistry interface doc for the full contract.
+//
+// The read-check-write sequence for an existing key runs inside a Redis
+// WATCH/MULTI transaction so a concurrent writer (e.g. a DCR registration on
+// another replica racing this reconciliation) cannot interleave between the
+// fingerprint check and the write. Redis aborts the transaction if the
+// watched key changed concurrently, and go-redis surfaces that as
+// redis.TxFailedErr rather than retrying it — see
+// maxConfiguredClientReconcileRetries for why this method retries that error
+// itself, up to a bounded count. A configured client is stored with ttl=0
+// (operator-declared clients never expire), clearing any TTL the row might
+// have inherited.
+func (s *RedisStorage) ReconcileConfiguredClient(ctx context.Context, client fosite.Client) error {
+	if registration.DCRIssued(client) {
+		return fmt.Errorf("configured client %q must not carry the DCR-issued marker", client.GetID())
+	}
+	if err := ValidateRegisterableClientID(client.GetID()); err != nil {
+		return err
+	}
+
+	key := redisKey(s.keyPrefix, KeyTypeClient, client.GetID())
+	stored := buildStoredClient(client)
+	data, err := json.Marshal(stored) //nolint:gosec // G117 - internal Redis storage serialization, not exposed to users
+	if err != nil {
+		return fmt.Errorf("failed to marshal client: %w", err)
+	}
+
+	setPipelined := func(tx *redis.Tx) error {
+		_, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.Set(ctx, key, data, 0)
+			return nil
+		})
+		return err
+	}
+
+	txFn := func(tx *redis.Tx) error {
+		existingData, getErr := tx.Get(ctx, key).Bytes()
+		if errors.Is(getErr, redis.Nil) {
+			return setPipelined(tx)
+		}
+		if getErr != nil {
+			return fmt.Errorf("failed to get existing client: %w", getErr)
+		}
+
+		ttl, ttlErr := tx.TTL(ctx, key).Result()
+		if ttlErr != nil {
+			return fmt.Errorf("failed to get existing client TTL: %w", ttlErr)
+		}
+
+		var existingStored storedClient
+		if unmarshalErr := json.Unmarshal(existingData, &existingStored); unmarshalErr != nil {
+			return fmt.Errorf("failed to unmarshal existing client: %w", unmarshalErr)
+		}
+
+		// DCR-issued detection goes through the reconstructed client (not the
+		// raw existingStored.DCRIssued field) so it inherits clientFromStored's
+		// legacy-row compensation for rows written before the DCRIssued field
+		// existed. The fingerprint comparison below deliberately does NOT go
+		// through the reconstructed client — see storedClient.fingerprint.
+		if registration.DCRIssued(clientFromStored(existingStored, ttl >= 0)) {
+			return fmt.Errorf("%w: client %q is DCR-issued, refusing to overwrite with a configured client",
+				ErrAlreadyExists, client.GetID())
+		}
+		if !existingStored.fingerprint().equal(stored.fingerprint()) {
+			return fmt.Errorf("%w: client %q is already registered as a different configured client",
+				ErrAlreadyExists, client.GetID())
+		}
+
+		return setPipelined(tx)
+	}
+
+	var watchErr error
+	for attempt := 0; attempt < maxConfiguredClientReconcileRetries; attempt++ {
+		watchErr = s.client.Watch(ctx, txFn, key)
+		if !errors.Is(watchErr, redis.TxFailedErr) {
+			return watchErr
+		}
+	}
+	return watchErr
 }
 
 // GetClient loads the client by its ID.
+//
+// The value and the key's TTL are fetched together in one pipelined round
+// trip: clientFromStored needs the TTL to disambiguate the legacy public
+// client shape (see DCRIssued and clientFromStored for why), and issuing GET
+// then TTL as two separate round trips would leave a window where a
+// concurrent RenewClientTTL or expiry changes the answer between them.
 func (s *RedisStorage) GetClient(ctx context.Context, id string) (fosite.Client, error) {
 	key := redisKey(s.keyPrefix, KeyTypeClient, id)
 
-	data, err := s.client.Get(ctx, key).Bytes()
+	pipe := s.client.Pipeline()
+	getCmd := pipe.Get(ctx, key)
+	ttlCmd := pipe.TTL(ctx, key)
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("failed to get client: %w", err)
+	}
+
+	data, err := getCmd.Bytes()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
 			return nil, fmt.Errorf("%w: %w", ErrNotFound, fosite.ErrNotFound.WithHint("Client not found"))
@@ -232,63 +663,119 @@ func (s *RedisStorage) GetClient(ctx context.Context, id string) (fosite.Client,
 		return nil, fmt.Errorf("failed to get client: %w", err)
 	}
 
+	// TTL returns -2 for a missing key (already excluded above by getCmd
+	// succeeding) and -1 for a key with no expiry ("persist"); any value >= 0
+	// means the key currently carries an expiry.
+	ttl, err := ttlCmd.Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get client TTL: %w", err)
+	}
+	hasTTL := ttl >= 0
+
 	var stored storedClient
 	if err := json.Unmarshal(data, &stored); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal client: %w", err)
 	}
 
-	return &redisClient{storedClient: stored}, nil
+	return clientFromStored(stored, hasTTL), nil
 }
 
-// RenewClientTTL extends a public client's registration TTL to DefaultPublicClientTTL.
+// RenewClientTTL extends a DCR-issued client's registration TTL to DefaultDCRClientTTL.
 //
 // Call this on a proven-use signal — a successful token exchange/refresh — not on a
 // client read. GetClient is reached from the unauthenticated front-channel
-// /oauth/authorize handler before any authentication, and public clients have no
-// secret, so renewing there would let any caller who knows a public client_id keep
-// its row alive indefinitely and defeat the anti-bloat TTL. Renewing on token
+// /oauth/authorize handler before any authentication, and DCR-issued public clients
+// have no secret, so renewing there would let any caller who knows a public client_id
+// keep its row alive indefinitely and defeat the anti-bloat TTL. Renewing on token
 // issuance ties registration survival to actual use.
 //
-// Only public clients carry a TTL; confidential clients are stored without one and
-// are left untouched. EXPIRE on a missing key is a no-op, so a client whose row has
-// already been evicted (or a non-persisted CIMD client) is safely ignored.
+// Only DCR-issued clients carry a TTL; pre-provisioned clients are stored without one
+// and are left untouched. The gate is the registration.DCRIssued marker, not IsPublic:
+// EXPIRE on a key with no TTL creates one, so keying on IsPublic would hand an
+// existing permanent confidential client an expiry on its first token request after
+// upgrade. EXPIRE on a missing key is a no-op, so a client whose row has already been
+// evicted (or a non-persisted CIMD client) is safely ignored.
 func (s *RedisStorage) RenewClientTTL(ctx context.Context, client fosite.Client) error {
-	if client == nil || !client.IsPublic() {
+	if client == nil || !registration.DCRIssued(client) {
 		return nil
 	}
 	key := redisKey(s.keyPrefix, KeyTypeClient, client.GetID())
-	return s.client.Expire(ctx, key, DefaultPublicClientTTL).Err()
+	return s.client.Expire(ctx, key, DefaultDCRClientTTL).Err()
 }
 
-// ClientAssertionJWTValid returns an error if the JTI is known.
+// ClientAssertionJWTValid atomically reserves jti for a short window via
+// Redis SET NX, returning fosite.ErrJTIKnown if it is already reserved or
+// was previously consumed and not yet expired. This is the only atomic
+// checkpoint in fosite's two-call client-assertion replay protocol (Valid,
+// then SetClientAssertionJWT with the real expiry once the rest of the
+// assertion has been validated) — an Exists-then-Set pair (the prior
+// implementation) lets two concurrent requests presenting the same
+// assertion both observe jti as unused before either records it. jti
+// length is bounded here too, before it's ever sent to Redis, since fosite
+// hands it to us before parsing exp.
 func (s *RedisStorage) ClientAssertionJWTValid(ctx context.Context, jti string) error {
-	key := redisKey(s.keyPrefix, KeyTypeJWT, jti)
-
-	exists, err := s.client.Exists(ctx, key).Result()
-	if err != nil {
-		return fmt.Errorf("failed to check JWT: %w", err)
+	if len(jti) > server.MaxAssertionJTILength {
+		return fmt.Errorf("jti exceeds maximum length of %d bytes", server.MaxAssertionJTILength)
 	}
-	if exists > 0 {
-		return fosite.ErrJTIKnown
+
+	key := redisKey(s.keyPrefix, KeyTypeJWT, jti)
+	_, err := s.client.SetArgs(ctx, key, "1", redis.SetArgs{TTL: assertionReservationTTL, Mode: "NX"}).Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return fosite.ErrJTIKnown
+		}
+		return fmt.Errorf("failed to reserve JWT: %w", err)
 	}
 	return nil
 }
 
-// SetClientAssertionJWT marks a JTI as known for the given expiry time.
-// If the JWT has already expired (exp is in the past), this is a no-op: there is
-// no need to store it for replay detection since it will be rejected on expiry
-// checks before reaching the JTI lookup.
+// SetClientAssertionJWT extends jti's replay marker to its real expiry,
+// rejecting an exp further than MaxAssertionLifespan in the future. This
+// bounds how long a replay-tracking entry survives regardless of what the
+// client's own assertion claims — otherwise a registered caller could set
+// exp decades out and give Redis a key with a correspondingly enormous TTL.
+// Unconditional overwrite, not a fresh atomic check: only the caller that
+// already won ClientAssertionJWTValid's reservation reaches this call. If
+// the JWT has already expired (exp is in the past), this deletes the
+// reservation instead: there is no need to keep it for replay detection
+// since the assertion will be rejected on expiry checks before reaching the
+// JTI lookup.
 func (s *RedisStorage) SetClientAssertionJWT(ctx context.Context, jti string, exp time.Time) error {
+	if time.Until(exp) > server.MaxAssertionLifespan {
+		return fmt.Errorf("assertion lifetime exceeds maximum of %s", server.MaxAssertionLifespan)
+	}
+
 	key := redisKey(s.keyPrefix, KeyTypeJWT, jti)
 
 	ttl := time.Until(exp)
 	if ttl <= 0 {
-		slog.Debug("skipping storage of already-expired client assertion JWT",
+		slog.Debug("removing reservation for already-expired client assertion JWT",
 			"jti", jti, "exp", exp)
-		return nil
+		return s.client.Del(ctx, key).Err()
 	}
 
 	return s.client.Set(ctx, key, "1", ttl).Err()
+}
+
+// ConsumeAssertionJWT atomically records an assertion JWT as consumed until its
+// expiry. Reusing an unexpired (purpose, issuer, jti) tuple returns
+// fosite.ErrJTIKnown. Redis errors are returned so callers fail closed rather
+// than accepting an assertion whose replay status is unknown.
+func (s *RedisStorage) ConsumeAssertionJWT(ctx context.Context, purpose, issuer, jti string, exp time.Time) error {
+	ttl := time.Until(exp)
+	if ttl <= 0 {
+		return nil
+	}
+
+	key := redisAssertionJWTKey(s.keyPrefix, purpose, issuer, jti)
+	_, err := s.client.SetArgs(ctx, key, "1", redis.SetArgs{TTL: ttl, Mode: "NX"}).Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return fosite.ErrJTIKnown
+		}
+		return fmt.Errorf("consume assertion JWT replay marker: %w", err)
+	}
+	return nil
 }
 
 // -----------------------
@@ -893,6 +1380,18 @@ func (s *RedisStorage) StoreUpstreamTokens(ctx context.Context, sessionID, provi
 	return fmt.Errorf("failed to store upstream tokens: %w", redis.TxFailedErr)
 }
 
+// ResolveUpstreamTokenRowID returns an opaque ID for process-local refresh
+// coordination of a logical upstream-token row.
+func (s *RedisStorage) ResolveUpstreamTokenRowID(_ context.Context, sessionID, providerName string) (UpstreamTokenRowID, error) {
+	if sessionID == "" {
+		return "", fosite.ErrInvalidRequest.WithHint("session ID cannot be empty")
+	}
+	if providerName == "" {
+		return "", fosite.ErrInvalidRequest.WithHint("provider name cannot be empty")
+	}
+	return upstreamTokenRowID(redisUpstreamKey(s.keyPrefix, sessionID, providerName)), nil
+}
+
 // GetUpstreamTokens retrieves the upstream IDP tokens for a session and provider.
 // Returns a new UpstreamTokens struct deserialized from Redis, which acts as
 // a defensive copy - callers cannot modify the stored data by mutating the return value.
@@ -1227,7 +1726,7 @@ func unmarshalUpstreamTokens(data []byte) (*UpstreamTokens, error) {
 // Time fields use int64 Unix epoch; 0 is the sentinel meaning "not set", matching
 // the storedUpstreamTokens convention. ClientSecretExpiresAt == 0 specifically
 // encodes the RFC 7591 §3.2.1 "client_secret does not expire" semantics, in
-// which case StoreDCRCredentials persists the entry without a Redis TTL.
+// which case StoreDCRCredentialsIfAbsent persists the entry without a Redis TTL.
 type storedDCRCredentials struct {
 	// Embed the canonical key so a row recovered without its lookup key
 	// (e.g. via SCAN during diagnostics) still self-identifies.
@@ -1286,9 +1785,50 @@ func (s *storedDCRCredentials) toDCRCredentials() *DCRCredentials {
 	}
 }
 
-// StoreDCRCredentials persists DCR credentials, overwriting any existing entry
-// for the same Key. Defensive copy is provided implicitly by JSON serialisation —
+// StoreDCRCredentialsIfAbsent claims creds.Key for creds via a Redis
+// WATCH/MULTI compare-and-set (the same pattern ReconcileConfiguredClient
+// uses above), returning the authoritative durable value: creds itself on a
+// successful claim, or the existing winner's credentials when the key
+// already holds a live (non-expired) entry. Callers MUST use the returned
+// value — RFC 7591 dynamic registration mints a unique client_id/client_secret
+// on every call, so two replicas racing a cache miss for the same Key
+// register genuinely different OAuth clients with the upstream, and only the
+// value the durable store agrees to is a credential either replica actually
+// holds. Defensive copy is provided implicitly by JSON serialisation —
 // caller mutations after the call cannot reach the persisted bytes.
+//
+// # Expired existing rows are claimable
+//
+// An existing row whose ClientSecretExpiresAt is non-zero and already in the
+// past is treated as absent, mirroring MemoryStorage.StoreDCRCredentialsIfAbsent:
+// it is overwritten with creds rather than handed back as if it were still
+// the authoritative winner — but only when creds itself is fresher (creds'
+// own ClientSecretExpiresAt is zero or still in the future). When both the
+// existing row and the incoming creds are already expired — the startup
+// case where many replicas independently re-resolve a dead upstream
+// registration and each mints equally-stale credentials — the existing row
+// is returned as-is instead. Overwriting would gain nothing there, and
+// without this guard every concurrent claimant would keep re-observing an
+// expired row and re-entering the write path, risking exhausting
+// maxDCRClaimRetries under contention instead of converging the way the
+// genuinely-absent case does. WATCH still guards the overwrite path: if
+// another replica claims or refreshes the same key between our GET and our
+// SET, EXEC aborts with redis.TxFailedErr and the loop below retries, so
+// this does not reopen the double-registration race the NX-based
+// predecessor of this method was built to close — it only changes what
+// happens when the existing row is provably expired.
+//
+// This means a caller CAN receive an already-expired credential back from
+// this call — deliberately, per the above, rather than as an oversight. The
+// only thing that later re-checks an expiry against ResolveCredentials'
+// cache is lookupCachedResolution, which only runs on a *subsequent*
+// ResolveCredentials call for the same key; nothing currently re-resolves
+// after the one-time boot-time call in embeddedauthserver.go. So a replica
+// that receives an expired credential here keeps it for the rest of its
+// process lifetime, failing cleanly with an upstream invalid_client/
+// invalid_grant on every use until restart. Closing that gap needs
+// revisiting credentials after boot, not another guard in this function —
+// tracked in #6496.
 //
 // # TTL
 //
@@ -1296,7 +1836,7 @@ func (s *storedDCRCredentials) toDCRCredentials() *DCRCredentials {
 // RFC 7591 §3.2.1 client_secret_expires_at), the entry is stored with a Redis
 // TTL derived from time.Until(ClientSecretExpiresAt) so the row evicts before
 // the upstream rejects the secret at the token endpoint. When zero (RFC 7591
-// "never"), Set with TTL=0 is used and the entry is long-lived.
+// "never"), TTL=0 is used and the entry is long-lived.
 //
 // If ClientSecretExpiresAt is already in the past at call time, the entry is
 // written with the bounded TTL pastExpiryDCRTTL (1 second) rather than rejected
@@ -1307,13 +1847,57 @@ func (s *storedDCRCredentials) toDCRCredentials() *DCRCredentials {
 //
 // Validation is delegated to validateDCRCredentialsForStore so the rejection
 // set stays in sync with MemoryStorage and any future backend.
-func (s *RedisStorage) StoreDCRCredentials(ctx context.Context, creds *DCRCredentials) error {
+func (s *RedisStorage) StoreDCRCredentialsIfAbsent(ctx context.Context, creds *DCRCredentials) (*DCRCredentials, error) {
 	if err := validateDCRCredentialsForStore(creds); err != nil {
-		return err
+		return nil, err
 	}
 
 	key := redisDCRKey(s.keyPrefix, creds.Key)
 
+	data, ttl, err := marshalDCRCredentialsForStore(creds)
+	if err != nil {
+		return nil, err
+	}
+
+	// result is set by txFn on every non-error path: either to creds (a
+	// successful claim) or to the decoded existing row (a live winner
+	// already present). It must not be read until s.client.Watch returns nil.
+	var result *DCRCredentials
+	txFn := func(tx *redis.Tx) error {
+		var txErr error
+		result, txErr = dcrClaimOrReturnWinner(ctx, tx, key, data, ttl, creds)
+		return txErr
+	}
+
+	// Retry bound mirrors ReconcileConfiguredClient's maxConfiguredClientReconcileRetries:
+	// go-redis does not retry Watch internally, so a concurrent writer to the
+	// watched key aborts EXEC with redis.TxFailedErr, which must be retried
+	// here for the race this method exists to close to resolve on its own.
+	var watchErr error
+	for attempt := 0; attempt < maxDCRClaimRetries; attempt++ {
+		watchErr = s.client.Watch(ctx, txFn, key)
+		if watchErr == nil {
+			return result, nil
+		}
+		if !errors.Is(watchErr, redis.TxFailedErr) {
+			return nil, fmt.Errorf("failed to store dcr credentials: %w", watchErr)
+		}
+	}
+	return nil, fmt.Errorf("failed to claim dcr credentials after %d attempts: %w", maxDCRClaimRetries, watchErr)
+}
+
+// marshalDCRCredentialsForStore serializes creds to its Redis wire form and
+// derives the TTL to store it with. Split out of StoreDCRCredentialsIfAbsent
+// purely to keep that method's cyclomatic complexity down; it has no
+// transaction-retry concerns of its own.
+//
+// Derive Redis TTL from ClientSecretExpiresAt:
+//   - Zero (unset)  -> TTL=0 (no expiration) per RFC 7591 §3.2.1 "never".
+//   - Future expiry -> TTL = time.Until(expiry).
+//   - Past expiry   -> TTL = pastExpiryDCRTTL (bounded eviction window).
+//
+// See StoreDCRCredentialsIfAbsent's docstring for the past-expiry rationale.
+func marshalDCRCredentialsForStore(creds *DCRCredentials) ([]byte, time.Duration, error) {
 	stored := storedDCRCredentials{
 		KeyIssuer:               creds.Key.Issuer,
 		KeyUpstreamID:           creds.Key.UpstreamID,
@@ -1337,14 +1921,9 @@ func (s *RedisStorage) StoreDCRCredentials(ctx context.Context, creds *DCRCreden
 
 	data, err := json.Marshal(stored) //nolint:gosec // G117 - internal Redis storage serialization, not exposed to users
 	if err != nil {
-		return fmt.Errorf("failed to marshal dcr credentials: %w", err)
+		return nil, 0, fmt.Errorf("failed to marshal dcr credentials: %w", err)
 	}
 
-	// Derive Redis TTL from ClientSecretExpiresAt:
-	//   * Zero (unset)   -> TTL=0 (no expiration) per RFC 7591 §3.2.1 "never".
-	//   * Future expiry  -> TTL = time.Until(expiry).
-	//   * Past expiry    -> TTL = pastExpiryDCRTTL (bounded eviction window).
-	// See the function docstring for the past-expiry rationale.
 	ttl := time.Duration(0)
 	if !creds.ClientSecretExpiresAt.IsZero() {
 		if until := time.Until(creds.ClientSecretExpiresAt); until > 0 {
@@ -1353,11 +1932,73 @@ func (s *RedisStorage) StoreDCRCredentials(ctx context.Context, creds *DCRCreden
 			ttl = pastExpiryDCRTTL
 		}
 	}
+	return data, ttl, nil
+}
 
-	if err := s.client.Set(ctx, key, data, ttl).Err(); err != nil {
-		return fmt.Errorf("failed to store dcr credentials: %w", err)
+// dcrClaimOrReturnWinner runs the read-check-write body of
+// StoreDCRCredentialsIfAbsent's WATCH transaction: an absent row, or an
+// existing row that is expired while creds is fresher, is claimed with
+// (data, ttl) inside MULTI; a live existing row — or one that is expired but
+// no fresher than creds — is decoded and returned as-is, with no write. See
+// StoreDCRCredentialsIfAbsent's "Expired existing rows" doc section for why.
+// Split out purely to keep StoreDCRCredentialsIfAbsent's cyclomatic
+// complexity down.
+func dcrClaimOrReturnWinner(
+	ctx context.Context, tx *redis.Tx, key string, data []byte, ttl time.Duration, creds *DCRCredentials,
+) (*DCRCredentials, error) {
+	claim := func() error {
+		_, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.Set(ctx, key, data, ttl)
+			return nil
+		})
+		return err
 	}
-	return nil
+
+	existingData, getErr := tx.Get(ctx, key).Bytes()
+	if errors.Is(getErr, redis.Nil) {
+		if err := claim(); err != nil {
+			return nil, err
+		}
+		return creds, nil
+	}
+	if getErr != nil {
+		return nil, fmt.Errorf("failed to get existing dcr credentials: %w", getErr)
+	}
+
+	var existingStored storedDCRCredentials
+	if unmarshalErr := json.Unmarshal(existingData, &existingStored); unmarshalErr != nil {
+		return nil, fmt.Errorf("failed to unmarshal existing dcr credentials: %w", unmarshalErr)
+	}
+	existing := existingStored.toDCRCredentials()
+
+	expired := !existing.ClientSecretExpiresAt.IsZero() && time.Now().After(existing.ClientSecretExpiresAt)
+	if !expired {
+		return existing, nil
+	}
+
+	// The existing row is expired. Only overwrite it when the incoming
+	// credentials are actually fresher — a genuine new registration
+	// reclaiming a dead slot. If the incoming credentials are ALSO already
+	// expired (the startup-reconciliation case: many replicas independently
+	// re-resolving a dead upstream registration all mint equally-stale
+	// credentials), overwriting gains nothing and, under contention, every
+	// concurrent claimant would keep re-observing an expired row and
+	// re-entering this write path, burning through maxDCRClaimRetries
+	// instead of converging. Returning the stable existing row lets every
+	// claimant converge without a write, matching the "genuinely absent"
+	// case's self-limiting behaviour.
+	incomingExpired := !creds.ClientSecretExpiresAt.IsZero() && time.Now().After(creds.ClientSecretExpiresAt)
+	if incomingExpired {
+		return existing, nil
+	}
+
+	// The existing row is provably expired: treat it as absent and overwrite
+	// it, matching MemoryStorage's semantics. WATCH still protects this — see
+	// StoreDCRCredentialsIfAbsent's "Expired existing rows" doc section.
+	if err := claim(); err != nil {
+		return nil, err
+	}
+	return creds, nil
 }
 
 // GetDCRCredentials retrieves the credentials previously persisted under key.
@@ -1365,7 +2006,7 @@ func (s *RedisStorage) StoreDCRCredentials(ctx context.Context, creds *DCRCreden
 // fresh struct decoded from JSON, which acts as a defensive copy.
 //
 // An unpopulated key (empty Issuer, UpstreamID, RedirectURI, or ScopesHash) cannot match
-// any stored row because StoreDCRCredentials rejects such keys, so a Get
+// any stored row because StoreDCRCredentialsIfAbsent rejects such keys, so a Get
 // against one is a normal miss — ErrNotFound — matching
 // MemoryStorage.GetDCRCredentials and the DCRCredentialStore interface contract.
 func (s *RedisStorage) GetDCRCredentials(ctx context.Context, key DCRKey) (*DCRCredentials, error) {
@@ -1819,8 +2460,17 @@ func marshalRequester(request fosite.Requester) ([]byte, error) {
 		return nil, fmt.Errorf("failed to marshal session: %w", err)
 	}
 
+	// A clientless grant (fosite's CanSkipClientAuth) is expected to attach a
+	// synthetic client (see NewSyntheticClient) rather than leave this nil;
+	// this fallback only guards against a future clientless grant that
+	// forgets to.
+	var clientID string
+	if client := request.GetClient(); client != nil {
+		clientID = client.GetID()
+	}
+
 	stored := storedSession{
-		ClientID:          request.GetClient().GetID(),
+		ClientID:          clientID,
 		RequestedAt:       request.GetRequestedAt(),
 		RequestedScopes:   request.GetRequestedScopes(),
 		GrantedScopes:     request.GetGrantedScopes(),
@@ -1843,10 +2493,28 @@ func unmarshalRequester(ctx context.Context, data []byte, s *RedisStorage) (fosi
 		return nil, fmt.Errorf("failed to unmarshal session: %w", err)
 	}
 
-	// Look up the client
-	client, err := s.GetClient(ctx, stored.ClientID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get client for session: %w", err)
+	// A synthetic client (see NewSyntheticClient) was never registered via
+	// RegisterClient, so its ID alone reconstructs it rather than looking it
+	// up through the client registry.
+	var client fosite.Client
+	if IsSyntheticClientID(stored.ClientID) {
+		client = NewSyntheticClient(stored.ClientID)
+	} else {
+		// This lookup consults only this storage's own client rows: a client
+		// that was resolved dynamically at authorize time but never persisted
+		// would fail exactly here, surfacing to the client as a bare
+		// invalid_grant at the token endpoint — so log the client id and the
+		// underlying error once, which otherwise leave no server-side trace
+		// (see issue #6187). The returned error deliberately does not repeat
+		// the client id: all four call sites propagate it up to fosite, which
+		// would otherwise report the same failure to the operator twice.
+		fetchedClient, err := s.GetClient(ctx, stored.ClientID)
+		if err != nil {
+			slog.WarnContext(ctx, "failed to resolve client for stored session",
+				"client_id", stored.ClientID, "error", err)
+			return nil, fmt.Errorf("failed to get client for session: %w", err)
+		}
+		client = fetchedClient
 	}
 
 	// Create a session prototype via factory, then deserialize the full session
@@ -1903,4 +2571,5 @@ var (
 	_ UpstreamTokenStorage        = (*RedisStorage)(nil)
 	_ UserStorage                 = (*RedisStorage)(nil)
 	_ DCRCredentialStore          = (*RedisStorage)(nil)
+	_ AssertionJWTConsumer        = (*RedisStorage)(nil)
 )

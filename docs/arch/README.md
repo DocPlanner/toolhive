@@ -134,11 +134,18 @@ Welcome to the ToolHive architecture documentation. This directory contains comp
     - Composite-workflow suspend/resume as the sole durable-state trigger (RFC-0083 D5 handles, owner binding, TTL)
     - Sampling's deprecated-pass-through-only disposition (SEP-2577) and the go-sdk/mcpcompat gap list
 
-17. **[External Subject-Token Exchange (Delegation)](17-token-exchange-delegation.md)**
+17. **[External Subject-Token Exchange and JWT-bearer Grants](17-token-exchange-delegation.md)**
     - `trustedIssuers`: accepting subject tokens from an external OIDC issuer during RFC 8693 token exchange
+    - RFC 7523 JWT-bearer assertions, audience configuration, and replay protection
     - Confused-deputy trust model and the `may_act` / allowlist consent signals
     - Accepted limitations: client-set equivalence, disjoint subject namespaces, partial provenance
     - Operational gotchas: audience/scope binding, discovery redirects, JWKS caching, diagnostics
+
+18. **[SPIFFE Association Declarations](18-spiffe-association-declarations.md)**
+    - Not yet deployable: rejected at startup pending real SVID verification
+    - Configuration-only SPIFFE trust, association, and static-client model
+    - Fail-closed policy validation and durable, restart-safe static-client reservation
+    - Explicit authentication and bundle-loading delivery boundaries
 
 ### Existing Documentation
 

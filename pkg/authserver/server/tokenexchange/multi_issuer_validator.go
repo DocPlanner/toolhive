@@ -18,11 +18,14 @@ import (
 	"sync"
 	"time"
 
+	celgo "cel.dev/cel-go/cel"
 	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/lestrrat-go/httprc/v3"
 	"github.com/lestrrat-go/jwx/v3/jwk"
 
+	"github.com/stacklok/toolhive-core/cel"
+	"github.com/stacklok/toolhive/pkg/authserver/server"
 	"github.com/stacklok/toolhive/pkg/networking"
 	"github.com/stacklok/toolhive/pkg/oauthproto"
 )
@@ -105,8 +108,37 @@ var actorClaimsNotInExtra = []string{
 // Compile-time check that MultiIssuerTokenValidator implements SubjectTokenValidator.
 var _ SubjectTokenValidator = (*MultiIssuerTokenValidator)(nil)
 
-// TrustedIssuer configures an external OIDC issuer whose tokens are
-// accepted as subject tokens during token exchange.
+// Compile-time check that MultiIssuerTokenValidator implements JWTBearerAssertionValidator.
+var _ JWTBearerAssertionValidator = (*MultiIssuerTokenValidator)(nil)
+
+// JWTBearerSubjectBinding restricts a JWT-bearer assertion subject to the
+// resources for which it may obtain an access token.
+type JWTBearerSubjectBinding struct {
+	Subject          string   `json:"subject" yaml:"subject"`
+	AllowedResources []string `json:"allowed_resources" yaml:"allowed_resources"`
+}
+
+// JWTBearerGrantPolicy enables RFC 7523 JWT-bearer assertions for an issuer.
+// MaxAssertionAge uses Go's duration syntax in serialized RunConfig.
+type JWTBearerGrantPolicy struct {
+	MaxAssertionAge string                    `json:"max_assertion_age" yaml:"max_assertion_age"`
+	SubjectBindings []JWTBearerSubjectBinding `json:"subject_bindings" yaml:"subject_bindings"`
+	// AcceptedAudiences is the set of "this AS" identity strings an
+	// assertion's "aud" claim must intersect — e.g. to support migrating
+	// this server's issuer/token-endpoint URL, or exposing it under more
+	// than one valid name. Each value uniquely identifies this
+	// authorization server for this grant; it is NOT a resource/API
+	// identifier — a bare resource audience is deliberately not accepted
+	// here, that would let any RFC 8707 resource-scoped token satisfy the
+	// grant instead of only tokens minted for this AS. Defaults to
+	// [tokenEndpoint] when empty, preserving prior exact-match behavior.
+	AcceptedAudiences []string `json:"accepted_audiences,omitempty" yaml:"accepted_audiences,omitempty"`
+
+	maxAssertionAge time.Duration
+}
+
+// TrustedIssuer configures an external OIDC issuer whose tokens are accepted
+// as RFC 8693 subject tokens or RFC 7523 JWT-bearer assertions.
 //
 // This type is reused verbatim as the wire schema for
 // authserver.RunConfig.TrustedIssuers (deliberately, to avoid a parallel
@@ -115,11 +147,18 @@ var _ SubjectTokenValidator = (*MultiIssuerTokenValidator)(nil)
 // into docs/server/swagger.*; adding, renaming, or retagging a field here is
 // a schema change, not a purely internal one.
 type TrustedIssuer struct {
+	// Name optionally identifies this trust declaration for canonical issuer_ref references.
+	Name string `json:"name,omitempty" yaml:"name,omitempty"`
 	// IssuerURL is the expected "iss" claim value (exact match).
 	IssuerURL string `json:"issuer_url" yaml:"issuer_url"`
 	// ExpectedAudience is the expected "aud" claim value that must appear
-	// in the token's audience list (a resource/API identifier, not a
-	// client ID — required, but not enforced; see looksLikeResourceIdentifier).
+	// in an RFC 8693 subject token's audience list (a resource/API identifier,
+	// not a client ID — required for delegation unless JWTBearerGrant is
+	// configured; see looksLikeResourceIdentifier). RFC 7523 assertions use
+	// the token endpoint as their audience instead.
+	//
+	// This legacy field is deprecated; configure RFC 8693 policy under
+	// inbound_grants.token_exchange.issuer_policies.
 	// See docs/arch/17-token-exchange-delegation.md ("ID/access-token
 	// discrimination") for why and its limits.
 	ExpectedAudience string `json:"expected_audience" yaml:"expected_audience"`
@@ -139,6 +178,11 @@ type TrustedIssuer struct {
 	// issuer to resolve to a private or loopback address. Use only when the
 	// issuer is hosted inside the same cluster and has no public endpoint.
 	AllowPrivateIPs bool `json:"allow_private_ips,omitempty" yaml:"allow_private_ips,omitempty"`
+	// CAFilePath is the path to a PEM CA bundle added to the system roots when
+	// fetching this issuer's OIDC discovery document and JWKS. Trust is additive
+	// and scoped to this issuer: the public roots still apply, and no other
+	// issuer's client is affected.
+	CAFilePath string `json:"ca_file_path,omitempty" yaml:"ca_file_path,omitempty"`
 	// ActorClaim names the claim identifying the client that requested the
 	// subject token from THIS EXTERNAL ISSUER (used by AllowedActors below).
 	// Values are in the external issuer's namespace, NOT ToolHive client
@@ -149,11 +193,23 @@ type TrustedIssuer struct {
 	ActorClaim string `json:"actor_claim,omitempty" yaml:"actor_claim,omitempty"`
 	// AllowedActors is the allowlist of ActorClaim values authorized to
 	// exchange a subject token from this issuer when it carries no
-	// "may_act" claim; empty means only may_act-bearing tokens are
-	// accepted. By itself names no ToolHive client — see
-	// AllowedDelegateClients and docs/arch/17-token-exchange-delegation.md
-	// ("Accepted limitations" #1).
+	// "may_act" claim. ActorMatcher can additionally authorize a token by
+	// matching its complete verified claims map; either signal is sufficient.
+	// When both are empty, only may_act-bearing tokens are accepted, and only
+	// if AllowMayAct is also true for this issuer. By itself names no
+	// ToolHive client — see AllowedDelegateClients and
+	// docs/arch/17-token-exchange-delegation.md ("Accepted limitations" #1).
 	AllowedActors []string `json:"allowed_actors,omitempty" yaml:"allowed_actors,omitempty"`
+	// ActorMatcher is an admin-authored CEL expression evaluated against the
+	// complete signature-verified JWT claims map as "claims". A true result
+	// authorizes delegation alongside AllowedActors; a syntax or type error
+	// fails configuration validation. An expression that compiles but does
+	// not return bool is NOT caught at that point, though — it compiles
+	// successfully and is only rejected the first time it is evaluated
+	// against a real token, denying that token (and every one after it, since
+	// the expression will never return bool). Any other runtime evaluation
+	// error denies the token the same way.
+	ActorMatcher string `json:"actor_matcher,omitempty" yaml:"actor_matcher,omitempty"`
 	// AllowedDelegateClients restricts which ToolHive client IDs may
 	// exchange a subject token from this issuer, for BOTH consent paths.
 	// Required (validateTrustedIssuer rejects empty/absent); "*" permits
@@ -161,6 +217,21 @@ type TrustedIssuer struct {
 	// docs/arch/17-token-exchange-delegation.md ("Accepted limitations" #1).
 	//nolint:lll // field tags require full JSON+YAML names
 	AllowedDelegateClients []string `json:"allowed_delegate_clients,omitempty" yaml:"allowed_delegate_clients,omitempty"`
+	// AllowMayAct permits this external issuer's may_act claim to authorize
+	// delegation. It defaults to false; external issuers must be opted in
+	// explicitly because may_act bypasses AllowedActors and ActorMatcher. It
+	// does not affect self-issued subject tokens. When enabled,
+	// AllowedDelegateClients must name specific ToolHive clients rather than
+	// use the wildcard.
+	AllowMayAct bool `json:"allow_may_act,omitempty" yaml:"allow_may_act,omitempty"`
+	// JWTBearerGrant optionally enables the plain RFC 7523 JWT-bearer grant.
+	// It accepts assertions from this issuer without client authentication and
+	// limits their maximum age, subjects, and RFC 8707 resources. It is
+	// independent from RFC 8693 delegation policy.
+	//
+	// This legacy field is deprecated; configure RFC 7523 policy under
+	// inbound_grants.jwt_bearer.issuer_policies.
+	JWTBearerGrant *JWTBearerGrantPolicy `json:"jwt_bearer_grant,omitempty" yaml:"jwt_bearer_grant,omitempty"`
 }
 
 // MultiIssuerTokenValidator validates subject tokens from the authorization
@@ -172,24 +243,35 @@ type TrustedIssuer struct {
 // A valid signature and audience alone would authorize ToolHive as a
 // resource, not any particular client, as a delegate — a confused-deputy
 // risk (CWE-863). validateExternalToken therefore requires a "may_act"
-// claim or a matching AllowedActors entry (surfaced as
-// ValidatedClaims.ExternalActor) before returning successfully. See
-// docs/arch/17-token-exchange-delegation.md for the full consent-signal
-// precedence and trust model.
+// claim or authorization by AllowedActors or ActorMatcher before returning
+// successfully. See docs/arch/17-token-exchange-delegation.md for the full
+// consent-signal precedence and trust model.
 type MultiIssuerTokenValidator struct {
 	selfIssuer    string
 	selfValidator *SelfIssuedTokenValidator
 	issuers       map[string]*externalIssuerConfig
+
+	// cancel tears down the validator-scoped context that every per-issuer
+	// jwksCache's background worker pool is rooted in. Close calls it after
+	// shutting each cache down individually; see Close. It is always set for a
+	// validator returned by NewMultiIssuerTokenValidator, even one with no
+	// external issuers.
+	cancel context.CancelFunc
 }
 
 // externalIssuerConfig holds the configuration and cached state for an external
 // OIDC issuer. The embedded TrustedIssuer is treated as immutable after
-// construction: resolveAllowedActor reads TrustedIssuer.AllowedActors (and
-// discoverJWKSURL/fetchJWKS read httpClient) on every validation without
-// holding mu, since mu protects JWKS state only. Mutating TrustedIssuer
-// fields in place after NewMultiIssuerTokenValidator returns is a data race.
+// construction: resolveActorAuthorization reads TrustedIssuer.AllowedActors
+// and actorMatcher (and discoverJWKSURL/fetchJWKS read httpClient) on every
+// validation without holding mu, since mu protects JWKS state only. Mutating
+// TrustedIssuer fields in place after NewMultiIssuerTokenValidator returns is
+// a data race.
 type externalIssuerConfig struct {
 	TrustedIssuer
+
+	// actorMatcher is compiled once from TrustedIssuer.ActorMatcher during
+	// construction and is immutable thereafter.
+	actorMatcher *cel.CompiledExpression
 
 	// httpClient is dedicated to this issuer, built once at construction
 	// time from its own InsecureAllowHTTP/AllowPrivateIPs. A single
@@ -276,6 +358,66 @@ func (t *limitedBodyTransport) RoundTrip(req *http.Request) (*http.Response, err
 	return resp, nil
 }
 
+// CloseIdleConnections forwards to the wrapped transport, as every wrapping
+// RoundTripper must — see networking.IdleConnectionCloser. There is no pool to
+// drain today (this client is built WithDisableKeepAlives(true)); the forwarder
+// keeps that an optimization decision rather than a correctness dependency.
+func (t *limitedBodyTransport) CloseIdleConnections() {
+	if closer, ok := t.base.(networking.IdleConnectionCloser); ok {
+		closer.CloseIdleConnections()
+	}
+}
+
+// newActorMatcherEngine creates a CEL engine for admin-authored actor matcher
+// expressions. The only available variable is "claims", a map[string]any.
+func newActorMatcherEngine() *cel.Engine {
+	return cel.NewEngine(
+		celgo.Variable("claims", celgo.MapType(celgo.StringType, celgo.DynType)),
+	)
+}
+
+// compileActorMatcher compiles an optional admin-authored actor matcher.
+//
+// It does not check the expression's output type: toolhive-core's
+// cel.Engine has no accessor for the checked AST's static type, only the
+// compiled *cel.CompiledExpression. An expression that type-checks but
+// does not return bool (e.g. "claims.foo" where foo is a string) therefore
+// compiles successfully here — it is only rejected later, at evaluation
+// time, by EvaluateBool's runtime type assertion (see
+// resolveActorAuthorization), which denies the token on any evaluation
+// error including a wrong result type.
+func compileActorMatcher(actorMatcher string) (*cel.CompiledExpression, error) {
+	if actorMatcher == "" {
+		return nil, nil
+	}
+
+	expr, err := newActorMatcherEngine().Compile(actorMatcher)
+	if err != nil {
+		return nil, fmt.Errorf("invalid actor_matcher: %w", err)
+	}
+
+	return expr, nil
+}
+
+// ResolveJWTBearerGrantPolicies clones grant policies and parses their duration
+// fields once at the RunConfig-to-runtime boundary.
+func ResolveJWTBearerGrantPolicies(issuers []TrustedIssuer) ([]TrustedIssuer, error) {
+	resolved := slices.Clone(issuers)
+	for i := range resolved {
+		if resolved[i].JWTBearerGrant == nil {
+			continue
+		}
+		policy := cloneJWTBearerGrantPolicy(resolved[i].JWTBearerGrant)
+		age, err := time.ParseDuration(policy.MaxAssertionAge)
+		if err != nil || age <= 0 {
+			return nil, fmt.Errorf("trusted_issuers[%d].jwt_bearer_grant.max_assertion_age must be a positive duration", i)
+		}
+		policy.maxAssertionAge = age
+		resolved[i].JWTBearerGrant = policy
+	}
+	return resolved, nil
+}
+
 // NewMultiIssuerTokenValidator creates a validator that accepts tokens from
 // the authorization server itself and from the provided trusted external
 // issuers. Returns an error if selfValidator is nil, selfIssuer is empty,
@@ -286,7 +428,8 @@ func NewMultiIssuerTokenValidator(
 	selfValidator *SelfIssuedTokenValidator,
 	selfIssuer string,
 	trustedIssuers []TrustedIssuer,
-) (*MultiIssuerTokenValidator, error) {
+	allowedAudiences []string,
+) (_ *MultiIssuerTokenValidator, retErr error) {
 	if selfValidator == nil {
 		return nil, errors.New("selfValidator must not be nil")
 	}
@@ -294,16 +437,47 @@ func NewMultiIssuerTokenValidator(
 		return nil, errors.New("selfIssuer must not be empty")
 	}
 
+	// Root every per-issuer JWKS worker pool in one validator-scoped context so
+	// Close can tear them all down; see (*MultiIssuerTokenValidator).Close and
+	// newExternalIssuerConfig.
+	ctx, cancel := context.WithCancel(context.Background())
 	issuers := make(map[string]*externalIssuerConfig, len(trustedIssuers))
+	// If construction fails after some issuers' caches have already started,
+	// release them rather than leaking their workers for the life of the
+	// process (buildProvider runs after buildUpstreams, so a later failure that
+	// abandons a half-built validator is reachable). Same cancel-first, single
+	// shared-deadline shape as Close.
+	defer func() {
+		if retErr != nil {
+			cancel()
+			shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), httpTimeout)
+			defer cancelShutdown()
+			for issuerURL, issuerConfig := range issuers {
+				// Log rather than drop: retErr is the dominant signal, but a
+				// pool that fails to drain during this cleanup would otherwise
+				// leave no diagnostic.
+				if err := issuerConfig.shutdownJWKSCache(shutdownCtx); err != nil {
+					slog.Warn("failed to shut down JWKS cache during validator construction cleanup",
+						"issuer", issuerURL, "error", err)
+				}
+			}
+		}
+	}()
+
 	for _, ti := range trustedIssuers {
-		if err := validateTrustedIssuer(ti, selfIssuer, issuers); err != nil {
+		if err := validateTrustedIssuer(ti, selfIssuer, issuers, allowedAudiences); err != nil {
 			return nil, err
 		}
-		if len(ti.AllowedActors) == 0 {
-			slog.Warn("Trusted issuer has no allowed actors configured; "+
-				"only may_act-bearing subject tokens from it will be accepted",
-				"issuer", ti.IssuerURL,
-			)
+		if len(ti.AllowedActors) == 0 && ti.ActorMatcher == "" {
+			message := func() string {
+				if ti.AllowMayAct {
+					return "Trusted issuer has no allowed actors or actor matcher configured; " +
+						"only may_act-bearing subject tokens from it will be accepted"
+				}
+				return "Trusted issuer has no allowed actors or actor matcher configured; " +
+					"no subject tokens from it will be accepted"
+			}()
+			slog.Warn(message, "issuer", ti.IssuerURL)
 		}
 		if !looksLikeResourceIdentifier(ti.ExpectedAudience) {
 			slog.Warn("Trusted issuer's expected_audience does not look like a resource identifier "+
@@ -315,7 +489,7 @@ func NewMultiIssuerTokenValidator(
 			)
 		}
 
-		issuerConfig, err := newExternalIssuerConfig(ti)
+		issuerConfig, err := newExternalIssuerConfig(ctx, ti)
 		if err != nil {
 			return nil, err
 		}
@@ -326,23 +500,86 @@ func NewMultiIssuerTokenValidator(
 		selfIssuer:    selfIssuer,
 		selfValidator: selfValidator,
 		issuers:       issuers,
+		cancel:        cancel,
 	}, nil
+}
+
+// Close shuts down every per-issuer jwk.Cache, stopping the background JWKS
+// refresh worker pool (and its ~3 goroutines) each one runs. It cancels the
+// validator-scoped context those pools share — signalling them all to stop at
+// once — then waits, under a single shared httpTimeout budget, for each cache
+// to drain. Cancelling up front (rather than after the loop) means the pools
+// unwind in parallel, and the one shared deadline bounds the total wait by
+// httpTimeout rather than httpTimeout×N even if a pool ignores cancellation.
+// This is the same order the construction-failure path uses. It is safe to call
+// more than once and on a validator with no external issuers; the validator
+// must not be used after Close.
+//
+// A server holds its MultiIssuerTokenValidator and calls this from Close and
+// its construction error path (see pkg/authserver), so neither a normal
+// shutdown nor a failed reconstruction leaks these workers.
+// authserver.CloseIdleConnections deliberately does NOT reach it: that path
+// must stay safe to call on a still-serving server, which needs the workers to
+// keep refreshing external issuers' keys.
+func (v *MultiIssuerTokenValidator) Close() error {
+	if v == nil {
+		return nil
+	}
+	if v.cancel != nil {
+		v.cancel()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
+	defer cancel()
+	var errs []error
+	for issuerURL, issuerConfig := range v.issuers {
+		if err := issuerConfig.shutdownJWKSCache(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("issuer %s: %w", issuerURL, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func cloneJWTBearerGrantPolicy(policy *JWTBearerGrantPolicy) *JWTBearerGrantPolicy {
+	if policy == nil {
+		return nil
+	}
+	clone := *policy
+	clone.AcceptedAudiences = slices.Clone(policy.AcceptedAudiences)
+	clone.SubjectBindings = make([]JWTBearerSubjectBinding, len(policy.SubjectBindings))
+	for i, binding := range policy.SubjectBindings {
+		clone.SubjectBindings[i] = JWTBearerSubjectBinding{
+			Subject:          binding.Subject,
+			AllowedResources: slices.Clone(binding.AllowedResources),
+		}
+	}
+	if clone.maxAssertionAge == 0 {
+		clone.maxAssertionAge, _ = time.ParseDuration(clone.MaxAssertionAge)
+	}
+	return &clone
 }
 
 // newExternalIssuerConfig builds the *externalIssuerConfig for a single
 // already-validated TrustedIssuer: a dedicated HTTP client (scoped to that
 // issuer's own InsecureAllowHTTP/AllowPrivateIPs), its body-size-capped
-// transport, and its own jwk.Cache. Called once per issuer from
+// transport, and its own jwk.Cache rooted in ctx. Called once per issuer from
 // NewMultiIssuerTokenValidator's constructor loop, after validateTrustedIssuer
-// and the startup warnings have already run for ti.
-func newExternalIssuerConfig(ti TrustedIssuer) (*externalIssuerConfig, error) {
+// and the startup warnings have already run for ti. ctx is the validator-scoped
+// context (see NewMultiIssuerTokenValidator); cancelling it, or the validator's
+// Close, tears down the cache's worker pool.
+func newExternalIssuerConfig(ctx context.Context, ti TrustedIssuer) (*externalIssuerConfig, error) {
 	// Clone AllowedActors and AllowedDelegateClients so a caller mutating
 	// their original slices in place (e.g. a future config reload) cannot
-	// race with the unsynchronized reads in resolveAllowedActor and
+	// race with the unsynchronized reads in resolveActorAuthorization and
 	// validateExternalToken, which run on every validation without
 	// holding externalIssuerConfig.mu (that mutex guards JWKS state only).
 	ti.AllowedActors = slices.Clone(ti.AllowedActors)
 	ti.AllowedDelegateClients = slices.Clone(ti.AllowedDelegateClients)
+	ti.JWTBearerGrant = cloneJWTBearerGrantPolicy(ti.JWTBearerGrant)
+
+	actorMatcher, err := compileActorMatcher(ti.ActorMatcher)
+	if err != nil {
+		return nil, fmt.Errorf("issuer_url %q: %w", ti.IssuerURL, err)
+	}
 
 	// Deliberately networking.NewHttpClientBuilder(), not
 	// NewHostScopedClientBuilder: that helper ORs
@@ -356,12 +593,15 @@ func newExternalIssuerConfig(ti TrustedIssuer) (*externalIssuerConfig, error) {
 	// from an untrusted discovery document, only on the fixed
 	// jwksRefreshInterval schedule plus occasional on-demand refreshes —
 	// no hot path here to trade the per-dial SSRF check away for.
-	httpClient, err := networking.NewHttpClientBuilder().
+	builder := networking.NewHttpClientBuilder().
 		WithInsecureAllowHTTP(ti.InsecureAllowHTTP).
 		WithPrivateIPs(ti.AllowPrivateIPs).
 		WithTimeout(httpTimeout).
-		WithDisableKeepAlives(true).
-		Build()
+		WithDisableKeepAlives(true)
+	if ti.CAFilePath != "" {
+		builder = builder.WithSystemRootsPlusCABundle(ti.CAFilePath)
+	}
+	httpClient, err := builder.Build()
 	if err != nil {
 		return nil, fmt.Errorf("issuer_url %q: failed to build HTTP client: %w", ti.IssuerURL, err)
 	}
@@ -387,40 +627,59 @@ func newExternalIssuerConfig(ti TrustedIssuer) (*externalIssuerConfig, error) {
 
 	// One jwk.Cache per issuer (see externalIssuerConfig.jwksCache's doc
 	// comment for why), each running its own background worker pool
-	// (jwk.NewCache -> httprc.Client.Start) for the life of the process.
-	// WithWorkers(1) caps that pool to one worker per issuer instead of
-	// httprc's default five — budget roughly three goroutines per issuer
-	// including its controller loop and wait-group waiter.
-	// context.Background() is deliberate: there's no per-call context to
-	// root this in, and the loop is meant to outlive any single call,
-	// stopped only via jwk.Cache.Shutdown — which nothing here calls,
-	// matching pkg/auth/token.go's TokenValidator.
-	jwksCache, err := jwk.NewCache(context.Background(), httprc.NewClient(httprc.WithWorkers(1)))
+	// (jwk.NewCache -> httprc.Client.Start). WithWorkers(1) caps that pool to
+	// one worker per issuer instead of httprc's default five — budget roughly
+	// three goroutines per issuer including its controller loop and wait-group
+	// waiter.
+	//
+	// The pool is rooted in ctx, the validator-scoped context, so it outlives
+	// any single call but is torn down when the validator's Close cancels ctx
+	// and shuts each cache down (see shutdownJWKSCache). Before this wiring the
+	// pools ran for the life of the process, one leaked set per issuer on every
+	// server reconstruction; pkg/auth/token.go's TokenValidator still has that
+	// shape but roots its cache in a caller-supplied context.
+	jwksCache, err := jwk.NewCache(ctx, httprc.NewClient(httprc.WithWorkers(1)))
 	if err != nil {
 		return nil, fmt.Errorf("issuer_url %q: failed to create JWKS cache: %w", ti.IssuerURL, err)
 	}
 
 	return &externalIssuerConfig{
 		TrustedIssuer: ti,
+		actorMatcher:  actorMatcher,
 		jwksURL:       ti.JWKSURL,
 		httpClient:    httpClient,
 		jwksCache:     jwksCache,
 	}, nil
 }
 
+// shutdownJWKSCache stops this issuer's JWKS refresh worker pool, waiting for
+// its goroutines to drain until ctx expires. ctx must be fresh — not the
+// validator-scoped one the cache was started with, which Close cancels — or
+// Shutdown returns immediately without waiting; see httprc's
+// Controller.ShutdownContext. Callers pass one shared deadline context so a set
+// of N issuers drains within a single timeout budget, not N of them. A nil
+// cache (an externalIssuerConfig built by ValidateTrustedIssuers, which never
+// starts one) is a no-op, as is a double shutdown.
+func (c *externalIssuerConfig) shutdownJWKSCache(ctx context.Context) error {
+	if c.jwksCache == nil {
+		return nil
+	}
+	return c.jwksCache.Shutdown(ctx)
+}
+
 // ValidateTrustedIssuers runs every structural check
 // NewMultiIssuerTokenValidator performs on trustedIssuers — required fields,
-// self-issuer collision, duplicate issuers, and ActorClaim reachability —
-// without constructing a validator or any per-issuer HTTP client. Config
-// validation calls this to fail before the live upstream DCR registration
+// self-issuer collision, duplicate issuers, ActorClaim reachability, and
+// ActorMatcher compilation — without constructing a validator or any
+// per-issuer HTTP client. Config validation calls this to fail before the live upstream DCR registration
 // and storage creation that run between RunConfig.Validate and server
 // construction; NewMultiIssuerTokenValidator repeats the same checks at
 // server startup as defence in depth. Both route through validateTrustedIssuer,
 // so the two can't drift out of sync.
-func ValidateTrustedIssuers(trustedIssuers []TrustedIssuer, selfIssuer string) error {
+func ValidateTrustedIssuers(trustedIssuers []TrustedIssuer, selfIssuer string, allowedAudiences []string) error {
 	issuers := make(map[string]*externalIssuerConfig, len(trustedIssuers))
 	for _, ti := range trustedIssuers {
-		if err := validateTrustedIssuer(ti, selfIssuer, issuers); err != nil {
+		if err := validateTrustedIssuer(ti, selfIssuer, issuers, allowedAudiences); err != nil {
 			return err
 		}
 		issuers[ti.IssuerURL] = &externalIssuerConfig{TrustedIssuer: ti}
@@ -451,21 +710,69 @@ func (v *MultiIssuerTokenValidator) Validate(ctx context.Context, rawToken strin
 	return v.validateExternalToken(ctx, rawToken, issuerConfig)
 }
 
-// validateExternalToken verifies a JWT from a trusted external issuer by
-// fetching the issuer's JWKS (with caching) and validating the signature and claims.
-func (v *MultiIssuerTokenValidator) validateExternalToken(
-	ctx context.Context,
-	rawToken string,
-	issuerConfig *externalIssuerConfig,
+// ValidateJWTBearerAssertion verifies a plain RFC 7523 assertion issued by an
+// external issuer explicitly enabled for the JWT-bearer grant. It deliberately does not apply RFC 8693
+// delegation consent (AllowedActors, ActorMatcher, or may_act): a JWT-bearer
+// assertion's authorization policy is separate from delegation policy.
+//
+// The assertion audience must intersect the issuer's configured
+// JWTBearerGrant.AcceptedAudiences, or just tokenEndpoint when that is unset.
+// The caller is responsible for the phase-specific subject binding, maximum
+// age, replay, and issuance policy after this cryptographic verification
+// succeeds.
+func (v *MultiIssuerTokenValidator) ValidateJWTBearerAssertion(
+	ctx context.Context, rawToken, tokenEndpoint string,
 ) (*ValidatedClaims, error) {
+	if tokenEndpoint == "" {
+		return nil, errors.New("token endpoint must not be empty")
+	}
+
+	issuer, err := peekIssuer(rawToken)
+	if err != nil {
+		return nil, fmt.Errorf("failed to determine assertion issuer: %w", err)
+	}
+	issuerConfig, ok := v.issuers[issuer]
+	if !ok {
+		return nil, fmt.Errorf("untrusted assertion issuer: %q", issuer)
+	}
+	if issuerConfig.JWTBearerGrant == nil {
+		return nil, fmt.Errorf("assertion issuer is not enabled for the JWT-bearer grant: %q", issuer)
+	}
+
+	standardClaims, extraClaims, err := v.verifyExternalSignature(ctx, rawToken, issuerConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := rejectIDTokenClaims(extraClaims); err != nil {
+		return nil, err
+	}
+
+	acceptedAudiences := []string{tokenEndpoint}
+	if issuerConfig.JWTBearerGrant != nil && len(issuerConfig.JWTBearerGrant.AcceptedAudiences) > 0 {
+		acceptedAudiences = issuerConfig.JWTBearerGrant.AcceptedAudiences
+	}
+	if err := validateJWTBearerAssertionClaims(standardClaims, issuerConfig.IssuerURL, acceptedAudiences); err != nil {
+		return nil, err
+	}
+	return buildValidatedClaims(standardClaims, extraClaims), nil
+}
+
+// verifyExternalSignature parses and verifies a JWT using the configured
+// issuer's cached JWKS. Both RFC 8693 subject tokens and RFC 7523 assertions
+// use this path so unknown-kid refreshes and key-use/algorithm restrictions
+// cannot diverge between grant types.
+func (v *MultiIssuerTokenValidator) verifyExternalSignature(
+	ctx context.Context, rawToken string, issuerConfig *externalIssuerConfig,
+) (jwt.Claims, map[string]any, error) {
 	parsedToken, err := jwt.ParseSigned(rawToken, allowedSignatureAlgorithms)
 	if err != nil {
-		return nil, fmt.Errorf("subject token is not a valid JWT: %w", err)
+		return jwt.Claims{}, nil, fmt.Errorf("subject token is not a valid JWT: %w", err)
 	}
 
 	jwks, err := v.lookupJWKS(ctx, issuerConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch JWKS for issuer %s: %w", issuerConfig.IssuerURL, err)
+		return jwt.Claims{}, nil, fmt.Errorf("failed to fetch JWKS for issuer %s: %w", issuerConfig.IssuerURL, err)
 	}
 
 	standardClaims, extraClaims, kidMatched, err := verifySignature(parsedToken, jwks)
@@ -482,6 +789,20 @@ func (v *MultiIssuerTokenValidator) validateExternalToken(
 			standardClaims, extraClaims, _, err = verifySignature(parsedToken, refreshedJWKS)
 		}
 	}
+	if err != nil {
+		return jwt.Claims{}, nil, err
+	}
+	return standardClaims, extraClaims, nil
+}
+
+// validateExternalToken verifies a JWT from a trusted external issuer by
+// fetching the issuer's JWKS (with caching) and validating the signature and claims.
+func (v *MultiIssuerTokenValidator) validateExternalToken(
+	ctx context.Context,
+	rawToken string,
+	issuerConfig *externalIssuerConfig,
+) (*ValidatedClaims, error) {
+	standardClaims, extraClaims, err := v.verifyExternalSignature(ctx, rawToken, issuerConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -519,13 +840,7 @@ func (v *MultiIssuerTokenValidator) validateExternalToken(
 		return nil, err
 	}
 
-	// selfIssuer (not issuerConfig.IssuerURL) is the correct comparison for
-	// may_act's optional "iss": that member identifies the namespace of
-	// may_act.sub, always compared against a ToolHive client ID regardless
-	// of which issuer validated the surrounding token. requireIss is true
-	// here — unlike the self-issued path, the external path cannot leave
-	// "iss" optional; see validateMayActShape's doc comment.
-	if err := validateMayActShape(extraClaims, v.selfIssuer, true); err != nil {
+	if err := checkMayActAllowed(extraClaims, v.selfIssuer, issuerConfig); err != nil {
 		return nil, err
 	}
 
@@ -549,20 +864,44 @@ func (v *MultiIssuerTokenValidator) validateExternalToken(
 	// A may_act claim is authoritative and enforced by checkDelegationConsent
 	// against the authenticated client — validateMayActShape above has
 	// already confirmed its own "iss" (if any) names this server, so
-	// may_act.sub is in ToolHive's own client namespace. AllowedActors below
-	// is skipped entirely when MayAct is set. Otherwise, the resolved actor
-	// claim (even "client_id") is in the EXTERNAL issuer's namespace and
-	// must match AllowedActors — it can never be compared against the
-	// authenticated ToolHive client directly.
+	// may_act.sub is in ToolHive's own client namespace. AllowedActors and
+	// ActorMatcher below are skipped entirely when MayAct is set. Otherwise,
+	// either the resolved external actor claim or the matcher evaluated against
+	// the complete signature-verified JWT claims authorizes delegation. Neither
+	// is ever compared against the authenticated ToolHive client directly.
 	if claims.MayAct == nil {
-		actor, err := resolveAllowedActor(issuerConfig, claims)
+		actor, authorized, err := resolveActorAuthorization(issuerConfig, claims, extraClaims)
 		if err != nil {
 			return nil, err
 		}
 		claims.ExternalActor = actor
+		claims.ExternalActorAuthorized = authorized
 	}
 
 	return claims, nil
+}
+
+// checkMayActAllowed rejects a may_act claim from an issuer that hasn't
+// opted in (issuerConfig.AllowMayAct false) before validating the claim's
+// shape: a malformed may_act on a disabled-by-default issuer should surface
+// this clearer, more-actionable message rather than "malformed 'may_act'
+// claim" — both paths reject the token either way, but this one names the
+// actual reason for the common case.
+//
+// selfIssuer (not issuerConfig.IssuerURL) is the correct comparison for
+// may_act's optional "iss" once shape validation runs: that member
+// identifies the namespace of may_act.sub, always compared against a
+// ToolHive client ID regardless of which issuer validated the surrounding
+// token. requireIss is true here — unlike the self-issued path, the external
+// path cannot leave "iss" optional; see validateMayActShape's doc comment.
+func checkMayActAllowed(extraClaims map[string]any, selfIssuer string, issuerConfig *externalIssuerConfig) error {
+	rawMayAct, ok := extraClaims["may_act"]
+	if ok && rawMayAct != nil && !issuerConfig.AllowMayAct {
+		return fmt.Errorf(
+			"subject token from issuer %q carries a may_act claim, but allow_may_act is disabled",
+			issuerConfig.IssuerURL)
+	}
+	return validateMayActShape(extraClaims, selfIssuer, true)
 }
 
 // ensureRegistered resolves issuerConfig.jwksURL — via OIDC discovery on
@@ -830,7 +1169,7 @@ func (*MultiIssuerTokenValidator) discoverJWKSURL(ctx context.Context, issuerCon
 	}
 
 	if doc.Issuer != issuerConfig.IssuerURL {
-		return "", fmt.Errorf("discovery document issuer %q does not match expected issuer %q", doc.Issuer, issuerConfig.IssuerURL)
+		return "", fmt.Errorf("discovery document issuer does not match configured issuer")
 	}
 
 	if doc.JWKSURI == "" {
@@ -843,6 +1182,40 @@ func (*MultiIssuerTokenValidator) discoverJWKSURL(ctx context.Context, issuerCon
 	return doc.JWKSURI, nil
 }
 
+// ValidateTrustedIssuerURL checks that issuerURL is a valid trusted external
+// OIDC issuer identifier. Trusted issuers require HTTPS unless their own
+// insecureAllowHTTP opt-in is set; unlike this server's issuer, localhost is
+// not exempt. Query, fragment, and userinfo are forbidden, while a trailing
+// slash is permitted for providers such as Microsoft Entra ID v1.
+func ValidateTrustedIssuerURL(issuerURL string, insecureAllowHTTP bool) error {
+	if issuerURL == "" {
+		return errors.New("issuer_url is required")
+	}
+	parsed, err := url.Parse(issuerURL)
+	if err != nil {
+		return errors.New("invalid URL")
+	}
+	if parsed.Scheme == "" {
+		return errors.New("scheme is required")
+	}
+	if parsed.Hostname() == "" {
+		return errors.New("host is required")
+	}
+	if parsed.RawQuery != "" {
+		return errors.New("must not contain query component")
+	}
+	if parsed.Fragment != "" {
+		return errors.New("must not contain fragment component")
+	}
+	if parsed.User != nil {
+		return errors.New("must not contain userinfo (credentials in the URL)")
+	}
+	if parsed.Scheme != "https" && (parsed.Scheme != "http" || !insecureAllowHTTP) {
+		return errors.New("scheme must be https (or http with insecure_allow_http)")
+	}
+	return nil
+}
+
 // ValidateJWKSURL checks that jwksURL parses, has a host, uses HTTPS unless
 // insecureAllowHTTP permits plain HTTP — and only exactly the "http" scheme,
 // not any other non-https scheme such as "file" or "ftp" — and, when the
@@ -853,27 +1226,29 @@ func (*MultiIssuerTokenValidator) discoverJWKSURL(ctx context.Context, issuerCon
 // discovery document — or a hand-configured jwks_url — points to internal
 // services.
 //
-// This is the single implementation shared by the runtime choke point above
-// (ensureRegistered, on every fetch) and pkg/authserver/config.go's config-time
-// check (validateJWKSEndpointURL): the two must not drift out of sync, or a
-// laxer runtime check would silently defeat the config-time guard.
+// This is shared by endpoint-only config-time validation and the runtime fetch
+// choke point. Both use the issuer's allowPrivateIPs policy for literal IP
+// hosts; runtime additionally protects DNS resolution on every outbound fetch.
 func ValidateJWKSURL(jwksURL string, insecureAllowHTTP, allowPrivateIPs bool) error {
 	u, err := url.Parse(jwksURL)
 	if err != nil {
-		return fmt.Errorf("invalid URL: %w", err)
+		return errors.New("invalid URL")
 	}
 
-	if u.Host == "" {
+	if u.Hostname() == "" {
 		return errors.New("host is required")
+	}
+
+	if u.Fragment != "" {
+		return errors.New("must not contain fragment component")
 	}
 
 	// Unlike issuer_url, a jwks_url carrying userinfo would actually work —
 	// net/http turns it into a Basic auth header on every JWKS fetch — which
 	// is precisely why it is rejected rather than tolerated: it would put a
-	// live credential in the RunConfig, in this function's error strings, and
-	// in any log that quotes the URL. A JWKS endpoint is public by
-	// definition (it serves verification keys), so there is no legitimate
-	// reason to authenticate to one.
+	// live credential in the RunConfig or in any log that quotes the URL. A
+	// JWKS endpoint is public by definition (it serves verification keys), so
+	// there is no legitimate reason to authenticate to one.
 	if u.User != nil {
 		return errors.New("must not contain userinfo (credentials in the URL)")
 	}
@@ -891,31 +1266,49 @@ func ValidateJWKSURL(jwksURL string, insecureAllowHTTP, allowPrivateIPs bool) er
 	return nil
 }
 
+func validateTrustedIssuerEndpoints(ti TrustedIssuer) error {
+	if err := ValidateTrustedIssuerURL(ti.IssuerURL, ti.InsecureAllowHTTP); err != nil {
+		return err
+	}
+	if ti.JWKSURL != "" {
+		if err := ValidateJWKSURL(ti.JWKSURL, ti.InsecureAllowHTTP, ti.AllowPrivateIPs); err != nil {
+			return fmt.Errorf("jwks_url: %w", err)
+		}
+	}
+	if ti.AllowPrivateIPs && ti.JWKSURL == "" {
+		return errors.New("allow_private_ips requires jwks_url to be set explicitly")
+	}
+	return nil
+}
+
 // validateTrustedIssuer checks a single TrustedIssuer for structural validity
 // before it is admitted into issuers: required fields, no collision with
 // selfIssuer or an already-registered issuer, an ActorClaim that
-// resolveAllowedActor can actually read from Extra (or ClientID), and a
-// well-formed AllowedDelegateClients (non-empty, no empty entries, and the
-// wildcard anyDelegateClient never combined with specific client IDs).
+// resolveActorAuthorization can actually read from Extra (or ClientID), a
+// compilable ActorMatcher, and a well-formed AllowedDelegateClients (non-empty,
+// no empty entries, and the wildcard anyDelegateClient never combined with
+// specific client IDs or AllowMayAct).
 //
 // Error messages name TrustedIssuer's wire keys (issuer_url,
 // expected_audience, actor_claim), not its Go field names: TrustedIssuer is
 // the serialized RunConfig.TrustedIssuers schema (see its doc comment), so an
 // operator's YAML uses these keys and should see them echoed back, not Go
 // identifiers they never wrote.
-func validateTrustedIssuer(ti TrustedIssuer, selfIssuer string, issuers map[string]*externalIssuerConfig) error {
-	if ti.IssuerURL == "" {
-		return errors.New("issuer_url is required")
+func validateTrustedIssuer(
+	ti TrustedIssuer, selfIssuer string, issuers map[string]*externalIssuerConfig, allowedAudiences []string,
+) error {
+	if err := validateTrustedIssuerEndpoints(ti); err != nil {
+		return err
 	}
-	if ti.ExpectedAudience == "" {
-		return fmt.Errorf("issuer_url %q: expected_audience is required", ti.IssuerURL)
+	if ti.ExpectedAudience == "" && ti.JWTBearerGrant == nil {
+		return fmt.Errorf("issuer_url %q: expected_audience is required when JWT-bearer grant is disabled", ti.IssuerURL)
 	}
 	if ti.IssuerURL == selfIssuer {
 		return fmt.Errorf("issuer_url %q: must not equal the authorization server's own issuer; "+
 			"self-issued tokens are already handled separately", ti.IssuerURL)
 	}
 	if _, dup := issuers[ti.IssuerURL]; dup {
-		return fmt.Errorf("issuer_url %q: configured more than once", ti.IssuerURL)
+		return errors.New("issuer_url configured more than once")
 	}
 	if ti.ActorClaim != "" && slices.Contains(actorClaimsNotInExtra, ti.ActorClaim) {
 		return fmt.Errorf(
@@ -923,6 +1316,119 @@ func validateTrustedIssuer(ti TrustedIssuer, selfIssuer string, issuers map[stri
 				`(use "client_id" or a non-registered claim such as "azp", "appid", "cid")`,
 			ti.IssuerURL, ti.ActorClaim)
 	}
+	if _, err := compileActorMatcher(ti.ActorMatcher); err != nil {
+		return fmt.Errorf("issuer_url %q: %w", ti.IssuerURL, err)
+	}
+	if err := validateDelegationPolicy(ti); err != nil {
+		return err
+	}
+	if err := validateJWTBearerGrantPolicy(ti, allowedAudiences); err != nil {
+		return err
+	}
+	if ti.AllowMayAct && slices.Contains(ti.AllowedDelegateClients, anyDelegateClient) {
+		return fmt.Errorf(
+			"issuer_url %q: allow_may_act must not be enabled when allowed_delegate_clients contains the wildcard %q",
+			ti.IssuerURL, anyDelegateClient)
+	}
+	return nil
+}
+
+// validateDelegationPolicy validates fields used exclusively by RFC 8693.
+func validateDelegationPolicy(ti TrustedIssuer) error {
+	hasDelegationSignal := ti.ActorClaim != "" || ti.ActorMatcher != "" || ti.AllowMayAct || len(ti.AllowedActors) > 0
+	if ti.ExpectedAudience == "" && !hasDelegationSignal {
+		return nil
+	}
+	if ti.ExpectedAudience == "" && hasDelegationSignal {
+		return fmt.Errorf(
+			"issuer_url %q: expected_audience is required when actor_claim, actor_matcher, allow_may_act, or allowed_actors is set",
+			ti.IssuerURL)
+	}
+	return validateAllowedDelegateClients(ti)
+}
+
+func validateJWTBearerGrantPolicy(ti TrustedIssuer, allowedAudiences []string) error {
+	if ti.JWTBearerGrant == nil {
+		return nil
+	}
+	policy := ti.JWTBearerGrant
+	age, err := time.ParseDuration(policy.MaxAssertionAge)
+	if err != nil || age <= 0 {
+		return fmt.Errorf("issuer_url %q: jwt_bearer_grant.max_assertion_age must be a positive duration", ti.IssuerURL)
+	}
+	if err := validateJWTBearerSubjectBindings(ti, policy.SubjectBindings); err != nil {
+		return err
+	}
+	return validateJWTBearerAcceptedAudiences(ti, policy.AcceptedAudiences, allowedAudiences)
+}
+
+func validateJWTBearerSubjectBindings(ti TrustedIssuer, bindings []JWTBearerSubjectBinding) error {
+	if len(bindings) == 0 {
+		return fmt.Errorf("issuer_url %q: jwt_bearer_grant.subject_bindings is required", ti.IssuerURL)
+	}
+	seenSubjects := make(map[string]struct{}, len(bindings))
+	for _, binding := range bindings {
+		if binding.Subject == "" || binding.Subject == anyDelegateClient {
+			return fmt.Errorf("issuer_url %q: jwt_bearer_grant.subject_bindings contains an empty or wildcard subject", ti.IssuerURL)
+		}
+		if _, duplicate := seenSubjects[binding.Subject]; duplicate {
+			return fmt.Errorf(
+				"issuer_url %q: jwt_bearer_grant.subject_bindings contains duplicate subject %q",
+				ti.IssuerURL, binding.Subject)
+		}
+		seenSubjects[binding.Subject] = struct{}{}
+		if len(binding.AllowedResources) == 0 {
+			return fmt.Errorf("issuer_url %q: jwt_bearer_grant subject %q has no allowed_resources", ti.IssuerURL, binding.Subject)
+		}
+		for _, resource := range binding.AllowedResources {
+			if resource == "" || resource == anyDelegateClient {
+				return fmt.Errorf(
+					"issuer_url %q: jwt_bearer_grant subject %q has an empty or wildcard resource",
+					ti.IssuerURL, binding.Subject)
+			}
+			if err := server.ValidateAudienceURI(resource); err != nil {
+				return fmt.Errorf(
+					"issuer_url %q: jwt_bearer_grant subject %q resource %q is invalid: %w",
+					ti.IssuerURL, binding.Subject, resource, err)
+			}
+		}
+	}
+	return nil
+}
+
+// validateJWTBearerAcceptedAudiences also rejects any accepted_audiences
+// entry that is a configured resource audience (allowedAudiences).
+// AcceptedAudiences identifies this authorization server itself (see its
+// doc comment); an entry shared with a resource audience would let an
+// upstream access token minted for that resource — not for this AS — pass
+// ValidateJWTBearerAssertion's audience check and mint a ToolHive token for
+// whatever resource the subject binding allows, bypassing the
+// client-authenticated RFC 8693 delegation route entirely.
+func validateJWTBearerAcceptedAudiences(ti TrustedIssuer, acceptedAudiences, allowedAudiences []string) error {
+	for _, audience := range acceptedAudiences {
+		if audience == "" {
+			return fmt.Errorf("issuer_url %q: jwt_bearer_grant.accepted_audiences must not contain an empty value", ti.IssuerURL)
+		}
+		if err := server.ValidateAudienceURI(audience); err != nil {
+			return fmt.Errorf(
+				"issuer_url %q: jwt_bearer_grant.accepted_audiences value %q is invalid: %w",
+				ti.IssuerURL, audience, err)
+		}
+		if slices.Contains(allowedAudiences, audience) {
+			return fmt.Errorf(
+				"issuer_url %q: jwt_bearer_grant.accepted_audiences value %q must not also be a "+
+					"configured resource audience (allowed_audiences); accepted_audiences identifies "+
+					"this authorization server, not a resource, or a resource-scoped access token "+
+					"could be replayed as a JWT-bearer assertion", ti.IssuerURL, audience)
+		}
+	}
+	return nil
+}
+
+// validateAllowedDelegateClients checks the structural and narrowing
+// invariants for TrustedIssuer.AllowedDelegateClients, split out of
+// validateTrustedIssuer to keep that function's cyclomatic complexity down.
+func validateAllowedDelegateClients(ti TrustedIssuer) error {
 	if len(ti.AllowedDelegateClients) == 0 {
 		return fmt.Errorf(
 			"issuer_url %q: allowed_delegate_clients is required; set it to [%q] to permit any ToolHive "+
@@ -939,19 +1445,10 @@ func validateTrustedIssuer(ti TrustedIssuer, selfIssuer string, issuers map[stri
 			"issuer_url %q: allowed_delegate_clients must not combine the wildcard %q with specific client IDs",
 			ti.IssuerURL, anyDelegateClient)
 	}
-	// AllowPrivateIPs without a hand-configured jwks_url would let OIDC
-	// discovery — a document fetched from, and thus influenceable by, the
-	// external issuer itself — choose the private target the dial is
-	// allowed to reach. Requiring jwks_url pins that target to
-	// operator-supplied config. Mirrors the config-time check in
-	// pkg/authserver/config.go's validateTrustedIssuers; duplicated here so
-	// a caller that builds the validator directly (factory, tests) without
-	// running Config.Validate cannot bypass it.
-	if ti.AllowPrivateIPs && ti.JWKSURL == "" {
+	if ti.AllowMayAct && slices.Contains(ti.AllowedDelegateClients, anyDelegateClient) {
 		return fmt.Errorf(
-			"issuer_url %q: allow_private_ips requires jwks_url to be set explicitly; "+
-				"otherwise OIDC discovery — fetched from the external issuer — would choose the private target",
-			ti.IssuerURL)
+			"issuer_url %q: allow_may_act must not be enabled when allowed_delegate_clients contains the wildcard %q",
+			ti.IssuerURL, anyDelegateClient)
 	}
 	return nil
 }
@@ -967,10 +1464,49 @@ func looksLikeResourceIdentifier(aud string) bool {
 	return strings.Contains(aud, "://")
 }
 
+// resolveActorAuthorization authorizes an external token when either its
+// configured actor claim matches AllowedActors or ActorMatcher evaluates true
+// against the complete signature-verified JWT claims map. It returns the
+// resolved actor, when one exists, separately from authorization because a
+// matcher need not depend on an actor claim. Called only when the subject token
+// carries no may_act claim — see validateExternalToken.
+func resolveActorAuthorization(
+	issuerConfig *externalIssuerConfig,
+	claims *ValidatedClaims,
+	verifiedClaims map[string]any,
+) (string, bool, error) {
+	actor, actorErr := resolveAllowedActor(issuerConfig, claims)
+	if actorErr == nil {
+		return actor, true, nil
+	}
+
+	if issuerConfig.actorMatcher != nil {
+		matched, err := issuerConfig.actorMatcher.EvaluateBool(map[string]any{"claims": verifiedClaims})
+		if err != nil {
+			// The raw CEL error is never logged or returned: it can quote
+			// runtime values from the claims map (e.g. timestamp(claims.foo)
+			// on a malformed string embeds that string in the error),
+			// which would otherwise leak signed claim data into logs and,
+			// via HandleTokenEndpointRequest's own error logging, further
+			// downstream.
+			slog.Debug("Trusted issuer actor matcher evaluation failed; denying subject token",
+				"issuer", issuerConfig.IssuerURL)
+			return "", false, fmt.Errorf("actor matcher evaluation failed for issuer %q", issuerConfig.IssuerURL)
+		} else if matched {
+			return actor, true, nil
+		}
+	}
+
+	if len(issuerConfig.AllowedActors) == 0 && issuerConfig.actorMatcher != nil {
+		return "", false, fmt.Errorf("subject token from issuer %q was not authorized by actor matcher", issuerConfig.IssuerURL)
+	}
+
+	return "", false, actorErr
+}
+
 // resolveAllowedActor resolves the issuer's configured actor claim from
 // claims and checks it against issuerConfig.AllowedActors, returning the
-// matched value on success. Called only when the subject token carries no
-// may_act claim — see validateExternalToken.
+// matched value on success.
 func resolveAllowedActor(issuerConfig *externalIssuerConfig, claims *ValidatedClaims) (string, error) {
 	claimName := issuerConfig.ActorClaim
 	if claimName == "" {

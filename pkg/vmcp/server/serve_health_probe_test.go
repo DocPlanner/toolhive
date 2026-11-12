@@ -112,8 +112,6 @@ func TestServeSkipsHealthProbeSessions(t *testing.T) {
 	assert.False(t, state.makeWithIDCalled.Load(), "a probe must not open backend connections")
 	assert.Zero(t, fc.listToolsCalls.Load(), "a probe must not list capabilities")
 	assert.Empty(t, sess.tools, "a probe must not get tools injected")
-	_, registered := srv.refreshSinks.Load(sess.id)
-	assert.False(t, registered, "a probe must not be registered for capability refreshes")
 }
 
 // TestPeerProbeHeaderCannotCall verifies that the client-controlled probe header

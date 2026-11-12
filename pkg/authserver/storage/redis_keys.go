@@ -3,7 +3,10 @@
 
 package storage
 
-import "fmt"
+import (
+	"crypto/sha256"
+	"fmt"
+)
 
 // Key type constants for Redis storage.
 // These define the different types of data stored in Redis.
@@ -40,6 +43,9 @@ const (
 
 	// KeyTypeJWT is the key type for client assertion JWTs.
 	KeyTypeJWT = "jwt"
+
+	// KeyTypeAssertionJWT is the key type for consumed assertion JWTs.
+	KeyTypeAssertionJWT = "assertion-jwt"
 
 	// KeyTypeReqIDAccess is the key type for request ID to access token mappings.
 	KeyTypeReqIDAccess = "reqid:access"
@@ -88,6 +94,16 @@ func redisKey(prefix, keyType, id string) string {
 	return fmt.Sprintf("%s%s:%s", prefix, keyType, id)
 }
 
+// redisAssertionJWTKey returns the namespaced replay key for an assertion JWT.
+// The tuple is length-prefixed before hashing, so arbitrary purpose, issuer, and
+// JTI values cannot create ambiguous encodings or inject Redis key segments. The
+// digest also avoids exposing assertion identifiers in Redis key names.
+func redisAssertionJWTKey(prefix, purpose, issuer, jti string) string {
+	tuple := fmt.Sprintf("%d:%s%d:%s%d:%s", len(purpose), purpose, len(issuer), issuer, len(jti), jti)
+	digest := sha256.Sum256([]byte(tuple))
+	return fmt.Sprintf("%s%s:%x", prefix, KeyTypeAssertionJWT, digest)
+}
+
 // redisProviderKey generates a Redis key for provider identities.
 // Uses length-prefixed format to handle colons in provider IDs/subjects.
 func redisProviderKey(prefix, providerID, providerSubject string) string {
@@ -115,7 +131,7 @@ func redisProviderKey(prefix, providerID, providerSubject string) string {
 // format, so entries written by an older binary (without the segment) will
 // miss on lookup and be harmlessly re-registered under the new key. Orphaned
 // old rows self-evict only when the upstream asserted an RFC 7591 §3.2.1
-// client_secret_expires_at (StoreDCRCredentials sets a matching Redis TTL for
+// client_secret_expires_at (StoreDCRCredentialsIfAbsent sets a matching Redis TTL for
 // those); entries for non-expiring secrets — the common §3.2.1 "never" case —
 // carry no TTL and persist indefinitely, so they require manual cleanup.
 // There is no automated one-shot migration for this key-format change today.

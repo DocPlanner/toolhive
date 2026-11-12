@@ -595,6 +595,16 @@ func (*DefaultValidator) validateCompositeToolRefs(refs []CompositeToolRef) erro
 	return nil
 }
 
+// The standalone header-forward middleware deliberately allows Authorization
+// (an operator may legitimately forward it), but for vMCP passthrough the
+// documented contract is stricter: Authorization and Cookie are rejected at
+// startup because forwarding caller-supplied credentials verbatim to every
+// backend is a credential-leak footgun, not a pass-through use case.
+var vmcpRestrictedHeaders = map[string]bool{
+	"Authorization": true,
+	"Cookie":        true,
+}
+
 func (*DefaultValidator) validatePassthroughHeaders(cfg *Config) error {
 	for i, name := range cfg.PassthroughHeaders {
 		if name == "" {
@@ -603,7 +613,7 @@ func (*DefaultValidator) validatePassthroughHeaders(cfg *Config) error {
 
 		canonical := http.CanonicalHeaderKey(name)
 
-		if middleware.RestrictedHeaders[canonical] {
+		if middleware.RestrictedHeaders[canonical] || vmcpRestrictedHeaders[canonical] {
 			return fmt.Errorf("passthroughHeaders[%d]: %q is a restricted header and cannot be forwarded", i, canonical)
 		}
 
@@ -663,8 +673,10 @@ func validateAuthServerRunConfig(rc *authserver.RunConfig) error {
 	if rc.Issuer == "" {
 		return fmt.Errorf("auth server issuer is required")
 	}
-	if len(rc.Upstreams) == 0 {
-		return fmt.Errorf("auth server requires at least one upstream")
+	if len(rc.Upstreams) == 0 && len(rc.DelegateClients) == 0 &&
+		!authserver.JWTBearerGrantEnabled(rc.TrustedIssuers) {
+		return fmt.Errorf("auth server requires at least one upstream unless delegate clients or a " +
+			"trusted issuer with JWT bearer grant is configured")
 	}
 	// AllowedAudiences is required for MCP compliance (RFC 8707).
 	if len(rc.AllowedAudiences) == 0 {

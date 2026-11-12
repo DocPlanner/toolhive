@@ -3,13 +3,18 @@
 
 // Package verifier verifies Sigstore signatures on skill artifacts.
 //
-// It is a thin wrapper over toolhive-core's container/verifier exports: all
-// cryptographic verification — including binding an expected identity into
-// the Sigstore policy — happens in core. This package adds the
+// It is a thin wrapper over toolhive-core's container/verifier exports. Lock
+// identities are bound into core's Sigstore policy; independently optional
+// catalog constraints are matched against the observed certificate inside
+// each bundle-verification attempt. This package adds the
 // skills-domain vocabulary: lock file provenance conversion, the
 // unsigned/invalid/mismatch error taxonomy, and the trust-on-first-use flow
 // (nil expected identity verifies the chain of trust only; the caller
 // records the observed identity).
+//
+// It also enforces the two pinned certificate fields core's Identity cannot
+// express — the signing workflow's git ref and runner class — against the
+// certificate a successful policy verification produced.
 //
 // Verification uses the trusted root embedded in toolhive-core — hermetic,
 // no TUF fetch — so results are reproducible offline at the cost of
@@ -30,11 +35,12 @@ import (
 type Verifier interface {
 	// VerifyOCI discovers the Sigstore signature material attached to the
 	// OCI artifact and verifies it (keyless/Fulcio flow). A non-nil
-	// expected identity is enforced inside the Sigstore verification
-	// policy; nil expected is the trust-on-first-use case and verifies the
-	// chain of trust only. Returns ErrUnsigned when the artifact carries
-	// no signature material.
-	VerifyOCI(ctx context.Context, imageRef, digest string, expected *lockfile.Provenance) (*Result, error)
+	// lock expectation is enforced inside the Sigstore verification policy;
+	// catalog fields are checked independently against each verified bundle.
+	// nil expected is the trust-on-first-use case and verifies the chain of
+	// trust only.
+	// Returns ErrUnsigned when the artifact carries no signature material.
+	VerifyOCI(ctx context.Context, imageRef, digest string, expected *ProvenanceExpectation) (*Result, error)
 
 	// VerifyOCIWithKey discovers the signature material and verifies it
 	// against the given PEM public key (the cosign key-pair flow).
@@ -43,10 +49,10 @@ type Verifier interface {
 
 	// VerifyGit cryptographically verifies a gitsign commit signature over
 	// the commit payload against the embedded Fulcio roots. A non-nil
-	// expected identity must match the certificate identity; nil expected
-	// is the trust-on-first-use case. Returns ErrUnsigned for an empty
-	// signature.
-	VerifyGit(ctx context.Context, payload, signature []byte, expected *lockfile.Provenance) (*Result, error)
+	// expectation must match the certificate identity according to its lock
+	// or catalog semantics; nil expected is the trust-on-first-use case.
+	// Returns ErrUnsigned for an empty signature.
+	VerifyGit(ctx context.Context, payload, signature []byte, expected *ProvenanceExpectation) (*Result, error)
 
 	// VerifyBundleOffline re-verifies a stored bundle against the artifact
 	// digest ("sha256:<hex>") without network access, enforcing expected
@@ -55,9 +61,10 @@ type Verifier interface {
 
 	// VerifyBundleOfflineWithKey re-verifies a stored key-signed bundle
 	// against the signer's PEM public key without network access — the
-	// offline counterpart of VerifyOCIWithKey. imageRef and digest
-	// reconstruct the signed payload, binding the check to the artifact.
-	VerifyBundleOfflineWithKey(bundle []byte, imageRef, digest string, pubKeyPEM []byte) error
+	// offline counterpart of VerifyOCIWithKey. digest is the artifact's own
+	// manifest digest, as for VerifyBundleOffline: the stored bundle carries
+	// whatever the signature actually covers, so no caller reconstructs it.
+	VerifyBundleOfflineWithKey(bundle []byte, digest string, pubKeyPEM []byte) error
 
 	// ResultFromBundle verifies a stored bundle offline (chain of trust
 	// only) and returns the observed identity — used to back-fill

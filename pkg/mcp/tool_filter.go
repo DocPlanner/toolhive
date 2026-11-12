@@ -253,8 +253,11 @@ func NewToolCallMappingMiddleware(opts ...ToolMiddlewareOption) (types.Middlewar
 				return
 			}
 
-			// Restore the request body for downstream handlers
+			bodyBytes = bytes.TrimPrefix(bodyBytes, UTF8BOM)
+
+			// Restore the normalized request body for downstream handlers.
 			r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+			r.ContentLength = int64(len(bodyBytes))
 
 			// Try to parse the request as a tool call request. If it succeeds,
 			// check if the tool is in the filter. If it is not a tool call request,
@@ -315,7 +318,6 @@ func NewToolCallMappingMiddleware(opts ...ToolMiddlewareOption) (types.Middlewar
 					}
 
 					r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-					// TODO: find a reasonable way to test this
 					r.ContentLength = int64(len(bodyBytes))
 
 				// According to the current version of the MCP spec at
@@ -495,6 +497,10 @@ func (rw *toolFilterWriter) drainBuffer(terminal bool) bool {
 	if len(rw.buffer) == 0 {
 		return true
 	}
+
+	// Normalize once before MIME dispatch so every response path applies the
+	// same parsing and forwarding semantics as clients that strip a leading BOM.
+	rw.buffer = bytes.TrimPrefix(rw.buffer, UTF8BOM)
 
 	mimeType := strings.Split(rw.ResponseWriter.Header().Get("Content-Type"), ";")[0]
 	successResponse := rw.statusCode == http.StatusOK || rw.statusCode == http.StatusAccepted

@@ -61,9 +61,6 @@ type ServerConfig struct {
 	// SessionTTL is the session time-to-live duration (default: 30 minutes).
 	SessionTTL time.Duration
 
-	// WriteTimeout is the HTTP server write deadline. Values below the default
-	// (30 s) are raised to it.
-	WriteTimeout time.Duration
 	// HeartbeatInterval configures the SSE keep-alive ping interval on GET
 	// connections (default: 30s when zero).
 	HeartbeatInterval time.Duration
@@ -375,6 +372,18 @@ func Serve(ctx context.Context, v core.VMCP, cfg *ServerConfig) (*Server, error)
 		srv.lazyInjectSessionTools(hookCtx, req.Params.Name)
 	})
 
+	// Backend-health-driven tools resync (#5786, serve_health_resync.go):
+	// subscribe to the core-owned health monitor so passthrough sessions pick
+	// up catalog changes (a backend recovering/failing, backends added/removed)
+	// without reconnecting. The monitor debounces delivery and the listener
+	// runs off the health-check path; the core stops the monitor — and with it
+	// this callback — inside v.Close() during Stop. Nil when health monitoring
+	// is disabled, in which case sessions keep today's snapshot-at-registration
+	// behavior.
+	if reporter := srv.backendHealth(); reporter != nil {
+		reporter.OnChange(srv.resyncSessionsOnBackendHealthChange)
+	}
+
 	// Surface the capability gate's verdict once at startup: the blocker list is
 	// derived from construction-time configuration and cannot change afterwards,
 	// so this single line is the operator-visible record of why Modern-capable
@@ -420,7 +429,6 @@ func buildServeConfig(cfg *ServerConfig) *Config {
 		Port:                    cfg.Port,
 		EndpointPath:            cfg.EndpointPath,
 		SessionTTL:              cfg.SessionTTL,
-		WriteTimeout:            cfg.WriteTimeout,
 		HeartbeatInterval:       cfg.HeartbeatInterval,
 		AuthMiddleware:          cfg.AuthMiddleware,
 		AuthInfoHandler:         cfg.AuthInfoHandler,

@@ -14,11 +14,13 @@ import (
 	"context"
 	"sync"
 
+	"github.com/stacklok/toolhive-core/container/signer"
 	ociplugins "github.com/stacklok/toolhive-core/oci/plugins"
 	"github.com/stacklok/toolhive/pkg/client"
 	"github.com/stacklok/toolhive/pkg/git"
 	"github.com/stacklok/toolhive/pkg/groups"
 	"github.com/stacklok/toolhive/pkg/plugins"
+	"github.com/stacklok/toolhive/pkg/skills/verifier"
 	"github.com/stacklok/toolhive/pkg/storage"
 )
 
@@ -131,6 +133,23 @@ func WithPluginLookup(pl PluginLookup) Option {
 	}
 }
 
+// WithSigner sets the artifact signer used by Push. Defaults to the Sigstore
+// signer with the composite registry keychain.
+func WithSigner(sg signer.Signer) Option {
+	return func(s *service) {
+		s.sigSigner = sg
+	}
+}
+
+// WithVerifier sets the signature verifier used for install-time
+// verification. Defaults to the Sigstore verifier with the composite
+// registry keychain.
+func WithVerifier(v verifier.Verifier) Option {
+	return func(s *service) {
+		s.sigVerifier = v
+	}
+}
+
 // pluginLock provides per-plugin mutual exclusion keyed by scope/name/projectRoot.
 // Entries are never evicted. This is acceptable because the number of distinct
 // plugins on a single machine is expected to remain small (< 1000). The key
@@ -161,6 +180,18 @@ func (pl *pluginLock) lock(name string, scope plugins.Scope, projectRoot string)
 	return m.Unlock
 }
 
+// lockPlugin acquires the per-plugin mutex. Callers that already hold the lock
+// (Sync/Upgrade) must use the *AlreadyLocked / *Locked helpers instead of
+// re-entering through public Install/Uninstall/adoptPlugin.
+func (s *service) lockPlugin(
+	ctx context.Context,
+	name string,
+	scope plugins.Scope,
+	projectRoot string,
+) (context.Context, func()) {
+	return ctx, s.locks.lock(name, scope, projectRoot)
+}
+
 // service is the default implementation of plugins.PluginService. It implements
 // the build/validate/push/content surface (Phase 2) and the install/uninstall/
 // list/info surface (Phase 3), the latter driving per-client materialization
@@ -176,6 +207,8 @@ type service struct {
 	pluginLookup  PluginLookup
 	gitClient     git.Client
 	clientManager *client.ClientManager
+	sigVerifier   verifier.Verifier
+	sigSigner     signer.Signer
 }
 
 // New creates a new plugin service and returns it as a plugins.PluginService.

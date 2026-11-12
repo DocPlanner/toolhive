@@ -28,6 +28,7 @@ import (
 	"github.com/stacklok/toolhive/pkg/config"
 	ct "github.com/stacklok/toolhive/pkg/container"
 	rt "github.com/stacklok/toolhive/pkg/container/runtime"
+	"github.com/stacklok/toolhive/pkg/diagnostics"
 	"github.com/stacklok/toolhive/pkg/labels"
 	"github.com/stacklok/toolhive/pkg/process"
 	"github.com/stacklok/toolhive/pkg/runtime"
@@ -91,6 +92,11 @@ type Runner struct {
 
 	// prometheusHandler is the Prometheus metrics handler set by telemetry middleware
 	prometheusHandler http.Handler
+
+	// diagnosticsServer serves the Prometheus /metrics endpoint on its own
+	// listener, keeping it off the application listener where it would bypass
+	// the middleware chain. Nil unless the metrics path is enabled.
+	diagnosticsServer *diagnostics.Server
 
 	statusManager statuses.StatusManager
 
@@ -225,6 +231,12 @@ func (c *RunConfig) GetPort() int {
 //
 //nolint:gocyclo // This function is complex but manageable
 func (r *Runner) Run(ctx context.Context) error {
+	// Validate serialized RunConfig input before any provider or runtime work.
+	// The builder and middleware helper repeat this check at their own boundaries.
+	if r.Config.MaxRequestBodySize < 0 {
+		return fmt.Errorf("max_request_body_size must be non-negative, got %d", r.Config.MaxRequestBodySize)
+	}
+
 	// Resolve session TTL once so both the transport proxy and Redis storage use
 	// the same effective value, rather than each applying their own zero-fallback
 	// independently. SessionTTL is stored as a Go duration string so the
@@ -331,6 +343,14 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}
 
+	if err := canonicalizeOIDCMiddlewareConfig(r.Config); err != nil {
+		return fmt.Errorf("invalid OIDC middleware configuration: %w", err)
+	}
+
+	if err := validateCredentialStrippingMiddleware(r.Config.MiddlewareConfigs, r.Config); err != nil {
+		return fmt.Errorf("invalid credential stripping middleware configuration: %w", err)
+	}
+
 	// Origin-header validation (DNS-rebinding protection per MCP 2025-11-25
 	// §"Security Warning") is wired here, after both middleware-population
 	// paths, because it is the single place where Host/Port/AllowedOrigins are
@@ -345,9 +365,12 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	// Body-size limit is always the outermost middleware, regardless of how the
 	// chain was assembled (PopulateMiddlewareConfigs above, or WithMiddlewareFromFlags
-	// which pre-populates the slice and takes the else branch). Idempotent, so the
-	// operator/Populate path is a no-op here.
-	r.Config.MiddlewareConfigs, err = addBodyLimitMiddleware(r.Config.MiddlewareConfigs)
+	// which pre-populates the slice and takes the else branch). Existing body-limit
+	// entries are replaced so the typed RunConfig value is authoritative.
+	r.Config.MiddlewareConfigs, err = addBodyLimitMiddleware(
+		r.Config.MiddlewareConfigs,
+		r.Config.MaxRequestBodySize,
+	)
 	if err != nil {
 		return fmt.Errorf("failed to add body limit middleware: %w", err)
 	}
@@ -407,7 +430,44 @@ func (r *Runner) Run(ctx context.Context) error {
 	// Set all named middleware and handlers on transport config
 	transportConfig.Middlewares = r.namedMiddlewares
 	transportConfig.AuthInfoHandler = r.authInfoHandler
-	transportConfig.PrometheusHandler = r.prometheusHandler
+
+	// Metrics are served on a dedicated diagnostics listener so access can be
+	// restricted by port; see pkg/diagnostics.
+	if err := r.startDiagnosticsServer(); err != nil {
+		return err
+	}
+
+	// During the deprecation window /metrics is ALSO served on the transport port,
+	// so an existing scrape configuration keeps working while it is moved. Handing
+	// the handler to the transport is what mounts it there; leaving it nil is what
+	// keeps the proxies from mounting it at all. See
+	// telemetry.DefaultMetricsOnTransportPort for the cutover.
+	if mountPrometheusHandlerOnTransportPort(r.prometheusHandler, r.Config.TelemetryConfig) {
+		transportConfig.PrometheusHandler = r.prometheusHandler
+		slog.Warn("serving prometheus metrics on the transport port as well as the diagnostics port; "+
+			"this is deprecated and the transport-port copy will be removed; see #6384 for the timeline. "+
+			"Move scrapers to the "+
+			"diagnostics address logged above, then set metricsOnTransportPort: false to verify",
+			"transport_port", r.Config.Port)
+	}
+
+	// Release the listener on every exit from Run, not just the happy path.
+	// Cleanup runs only via stopMCPServer, which several paths skip: the early
+	// error returns below, and the graceful container-exit branch that returns
+	// nil after the transport already stopped. Leaking here would strand a
+	// goroutine and a bound port, and under workloads.Manager's restart loop each
+	// attempt would strand another and push the next onto a different port —
+	// silently breaking the scrape target this change exists to stabilise.
+	//
+	// A duplicate stop is harmless: stopDiagnosticsServer is nil-safe and
+	// idempotent, so the paths that do reach Cleanup are unaffected.
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), diagnosticsStopTimeout)
+		defer cancel()
+		if err := r.stopDiagnosticsServer(stopCtx); err != nil {
+			slog.Warn("failed to stop diagnostics server", "error", err)
+		}
+	}()
 
 	// Set up the transport
 	slog.Debug("setting up transport", "transport", r.Config.Transport)
@@ -872,12 +932,19 @@ func (r *Runner) persistRefreshToken(
 		return fmt.Errorf("failed to store refresh token: %w", err)
 	}
 
-	r.Config.RemoteAuthConfig.CachedRefreshTokenRef = secretName
-	r.Config.RemoteAuthConfig.CachedTokenExpiry = expiry
+	updatedConfig := *r.Config
+	updatedRemoteAuthConfig := *r.Config.RemoteAuthConfig
+	updatedConfig.RemoteAuthConfig = &updatedRemoteAuthConfig
+	updatedRemoteAuthConfig.CachedRefreshTokenRef = secretName
+	updatedRemoteAuthConfig.CachedTokenExpiry = expiry
 
-	if err := r.Config.SaveState(ctx); err != nil {
+	if err := updatedConfig.SaveState(ctx); err != nil {
 		return fmt.Errorf("failed to save config with token reference: %w", err)
 	}
+
+	// Preserve pointer identity so the auth handler and runner observe the same
+	// complete config only after the durable write succeeds.
+	*r.Config.RemoteAuthConfig = updatedRemoteAuthConfig
 
 	slog.Debug("Stored OAuth refresh token in secret manager", "secret_name", secretName)
 	return nil
@@ -982,6 +1049,15 @@ func (r *Runner) Cleanup(ctx context.Context) error {
 			if lastErr == nil {
 				lastErr = err
 			}
+		}
+	}
+
+	// Stop the diagnostics listener before the telemetry provider it scrapes
+	// from is shut down.
+	if err := r.stopDiagnosticsServer(ctx); err != nil {
+		slog.Warn("Failed to stop diagnostics server", "error", err)
+		if lastErr == nil {
+			lastErr = err
 		}
 	}
 
