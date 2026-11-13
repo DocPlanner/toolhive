@@ -16,8 +16,6 @@ import (
 	"strings"
 
 	"golang.org/x/exp/jsonrpc2"
-
-	"github.com/stacklok/toolhive/pkg/transport/ssecommon"
 )
 
 // contextKey is a type for context keys to avoid collisions.
@@ -72,7 +70,7 @@ type ParsedMCPRequest struct {
 // middleware (authorization, audit, etc.).
 //
 // The middleware:
-// 1. Checks if the request should be parsed (POST with JSON content to MCP endpoints)
+// 1. Checks if the request should be parsed (POST with JSON content, on any path)
 // 2. Reads and parses the JSON-RPC message
 // 3. Extracts method, parameters, and resource information
 // 4. Stores the parsed data in request context
@@ -154,10 +152,10 @@ func ParsingMiddleware(next http.Handler) http.Handler {
 // the caller is responsible for terminating the request (e.g. writing an
 // error response) instead of proceeding with a stale or absent parse.
 //
-// This only refreshes consumers that read the parse from the request context or
-// from a ParsedRequestHolder. Middleware that inspects the raw body from OUTSIDE
-// ParsingMiddleware — the tool-call filter and the rate limiter — has already
-// decided against the pre-rewrite body and is not corrected by republishing.
+// This refreshes downstream context consumers and outer wrappers that inspect
+// ParsedRequestHolder after the inner chain returns. It cannot change decisions
+// already made before the rewrite: tool-call filtering and rate limiting still
+// evaluate the request as received.
 //
 // The caller must also refresh r.ContentLength when it replaces r.Body, or the
 // reverse proxy will reject the forwarded request.
@@ -268,32 +266,24 @@ func GetParsedMCPRequest(ctx context.Context) *ParsedMCPRequest {
 }
 
 // shouldParseMCPRequest determines if the request should be parsed as an MCP request.
+//
+// Deliberately path-agnostic. There is no fixed MCP endpoint path: the
+// streamable transport's path is server-chosen, and in 2024-11-05 HTTP+SSE the
+// server names its own message endpoint in the `endpoint` event, which
+// ToolHive's proxies forward as given. So any JSON POST on any path may carry an
+// MCP message. A path test here is a parsing gap that becomes an authorization
+// gap downstream, because pkg/authz decides what to authorize from what this
+// function chose to parse — see GHSA-h4mf-84xq-q2fc.
 func shouldParseMCPRequest(r *http.Request) bool {
-	// Only parse POST requests with JSON content type
-	if r.Method != http.MethodPost {
-		return false
-	}
-
-	if !RequestHasJSONContentType(r) {
-		return false
-	}
-
-	// Skip SSE endpoint establishment requests
-	if strings.HasSuffix(r.URL.Path, ssecommon.HTTPSSEEndpoint) {
-		return false
-	}
-
-	// Parse all other JSON POST requests
-	// The MCP spec allows for various endpoints:
-	// - Streamable HTTP transport: single endpoint
-	// - SSE transport: two distinct endpoints (one for SSE stream, one for messages)
-	return true
+	// Only parse POST requests with JSON content type.
+	return r.Method == http.MethodPost && RequestHasJSONContentType(r)
 }
 
 // parseMCPRequest parses the JSON-RPC message and extracts MCP-specific information.
 // Client responses are also captured so downstream middleware can distinguish them
 // from malformed requests and let the streamable HTTP handler process them.
 func parseMCPRequest(bodyBytes []byte) *ParsedMCPRequest {
+	bodyBytes = bytes.TrimPrefix(bodyBytes, UTF8BOM)
 	if len(bodyBytes) == 0 {
 		return nil
 	}

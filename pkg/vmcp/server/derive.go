@@ -76,7 +76,6 @@ func deriveServerConfig(
 		Port:                    cfg.Port, // 0 means "OS-assigned".
 		EndpointPath:            cfg.EndpointPath,
 		SessionTTL:              cfg.SessionTTL,
-		WriteTimeout:            cfg.WriteTimeout,
 		HeartbeatInterval:       cfg.HeartbeatInterval,
 		AuthMiddleware:          cfg.AuthMiddleware,
 		AuthInfoHandler:         cfg.AuthInfoHandler,

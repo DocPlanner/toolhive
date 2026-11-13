@@ -81,7 +81,8 @@ spec:
                       configMapRef:
                         description: |-
                           ConfigMapRef references a ConfigMap containing the CA certificate bundle.
-                          If Key is not specified, it defaults to "ca.crt".
+                          The ConfigMap key is required by the API. If omitted in a stored object, it
+                          defaults to "ca.crt" for backwards compatibility.
                         properties:
                           key:
                             description: The key to select.
@@ -104,6 +105,10 @@ spec:
                         type: object
                         x-kubernetes-map-type: atomic
                     type: object
+                    x-kubernetes-validations:
+                    - message: configMapRef.name is required and must be non-empty
+                      rule: has(self.configMapRef) && size(self.configMapRef.name)
+                        > 0
                   clientId:
                     description: ClientID is the OIDC client ID
                     type: string
@@ -353,7 +358,8 @@ spec:
                       configMapRef:
                         description: |-
                           ConfigMapRef references a ConfigMap containing the CA certificate bundle.
-                          If Key is not specified, it defaults to "ca.crt".
+                          The ConfigMap key is required by the API. If omitted in a stored object, it
+                          defaults to "ca.crt" for backwards compatibility.
                         properties:
                           key:
                             description: The key to select.
@@ -376,6 +382,10 @@ spec:
                         type: object
                         x-kubernetes-map-type: atomic
                     type: object
+                    x-kubernetes-validations:
+                    - message: configMapRef.name is required and must be non-empty
+                      rule: has(self.configMapRef) && size(self.configMapRef.name)
+                        > 0
                   clientId:
                     description: ClientID is the OIDC client ID
                     type: string

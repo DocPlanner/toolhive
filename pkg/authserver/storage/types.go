@@ -16,15 +16,17 @@
 // OAuth authorization server.
 package storage
 
-//go:generate mockgen -destination=mocks/mock_storage.go -package=mocks -source=types.go Storage,PendingAuthorizationStorage,ClientRegistry,UpstreamTokenStorage,UpstreamTokenRefresher,UserStorage,DCRCredentialStore
+//go:generate mockgen -destination=mocks/mock_storage.go -package=mocks -source=types.go Storage,PendingAuthorizationStorage,AssertionJWTConsumer,ClientRegistry,UpstreamTokenStorage,UpstreamTokenRefresher,UserStorage,DCRCredentialStore
 
 import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/ory/fosite"
@@ -47,6 +49,22 @@ var (
 	// ErrInvalidBinding is returned when token binding validation fails
 	// (e.g., subject or client ID mismatch).
 	ErrInvalidBinding = errors.New("storage: token binding validation failed")
+
+	// ErrClientCapacity is returned when the client map is full and no
+	// DCR-issued client has aged enough to be safely evicted.
+	ErrClientCapacity = errors.New("storage: client capacity reached")
+
+	// ErrReservedClientID is returned when a caller attempts to register a
+	// real client whose ID collides with SyntheticClientIDPrefix.
+	ErrReservedClientID = errors.New("storage: client id uses reserved synthetic prefix")
+
+	// ErrUserNotProvisioned is returned by a UserStorage.CreateUser implementation
+	// that deliberately refuses to auto-provision an upstream identity (e.g. a
+	// deployment where user accounts are only created out-of-band, such as via
+	// SCIM). It signals the authorization callback to deny the login with
+	// fosite.ErrAccessDenied instead of treating the refusal as an internal
+	// server error.
+	ErrUserNotProvisioned = errors.New("storage: user not provisioned")
 )
 
 // DefaultPendingAuthorizationTTL is the default TTL for pending authorization requests.
@@ -271,7 +289,7 @@ func validateDCRCredentialsForStore(creds *DCRCredentials) error {
 //
 // Callers receive a defensive copy from the store. Mutations on the returned
 // value do not affect persisted state, and mutations on a value passed to
-// StoreDCRCredentials are not observed by subsequent reads. This matches the
+// StoreDCRCredentialsIfAbsent are not observed by subsequent reads. This matches the
 // UpstreamTokens contract.
 //
 // # Lifetime
@@ -366,8 +384,8 @@ type DCRCredentials struct {
 //
 // # Why the key is embedded in DCRCredentials
 //
-// StoreDCRCredentials takes a single (ctx, creds) argument rather than the
-// (ctx, key, value) shape used by sibling Store* methods on Storage. The
+// StoreDCRCredentialsIfAbsent takes a single (ctx, creds) argument rather
+// than the (ctx, key, value) shape used by sibling Store* methods on Storage. The
 // DCRKey is embedded as DCRCredentials.Key so the persisted blob is
 // self-describing: a Redis SCAN, an admin-tool dump, or a cross-replica
 // reconciliation path can identify a record's logical cache slot
@@ -382,10 +400,16 @@ type DCRCredentialStore interface {
 	// The returned value is a defensive copy.
 	GetDCRCredentials(ctx context.Context, key DCRKey) (*DCRCredentials, error)
 
-	// StoreDCRCredentials persists the credentials, overwriting any existing
-	// entry for the same Key. See the interface-level "TTL handling" section
-	// for the contract on ClientSecretExpiresAt.
-	StoreDCRCredentials(ctx context.Context, creds *DCRCredentials) error
+	// StoreDCRCredentialsIfAbsent claims creds.Key for creds. Returns the
+	// authoritative durable value: the caller's own creds on a successful
+	// claim, the concurrent winner's value otherwise. Callers MUST use the
+	// returned value, not their input creds — RFC 7591 dynamic registration
+	// mints a unique client_id/client_secret on every call, so a caller that
+	// lost the race and kept using its own creds would hold credentials the
+	// durable store does not agree it owns. See the interface-level "TTL
+	// handling" section for the contract on ClientSecretExpiresAt. The
+	// returned *DCRCredentials is always non-nil when err is nil.
+	StoreDCRCredentialsIfAbsent(ctx context.Context, creds *DCRCredentials) (*DCRCredentials, error)
 }
 
 // User represents a user account in the authorization server.
@@ -521,26 +545,210 @@ type PendingAuthorizationStorage interface {
 	DeletePendingAuthorization(ctx context.Context, state string) error
 }
 
+// AssertionJWTConsumer atomically records a validated assertion JWT as consumed.
+//
+// Implementations must treat (purpose, issuer, jti) as the replay key, retain it
+// until exp, and return fosite.ErrJTIKnown when that key is already unexpired.
+// Purpose keeps distinct assertion profiles separate, while issuer binds a JTI to
+// its JWT issuer. This intentionally stays separate from Storage so only
+// assertion-grant composition needs replay-consumption access.
+type AssertionJWTConsumer interface {
+	ConsumeAssertionJWT(ctx context.Context, purpose, issuer, jti string, exp time.Time) error
+}
+
+// SyntheticClientIDPrefix marks a client ID minted by NewSyntheticClient. A
+// grant that skips client authentication (fosite's CanSkipClientAuth) has no
+// real registered fosite.Client to attach to its request, but every storage
+// backend's marshal/unmarshal path calls request.GetClient() unconditionally
+// — so the request still needs a non-nil one. A synthetic client ID encodes
+// everything needed to reconstruct that client, so unmarshaling never has to
+// look it up in the client registry (it was never registered there).
+const SyntheticClientIDPrefix = "synthetic:"
+
+// NewSyntheticClient returns a public fosite.Client identified only by id,
+// for a clientless grant to attach to its fosite.AccessRequester so no
+// storage backend ever has to marshal a nil client. id should carry the
+// SyntheticClientIDPrefix so IsSyntheticClientID recognizes it again on
+// unmarshal.
+func NewSyntheticClient(id string) fosite.Client {
+	return &fosite.DefaultClient{ID: id, Public: true}
+}
+
+// IsSyntheticClientID reports whether id was minted by NewSyntheticClient,
+// letting a storage backend reconstruct the client locally on unmarshal
+// instead of looking it up in the client registry.
+func IsSyntheticClientID(id string) bool {
+	return strings.HasPrefix(id, SyntheticClientIDPrefix)
+}
+
+// ValidateRegisterableClientID rejects a real client registration whose ID
+// collides with the SyntheticClientIDPrefix namespace. Synthetic clients are
+// minted directly by NewSyntheticClient and never go through RegisterClient,
+// so any caller reaching this check — DCR, static delegate-client config, or
+// a future registration path — is registering a real, externally-visible
+// client. Every ClientRegistry.RegisterClient implementation must call this
+// before persisting: without it, a colliding ID would round-trip through
+// Redis as a bare unregistered synthetic client (see IsSyntheticClientID),
+// silently discarding its real secret, scopes, and grants.
+func ValidateRegisterableClientID(id string) error {
+	if IsSyntheticClientID(id) {
+		return fmt.Errorf("%w: %q", ErrReservedClientID, id)
+	}
+	return nil
+}
+
+// sameStringSet reports whether a and b contain the same elements as sets:
+// order and duplicate count don't matter, only membership. Canonicalisation
+// (sort, then dedup) mirrors ScopesHash's approach so the two stay consistent.
+func sameStringSet(a, b []string) bool {
+	as := slices.Clone(a)
+	bs := slices.Clone(b)
+	sort.Strings(as)
+	sort.Strings(bs)
+	as = slices.Compact(as)
+	bs = slices.Compact(bs)
+	return slices.Equal(as, bs)
+}
+
+// clientFingerprint is the identity of a configured client registration: the
+// fields that decide whether two records at the same client ID are the same
+// logical client (idempotent restart) or two different colliding ones (a loud
+// failure). Client secrets are deliberately excluded -- an operator rotating a
+// secret must still be able to reconcile. TokenEndpointAuthMethod is excluded
+// for the same reason -- both memory.go and redis.go fully overwrite the
+// stored record on a fingerprint match rather than merging, so a match never
+// "keeps stale data": reconfiguring either field is always applied on the
+// next reconcile regardless of whether the fingerprint matched.
+//
+// Deliberately NOT fosite.Client: fosite.DefaultClient's GetGrantTypes/
+// GetResponseTypes substitute an interactive default when the underlying list
+// is empty, so a deliberately-empty SPIFFE placeholder compared through that
+// interface can mismatch itself. Each backend converts its own representation
+// into this type; the comparison exists once, so memory- and Redis-backed
+// deployments cannot disagree about what "same client" means.
+type clientFingerprint struct {
+	scopes        []string
+	audience      []string
+	grantTypes    []string
+	responseTypes []string
+	// resources is the RFC 8707 resource allowlist, distinct from audience
+	// (see resourceScopedClient in spiffe_decorator.go). Two clients sharing
+	// every other field but differing in their resource allowlist are
+	// different logical clients -- this is the field #6473's review found
+	// missing from the SPIFFE static-client placeholder's durable identity.
+	resources           []string
+	identityFingerprint string
+	public              bool
+}
+
+// equal reports whether f and o represent the same logical client
+// configuration: equal scope set, audience set, grant-type set,
+// response-type set, resource set, and public/confidential class.
+func (f clientFingerprint) equal(o clientFingerprint) bool {
+	return sameStringSet(f.scopes, o.scopes) &&
+		sameStringSet(f.audience, o.audience) &&
+		sameStringSet(f.grantTypes, o.grantTypes) &&
+		sameStringSet(f.responseTypes, o.responseTypes) &&
+		sameStringSet(f.resources, o.resources) &&
+		f.identityFingerprint == o.identityFingerprint &&
+		f.public == o.public
+}
+
+// fingerprintOfClient reads a live fosite.Client. Safe here because a
+// deliberately-empty client is the live inertPlaceholderClient, whose
+// overridden getters correctly return nil on both sides of the comparison.
+// resources is read through resourceScopedClient (nil when a client type
+// doesn't implement it), the same narrow interface staticClientPlaceholder
+// and buildStoredClient use.
+func fingerprintOfClient(c fosite.Client) clientFingerprint {
+	var resources []string
+	var identityFingerprint string
+	if rc, ok := c.(resourceScopedClient); ok {
+		resources = rc.Resources()
+	}
+	if identity, ok := c.(spiffeIdentityClient); ok {
+		identityFingerprint = identity.IdentityFingerprint()
+	}
+	return clientFingerprint{
+		scopes:              c.GetScopes(),
+		audience:            c.GetAudience(),
+		grantTypes:          c.GetGrantTypes(),
+		responseTypes:       c.GetResponseTypes(),
+		resources:           resources,
+		identityFingerprint: identityFingerprint,
+		public:              c.IsPublic(),
+	}
+}
+
 // ClientRegistry provides client registration and lookup operations.
 // It embeds fosite.ClientManager for client lookup (GetClient) and adds
-// RegisterClient for dynamic client registration (RFC 7591).
+// RegisterClient for dynamic client registration (RFC 7591) and
+// ReconcileConfiguredClient for operator-declared clients.
 type ClientRegistry interface {
 	// ClientManager provides client lookup (GetClient)
 	fosite.ClientManager
 
-	// RegisterClient registers a new OAuth client.
-	// This supports both static configuration and dynamic client registration (RFC 7591).
-	// Returns ErrAlreadyExists if a client with the same ID already exists.
+	// RegisterClient registers a new OAuth client. Always create-only: it
+	// returns ErrAlreadyExists if a client with the same ID already exists,
+	// regardless of the new client's origin. Used by unauthenticated DCR
+	// (RFC 7591) and any other caller that must never silently overwrite an
+	// existing registration.
 	RegisterClient(ctx context.Context, client fosite.Client) error
 
-	// RenewClientTTL extends the registration TTL of a public (DCR) client so an
-	// actively-used client is not evicted mid-lifecycle and forced to re-register.
-	// Call it on a proven-use signal (e.g. a successful token exchange), NOT on an
-	// unauthenticated client read such as the /oauth/authorize lookup. Implementations
-	// renew only public clients; confidential clients have no TTL. Backends without a
-	// native TTL (the in-memory backend) treat this as a no-op. A renewal failure is
-	// non-fatal to the caller's primary operation.
+	// UpsertDCRIssuedClient creates or replaces a DCR-issued client at
+	// client.GetID(). Unlike RegisterClient (create-only, for the unauthenticated
+	// /oauth/register endpoint), this is for callers that independently
+	// re-validate the client's authoritative source on every call -- today only
+	// CIMDStorageDecorator, which re-fetches and re-validates the document at
+	// client.GetID() before calling this. Creates the row if absent. If a row
+	// exists, replaces its data and refreshes its TTL only when the existing row
+	// is itself DCR-issued; refuses with ErrAlreadyExists if the existing row is
+	// NOT DCR-issued (protects a configured/SPIFFE-reconciled client from being
+	// clobbered). client MUST carry registration.DCRIssued -- refuses otherwise
+	// (mirrors ReconcileConfiguredClient's inverse check).
+	UpsertDCRIssuedClient(ctx context.Context, client fosite.Client) error
+
+	// ReconcileConfiguredClient applies an operator-declared (configured)
+	// client: creates it if no client with that ID exists, or idempotently
+	// replaces an existing record with the same ID when that record is itself
+	// operator-declared AND has a matching fingerprint (scopes, audience,
+	// grant types, response types, public/confidential class) — the
+	// restart-with-unchanged-config case. It refuses with ErrAlreadyExists if
+	// the existing record is DCR-issued (registration.DCRIssued), or if it is
+	// a *different* configured client at that ID (fingerprint mismatch — a
+	// misconfiguration, e.g. two colliding associations). The passed client
+	// must not itself carry the registration.DCRIssued marker;
+	// ReconcileConfiguredClient returns an error if it does.
+	ReconcileConfiguredClient(ctx context.Context, client fosite.Client) error
+
+	// RenewClientTTL extends the registration TTL of a DCR-issued client (public or
+	// confidential, gated on the registration.DCRIssued marker) so an actively-used
+	// client is not evicted mid-lifecycle and forced to re-register. Call it on a
+	// proven-use signal (e.g. a successful token exchange), NOT on an unauthenticated
+	// client read such as the /oauth/authorize lookup. Pre-provisioned/static clients
+	// carry no marker and this is a no-op for them on both backends. On the Redis
+	// backend this refreshes the key's sliding TTL; on the in-memory backend, which
+	// has no native TTL, this instead repositions the client to the back of the
+	// eviction order so it is not the next one dropped when WithMaxClients is reached.
+	// A renewal failure is non-fatal to the caller's primary operation.
 	RenewClientTTL(ctx context.Context, client fosite.Client) error
+}
+
+// UpstreamTokenRowID is an opaque, process-local coordination key for one
+// logical upstream token row. Callers must not persist, log, or expose it.
+type UpstreamTokenRowID string
+
+// upstreamTokenRowID returns a SHA-256 digest of the supplied row-key components.
+// Each component is length-prefixed so the encoding is self-delimiting: distinct
+// inputs cannot share a canonical representation when a component contains the
+// delimiter. Hashing keeps the session ID out of a value that is easy to log.
+func upstreamTokenRowID(components ...string) UpstreamTokenRowID {
+	h := sha256.New()
+	for _, component := range components {
+		// hash.Hash.Write never returns an error.
+		_, _ = fmt.Fprintf(h, "%d:%s", len(component), component)
+	}
+	return UpstreamTokenRowID(hex.EncodeToString(h.Sum(nil)))
 }
 
 // UpstreamTokenStorage provides storage for tokens obtained from upstream identity providers.
@@ -553,6 +761,23 @@ type ClientRegistry interface {
 // A secondary lookup by (userID, providerID) is exposed via GetLatestUpstreamTokensForUser;
 // see that method for usage and security contract.
 type UpstreamTokenStorage interface {
+	// ResolveUpstreamTokenRowID returns an opaque non-empty identity for the
+	// (sessionID, providerName) row. Equal physical rows must resolve to equal
+	// IDs; implementations must NOT alias rows that are not physically the
+	// same row (e.g. two distinct sessionIDs), because the singleflight leader
+	// reads and writes under its own sessionID, and aliasing distinct rows
+	// would cross credentials between sessions. A backend whose storage key is
+	// derived from (sessionID, providerName) may legitimately map two
+	// different (sessionID, providerName) pairs to the same ID when they are
+	// the same physical row under that key scheme.
+	//
+	// Resolution must be local and side-effect-free (no I/O): it is called
+	// before the singleflight joins, so any I/O here gives every concurrent
+	// caller its own round-trip and partially defeats the deduplication. This
+	// ID is solely for process-local refresh coordination: callers must not
+	// persist, log, or expose it.
+	ResolveUpstreamTokenRowID(ctx context.Context, sessionID, providerName string) (UpstreamTokenRowID, error)
+
 	// StoreUpstreamTokens stores the upstream IDP tokens for a session and provider.
 	// The providerName identifies which upstream provider these tokens belong to.
 	StoreUpstreamTokens(ctx context.Context, sessionID, providerName string, tokens *UpstreamTokens) error
@@ -649,6 +874,10 @@ type UpstreamTokenRefresher interface {
 type UserStorage interface {
 	// CreateUser creates a new user account.
 	// Returns ErrAlreadyExists if a user with the same ID already exists.
+	// A deployment that provisions users out-of-band (e.g. via SCIM) and never
+	// auto-creates them here may return ErrUserNotProvisioned to deny the login
+	// instead; the caller (the authorization callback) maps that specifically to
+	// an OAuth access_denied response rather than a server error.
 	CreateUser(ctx context.Context, user *User) error
 
 	// GetUser retrieves a user by their internal ID.
@@ -713,7 +942,7 @@ type Storage interface {
 	// and user management for multi-IDP support.
 	//
 	// DCRCredentialStore is intentionally NOT embedded here: doing so would
-	// promote GetDCRCredentials / StoreDCRCredentials onto every consumer of
+	// promote GetDCRCredentials / StoreDCRCredentialsIfAbsent onto every consumer of
 	// storage.Storage (handlers, server, registration, etc.), broadening the
 	// surface that can read raw client_secret / registration_access_token even
 	// when those consumers have no DCR responsibility. Code that legitimately

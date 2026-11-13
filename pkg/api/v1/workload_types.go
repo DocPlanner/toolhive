@@ -42,10 +42,13 @@ type workloadStatusResponse struct {
 type updateRequest struct {
 	// Docker image to use
 	Image string `json:"image"`
-	// RuntimeConfig is only accepted on create/update when image is a protocol
-	// URI such as go://, npx://, or uvx://.
-	// GET responses may include runtime_config for existing workloads, but
-	// clients should not send it back with a built/non-protocol image.
+	// RuntimeConfig is accepted on create/update when image is a protocol
+	// URI such as go://, npx://, or uvx://. GET responses may include
+	// runtime_config for existing workloads; on update it may be sent back
+	// unchanged even with a built/non-protocol image, as long as it exactly
+	// matches the persisted config and the image and URL are unchanged - it
+	// is then preserved rather than applied to a rebuild. Any other
+	// runtime_config on a non-protocol image is rejected.
 	RuntimeConfig *templates.RuntimeConfig `json:"runtime_config,omitempty"`
 	// Host to bind to
 	Host string `json:"host"`
@@ -55,6 +58,8 @@ type updateRequest struct {
 	TargetPort int `json:"target_port"`
 	// Port for the HTTP proxy to listen on
 	ProxyPort int `json:"proxy_port"`
+	// Maximum inbound MCP proxy request body size in bytes. Zero uses the default limit of 8 MiB.
+	MaxRequestBodySize int64 `json:"max_request_body_size,omitempty"`
 	// Environment variables to set in the container
 	EnvVars map[string]string `json:"env_vars"`
 	// Secret parameters to inject
@@ -291,7 +296,6 @@ func runConfigToCreateRequest(runConfig *runner.RunConfig) *createRequest {
 			JwksURL:          runConfig.OIDCConfig.JWKSURL,
 			IntrospectionURL: runConfig.OIDCConfig.IntrospectionURL,
 			ClientID:         runConfig.OIDCConfig.ClientID,
-			ClientSecret:     runConfig.OIDCConfig.ClientSecret,
 			Scopes:           runConfig.OIDCConfig.Scopes,
 		}
 	}
@@ -368,6 +372,7 @@ func runConfigToCreateRequest(runConfig *runner.RunConfig) *createRequest {
 			CmdArguments:       runConfig.CmdArgs,
 			TargetPort:         runConfig.TargetPort,
 			ProxyPort:          runConfig.Port,
+			MaxRequestBodySize: runConfig.MaxRequestBodySize,
 			EnvVars:            runConfig.EnvVars,
 			Secrets:            secretParams,
 			Volumes:            runConfig.Volumes,
@@ -392,14 +397,11 @@ func runConfigToCreateRequest(runConfig *runner.RunConfig) *createRequest {
 }
 
 func runtimeConfigForResponse(runConfig *runner.RunConfig) *templates.RuntimeConfig {
-	if runConfig == nil || runConfig.RuntimeConfig == nil {
+	if runConfig == nil {
 		return nil
 	}
-
-	return &templates.RuntimeConfig{
-		BuilderImage:       runConfig.RuntimeConfig.BuilderImage,
-		AdditionalPackages: append([]string{}, runConfig.RuntimeConfig.AdditionalPackages...),
-	}
+	// Clone's nil-receiver handling covers a nil runConfig.RuntimeConfig too.
+	return runConfig.RuntimeConfig.Clone()
 }
 
 // validateHeaderForwardConfig validates the header forward configuration.

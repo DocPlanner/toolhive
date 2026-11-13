@@ -133,6 +133,7 @@ thv run [flags] SERVER_OR_IMAGE_OR_PROTOCOL [-- ARGS...]
       --jwks-allow-private-ip                       Allow JWKS/OIDC endpoints on private IP addresses (use with caution) (default false)
       --jwks-auth-token-file string                 Path to file containing bearer token for authenticating JWKS/OIDC requests
   -l, --label stringArray                           Set labels on the container (format: key=value)
+      --max-request-body-size int                   Maximum inbound request body size in bytes; zero uses the default (8 MiB)
       --name string                                 Name of the MCP server (default to auto-generated from image)
       --network string                              Connect the container to a network (e.g., 'host' for host networking). Note: 'host' and 'none' cannot enforce network isolation, so isolation is dropped for those modes.
       --oidc-audience string                        Expected audience for the token
@@ -144,12 +145,13 @@ thv run [flags] SERVER_OR_IMAGE_OR_PROTOCOL [-- ARGS...]
       --oidc-jwks-url string                        URL to fetch the JWKS from
       --oidc-scopes strings                         OAuth scopes to advertise in the well-known endpoint (RFC 9728, defaults to 'openid' if not specified)
       --otel-custom-attributes string               Custom resource attributes for OpenTelemetry in key=value format (e.g., server_type=prod,region=us-east-1,team=platform)
-      --otel-enable-prometheus-metrics-path         Enable Prometheus-style /metrics endpoint on the main transport port (default false)
+      --otel-enable-prometheus-metrics-path         Enable Prometheus-style /metrics endpoint on a dedicated diagnostics port (default false)
       --otel-endpoint string                        OpenTelemetry OTLP endpoint URL (e.g., https://api.honeycomb.io)
       --otel-env-vars stringArray                   Environment variable names to include in OpenTelemetry spans (comma-separated: ENV1,ENV2)
       --otel-headers stringArray                    OpenTelemetry OTLP headers in key=value format (e.g., x-honeycomb-team=your-api-key)
       --otel-insecure                               Connect to the OpenTelemetry endpoint using HTTP instead of HTTPS (default false)
       --otel-metrics-enabled                        Enable OTLP metrics export (when OTLP endpoint is configured) (default true)
+      --otel-metrics-on-transport-port              Also serve Prometheus /metrics on the transport port, alongside the diagnostics port. Deprecated: this is a migration aid and the default will become false; see https://github.com/stacklok/toolhive/issues/6384 for the timeline. Move scrapers to the diagnostics port and set this to false to verify. (default true)
       --otel-sampling-rate float                    OpenTelemetry trace sampling rate (0.0-1.0) (default 0.1)
       --otel-service-name string                    OpenTelemetry service name (defaults to thv-<workload-name>)
       --otel-tracing-enabled                        Enable distributed tracing (when OTLP endpoint is configured) (default true)

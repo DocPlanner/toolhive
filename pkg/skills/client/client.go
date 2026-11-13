@@ -22,6 +22,7 @@ import (
 	"github.com/stacklok/toolhive-core/httperr"
 	"github.com/stacklok/toolhive/pkg/server/discovery"
 	"github.com/stacklok/toolhive/pkg/skills"
+	"github.com/stacklok/toolhive/pkg/skills/identitytoken"
 )
 
 const (
@@ -212,13 +213,18 @@ func (c *Client) Install(ctx context.Context, opts skills.InstallOptions) (*skil
 		Force:         opts.Force,
 		Group:         opts.Group,
 		AllowUnsigned: opts.AllowUnsigned,
+		PublicKey:     opts.PublicKey,
 	}
 
 	var resp installResponse
 	if err := c.doJSONRequest(ctx, http.MethodPost, "", nil, body, &resp); err != nil {
 		return nil, err
 	}
-	return &skills.InstallResult{Skill: resp.Skill}, nil
+	return &skills.InstallResult{
+		Skill:      resp.Skill,
+		Provenance: resp.Provenance,
+		Unsigned:   resp.Unsigned,
+	}, nil
 }
 
 // Uninstall removes an installed skill.
@@ -280,8 +286,29 @@ func (c *Client) Build(ctx context.Context, opts skills.BuildOptions) (*skills.B
 
 // Push pushes a built skill artifact to a remote registry.
 func (c *Client) Push(ctx context.Context, opts skills.PushOptions) error {
-	body := pushRequest{Reference: opts.Reference}
-	return c.doJSONRequest(ctx, http.MethodPost, "/push", nil, body, nil)
+	// An identity token is a bearer credential redeemable at Fulcio for a
+	// signing certificate in the caller's name, so it must not cross a
+	// plaintext link to a remote API server. Checked before the body is
+	// marshaled: nothing should serialize the token until the destination has
+	// been cleared. The request is then issued through a client that refuses
+	// redirects, because clearing the base URL says nothing about where a
+	// 307/308 from that URL would replay the body.
+	client := c
+	if opts.IdentityToken != "" {
+		if err := identitytoken.CheckTransport(c.baseURL); err != nil {
+			return err
+		}
+		guarded := *c
+		guarded.httpClient = identitytoken.NoRedirectClient(c.httpClient)
+		client = &guarded
+	}
+	body := pushRequest{
+		Reference:     opts.Reference,
+		Key:           opts.Key,
+		IdentityToken: opts.IdentityToken,
+		NoSign:        opts.NoSign,
+	}
+	return client.doJSONRequest(ctx, http.MethodPost, "/push", nil, body, nil)
 }
 
 // ListBuilds returns all locally-built OCI skill artifacts in the local store.

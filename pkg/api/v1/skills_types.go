@@ -35,6 +35,11 @@ type installSkillRequest struct {
 	// verified signature; the exception is recorded in the project's lock
 	// file.
 	AllowUnsigned bool `json:"allow_unsigned,omitempty"`
+	// PublicKey is the base64-encoded DER SPKI cosign public key the artifact
+	// must verify against, for artifacts signed with a cosign key pair rather
+	// than keylessly. Required the first time such an artifact is installed
+	// project-scoped, and pinned in the lock file from then on.
+	PublicKey string `json:"public_key,omitempty"`
 	// Group is the group name to add the skill to after installation
 	Group string `json:"group,omitempty"`
 }
@@ -45,6 +50,12 @@ type installSkillRequest struct {
 type installSkillResponse struct {
 	// The installed skill
 	Skill skills.InstalledSkill `json:"skill"`
+	// The signer identity trust-on-first-use pinned for this install, when
+	// the artifact was verified. Omitted for unsigned or non-lock-managed
+	// installs.
+	Provenance *skills.ProvenanceInfo `json:"provenance,omitempty"`
+	// Whether the install was recorded as an explicit unsigned exception.
+	Unsigned bool `json:"unsigned,omitempty"`
 }
 
 // validateSkillRequest represents the request to validate a skill.
@@ -71,6 +82,14 @@ type buildSkillRequest struct {
 type pushSkillRequest struct {
 	// OCI reference to push
 	Reference string `json:"reference"`
+	// Key is the path to a cosign private key used to sign the pushed
+	// artifact
+	Key string `json:"key,omitempty"`
+	// IdentityToken is a short-lived OIDC identity token used for keyless
+	// signing, mutually exclusive with Key
+	IdentityToken string `json:"identity_token,omitempty"`
+	// NoSign pushes without signing
+	NoSign bool `json:"no_sign,omitempty"`
 }
 
 // syncSkillsRequest represents the request to sync a project's skills.

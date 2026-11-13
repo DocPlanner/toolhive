@@ -6,15 +6,19 @@ package llm
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/stacklok/toolhive/pkg/llmgateway"
+	"github.com/stacklok/toolhive/pkg/networking"
 	pkgsecrets "github.com/stacklok/toolhive/pkg/secrets"
 )
 
@@ -34,6 +38,9 @@ type GatewayManager interface {
 	// IsManaged reports whether a managed-preferences profile overrides the
 	// client's local config (so the config setup writes would be ignored).
 	IsManaged(clientType string) bool
+	// LLMClientDetectionHint explains why clientType was not detected, or "".
+	// Used when --client names a CLI tool whose settings dir is leftover after uninstall.
+	LLMClientDetectionHint(clientType string) string
 	// ConfigureEnvFile writes .env file entries for the client and returns the
 	// env file path. Returns ("", nil) when the client has no env-file entries.
 	ConfigureEnvFile(clientType string, cfg llmgateway.ApplyConfig) (string, error)
@@ -74,17 +81,9 @@ func Setup(
 	inlineOpts SetOptions, anthropicPathPrefix string, anthropicPathPrefixSet bool, targetClient string,
 	lazy bool,
 ) error {
-	llmCfg := provider.GetLLMConfig()
-
-	// Apply inline flags in-memory so login and tool detection use the merged
-	// config without touching disk. Persistence happens below, only after login
-	// and tool patching succeed, so a failed login leaves no persisted state.
-	if err := llmCfg.SetFields(inlineOpts); err != nil {
-		return fmt.Errorf("invalid inline flag values: %w", err)
-	}
-
-	if !llmCfg.IsConfigured() {
-		return fmt.Errorf("LLM gateway is not configured — run \"thv llm config set\" first")
+	llmCfg, err := prepareSetupConfig(provider, inlineOpts)
+	if err != nil {
+		return err
 	}
 
 	proxyBaseURL := fmt.Sprintf("http://localhost:%d/v1", llmCfg.EffectiveProxyPort())
@@ -93,25 +92,14 @@ func Setup(
 	// there is nothing to configure. In non-lazy mode login still runs before any
 	// files are patched, preserving the guarantee that a failed login leaves no
 	// state.
-	detected, err := filterDetectedClients(gm.DetectedLLMGatewayClients(), targetClient)
+	detected, done, err := setupClients(gm, targetClient, lazy, out, errOut)
 	if err != nil {
 		return err
 	}
-	if len(detected) == 0 {
-		_, _ = fmt.Fprintln(out, "No supported AI tools detected.")
+	if done {
 		return nil
 	}
 
-	// Only build the shell-string token helper if a detected tool actually
-	// consumes it — its shell-safety check on the thv executable path would
-	// otherwise fail setup for e.g. a Codex-only run, which never uses it.
-	var tokenHelperCommand string
-	if tokenHelperCommandNeeded(gm, detected) {
-		tokenHelperCommand, err = buildTokenHelperCommand()
-		if err != nil {
-			return err
-		}
-	}
 	tokenHelperPath, tokenHelperArgs, err := buildTokenHelperArgv()
 	if err != nil {
 		return err
@@ -128,9 +116,22 @@ func Setup(
 	} else {
 		_, _ = fmt.Fprintln(out, "Ensuring you are logged in to the LLM gateway…")
 		if err := login(ctx, &llmCfg); err != nil {
+			if portErr := setupCallbackPortError(err); portErr != nil {
+				return fmt.Errorf("OIDC login failed: %w", portErr)
+			}
 			return fmt.Errorf("OIDC login failed: %s", SanitizeTokenError(err))
 		}
 		_, _ = fmt.Fprintln(out, "Login successful.")
+	}
+
+	detected, discoveredModels, err := discoverVSCodeModelsForSetup(
+		ctx, errOut, detected, targetClient, llmCfg,
+	)
+	if err != nil {
+		return err
+	}
+	if len(detected) == 0 {
+		return nil
 	}
 
 	// Resolve the effective path prefix for ANTHROPIC_BASE_URL.
@@ -142,9 +143,9 @@ func Setup(
 	// tools ignore the Anthropic prefix entirely.
 	anthropicPrefix := resolveAnthropicPrefix(ctx, gm, detected, llmCfg, anthropicPathPrefix, anthropicPathPrefixSet)
 
-	configured, err := configureDetectedTools(
-		out, errOut, gm, detected, llmCfg.GatewayURL, proxyBaseURL, tokenHelperCommand,
-		tokenHelperPath, tokenHelperArgs, llmCfg.TLSSkipVerify, anthropicPrefix, llmCfg.Models, llmCfg.Bedrock,
+	configured, err := configureDetectedToolsWithDiscovery(
+		out, errOut, gm, detected, llmCfg.GatewayURL, proxyBaseURL,
+		tokenHelperPath, tokenHelperArgs, llmCfg.TLSSkipVerify, anthropicPrefix, llmCfg.Models, discoveredModels, llmCfg.Bedrock,
 	)
 	if err != nil {
 		return err
@@ -185,11 +186,47 @@ func Setup(
 	return nil
 }
 
+func prepareSetupConfig(provider ConfigUpdater, inlineOpts SetOptions) (Config, error) {
+	llmCfg := provider.GetLLMConfig()
+	// Apply inline flags in-memory so login and tool detection use the merged
+	// config without touching disk. Persistence happens only after login and
+	// tool patching succeed, so a failed login leaves no persisted state.
+	if err := llmCfg.SetFields(inlineOpts); err != nil {
+		if portErr := setupCallbackPortError(err); portErr != nil {
+			return Config{}, fmt.Errorf("invalid inline flag values: %w", portErr)
+		}
+		return Config{}, fmt.Errorf("invalid inline flag values: %w", err)
+	}
+	if !llmCfg.IsConfigured() {
+		return Config{}, fmt.Errorf("LLM gateway is not configured — run \"thv llm config set\" first")
+	}
+	return llmCfg, nil
+}
+
+func setupCallbackPortError(err error) error {
+	var portErr *networking.CallbackPortInUseError
+	if !errors.As(err, &portErr) {
+		return nil
+	}
+	return fmt.Errorf(
+		"requested callback port %d is already in use; "+
+			"stop the process using it or choose another provider-registered port with "+
+			`"thv llm setup --callback-port <port>"`,
+		portErr.Port,
+	)
+}
+
 // Teardown removes LLM gateway configuration from all (or one) configured tools.
 //
 // targetTool selects which tool to revert; pass an empty string to revert all
 // configured tools. An error is returned when targetTool is non-empty but not
 // found in the configured tool list.
+//
+// Reverting the last configured tool also resets the persisted LLM config to its
+// zero value, so settings that are deliberately sticky across "thv llm setup"
+// re-runs (e.g. Bedrock compat) are not silently re-applied by a later setup.
+// A targeted teardown that leaves other tools configured keeps the config, which
+// those tools still need to reach the gateway.
 //
 // If secretsProvider is non-nil and purgeTokens is true, cached OIDC tokens
 // are deleted after the config update succeeds.
@@ -239,15 +276,17 @@ func Teardown(
 	// Persist the updated tool list (and clear token metadata if purging) in a
 	// single write before mutating any tool config files. If this fails,
 	// nothing on disk has changed and the caller can retry.
+	lastTool := len(remaining) == 0
 	if err := provider.UpdateLLMConfig(func(c *Config) error {
-		c.ConfiguredTools = remaining
-		if purgeTokens {
-			c.OIDC.CachedRefreshTokenRef = ""
-			c.OIDC.CachedTokenExpiry = time.Time{}
-		}
+		applyTeardownToConfig(c, remaining, purgeTokens)
 		return nil
 	}); err != nil {
 		return fmt.Errorf("persisting tool configuration: %w", err)
+	}
+
+	if lastTool {
+		_, _ = fmt.Fprintln(out,
+			"Cleared the LLM gateway configuration: no tools are configured anymore.")
 	}
 
 	// Revert tool config files best-effort; warn on failure but do not undo
@@ -263,6 +302,40 @@ func Teardown(
 	}
 
 	return nil
+}
+
+// applyTeardownToConfig updates the persisted LLM config for a teardown that
+// leaves remaining configured. purgeTokens reports whether the caller also asked
+// to drop cached OIDC token state.
+//
+// When no tool remains, the config is reset wholesale rather than pruned field by
+// field. Settings such as Bedrock compat are deliberately sticky across "thv llm
+// setup" re-runs, so keeping them past the last teardown would let the next setup
+// silently re-apply settings the user just removed — possibly against a gateway
+// they have since repointed elsewhere. While any tool remains the config is left
+// intact, since those tools still need it to reach the gateway.
+//
+// Cached token state survives a reset unless purgeTokens is set: the secret lives
+// in the keyring, and dropping the only reference to it without deleting it would
+// strand it there once the user points at a different gateway (the fallback key is
+// derived from the gateway URL and issuer). Token lifetime stays the exclusive
+// business of --purge-tokens.
+func applyTeardownToConfig(c *Config, remaining []ToolConfig, purgeTokens bool) {
+	if len(remaining) > 0 {
+		c.ConfiguredTools = remaining
+		if purgeTokens {
+			c.OIDC.CachedRefreshTokenRef = ""
+			c.OIDC.CachedTokenExpiry = time.Time{}
+		}
+		return
+	}
+
+	tokenState := c.OIDC
+	*c = Config{}
+	if !purgeTokens {
+		c.OIDC.CachedRefreshTokenRef = tokenState.CachedRefreshTokenRef
+		c.OIDC.CachedTokenExpiry = tokenState.CachedTokenExpiry
+	}
 }
 
 // PurgeTokens deletes all cached OIDC tokens from the provided secrets
@@ -308,7 +381,7 @@ func mergeToolConfigs(existing, incoming []ToolConfig) []ToolConfig {
 //   - direct (Node.js tools like Claude Code, Gemini CLI): NODE_TLS_REJECT_UNAUTHORIZED=0
 //     is written to the tool's settings, disabling TLS for ALL of that tool's outbound
 //     connections — not just the LLM gateway.
-//   - proxy: only the proxy's upstream connection to the gateway has TLS verification
+//   - proxy-backed: only the proxy's upstream connection to the gateway has TLS verification
 //     disabled; the tool itself is unaffected.
 func warnTLSSkipVerify(errOut io.Writer, skip bool, configured []ToolConfig) {
 	if !skip {
@@ -322,7 +395,7 @@ func warnTLSSkipVerify(errOut io.Writer, skip bool, configured []ToolConfig) {
 					"settings, disabling TLS certificate verification for ALL of %s's outbound connections "+
 					"(LLM provider APIs, MCP registry, etc.), not just the LLM gateway. "+
 					"Use only in isolated local environments.\n", tc.Tool, tc.Tool)
-		case llmgateway.ModeProxy:
+		case llmgateway.ModeProxy, llmgateway.ModeVSCode:
 			if tc.Tool == "gemini-cli" {
 				_, _ = fmt.Fprintf(errOut,
 					"Note: --tls-skip-verify is not supported for Gemini CLI "+
@@ -345,7 +418,8 @@ func warnTLSSkipVerify(errOut io.Writer, skip bool, configured []ToolConfig) {
 // filterDetectedClients narrows the detected client list to a single entry when
 // targetClient is non-empty. It returns an error if the named client is not in
 // the detected list. When targetClient is empty the list is returned unchanged.
-func filterDetectedClients(detected []string, targetClient string) ([]string, error) {
+func filterDetectedClients(gm GatewayManager, targetClient string) ([]string, error) {
+	detected := gm.DetectedLLMGatewayClients()
 	if targetClient == "" {
 		return detected, nil
 	}
@@ -354,7 +428,156 @@ func filterDetectedClients(detected []string, targetClient string) ([]string, er
 			return []string{targetClient}, nil
 		}
 	}
+	if hint := gm.LLMClientDetectionHint(targetClient); hint != "" {
+		return nil, fmt.Errorf("client %q is not installed or not detected: %s", targetClient, hint)
+	}
 	return nil, fmt.Errorf("client %q is not installed or not detected", targetClient)
+}
+
+func setupClients(
+	gm GatewayManager, targetClient string, lazy bool, out, errOut io.Writer,
+) ([]string, bool, error) {
+	detected, err := filterDetectedClients(gm, targetClient)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(detected) == 0 {
+		_, _ = fmt.Fprintln(out, "No supported AI tools detected.")
+		return nil, true, nil
+	}
+	if !lazy {
+		return detected, false, nil
+	}
+	detected, err = filterLazyVSCodeClients(detected, targetClient, errOut)
+	if err != nil {
+		return nil, false, err
+	}
+	return detected, len(detected) == 0, nil
+}
+
+const (
+	vsCodeClient        = "vscode"
+	vsCodeInsiderClient = "vscode-insider"
+)
+
+func isVSCodeClient(clientType string) bool {
+	return clientType == vsCodeClient || clientType == vsCodeInsiderClient
+}
+
+func hasVSCodeClient(clients []string) bool {
+	for _, clientType := range clients {
+		if isVSCodeClient(clientType) {
+			return true
+		}
+	}
+	return false
+}
+
+func filterLazyVSCodeClients(clients []string, targetClient string, errOut io.Writer) ([]string, error) {
+	if targetClient != "" && isVSCodeClient(targetClient) {
+		return nil, fmt.Errorf(
+			"client %q does not support --lazy: VS Code requires non-lazy setup for authenticated model discovery; "+
+				"rerun without --lazy", targetClient)
+	}
+	filtered := make([]string, 0, len(clients))
+	for _, clientType := range clients {
+		if isVSCodeClient(clientType) {
+			_, _ = fmt.Fprintf(
+				errOut,
+				"Warning: skipping %s in lazy mode; VS Code requires non-lazy setup for authenticated model discovery.\n",
+				clientType,
+			)
+			continue
+		}
+		filtered = append(filtered, clientType)
+	}
+	return filtered, nil
+}
+
+func discoverVSCodeModelsForSetup(
+	ctx context.Context, errOut io.Writer, clients []string, targetClient string, cfg Config,
+) ([]string, []string, error) {
+	if !hasVSCodeClient(clients) {
+		return clients, nil, nil
+	}
+	models, err := discoverGatewayModels(ctx, cfg)
+	if err == nil {
+		return clients, models, nil
+	}
+	if isVSCodeClient(targetClient) {
+		return nil, nil, err
+	}
+
+	_, _ = fmt.Fprintf(
+		errOut,
+		"Warning: skipping auto-detected VS Code clients because gateway model discovery failed: %v\n",
+		err,
+	)
+	filtered := make([]string, 0, len(clients))
+	for _, clientType := range clients {
+		if !isVSCodeClient(clientType) {
+			filtered = append(filtered, clientType)
+		}
+	}
+	return filtered, nil, nil
+}
+
+type gatewayModelsResponse struct {
+	Object string `json:"object"`
+	Data   []struct {
+		ID string `json:"id"`
+	} `json:"data"`
+}
+
+func discoverGatewayModels(ctx context.Context, cfg Config) ([]string, error) {
+	if cfg.discoveryAccessToken == "" {
+		return nil, fmt.Errorf("discovering gateway models: authenticated setup did not provide an access token")
+	}
+	modelsURL, err := url.JoinPath(cfg.GatewayURL, "v1/models")
+	if err != nil {
+		return nil, fmt.Errorf("building gateway models URL: %w", err)
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, modelsURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating gateway model-discovery request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.discoveryAccessToken)
+	resp, err := gatewayHTTPClient(cfg.TLSSkipVerify).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("discovering gateway models: %w", err)
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil, fmt.Errorf("discovering gateway models: gateway returned %s", resp.Status)
+	}
+	var payload gatewayModelsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil, fmt.Errorf("decoding gateway model response: %w", err)
+	}
+	if payload.Object != "list" || len(payload.Data) == 0 {
+		return nil, fmt.Errorf("decoding gateway model response: expected a non-empty OpenAI model list")
+	}
+	seen := make(map[string]struct{}, len(payload.Data))
+	models := make([]string, 0, len(payload.Data))
+	for _, model := range payload.Data {
+		modelID := strings.TrimSpace(model.ID)
+		if modelID == "" {
+			return nil, fmt.Errorf("decoding gateway model response: model ID must not be empty")
+		}
+		if _, exists := seen[modelID]; exists {
+			continue
+		}
+		seen[modelID] = struct{}{}
+		models = append(models, modelID)
+	}
+	sort.Strings(models)
+	return models, nil
 }
 
 // claudeCodeClient is the canonical client identifier for Claude Code. Declared
@@ -456,16 +679,10 @@ func warnBedrockNoEffect(errOut io.Writer, opts SetOptions, effectiveCompat bool
 // configureDetectedTools patches each detected tool's config file and returns
 // the list of successfully configured tools. An error is returned only when no
 // tool was configured successfully.
-func configureDetectedTools(
-	out, errOut io.Writer,
-	gm GatewayManager,
-	detected []string,
-	gatewayURL, proxyBaseURL, tokenHelperCommand string,
-	tokenHelperPath string, tokenHelperArgs []string,
-	tlsSkipVerify bool,
-	anthropicPathPrefix string,
-	models []string,
-	bedrock BedrockConfig,
+func configureDetectedToolsWithDiscovery(
+	out, errOut io.Writer, gm GatewayManager, detected []string,
+	gatewayURL, proxyBaseURL, tokenHelperPath string, tokenHelperArgs []string,
+	tlsSkipVerify bool, anthropicPathPrefix string, models, discoveredModels []string, bedrock BedrockConfig,
 ) ([]ToolConfig, error) {
 	var configured []ToolConfig
 	for _, clientType := range detected {
@@ -488,11 +705,12 @@ func configureDetectedTools(
 			GatewayURL:         gatewayURL,
 			AnthropicBaseURL:   anthropicBaseURL,
 			ProxyBaseURL:       proxyBaseURL,
-			TokenHelperCommand: tokenHelperCommand,
+			TokenHelperCommand: tokenHelperShellCommand,
 			TokenHelperPath:    tokenHelperPath,
 			TokenHelperArgs:    tokenHelperArgs,
 			TLSSkipVerify:      tlsSkipVerify,
 			Models:             models,
+			DiscoveredModels:   discoveredModels,
 		}
 
 		// Bedrock-compat applies only to Claude Code: it disables the experimental
@@ -567,20 +785,7 @@ func probeAnthropicPrefix(ctx context.Context, gatewayURL string, tlsSkipVerify 
 		return ""
 	}
 
-	// Build an http.Client that honours --tls-skip-verify so the probe works
-	// against gateways with self-signed certificates (local dev). Clone
-	// http.DefaultTransport to preserve all production defaults (timeouts,
-	// ProxyFromEnvironment, HTTP/2, connection pooling) and only toggle
-	// InsecureSkipVerify.
-	//nolint:forcetypeassert // DefaultTransport is always *http.Transport
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if tlsSkipVerify {
-		if transport.TLSClientConfig == nil {
-			transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
-		}
-		transport.TLSClientConfig.InsecureSkipVerify = true //nolint:gosec // G402: intentional for local dev with self-signed certs
-	}
-	httpClient := &http.Client{Transport: transport}
+	httpClient := gatewayHTTPClient(tlsSkipVerify)
 
 	// Use a short timeout so setup is not significantly slowed by an unreachable gateway.
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -602,46 +807,38 @@ func probeAnthropicPrefix(ctx context.Context, gatewayURL string, tlsSkipVerify 
 	return ""
 }
 
-// tokenHelperCommandNeeded reports whether any detected client's mode consumes
-// the shell-string token helper (TokenHelperCommand) — direct-mode's
-// apiKeyHelper-style JSON-Pointer clients and Claude Desktop's credential
-// helper. Proxy-mode tools and Codex (argv-based auth) never use it.
-func tokenHelperCommandNeeded(gm GatewayManager, detected []string) bool {
-	for _, clientType := range detected {
-		switch gm.LLMGatewayModeFor(clientType) {
-		case llmgateway.ModeDirect, llmgateway.ModeCredentialHelper:
-			return true
+// gatewayHTTPClient clones the default transport so gateway requests retain
+// its proxy, timeout, HTTP/2, and connection-pooling behavior.
+func gatewayHTTPClient(tlsSkipVerify bool) *http.Client {
+	//nolint:forcetypeassert // DefaultTransport is always *http.Transport
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if tlsSkipVerify {
+		if transport.TLSClientConfig == nil {
+			transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 		}
+		transport.TLSClientConfig.InsecureSkipVerify = true //nolint:gosec // G402: intentional for local dev with self-signed certs
 	}
-	return false
+	return &http.Client{Transport: transport}
 }
 
-// buildTokenHelperCommand returns the shell command string used as the
-// token-helper for direct-mode tools. It rejects executable paths that contain
-// shell metacharacters, since the command is written verbatim into long-lived
-// tool config files and re-executed by the shell inside Claude Code / Gemini CLI.
-// A path with '"', '\', ';', '$', '`', newline, or carriage-return would
-// silently produce a broken or exploitable command. '$' and '`' are included
-// because they trigger variable/command substitution inside double-quoted strings.
+// tokenHelperShellCommand is the shell command written into direct-mode tools'
+// config as their token helper — e.g. Claude Code's apiKeyHelper, which is run
+// through a shell (execa with shell:true; see anthropics/claude-code#42593).
 //
-// Note: backslashes are Windows path separators, so this effectively makes
-// "thv llm setup" unsupported on Windows — consistent with the rest of the LLM
-// gateway feature (token-helper tools use POSIX-style shells).
-func buildTokenHelperCommand() (string, error) {
-	self, err := os.Executable()
-	if err != nil {
-		return "", fmt.Errorf("resolving thv executable path: %w", err)
-	}
-	const shellUnsafe = `"\;$` + "`\n\r"
-	if strings.ContainsAny(self, shellUnsafe) {
-		return "", fmt.Errorf(
-			"executable path %q contains shell-unsafe characters; "+
-				"move thv to a path without quotes, backslashes, semicolons, "+
-				"dollar signs, or backticks "+
-				"(Windows paths are not supported by thv llm setup)", self)
-	}
-	return fmt.Sprintf(`"%s" llm token`, self), nil
-}
+// It deliberately names "thv" bare rather than interpolating os.Executable().
+// A bare command has nothing to escape, so it is correct in both /bin/sh and
+// cmd.exe without a platform branch, and it re-resolves on every invocation —
+// so upgrading, reinstalling, or relocating thv keeps working without re-running
+// "thv llm setup".
+//
+// The trade-off is that it resolves via PATH at invocation time. A tool launched
+// without the user's shell PATH (e.g. from the macOS Dock, which inherits
+// launchd's environment) will not find thv, and a binary earlier on PATH can
+// shadow it. Both are accepted here: direct-mode tools are terminal-oriented.
+// Claude Desktop cannot accept them — it is only ever GUI-launched — so its
+// credential-helper shim uses the absolute TokenHelperPath instead (see
+// writeCredentialHelperShim in pkg/client).
+const tokenHelperShellCommand = "thv llm token" //nolint:gosec // G101: a command line, not a credential
 
 // buildTokenHelperArgv returns the argv-form of the token helper, for config
 // formats that invoke an executable directly (no shell) — e.g. Codex's
@@ -725,10 +922,10 @@ func rollbackConfiguredTools(errOut io.Writer, gm GatewayManager, configured []T
 	}
 }
 
-// hasProxyMode reports whether any of the given tool configs uses proxy mode.
+// hasProxyMode reports whether any tool requires the localhost proxy.
 func hasProxyMode(cfgs []ToolConfig) bool {
 	for _, t := range cfgs {
-		if t.Mode == llmgateway.ModeProxy {
+		if t.Mode == llmgateway.ModeProxy || t.Mode == llmgateway.ModeVSCode {
 			return true
 		}
 	}

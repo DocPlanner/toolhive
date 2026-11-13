@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	servercrypto "github.com/stacklok/toolhive/pkg/authserver/server/crypto"
 	"github.com/stacklok/toolhive/pkg/authserver/server/handlers"
 	"github.com/stacklok/toolhive/pkg/authserver/server/keys"
+	"github.com/stacklok/toolhive/pkg/authserver/server/tokenexchange"
 	"github.com/stacklok/toolhive/pkg/authserver/storage"
 	"github.com/stacklok/toolhive/pkg/authserver/upstream"
 	"github.com/stacklok/toolhive/pkg/bodylimit"
@@ -58,9 +60,9 @@ type EmbeddedAuthServer struct {
 }
 
 // NewEmbeddedAuthServer creates an EmbeddedAuthServer from authserver.RunConfig.
-// It loads signing keys from files, reads HMAC secrets from files,
-// resolves the upstream client secret from file or environment variable, and initializes
-// all auth server components.
+// It loads signing keys from files, reads HMAC secrets from files, resolves
+// upstream and delegate-client secret references from files or environment
+// variables, and initializes all auth server components.
 //
 // The cfg parameter contains file paths and environment variable names that are
 // resolved at runtime to build the underlying authserver.Config.
@@ -82,7 +84,6 @@ func NewEmbeddedAuthServer(ctx context.Context, cfg *authserver.RunConfig) (*Emb
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid run config: %w", err)
 	}
-
 	// Create the storage backend FIRST so the DCR resolver and the auth
 	// server share the same persistence. Both MemoryStorage and RedisStorage
 	// satisfy storage.DCRCredentialStore (verified by package-level var _
@@ -95,7 +96,7 @@ func NewEmbeddedAuthServer(ctx context.Context, cfg *authserver.RunConfig) (*Emb
 	if err != nil {
 		return nil, fmt.Errorf("failed to create storage: %w", err)
 	}
-	return NewEmbeddedAuthServerWithStorage(ctx, cfg, stor)
+	return newEmbeddedAuthServerWithStorage(ctx, cfg, stor, nil)
 }
 
 // NewEmbeddedAuthServerWithStorage is the exported core constructor that
@@ -132,7 +133,73 @@ func NewEmbeddedAuthServerWithStorage(
 	ctx context.Context,
 	cfg *authserver.RunConfig,
 	stor storage.Storage,
+) (*EmbeddedAuthServer, error) {
+	return newEmbeddedAuthServerWithStorage(ctx, cfg, stor, nil)
+}
+
+func warnDeprecatedInboundGrantFields(fields []authserver.DeprecatedFieldPath) {
+	if len(fields) == 0 {
+		return
+	}
+	paths := make([]string, len(fields))
+	for i, field := range fields {
+		paths[i] = field.Path + " -> " + field.Replacement
+	}
+	slog.Warn("deprecated inbound grant configuration; migrate to canonical fields", "paths", strings.Join(paths, ", "))
+}
+
+func prepareInboundGrantConfiguration(
+	cfg *authserver.RunConfig,
+	delegateClients []authserver.DelegateClient,
+) (*authserver.NormalizedInboundGrants, []authserver.DelegateClient, *authserver.SPIFFETrustConfig, error) {
+	normalized, err := authserver.NormalizeInboundGrants(cfg)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("normalize inbound grants: %w", err)
+	}
+	warnDeprecatedInboundGrantFields(normalized.DeprecatedFields)
+
+	if delegateClients == nil && len(normalized.DelegateClients) > 0 {
+		delegateClients, err = resolveDelegateClients(normalized.DelegateClients)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	// SPIFFE client authentication is independent of the legacy/canonical
+	// token-exchange projection above: it is read straight from cfg.InboundGrants,
+	// never through NormalizedInboundGrants, so authentication method and
+	// grant-family enablement stay separately configurable.
+	spiffeTrust, err := authserver.NewSPIFFETrustConfig(
+		cfg.SPIFFETrustDomains, cfg.InboundGrants, cfg.ScopesSupported, cfg.AllowedAudiences,
+	)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("build SPIFFE trust config: %w", err)
+	}
+	// SPIFFE client authentication exclusively uses the token-exchange grant
+	// (validateSPIFFEGrants enforces this), so configuring any SPIFFE
+	// association implies token-exchange capability independent of
+	// legacy/canonical token-exchange enablement.
+	normalized.Capabilities.TokenExchange = normalized.Capabilities.TokenExchange || hasSPIFFEClientAuth(cfg)
+	return normalized, delegateClients, spiffeTrust, nil
+}
+
+// hasSPIFFEClientAuth reports whether cfg declares any SPIFFE client-auth
+// association.
+func hasSPIFFEClientAuth(cfg *authserver.RunConfig) bool {
+	return cfg.InboundGrants != nil && len(cfg.InboundGrants.SPIFFEClientAuth) > 0
+}
+
+func newEmbeddedAuthServerWithStorage(
+	ctx context.Context,
+	cfg *authserver.RunConfig,
+	stor storage.Storage,
+	delegateClients []authserver.DelegateClient,
 ) (retEAS *EmbeddedAuthServer, retErr error) {
+	// Validate required inputs before the deferred cleanup is installed: cfg is
+	// dereferenced during validation and stor is closed by that cleanup.
+	if err := validateEmbeddedAuthServerInputs(cfg, stor); err != nil {
+		return nil, err
+	}
+
 	// From here on, any error must close stor before returning.
 	//
 	// Both errors are passed through dcr.SanitizeErrorForLog before being
@@ -164,6 +231,14 @@ func NewEmbeddedAuthServerWithStorage(
 	// resource-ownership contract.
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid run config: %w", err)
+	}
+	normalized, delegateClients, spiffeTrust, err := prepareInboundGrantConfiguration(cfg, delegateClients)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := authserver.PreflightSPIFFEStaticClientCollisions(ctx, stor, spiffeTrust); err != nil {
+		return nil, fmt.Errorf("preflight SPIFFE static client collisions: %w", err)
 	}
 
 	// 1. Create key provider from RunConfig.SigningKeyConfig
@@ -205,12 +280,9 @@ func NewEmbeddedAuthServerWithStorage(
 	}
 
 	// 6. Parse delegation token lifespan if configured.
-	var delegationLifespan time.Duration
-	if cfg.DelegationTokenLifespan != "" {
-		delegationLifespan, err = time.ParseDuration(cfg.DelegationTokenLifespan)
-		if err != nil {
-			return nil, fmt.Errorf("invalid delegation token lifespan: %w", err)
-		}
+	delegationLifespan, err := parseOptionalDuration(cfg.DelegationTokenLifespan, "delegation token lifespan")
+	if err != nil {
+		return nil, err
 	}
 
 	// 7. Build the resolved Config.
@@ -224,28 +296,43 @@ func NewEmbeddedAuthServerWithStorage(
 	// for BaselineClientScopes, low cardinality in practice for the others).
 	cimdEnabled, cimdCacheMaxSize, cimdCacheFallbackTTL := resolveCIMDConfig(cfg.CIMD)
 
+	trustedIssuers, err := tokenexchange.ResolveJWTBearerGrantPolicies(normalized.TrustedIssuers)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve JWT-bearer grant policies: %w", err)
+	}
+
 	resolvedCfg := authserver.Config{
-		Issuer:                       cfg.Issuer,
-		AuthorizationEndpointBaseURL: cfg.AuthorizationEndpointBaseURL,
-		KeyProvider:                  keyProvider,
-		HMACSecrets:                  hmacSecrets,
-		AccessTokenLifespan:          accessLifespan,
-		RefreshTokenLifespan:         refreshLifespan,
-		AuthCodeLifespan:             authCodeLifespan,
-		DelegationTokenLifespan:      delegationLifespan,
-		Upstreams:                    upstreams,
-		ScopesSupported:              slices.Clone(cfg.ScopesSupported),
-		BaselineClientScopes:         slices.Clone(cfg.BaselineClientScopes),
-		AllowedAudiences:             slices.Clone(cfg.AllowedAudiences),
-		CIMDEnabled:                  cimdEnabled,
-		CIMDCacheMaxSize:             cimdCacheMaxSize,
-		CIMDCacheFallbackTTL:         cimdCacheFallbackTTL,
-		InsecureAllowHTTP:            cfg.InsecureAllowHTTP,
+		Issuer:                                    cfg.Issuer,
+		AuthorizationEndpointBaseURL:              cfg.AuthorizationEndpointBaseURL,
+		KeyProvider:                               keyProvider,
+		HMACSecrets:                               hmacSecrets,
+		AccessTokenLifespan:                       accessLifespan,
+		RefreshTokenLifespan:                      refreshLifespan,
+		AuthCodeLifespan:                          authCodeLifespan,
+		DelegationTokenLifespan:                   delegationLifespan,
+		Upstreams:                                 upstreams,
+		ScopesSupported:                           slices.Clone(cfg.ScopesSupported),
+		BaselineClientScopes:                      slices.Clone(cfg.BaselineClientScopes),
+		AllowedAudiences:                          slices.Clone(cfg.AllowedAudiences),
+		CIMDEnabled:                               cimdEnabled,
+		CIMDCacheMaxSize:                          cimdCacheMaxSize,
+		CIMDCacheFallbackTTL:                      cimdCacheFallbackTTL,
+		InsecureAllowHTTP:                         cfg.InsecureAllowHTTP,
+		AllowConfidentialClientRegistration:       cfg.AllowConfidentialClientRegistration,
+		AllowPrivateKeyJWTRegistration:            cfg.AllowPrivateKeyJWTRegistration,
+		ForceConfidentialRedirectURIs:             slices.Clone(cfg.ForceConfidentialRedirectURIs),
+		InsecureAllowConfidentialOverLoopbackHTTP: cfg.InsecureAllowConfidentialOverLoopbackHTTP,
 		// slices.Clone is shallow: each TrustedIssuer's own AllowedActors
 		// slice is still shared with cfg. NewMultiIssuerTokenValidator's
 		// constructor clones AllowedActors per issuer before use, so the
 		// authorization-critical data is protected without a deep copy here.
-		TrustedIssuers: slices.Clone(cfg.TrustedIssuers),
+		TrustedIssuers:  trustedIssuers,
+		DelegateClients: delegateClients,
+		// SPIFFE client authentication factors into Capabilities.TokenExchange
+		// already (see prepareInboundGrantConfiguration): it exclusively uses
+		// the token-exchange grant, independent of legacy/canonical enablement.
+		DisableTokenExchange: !normalized.Capabilities.TokenExchange,
+		SPIFFETrust:          spiffeTrust,
 	}
 
 	// 8. Create the auth server. authserver.New also asserts the DCR
@@ -287,6 +374,13 @@ func (e *EmbeddedAuthServer) Close() error {
 		e.closeErr = e.server.Close()
 	})
 	return e.closeErr
+}
+
+// CloseIdleConnections releases the idle keep-alive connections pooled by the
+// underlying server's upstream IDP providers, without touching storage. See
+// authserver.CloseIdleConnections for when to use this rather than Close.
+func (e *EmbeddedAuthServer) CloseIdleConnections() {
+	authserver.CloseIdleConnections(e.server)
 }
 
 // IDPTokenStorage returns storage for upstream IDP tokens.
@@ -351,6 +445,18 @@ func (e *EmbeddedAuthServer) RegisterHandlers(mux *http.ServeMux) {
 	}
 }
 
+// validateEmbeddedAuthServerInputs rejects required inputs before construction
+// can dereference cfg or install cleanup that closes stor.
+func validateEmbeddedAuthServerInputs(cfg *authserver.RunConfig, stor storage.Storage) error {
+	if cfg == nil {
+		return fmt.Errorf("config is required")
+	}
+	if stor == nil {
+		return fmt.Errorf("storage is required")
+	}
+	return nil
+}
+
 // createKeyProvider creates a KeyProvider from SigningKeyRunConfig.
 // Returns a GeneratingProvider if config is nil or empty (development mode).
 func createKeyProvider(cfg *authserver.SigningKeyRunConfig) (keys.KeyProvider, error) {
@@ -412,6 +518,17 @@ func loadHMACSecrets(files []string) (*servercrypto.HMACSecrets, error) {
 	}
 
 	return secrets, nil
+}
+
+func parseOptionalDuration(value, name string) (time.Duration, error) {
+	if value == "" {
+		return 0, nil
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s: %w", name, err)
+	}
+	return duration, nil
 }
 
 // parseTokenLifespans parses duration strings from TokenLifespanRunConfig.
@@ -606,6 +723,7 @@ func buildOIDCConfig(rc *authserver.UpstreamRunConfig, insecureAllowHTTP bool) (
 		Issuer:            oidc.IssuerURL,
 		SubjectClaim:      oidc.SubjectClaim,
 		AllowPrivateIPs:   oidc.AllowPrivateIPs,
+		CAFilePath:        oidc.CAFilePath,
 		InsecureAllowHTTP: insecureAllowHTTP || oidc.InsecureAllowHTTP,
 	}, nil
 }
@@ -641,6 +759,7 @@ func buildPureOAuth2Config(rc *authserver.UpstreamRunConfig, insecureAllowHTTP b
 		AuthorizationEndpoint: oauth2.AuthorizationEndpoint,
 		TokenEndpoint:         oauth2.TokenEndpoint,
 		UserInfo:              convertUserInfoConfig(oauth2.UserInfo),
+		CAFilePath:            oauth2.CAFilePath,
 		AllowPrivateIPs:       oauth2.AllowPrivateIPs,
 		InsecureAllowHTTP:     insecureAllowHTTP || oauth2.InsecureAllowHTTP,
 	}
@@ -687,6 +806,28 @@ func resolveSecret(file, envVar string) (string, error) {
 	}
 	slog.Debug("no client secret configured (neither file nor env var specified)")
 	return "", nil
+}
+
+// resolveDelegateClients resolves secret references and copies authorization
+// permissions before configuration crosses into the running authorization server.
+func resolveDelegateClients(clients []authserver.DelegateClientRunConfig) ([]authserver.DelegateClient, error) {
+	resolved := make([]authserver.DelegateClient, len(clients))
+	for i, client := range clients {
+		secret, err := resolveSecret(client.ClientSecretFile, client.ClientSecretEnvVar)
+		if err != nil {
+			return nil, fmt.Errorf("delegate client %q: %w", client.ClientID, err)
+		}
+		if secret == "" {
+			return nil, fmt.Errorf("delegate client %q: resolved client secret is empty", client.ClientID)
+		}
+		resolved[i] = authserver.DelegateClient{
+			ClientID:     client.ClientID,
+			ClientSecret: secret,
+			Scopes:       slices.Clone(client.Scopes),
+			Audiences:    slices.Clone(client.Audiences),
+		}
+	}
+	return resolved, nil
 }
 
 // convertUserInfoConfig converts UserInfoRunConfig to upstream.UserInfoConfig.

@@ -93,6 +93,8 @@ const (
 	Factory ClientApp = "factory"
 	// CopilotCli represents the GitHub Copilot CLI.
 	CopilotCli ClientApp = "copilot-cli"
+	// Qoder represents the Qoder IDE.
+	Qoder ClientApp = "qoder"
 )
 
 const (
@@ -423,19 +425,14 @@ var supportedClientIntegrations = []clientAppConfig{
 		SupportsSkills:    true,
 		SkillsGlobalPath:  []string{".copilot", skillsDirName},
 		SkillsProjectPath: []string{".github", skillsDirName},
-		// LLM gateway: patches settings.json (same dir as mcp.json, different file)
-		LLMGatewayMode:     llmgateway.ModeProxy,
-		LLMBinaryName:      "code-insiders",
-		LLMSettingsFile:    "settings.json",
+		// VS Code reads custom LLM provider groups from chatLanguageModels.json.
+		LLMGatewayMode:     llmgateway.ModeVSCode,
+		LLMSettingsFile:    "chatLanguageModels.json",
 		LLMSettingsRelPath: []string{"Code - Insiders", "User"},
 		LLMSettingsPlatformPrefix: map[Platform][]string{
 			PlatformLinux:   {".config"},
 			PlatformDarwin:  {"Library", "Application Support"},
 			PlatformWindows: {"AppData", "Roaming"},
-		},
-		LLMGatewayKeys: []LLMGatewayKeySpec{
-			{JSONPointer: "/github.copilot.advanced.serverUrl", ValueField: "ProxyBaseURL"},
-			{JSONPointer: "/github.copilot.advanced.apiKey", ValueField: "PlaceholderAPIKey"},
 		},
 	},
 	{
@@ -466,19 +463,14 @@ var supportedClientIntegrations = []clientAppConfig{
 		SupportsSkills:    true,
 		SkillsGlobalPath:  []string{".copilot", skillsDirName},
 		SkillsProjectPath: []string{".github", skillsDirName},
-		// LLM gateway: patches settings.json (same dir as mcp.json, different file)
-		LLMGatewayMode:     llmgateway.ModeProxy,
-		LLMBinaryName:      "code",
-		LLMSettingsFile:    "settings.json",
+		// VS Code reads custom LLM provider groups from chatLanguageModels.json.
+		LLMGatewayMode:     llmgateway.ModeVSCode,
+		LLMSettingsFile:    "chatLanguageModels.json",
 		LLMSettingsRelPath: []string{"Code", "User"},
 		LLMSettingsPlatformPrefix: map[Platform][]string{
 			PlatformLinux:   {".config"},
 			PlatformDarwin:  {"Library", "Application Support"},
 			PlatformWindows: {"AppData", "Roaming"},
-		},
-		LLMGatewayKeys: []LLMGatewayKeySpec{
-			{JSONPointer: "/github.copilot.advanced.serverUrl", ValueField: "ProxyBaseURL"},
-			{JSONPointer: "/github.copilot.advanced.apiKey", ValueField: "PlaceholderAPIKey"},
 		},
 	},
 	{
@@ -506,7 +498,6 @@ var supportedClientIntegrations = []clientAppConfig{
 		SkillsProjectPath: []string{".cursor", skillsDirName},
 		// LLM gateway: patches the editor settings.json (different from the MCP mcp.json)
 		LLMGatewayMode:     llmgateway.ModeProxy,
-		LLMBinaryName:      "cursor",
 		LLMSettingsFile:    "settings.json",
 		LLMSettingsRelPath: []string{"Cursor", "User"},
 		LLMSettingsPlatformPrefix: map[Platform][]string{
@@ -1004,6 +995,33 @@ var supportedClientIntegrations = []clientAppConfig{
 			types.TransportTypeSSE:            defaultURLFieldName,
 			types.TransportTypeStreamableHTTP: defaultURLFieldName,
 		},
+	},
+	{
+		ClientType:           Qoder,
+		Description:          "Qoder IDE",
+		SettingsFile:         "mcp.json",
+		MCPServersPathPrefix: "/mcpServers",
+		RelPath:              []string{},
+		PlatformPrefix: map[Platform][]string{
+			PlatformDarwin:  {".qoder"},
+			PlatformLinux:   {".qoder"},
+			PlatformWindows: {"AppData", "Roaming", "Qoder", "SharedClientCache"},
+		},
+		Extension:                     JSON,
+		IsTransportTypeFieldSupported: true,
+		SupportedTransportTypesMap: map[types.TransportType]string{
+			types.TransportTypeStdio:          httpTransportLabel,
+			types.TransportTypeSSE:            "sse",
+			types.TransportTypeStreamableHTTP: httpTransportLabel,
+		},
+		MCPServersUrlLabelMap: map[types.TransportType]string{
+			types.TransportTypeStdio:          defaultURLFieldName,
+			types.TransportTypeSSE:            defaultURLFieldName,
+			types.TransportTypeStreamableHTTP: defaultURLFieldName,
+		},
+		SupportsSkills:    true,
+		SkillsGlobalPath:  []string{".qoder", skillsDirName},
+		SkillsProjectPath: []string{".qoder", skillsDirName},
 	},
 	{
 		// Xcode does not support MCP; it is an LLM-gateway-only entry.

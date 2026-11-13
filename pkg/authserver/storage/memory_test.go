@@ -20,6 +20,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"sync"
@@ -30,7 +31,25 @@ import (
 	"github.com/ory/fosite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/stacklok/toolhive/pkg/authserver/server/registration"
+	"github.com/stacklok/toolhive/pkg/oauthproto"
 )
+
+// dcrClient builds a DCR-issued public client (carrying registration.DCRIssued's
+// marker) for tests that exercise eviction/renewal gating, which requires the
+// real marker rather than a bare mockClient.
+func dcrClient(t *testing.T, id string) fosite.Client {
+	t.Helper()
+	client, err := registration.New(registration.Config{
+		ID:                      id,
+		TokenEndpointAuthMethod: oauthproto.TokenEndpointAuthMethodNone,
+		RedirectURIs:            []string{"https://app.example/cb"},
+	})
+	require.NoError(t, err)
+	require.True(t, registration.DCRIssued(client), "precondition: dcrClient must carry the DCRIssued marker")
+	return client
+}
 
 // --- Mock Types ---
 
@@ -221,16 +240,431 @@ func TestMemoryStorage_RegisterClient(t *testing.T) {
 	})
 }
 
-func TestMemoryStorage_RenewClientTTL_NoOp(t *testing.T) {
+func TestMemoryStorage_RegisterClient_RejectsSyntheticPrefix(t *testing.T) {
 	withStorage(t, func(ctx context.Context, s *MemoryStorage) {
-		// In-memory clients have no TTL, so renewal is a documented no-op: it must
-		// not error and must leave the client retrievable.
-		client := &mockClient{id: "public-client", public: true}
-		require.NoError(t, s.RegisterClient(ctx, client))
-		require.NoError(t, s.RenewClientTTL(ctx, client))
-		retrieved, err := s.GetClient(ctx, "public-client")
+		client := &mockClient{id: SyntheticClientIDPrefix + "delegate"}
+		err := s.RegisterClient(ctx, client)
+		require.ErrorIs(t, err, ErrReservedClientID)
+
+		_, err = s.GetClient(ctx, client.id)
+		require.ErrorIs(t, err, ErrNotFound)
+	})
+}
+
+// TestMemoryStorage_RegisterClient_AlwaysCreateOnly pins the security fix:
+// RegisterClient never overwrites an existing client, regardless of whether
+// the existing registration is DCR-issued or pre-provisioned. A caller that
+// needs authoritative replacement of an operator-declared client must use
+// ReconcileConfiguredClient instead.
+func TestMemoryStorage_RegisterClient_AlwaysCreateOnly(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		existing fosite.Client
+	}{
+		{"existing is DCR-issued", nil}, // replaced with dcrClient(t, id) below
+		{"existing is pre-provisioned", &mockClient{id: "existing"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			s := NewMemoryStorage()
+			defer s.Close()
+
+			existing := tt.existing
+			if existing == nil {
+				existing = dcrClient(t, "existing")
+			}
+			require.NoError(t, s.RegisterClient(ctx, existing))
+
+			err := s.RegisterClient(ctx, &mockClient{id: "existing", public: true})
+			require.ErrorIs(t, err, ErrAlreadyExists)
+
+			// The original registration must be untouched.
+			retrieved, err := s.GetClient(ctx, "existing")
+			require.NoError(t, err)
+			assert.Equal(t, existing, retrieved)
+		})
+	}
+}
+
+// TestMemoryStorage_ReconcileConfiguredClient covers the create/idempotent/
+// reject matrix ReconcileConfiguredClient must implement: create when
+// absent, no-op (replace with an equivalent record) when the existing record
+// is itself configured and fingerprint-equal, and refuse with
+// ErrAlreadyExists when the existing record is DCR-issued or a different
+// configured client.
+func TestMemoryStorage_ReconcileConfiguredClient(t *testing.T) {
+	t.Parallel()
+
+	newConfigured := func(id string, scopes []string) fosite.Client {
+		return &mockClient{id: id, scopes: scopes, public: false}
+	}
+
+	t.Run("creates when absent", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		s := NewMemoryStorage()
+		defer s.Close()
+
+		client := newConfigured("configured", []string{"openid"})
+		require.NoError(t, s.ReconcileConfiguredClient(ctx, client))
+
+		retrieved, err := s.GetClient(ctx, "configured")
 		require.NoError(t, err)
-		assert.Equal(t, "public-client", retrieved.GetID())
+		assert.Equal(t, client, retrieved)
+	})
+
+	t.Run("idempotent on matching fingerprint", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		s := NewMemoryStorage()
+		defer s.Close()
+
+		first := newConfigured("configured", []string{"openid"})
+		require.NoError(t, s.ReconcileConfiguredClient(ctx, first))
+
+		// A second call with an equivalent (but not identical) client value --
+		// simulating a restart re-deriving the same configuration -- succeeds.
+		second := newConfigured("configured", []string{"openid"})
+		require.NoError(t, s.ReconcileConfiguredClient(ctx, second))
+
+		retrieved, err := s.GetClient(ctx, "configured")
+		require.NoError(t, err)
+		assert.Equal(t, second, retrieved)
+	})
+
+	t.Run("refuses to overwrite a DCR-issued client", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		s := NewMemoryStorage()
+		defer s.Close()
+
+		require.NoError(t, s.RegisterClient(ctx, dcrClient(t, "configured")))
+
+		err := s.ReconcileConfiguredClient(ctx, newConfigured("configured", []string{"openid"}))
+		require.ErrorIs(t, err, ErrAlreadyExists)
+	})
+
+	t.Run("refuses a different configured client at the same ID", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		s := NewMemoryStorage()
+		defer s.Close()
+
+		first := newConfigured("configured", []string{"openid"})
+		require.NoError(t, s.ReconcileConfiguredClient(ctx, first))
+
+		different := newConfigured("configured", []string{"profile"})
+		err := s.ReconcileConfiguredClient(ctx, different)
+		require.ErrorIs(t, err, ErrAlreadyExists)
+
+		// The original registration must be untouched.
+		retrieved, err := s.GetClient(ctx, "configured")
+		require.NoError(t, err)
+		assert.Equal(t, first, retrieved)
+	})
+
+	t.Run("rejects a client carrying the DCR-issued marker", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		s := NewMemoryStorage()
+		defer s.Close()
+
+		err := s.ReconcileConfiguredClient(ctx, dcrClient(t, "configured"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "must not carry the DCR-issued marker")
+	})
+}
+
+// TestMemoryStorage_UpsertDCRIssuedClient covers the create/replace/reject
+// matrix UpsertDCRIssuedClient must implement: create when absent, replace
+// (and renew the eviction position) when the existing record is itself
+// DCR-issued, refuse with ErrAlreadyExists when the existing record is NOT
+// DCR-issued (the critical protection: a configured/SPIFFE client must never
+// be clobbered by this path), and refuse when the incoming client itself does
+// not carry the DCR-issued marker (misuse guard).
+func TestMemoryStorage_UpsertDCRIssuedClient(t *testing.T) {
+	t.Parallel()
+
+	t.Run("creates when absent", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		s := NewMemoryStorage()
+		defer s.Close()
+
+		client := dcrClient(t, "cimd-client")
+		require.NoError(t, s.UpsertDCRIssuedClient(ctx, client))
+
+		retrieved, err := s.GetClient(ctx, "cimd-client")
+		require.NoError(t, err)
+		assert.Equal(t, client, retrieved)
+	})
+
+	t.Run("replaces and renews when existing row is DCR-issued", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		// MinClientAge(0) isolates this test to the replace/renew behaviour;
+		// the age-floor grace window has its own tests above.
+		s := NewMemoryStorage(WithMaxClients(2), WithMinClientAge(0))
+		defer s.Close()
+
+		first := dcrClient(t, "cimd-client")
+		require.NoError(t, s.UpsertDCRIssuedClient(ctx, first))
+		require.NoError(t, s.RegisterClient(ctx, dcrClient(t, "client-b")))
+
+		// A distinguishing field on the replacement proves the replace branch
+		// actually overwrote the stored data rather than being a silent no-op.
+		second, err := registration.New(registration.Config{
+			ID:                      "cimd-client",
+			TokenEndpointAuthMethod: oauthproto.TokenEndpointAuthMethodNone,
+			RedirectURIs:            []string{"https://app.example/cb-v2"},
+		})
+		require.NoError(t, err)
+		require.NoError(t, s.UpsertDCRIssuedClient(ctx, second))
+
+		retrieved, err := s.GetClient(ctx, "cimd-client")
+		require.NoError(t, err)
+		assert.Equal(t, second, retrieved, "second call must replace the stored row")
+
+		// Renewed eviction position: cimd-client was registered first (oldest)
+		// but the upsert must have moved it to the back, so overflow evicts
+		// client-b instead.
+		require.NoError(t, s.RegisterClient(ctx, dcrClient(t, "client-c")))
+		_, err = s.GetClient(ctx, "cimd-client")
+		require.NoError(t, err, "renewed client must survive eviction")
+		_, err = s.GetClient(ctx, "client-b")
+		requireNotFoundError(t, err)
+	})
+
+	t.Run("refuses to overwrite a non-DCR-issued client", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		s := NewMemoryStorage()
+		defer s.Close()
+
+		configured := &mockClient{id: "configured", public: false}
+		require.NoError(t, s.ReconcileConfiguredClient(ctx, configured))
+
+		err := s.UpsertDCRIssuedClient(ctx, dcrClient(t, "configured"))
+		require.ErrorIs(t, err, ErrAlreadyExists)
+
+		// The original registration must be untouched.
+		retrieved, err := s.GetClient(ctx, "configured")
+		require.NoError(t, err)
+		assert.Equal(t, configured, retrieved)
+	})
+
+	t.Run("rejects a client not carrying the DCR-issued marker", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		s := NewMemoryStorage()
+		defer s.Close()
+
+		err := s.UpsertDCRIssuedClient(ctx, &mockClient{id: "not-dcr"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "must carry the DCR-issued marker")
+
+		_, err = s.GetClient(ctx, "not-dcr")
+		require.ErrorIs(t, err, ErrNotFound)
+	})
+}
+
+// TestMemoryStorage_RegisterClient_Bounded pins the anti-DoS cap: the client
+// map is bounded by maxClients with oldest-first eviction among DCR-issued
+// clients only, and duplicate registrations fail without changing stored state.
+func TestMemoryStorage_RegisterClient_Bounded(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	// MinClientAge(0) isolates this test to the maxClients/DCR-issued gate;
+	// the age-floor grace window has its own tests below.
+	s := NewMemoryStorage(WithMaxClients(3), WithMinClientAge(0))
+	defer s.Close()
+
+	// Register at capacity: client-1 is the oldest.
+	for _, id := range []string{"client-1", "client-2", "client-3"} {
+		require.NoError(t, s.RegisterClient(ctx, dcrClient(t, id)))
+	}
+
+	// A duplicate does not update the original registration or eviction order.
+	require.ErrorIs(t, s.RegisterClient(ctx, dcrClient(t, "client-1")), ErrAlreadyExists)
+
+	// Overflow evicts the oldest client.
+	require.NoError(t, s.RegisterClient(ctx, dcrClient(t, "client-4")))
+
+	_, err := s.GetClient(ctx, "client-1")
+	requireNotFoundError(t, err)
+
+	for _, id := range []string{"client-2", "client-3", "client-4"} {
+		client, err := s.GetClient(ctx, id)
+		require.NoError(t, err, "surviving client %q must still authenticate", id)
+		assert.Equal(t, id, client.GetID())
+	}
+}
+
+// TestMemoryStorage_RegisterClient_MinAgeGraceWindow pins the eviction floor:
+// a DCR-issued client younger than minClientAge is never picked as an
+// eviction victim. Without this floor, a legitimately registered but
+// not-yet-used client (RenewClientTTL only fires on a successful token
+// exchange) sits at the front of the queue and can be evicted on demand by
+// an attacker filling the map to capacity — the rate limiter bounds the
+// speed of this but not the outcome.
+func TestMemoryStorage_RegisterClient_MinAgeGraceWindow(t *testing.T) {
+	t.Parallel()
+
+	const floor = 20 * time.Millisecond
+
+	t.Run("young client is not evicted at capacity", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		// A large floor, not the small one the "old client is evicted" case
+		// needs: this subtest asserts an eviction does NOT happen, so pinning
+		// it to a 20ms wall-clock window would fail on any CI stall (GC pause,
+		// scheduler) between the two RegisterClient calls. An hour cannot be
+		// crossed accidentally.
+		s := NewMemoryStorage(WithMaxClients(1), WithMinClientAge(time.Hour))
+		defer s.Close()
+
+		require.NoError(t, s.RegisterClient(ctx, dcrClient(t, "young")))
+		// Overflow immediately: "young" is well within the floor, so no
+		// DCR-issued client can be safely evicted and the insertion is rejected.
+		err := s.RegisterClient(ctx, dcrClient(t, "new-arrival"))
+		require.ErrorIs(t, err, ErrClientCapacity)
+
+		_, err = s.GetClient(ctx, "young")
+		require.NoError(t, err, "client younger than the floor must survive")
+		_, err = s.GetClient(ctx, "new-arrival")
+		requireNotFoundError(t, err)
+	})
+
+	t.Run("old client is evicted", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		s := NewMemoryStorage(WithMaxClients(1), WithMinClientAge(floor))
+		defer s.Close()
+
+		require.NoError(t, s.RegisterClient(ctx, dcrClient(t, "old")))
+		time.Sleep(floor * 2)
+		require.NoError(t, s.RegisterClient(ctx, dcrClient(t, "new-arrival")))
+
+		_, err := s.GetClient(ctx, "old")
+		requireNotFoundError(t, err)
+		_, err = s.GetClient(ctx, "new-arrival")
+		require.NoError(t, err)
+	})
+
+	t.Run("all candidates young reject new registrations", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		s := NewMemoryStorage(WithMaxClients(2), WithMinClientAge(time.Hour))
+		defer s.Close()
+
+		for _, id := range []string{"a", "b"} {
+			require.NoError(t, s.RegisterClient(ctx, dcrClient(t, id)))
+		}
+		for _, id := range []string{"c", "d"} {
+			require.ErrorIs(t, s.RegisterClient(ctx, dcrClient(t, id)), ErrClientCapacity)
+		}
+
+		s.mu.RLock()
+		size := len(s.clients)
+		s.mu.RUnlock()
+		assert.Equal(t, 2, size, "the client map must not exceed maxClients")
+	})
+}
+
+// TestMemoryStorage_RegisterClient_NeverEvictsNonDCRIssued pins the eviction
+// gate: a pre-provisioned client (no registration.DCRIssued marker) must
+// never be evicted, even when it is the oldest entry at capacity. Redis gates
+// its TTL on the identical predicate; the two backends must agree on which
+// clients are evictable.
+func TestMemoryStorage_RegisterClient_NeverEvictsNonDCRIssued(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	s := NewMemoryStorage(WithMaxClients(2), WithMinClientAge(0))
+	defer s.Close()
+
+	// permanent-client is pre-provisioned (no DCRIssued marker) and registered
+	// first, so it would be the oldest under naive FIFO eviction.
+	require.NoError(t, s.RegisterClient(ctx, &mockClient{id: "permanent-client"}))
+	require.NoError(t, s.RegisterClient(ctx, dcrClient(t, "dcr-1")))
+
+	// Overflow at cap=2: the only evictable (DCR-issued) entry is dcr-1, even
+	// though permanent-client is older.
+	require.NoError(t, s.RegisterClient(ctx, dcrClient(t, "dcr-2")))
+
+	_, err := s.GetClient(ctx, "permanent-client")
+	require.NoError(t, err, "pre-provisioned client must never be evicted")
+	_, err = s.GetClient(ctx, "dcr-1")
+	requireNotFoundError(t, err)
+	_, err = s.GetClient(ctx, "dcr-2")
+	require.NoError(t, err)
+
+	// dcr-2 is evicted to preserve the cap; permanent-client remains.
+	require.NoError(t, s.RegisterClient(ctx, &mockClient{id: "permanent-client-2"}))
+	_, err = s.GetClient(ctx, "permanent-client")
+	require.NoError(t, err)
+	_, err = s.GetClient(ctx, "dcr-2")
+	requireNotFoundError(t, err)
+	_, err = s.GetClient(ctx, "permanent-client-2")
+	require.NoError(t, err)
+}
+
+// TestMemoryStorage_RenewClientTTL pins the new use-based retention contract:
+// RenewClientTTL moves a DCR-issued client to the back of the eviction
+// queue, protecting it from the next overflow eviction, while a
+// non-DCR-issued client is left untouched (it was never evictable anyway).
+func TestMemoryStorage_RenewClientTTL(t *testing.T) {
+	t.Parallel()
+
+	t.Run("proven use protects a DCR-issued client from eviction", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		s := NewMemoryStorage(WithMaxClients(2), WithMinClientAge(0))
+		defer s.Close()
+
+		clientA := dcrClient(t, "client-a")
+		require.NoError(t, s.RegisterClient(ctx, clientA))
+		require.NoError(t, s.RegisterClient(ctx, dcrClient(t, "client-b")))
+
+		// client-a is oldest; renew it so it is no longer the eviction target.
+		require.NoError(t, s.RenewClientTTL(ctx, clientA))
+
+		// Overflow: client-b (now oldest) is evicted instead of client-a.
+		require.NoError(t, s.RegisterClient(ctx, dcrClient(t, "client-c")))
+
+		_, err := s.GetClient(ctx, "client-a")
+		require.NoError(t, err, "renewed client must survive eviction")
+		_, err = s.GetClient(ctx, "client-b")
+		requireNotFoundError(t, err)
+	})
+
+	t.Run("non-DCR-issued client is a no-op", func(t *testing.T) {
+		withStorage(t, func(ctx context.Context, s *MemoryStorage) {
+			client := &mockClient{id: "public-client", public: true}
+			require.NoError(t, s.RegisterClient(ctx, client))
+			require.NoError(t, s.RenewClientTTL(ctx, client))
+			retrieved, err := s.GetClient(ctx, "public-client")
+			require.NoError(t, err)
+			assert.Equal(t, "public-client", retrieved.GetID())
+		})
+	})
+
+	t.Run("absent client is a no-op", func(t *testing.T) {
+		withStorage(t, func(ctx context.Context, s *MemoryStorage) {
+			require.NoError(t, s.RenewClientTTL(ctx, dcrClient(t, "never-registered")))
+		})
+	})
+
+	t.Run("nil client is a no-op", func(t *testing.T) {
+		withStorage(t, func(ctx context.Context, s *MemoryStorage) {
+			require.NoError(t, s.RenewClientTTL(ctx, nil))
+		})
 	})
 }
 
@@ -244,7 +678,7 @@ func TestMemoryStorage_ClientAssertionJWT(t *testing.T) {
 	}{
 		{"unknown JTI is valid", nil, "unknown-jti", nil},
 		{"known JTI is invalid", func(ctx context.Context, s *MemoryStorage) {
-			_ = s.SetClientAssertionJWT(ctx, "test-jti", time.Now().Add(time.Hour))
+			_ = s.SetClientAssertionJWT(ctx, "test-jti", time.Now().Add(time.Minute))
 		}, "test-jti", fosite.ErrJTIKnown},
 		{"expired JTI is valid", func(ctx context.Context, s *MemoryStorage) {
 			_ = s.SetClientAssertionJWT(ctx, "expired-jti", time.Now().Add(-time.Hour))
@@ -267,19 +701,121 @@ func TestMemoryStorage_ClientAssertionJWT(t *testing.T) {
 		})
 	}
 
-	t.Run("cleanup expired JTIs on set", func(t *testing.T) {
+	t.Run("cleanup expired JTIs on valid check", func(t *testing.T) {
 		withStorage(t, func(ctx context.Context, s *MemoryStorage) {
 			s.mu.Lock()
 			s.clientAssertionJWTs["old-jti"] = time.Now().Add(-time.Hour)
 			s.mu.Unlock()
 
-			require.NoError(t, s.SetClientAssertionJWT(ctx, "new-jti", time.Now().Add(time.Hour)))
+			// Cleanup now happens in ClientAssertionJWTValid (the atomic
+			// reservation checkpoint), not SetClientAssertionJWT, since
+			// fosite always calls Valid before Set on every assertion.
+			require.NoError(t, s.ClientAssertionJWTValid(ctx, "new-jti"))
 
 			s.mu.RLock()
 			_, exists := s.clientAssertionJWTs["old-jti"]
 			s.mu.RUnlock()
 			assert.False(t, exists, "expired JTI should have been cleaned up")
 		})
+	})
+}
+
+// TestMemoryStorage_ClientAssertionJWT_ConcurrentReplay proves
+// ClientAssertionJWTValid's reservation is atomic: of many goroutines
+// racing to validate the identical jti, exactly one must observe it as
+// unused. Before the reserve-then-confirm fix, fosite's separate
+// Valid-then-Set calls let concurrent requests carrying the same assertion
+// both pass the check before either recorded it.
+func TestMemoryStorage_ClientAssertionJWT_ConcurrentReplay(t *testing.T) {
+	withStorage(t, func(ctx context.Context, s *MemoryStorage) {
+		const attempts = 20
+		var succeeded atomic.Int32
+		var wg sync.WaitGroup
+		wg.Add(attempts)
+		for range attempts {
+			go func() {
+				defer wg.Done()
+				if err := s.ClientAssertionJWTValid(ctx, "race-jti"); err == nil {
+					succeeded.Add(1)
+				}
+			}()
+		}
+		wg.Wait()
+
+		assert.Equal(t, int32(1), succeeded.Load(), "exactly one concurrent validator must win the reservation")
+	})
+}
+
+func TestMemoryStorage_ConsumeAssertionJWT(t *testing.T) {
+	withStorage(t, func(ctx context.Context, s *MemoryStorage) {
+		exp := time.Now().Add(time.Hour)
+		require.NoError(t, s.ConsumeAssertionJWT(ctx, "jwt-bearer", "https://issuer.example", "shared-jti", exp))
+		require.ErrorIs(t, s.ConsumeAssertionJWT(ctx, "jwt-bearer", "https://issuer.example", "shared-jti", exp), fosite.ErrJTIKnown)
+
+		for _, assertion := range []struct {
+			purpose string
+			issuer  string
+		}{
+			{purpose: "client-auth", issuer: "https://issuer.example"},
+			{purpose: "jwt-bearer", issuer: "https://other-issuer.example"},
+		} {
+			require.NoError(t, s.ConsumeAssertionJWT(ctx, assertion.purpose, assertion.issuer, "shared-jti", exp))
+		}
+	})
+}
+
+func TestMemoryStorage_ConsumeAssertionJWT_Expired(t *testing.T) {
+	withStorage(t, func(ctx context.Context, s *MemoryStorage) {
+		exp := time.Now().Add(time.Hour)
+		const purpose = "jwt-bearer"
+		const issuer = "https://issuer.example"
+		const jti = "expired-jti"
+		require.NoError(t, s.ConsumeAssertionJWT(ctx, purpose, issuer, jti, exp))
+
+		s.mu.Lock()
+		s.assertionJWTs[assertionJWTKey{purpose: purpose, issuer: issuer, jti: jti}] = time.Now().Add(-time.Second)
+		s.mu.Unlock()
+
+		require.NoError(t, s.ConsumeAssertionJWT(ctx, purpose, issuer, jti, exp))
+	})
+}
+
+func TestMemoryStorage_ConsumeAssertionJWT_Concurrent(t *testing.T) {
+	withStorage(t, func(ctx context.Context, s *MemoryStorage) {
+		const consumers = 32
+		var successes atomic.Int32
+		errs := make(chan error, consumers)
+		var wg sync.WaitGroup
+		wg.Add(consumers)
+		for range consumers {
+			go func() {
+				defer wg.Done()
+				err := s.ConsumeAssertionJWT(ctx, "jwt-bearer", "https://issuer.example", "concurrent-jti", time.Now().Add(time.Hour))
+				if err == nil {
+					successes.Add(1)
+					return
+				}
+				if !errors.Is(err, fosite.ErrJTIKnown) {
+					errs <- err
+				}
+			}()
+		}
+
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for concurrent assertion JWT consumers")
+		}
+		close(errs)
+		for err := range errs {
+			require.NoError(t, err)
+		}
+		assert.Equal(t, int32(1), successes.Load())
 	})
 }
 
@@ -1203,7 +1739,7 @@ func TestMemoryStorage_Stats(t *testing.T) {
 		_ = s.CreatePKCERequestSession(ctx, "pkce-1", request)
 		_ = s.StoreUpstreamTokens(ctx, "upstream-1", "provider-a", &UpstreamTokens{AccessToken: "test"})
 		_ = s.InvalidateAuthorizeCodeSession(ctx, "code-1")
-		_ = s.SetClientAssertionJWT(ctx, "jti-1", time.Now().Add(time.Hour))
+		_ = s.SetClientAssertionJWT(ctx, "jti-1", time.Now().Add(time.Minute))
 
 		now := time.Now()
 		_ = s.CreateUser(ctx, &User{ID: "user-1", CreatedAt: now, UpdatedAt: now})
@@ -1784,7 +2320,9 @@ func TestMemoryStorage_DCRCredentials_RoundTrip(t *testing.T) {
 			ClientSecretExpiresAt:   time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC),
 		}
 
-		require.NoError(t, s.StoreDCRCredentials(ctx, creds))
+		authoritative, err := s.StoreDCRCredentialsIfAbsent(ctx, creds)
+		require.NoError(t, err)
+		assert.Equal(t, *creds, *authoritative)
 
 		got, err := s.GetDCRCredentials(ctx, key)
 		require.NoError(t, err)
@@ -1824,7 +2362,8 @@ func TestMemoryStorage_DCRCredentials_DistinctKeysDoNotCollide(t *testing.T) {
 			mkCreds(mkKey("https://idp-a.example.com", "https://up-b", "https://x/cb", []string{"openid"}), "e"),
 		}
 		for _, e := range entries {
-			require.NoError(t, s.StoreDCRCredentials(ctx, e))
+			_, err := s.StoreDCRCredentialsIfAbsent(ctx, e)
+			require.NoError(t, err)
 		}
 
 		for _, want := range entries {
@@ -1836,7 +2375,14 @@ func TestMemoryStorage_DCRCredentials_DistinctKeysDoNotCollide(t *testing.T) {
 	})
 }
 
-func TestMemoryStorage_DCRCredentials_OverwriteSemantics(t *testing.T) {
+// TestMemoryStorage_DCRCredentials_FirstClaimWins pins the create-if-absent
+// contract that replaced unconditional overwrite: a second
+// StoreDCRCredentialsIfAbsent for a key that already holds a (non-expired)
+// value must not replace it. It returns the existing entry as the
+// authoritative value instead, mirroring RedisStorage's create-if-absent
+// claim so the two backends behave symmetrically for a concurrent-
+// registration race.
+func TestMemoryStorage_DCRCredentials_FirstClaimWins(t *testing.T) {
 	withStorage(t, func(ctx context.Context, s *MemoryStorage) {
 		key := DCRKey{
 			Issuer:      "https://idp.example.com",
@@ -1853,12 +2399,58 @@ func TestMemoryStorage_DCRCredentials_OverwriteSemantics(t *testing.T) {
 			}
 		}
 
-		require.NoError(t, s.StoreDCRCredentials(ctx, mkCreds("first")))
-		require.NoError(t, s.StoreDCRCredentials(ctx, mkCreds("second")))
+		first, err := s.StoreDCRCredentialsIfAbsent(ctx, mkCreds("first"))
+		require.NoError(t, err)
+		assert.Equal(t, "first", first.ClientID)
+
+		second, err := s.StoreDCRCredentialsIfAbsent(ctx, mkCreds("second"))
+		require.NoError(t, err)
+		assert.Equal(t, "first", second.ClientID,
+			"the loser must get back the winner's credentials, not its own")
 
 		got, err := s.GetDCRCredentials(ctx, key)
 		require.NoError(t, err)
-		assert.Equal(t, "second", got.ClientID)
+		assert.Equal(t, "first", got.ClientID, "the store must keep the first-claimed entry")
+	})
+}
+
+// TestMemoryStorage_DCRCredentials_ExpiredEntryCanBeReclaimed pins the
+// TTL-awareness of the in-memory "absent" check: the in-memory backend has
+// no native TTL, so an existing entry whose ClientSecretExpiresAt is already
+// in the past must be treated as absent — otherwise an expired secret would
+// permanently block re-registration, unlike the Redis backend where the row
+// self-evicts.
+func TestMemoryStorage_DCRCredentials_ExpiredEntryCanBeReclaimed(t *testing.T) {
+	withStorage(t, func(ctx context.Context, s *MemoryStorage) {
+		key := DCRKey{
+			Issuer:      "https://idp.example.com",
+			UpstreamID:  "https://upstream.example.com",
+			RedirectURI: "https://x/cb",
+			ScopesHash:  ScopesHash([]string{"openid"}),
+		}
+		expired, err := s.StoreDCRCredentialsIfAbsent(ctx, &DCRCredentials{
+			Key:                   key,
+			ClientID:              "expired-client",
+			AuthorizationEndpoint: "https://idp.example.com/auth",
+			TokenEndpoint:         "https://idp.example.com/token",
+			ClientSecretExpiresAt: time.Now().Add(-time.Hour),
+		})
+		require.NoError(t, err)
+		assert.Equal(t, "expired-client", expired.ClientID)
+
+		reclaimed, err := s.StoreDCRCredentialsIfAbsent(ctx, &DCRCredentials{
+			Key:                   key,
+			ClientID:              "fresh-client",
+			AuthorizationEndpoint: "https://idp.example.com/auth",
+			TokenEndpoint:         "https://idp.example.com/token",
+		})
+		require.NoError(t, err)
+		assert.Equal(t, "fresh-client", reclaimed.ClientID,
+			"an expired entry must be treated as absent and reclaimable")
+
+		got, err := s.GetDCRCredentials(ctx, key)
+		require.NoError(t, err)
+		assert.Equal(t, "fresh-client", got.ClientID)
 	})
 }
 
@@ -1958,7 +2550,7 @@ func TestMemoryStorage_DCRCredentials_StoreInvalidInputRejected(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			withStorage(t, func(ctx context.Context, s *MemoryStorage) {
-				err := s.StoreDCRCredentials(ctx, tc.mutator(validCreds()))
+				_, err := s.StoreDCRCredentialsIfAbsent(ctx, tc.mutator(validCreds()))
 				require.Error(t, err)
 				assert.ErrorIs(t, err, fosite.ErrInvalidRequest)
 				// Confirm the rejection did not partially populate the store.
@@ -1980,12 +2572,13 @@ func TestMemoryStorage_DCRCredentials_GetReturnsDefensiveCopy(t *testing.T) {
 			RedirectURI: "https://x/cb",
 			ScopesHash:  ScopesHash([]string{"openid"}),
 		}
-		require.NoError(t, s.StoreDCRCredentials(ctx, &DCRCredentials{
+		_, err := s.StoreDCRCredentialsIfAbsent(ctx, &DCRCredentials{
 			Key:                   key,
 			ClientID:              "orig",
 			AuthorizationEndpoint: "https://idp.example.com/auth",
 			TokenEndpoint:         "https://idp.example.com/token",
-		}))
+		})
+		require.NoError(t, err)
 
 		got, err := s.GetDCRCredentials(ctx, key)
 		require.NoError(t, err)
@@ -2014,7 +2607,8 @@ func TestMemoryStorage_DCRCredentials_StoreCopyIsolatesCaller(t *testing.T) {
 			AuthorizationEndpoint: "https://idp.example.com/auth",
 			TokenEndpoint:         "https://idp.example.com/token",
 		}
-		require.NoError(t, s.StoreDCRCredentials(ctx, input))
+		_, err := s.StoreDCRCredentialsIfAbsent(ctx, input)
+		require.NoError(t, err)
 
 		input.ClientID = "tampered-after-store"
 
@@ -2036,13 +2630,14 @@ func TestMemoryStorage_DCRCredentials_ExcludedFromCleanupExpired(t *testing.T) {
 			RedirectURI: "https://x/cb",
 			ScopesHash:  ScopesHash([]string{"openid"}),
 		}
-		require.NoError(t, s.StoreDCRCredentials(ctx, &DCRCredentials{
+		_, err := s.StoreDCRCredentialsIfAbsent(ctx, &DCRCredentials{
 			Key:                   key,
 			ClientID:              "abc",
 			AuthorizationEndpoint: "https://idp.example.com/auth",
 			TokenEndpoint:         "https://idp.example.com/token",
 			CreatedAt:             time.Now().Add(-365 * 24 * time.Hour),
-		}))
+		})
+		require.NoError(t, err)
 
 		s.cleanupExpired()
 
@@ -2053,7 +2648,7 @@ func TestMemoryStorage_DCRCredentials_ExcludedFromCleanupExpired(t *testing.T) {
 }
 
 // TestMemoryStorage_DCRCredentials_ConcurrentAccess fans out N goroutines
-// performing alternating StoreDCRCredentials / GetDCRCredentials against
+// performing alternating StoreDCRCredentialsIfAbsent / GetDCRCredentials against
 // overlapping and disjoint keys, exercising the sync.RWMutex guard
 // advertised in the DCRCredentialStore contract. With go test -race this
 // catches a future change that drops the lock or returns an internal
@@ -2110,7 +2705,7 @@ func TestMemoryStorage_DCRCredentials_ConcurrentAccess(t *testing.T) {
 					} else {
 						key = disjointKey(worker, i)
 					}
-					if err := s.StoreDCRCredentials(ctx, mkCreds(key, fmt.Sprintf("worker-%d-op-%d", worker, i))); err != nil {
+					if _, err := s.StoreDCRCredentialsIfAbsent(ctx, mkCreds(key, fmt.Sprintf("worker-%d-op-%d", worker, i))); err != nil {
 						atomic.AddInt32(&errCount, 1)
 					}
 					// The disjoint Get must always hit (the goroutine that

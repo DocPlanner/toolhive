@@ -31,3 +31,14 @@ func IsHealthCheck(ctx context.Context) bool {
 	val, ok := ctx.Value(healthCheckContextKey{}).(bool)
 	return ok && val
 }
+
+const (
+	// ProbeHeader marks wire-level health probe requests between vMCPs so the
+	// receiving spoke can skip heavyweight session creation. It lives here,
+	// not in pkg/vmcp/health, so pkg/vmcp/client can set it without importing
+	// the health package.
+	ProbeHeader = "X-ToolHive-Health-Check"
+
+	// ProbeHeaderValue is the canonical truthy value for ProbeHeader.
+	ProbeHeaderValue = "1"
+)

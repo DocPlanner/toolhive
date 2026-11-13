@@ -23,6 +23,9 @@ import (
 	"time"
 
 	"github.com/ory/fosite"
+
+	"github.com/stacklok/toolhive/pkg/authserver/server"
+	"github.com/stacklok/toolhive/pkg/authserver/server/registration"
 )
 
 // timedEntry wraps a value with its creation time for TTL tracking.
@@ -36,6 +39,22 @@ type timedEntry[T any] struct {
 type upstreamKey struct {
 	sessionID    string
 	providerName string
+}
+
+// assertionJWTKey identifies a consumed assertion JWT without sharing JTIs
+// across assertion purposes or authorization-server issuers.
+type assertionJWTKey struct {
+	purpose string
+	issuer  string
+	jti     string
+}
+
+// clientOrderEntry is one position in MemoryStorage.clientOrder: a client ID
+// and the time it was placed at the back of the eviction queue (registration
+// or renewal). touchedAt backs the minClientAge grace window.
+type clientOrderEntry struct {
+	id        string
+	touchedAt time.Time
 }
 
 // MemoryStorage implements the Storage interface with in-memory maps.
@@ -55,7 +74,45 @@ type MemoryStorage struct {
 	mu sync.RWMutex
 
 	// clients maps client_id -> Client for client lookup (fosite.ClientManager).
+	// A SPIFFE static-client durable placeholder (see staticClientPlaceholder
+	// in spiffe_decorator.go) is stored here as the live inertPlaceholderClient
+	// Go value, so its overridden GetGrantTypes/GetResponseTypes are called
+	// directly on every read — unlike RedisStorage, which serializes the
+	// client's fields and must re-derive the same guarantee on read-back via
+	// storedClient.Reserved (see clientFromStored in redis.go). No equivalent
+	// marker is needed here.
 	clients map[string]fosite.Client
+
+	// clientOrder is the least-recently-proven-used order of clients: a
+	// registration starts at the back, and RenewClientTTL moves a DCR-issued
+	// client to the back again on proven use (a successful token
+	// exchange/refresh), mirroring RedisStorage.RenewClientTTL's TTL bump.
+	// Each entry's touchedAt records when it was placed at the back
+	// (registration or renewal), which oldestEvictableClientIndex uses to
+	// apply the minClientAge grace window. Eviction in RegisterClient walks
+	// from the front and takes the first entry that both carries the
+	// registration.DCRIssued marker and has aged past minClientAge.
+	// /oauth/register is unauthenticated and every call mints an entry, so an
+	// uncapped map is a memory-exhaustion DoS in the same process as the
+	// proxy. RegisterClient evicts an aged DCR-issued client when safe;
+	// otherwise it rejects the registration to preserve the configured cap.
+	clientOrder []clientOrderEntry
+
+	// maxClients caps the client map; zero means unlimited. RegisterClient
+	// evicts the oldest DCR-issued entry once the cap is reached; a
+	// pre-provisioned client (no DCRIssued marker) is never evicted.
+	maxClients int
+
+	// minClientAge is the grace window below which a DCR-issued client is
+	// never evicted, regardless of position in clientOrder. Without it, a
+	// legitimately registered but not-yet-used client sits at the front of
+	// the queue (RenewClientTTL only fires on a successful token exchange),
+	// so an attacker filling the map at capacity can evict that specific
+	// victim on demand — the rate limiter bounds the speed of this but not
+	// the outcome. The floor removes that targeted-victim primitive while
+	// keeping the anti-bloat bound: if every current entry is younger than
+	// the floor, RegisterClient returns ErrClientCapacity.
+	minClientAge time.Duration
 
 	// authCodes maps authorization code -> Requester. Codes are one-time-use;
 	// invalidatedCodes tracks used codes to return ErrInvalidatedAuthorizeCode.
@@ -86,6 +143,9 @@ type MemoryStorage struct {
 	// clientAssertionJWTs tracks JTIs to prevent JWT replay attacks per RFC 7523.
 	clientAssertionJWTs map[string]time.Time
 
+	// assertionJWTs tracks consumed assertion JWTs by purpose, issuer, and JTI.
+	assertionJWTs map[assertionJWTKey]time.Time
+
 	// users maps user ID -> User for user account lookup.
 	// Users are not subject to TTL-based cleanup as they represent persistent accounts.
 	users map[string]*User
@@ -95,17 +155,26 @@ type MemoryStorage struct {
 	providerIdentities map[string]*ProviderIdentity
 
 	// dcrCredentials maps DCRKey -> DCRCredentials for RFC 7591 Dynamic Client
-	// Registration credentials. Entries are intentionally excluded from the
-	// periodic cleanupExpired loop: DCR registrations are long-lived and the
-	// authoritative expiry signal is RFC 7591 client_secret_expires_at, which
-	// is honored at read time by callers (and by the future Redis backend's
-	// SetEX TTL). Growth is bounded by upstream count × distinct scope sets
-	// ever registered for each upstream during the process lifetime; for a
-	// stable configuration this collapses to the upstream count, but rotating
-	// scope sets (operator-driven scope changes, or upstream
-	// scopes_supported rotations re-derived by the resolver) accumulate
-	// stale entries that survive until process restart. The Redis backend's
-	// SetEX TTL mitigates this in production deployments.
+	// Registration credentials. These entries come from OUTBOUND DCR: ToolHive
+	// acting as a DCR client to register itself against a configured upstream
+	// IdP (see pkg/auth/dcr/store.go, the only caller of StoreDCRCredentialsIfAbsent).
+	// This is not reachable from the inbound, unauthenticated /oauth/register
+	// handler, so unlike clients (bounded by maxClients/clientOrder because
+	// every inbound registration call mints an entry), growth here is bounded
+	// by the number of configured upstreams, which the operator controls, not
+	// by request volume — hence no eviction or cap on this map.
+	//
+	// Entries are intentionally excluded from the periodic cleanupExpired
+	// loop: DCR registrations are long-lived and the authoritative expiry
+	// signal is RFC 7591 client_secret_expires_at, which is honored at read
+	// time by callers (and by the future Redis backend's SetEX TTL). Growth
+	// is bounded by upstream count × distinct scope sets ever registered for
+	// each upstream during the process lifetime; for a stable configuration
+	// this collapses to the upstream count, but rotating scope sets
+	// (operator-driven scope changes, or upstream scopes_supported rotations
+	// re-derived by the resolver) accumulate stale entries that survive until
+	// process restart. The Redis backend's SetEX TTL mitigates this in
+	// production deployments.
 	dcrCredentials map[DCRKey]*DCRCredentials
 
 	// cleanupInterval is how often the background cleanup runs
@@ -128,6 +197,39 @@ func WithCleanupInterval(interval time.Duration) MemoryStorageOption {
 	}
 }
 
+// DefaultMaxClients is the default cap on the in-memory client map.
+// /oauth/register is unauthenticated and mints an entry per call; the cap
+// bounds memory growth while staying far above any legitimate client count
+// (clients register once and reuse their client_id).
+const DefaultMaxClients = 10000
+
+// WithMaxClients sets the client-map cap. Once reached, RegisterClient evicts
+// the oldest DCR-issued registration that has aged past minClientAge
+// (oldest-first). A pre-provisioned client (no registration.DCRIssued marker)
+// is never evicted; if no DCR-issued client can be safely evicted,
+// RegisterClient returns ErrClientCapacity.
+func WithMaxClients(n int) MemoryStorageOption {
+	return func(s *MemoryStorage) {
+		s.maxClients = n
+	}
+}
+
+// DefaultMinClientAge is the default grace window below which a DCR-issued
+// client is never evicted. See the minClientAge field doc for why the floor
+// exists: without it, a freshly registered but not-yet-used client can be
+// evicted on demand by an attacker filling the map to capacity.
+const DefaultMinClientAge = time.Hour
+
+// WithMinClientAge overrides the grace window below which a DCR-issued
+// client is protected from eviction regardless of queue position. Tests use
+// this to drive the floor down (e.g. to zero) instead of sleeping for real
+// wall-clock time.
+func WithMinClientAge(d time.Duration) MemoryStorageOption {
+	return func(s *MemoryStorage) {
+		s.minClientAge = d
+	}
+}
+
 // NewMemoryStorage creates a new MemoryStorage instance with initialized maps
 // and starts the background cleanup goroutine.
 func NewMemoryStorage(opts ...MemoryStorageOption) *MemoryStorage {
@@ -141,10 +243,13 @@ func NewMemoryStorage(opts ...MemoryStorageOption) *MemoryStorage {
 		pendingAuthorizations: make(map[string]*timedEntry[*PendingAuthorization]),
 		invalidatedCodes:      make(map[string]*timedEntry[bool]),
 		clientAssertionJWTs:   make(map[string]time.Time),
+		assertionJWTs:         make(map[assertionJWTKey]time.Time),
 		users:                 make(map[string]*User),
 		providerIdentities:    make(map[string]*ProviderIdentity),
 		dcrCredentials:        make(map[DCRKey]*DCRCredentials),
 		cleanupInterval:       DefaultCleanupInterval,
+		maxClients:            DefaultMaxClients,
+		minClientAge:          DefaultMinClientAge,
 		stopCleanup:           make(chan struct{}),
 		cleanupDone:           make(chan struct{}),
 	}
@@ -260,6 +365,13 @@ func (s *MemoryStorage) cleanupExpired() {
 		}
 	}
 
+	var expiredAssertionJWTs []assertionJWTKey
+	for k, v := range s.assertionJWTs {
+		if now.After(v) {
+			expiredAssertionJWTs = append(expiredAssertionJWTs, k)
+		}
+	}
+
 	s.mu.RUnlock()
 
 	// Phase 2: Early return if nothing to delete (no write lock needed)
@@ -270,7 +382,8 @@ func (s *MemoryStorage) cleanupExpired() {
 		len(expiredPKCERequests) == 0 &&
 		len(expiredUpstreamTokens) == 0 &&
 		len(expiredPendingAuthorizations) == 0 &&
-		len(expiredJWTs) == 0 {
+		len(expiredJWTs) == 0 &&
+		len(expiredAssertionJWTs) == 0 {
 		return
 	}
 
@@ -310,6 +423,12 @@ func (s *MemoryStorage) cleanupExpired() {
 	for _, k := range expiredJWTs {
 		delete(s.clientAssertionJWTs, k)
 	}
+
+	for _, k := range expiredAssertionJWTs {
+		if exp, ok := s.assertionJWTs[k]; ok && now.After(exp) {
+			delete(s.assertionJWTs, k)
+		}
+	}
 }
 
 // getExpirationFromRequester extracts expiration time from a fosite.Requester session.
@@ -337,19 +456,159 @@ func getExpirationFromRequester(request fosite.Requester, tokenType fosite.Token
 	return expTime
 }
 
-// RegisterClient adds or updates a client in the storage.
-// This is useful for setting up test clients.
+// RegisterClient creates a client in storage. Always create-only: it returns
+// ErrAlreadyExists when a client with the same ID is already registered,
+// regardless of the new client's origin. /oauth/register is unauthenticated,
+// so this must never clobber an existing client; operator-declared clients
+// reconcile through ReconcileConfiguredClient instead.
 func (s *MemoryStorage) RegisterClient(_ context.Context, client fosite.Client) error {
+	id := client.GetID()
+	if err := ValidateRegisterableClientID(id); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.clients[client.GetID()] = client
+
+	if _, exists := s.clients[id]; exists {
+		return fmt.Errorf("%w: client %q", ErrAlreadyExists, id)
+	}
+	return s.insertClientLocked(id, client)
+}
+
+// UpsertDCRIssuedClient creates or replaces a DCR-issued client at
+// client.GetID(). Unlike RegisterClient, an existing row is replaced (and its
+// eviction position refreshed) rather than rejected -- but only when the
+// existing row is itself DCR-issued; a configured/SPIFFE-reconciled row at
+// the same ID is protected and refuses with ErrAlreadyExists. See the
+// ClientRegistry interface doc for the full contract.
+func (s *MemoryStorage) UpsertDCRIssuedClient(_ context.Context, client fosite.Client) error {
+	if !registration.DCRIssued(client) {
+		return fmt.Errorf("client %q must carry the DCR-issued marker to use UpsertDCRIssuedClient", client.GetID())
+	}
+	id := client.GetID()
+	if err := ValidateRegisterableClientID(id); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	existing, exists := s.clients[id]
+	if !exists {
+		return s.insertClientLocked(id, client)
+	}
+	if !registration.DCRIssued(existing) {
+		return fmt.Errorf("%w: client %q", ErrAlreadyExists, id)
+	}
+
+	s.clientOrder = slices.DeleteFunc(s.clientOrder, func(e clientOrderEntry) bool { return e.id == id })
+	s.clientOrder = append(s.clientOrder, clientOrderEntry{id: id, touchedAt: time.Now()})
+	s.clients[id] = client
 	return nil
 }
 
-// RenewClientTTL is a no-op for the in-memory backend: clients are held for the
-// process lifetime with no TTL, so there is nothing to renew. The behavior that
-// matters for distributed deployments lives in RedisStorage.RenewClientTTL.
-func (*MemoryStorage) RenewClientTTL(_ context.Context, _ fosite.Client) error {
+// ReconcileConfiguredClient applies an operator-declared client: creates it
+// if absent, idempotently replaces a matching-fingerprint configured client
+// (the restart-with-unchanged-config case), or refuses with ErrAlreadyExists
+// when the existing record is DCR-issued or a different configured client.
+// See the ClientRegistry interface doc for the full contract.
+func (s *MemoryStorage) ReconcileConfiguredClient(_ context.Context, client fosite.Client) error {
+	if registration.DCRIssued(client) {
+		return fmt.Errorf("configured client %q must not carry the DCR-issued marker", client.GetID())
+	}
+	id := client.GetID()
+	if err := ValidateRegisterableClientID(id); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	existing, exists := s.clients[id]
+	if !exists {
+		return s.insertClientLocked(id, client)
+	}
+	if registration.DCRIssued(existing) {
+		return fmt.Errorf("%w: client %q is DCR-issued, refusing to overwrite with a configured client",
+			ErrAlreadyExists, id)
+	}
+	if !fingerprintOfClient(existing).equal(fingerprintOfClient(client)) {
+		return fmt.Errorf("%w: client %q is already registered as a different configured client",
+			ErrAlreadyExists, id)
+	}
+
+	// Idempotent restart with unchanged config: refresh the eviction position
+	// and replace the stored value so secret rotation still takes effect.
+	s.clientOrder = slices.DeleteFunc(s.clientOrder, func(e clientOrderEntry) bool { return e.id == id })
+	s.clientOrder = append(s.clientOrder, clientOrderEntry{id: id, touchedAt: time.Now()})
+	s.clients[id] = client
+	return nil
+}
+
+// insertClientLocked inserts client under id, evicting the oldest eligible
+// DCR-issued client if the map is at capacity. Callers must hold s.mu and
+// must have already verified that no client currently exists at id.
+func (s *MemoryStorage) insertClientLocked(id string, client fosite.Client) error {
+	now := time.Now()
+	if s.maxClients > 0 && len(s.clients) >= s.maxClients {
+		if idx := s.oldestEvictableClientIndex(now); idx >= 0 {
+			victim := s.clientOrder[idx].id
+			s.clientOrder = append(s.clientOrder[:idx], s.clientOrder[idx+1:]...)
+			delete(s.clients, victim)
+			slog.Debug("evicted oldest DCR-issued client registration at capacity",
+				"client_id", victim, "max_clients", s.maxClients)
+		} else {
+			slog.Debug("client map at capacity with no safely evictable DCR-issued client",
+				"max_clients", s.maxClients)
+			return fmt.Errorf("%w: no DCR-issued client can be safely evicted", ErrClientCapacity)
+		}
+	}
+	s.clientOrder = append(s.clientOrder, clientOrderEntry{id: id, touchedAt: now})
+	s.clients[id] = client
+	return nil
+}
+
+// oldestEvictableClientIndex returns the clientOrder index of the oldest
+// (frontmost) client that carries the registration.DCRIssued marker and has
+// aged past minClientAge as of now, or -1 if no current entry is evictable.
+// Callers must hold s.mu.
+func (s *MemoryStorage) oldestEvictableClientIndex(now time.Time) int {
+	for i, entry := range s.clientOrder {
+		if now.Sub(entry.touchedAt) < s.minClientAge {
+			continue
+		}
+		if client, ok := s.clients[entry.id]; ok && registration.DCRIssued(client) {
+			return i
+		}
+	}
+	return -1
+}
+
+// RenewClientTTL moves a DCR-issued client to the back of clientOrder on
+// proven use (a successful token exchange/refresh), the same signal
+// RedisStorage.RenewClientTTL uses to extend a Redis TTL. The in-memory
+// backend holds no wall-clock TTL, so "renewal" here means "make this client
+// the least-eligible-for-eviction" rather than resetting an expiry: FIFO
+// eviction order thereby becomes least-recently-proven-used order. Only
+// DCR-issued clients are repositioned; a pre-provisioned client is never
+// evicted so it needs no renewal. A client absent from the map (already
+// evicted, or never persisted) is a no-op, matching RedisStorage's EXPIRE
+// no-op on a missing key.
+func (s *MemoryStorage) RenewClientTTL(_ context.Context, client fosite.Client) error {
+	if client == nil || !registration.DCRIssued(client) {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	id := client.GetID()
+	if _, exists := s.clients[id]; !exists {
+		return nil
+	}
+	s.clientOrder = slices.DeleteFunc(s.clientOrder, func(e clientOrderEntry) bool { return e.id == id })
+	s.clientOrder = append(s.clientOrder, clientOrderEntry{id: id, touchedAt: time.Now()})
 	return nil
 }
 
@@ -370,35 +629,88 @@ func (s *MemoryStorage) GetClient(_ context.Context, id string) (fosite.Client, 
 	return client, nil
 }
 
-// ClientAssertionJWTValid returns an error if the JTI is known or the DB check failed,
-// and nil if the JTI is not known (meaning it can be used).
+// assertionReservationTTL bounds how long ClientAssertionJWTValid's atomic
+// reservation lives before SetClientAssertionJWT extends it to the
+// assertion's real (bounded) expiry. Short and fixed: if a caller wins the
+// reservation and then never calls SetClientAssertionJWT (crash, error path),
+// the jti becomes reusable again after this window rather than being stuck
+// or, worse, permanently reserved.
+const assertionReservationTTL = 30 * time.Second
+
+// ClientAssertionJWTValid atomically reserves jti for a short window,
+// returning fosite.ErrJTIKnown if it is already reserved or was previously
+// consumed and not yet expired. This is the only atomic checkpoint in
+// fosite's two-call client-assertion replay protocol (Valid, then
+// SetClientAssertionJWT with the real expiry once the rest of the assertion
+// has been validated) — without it, two concurrent requests presenting the
+// same assertion could both observe jti as unused before either recorded it.
+// jti length is bounded here too, before it's ever stored, since fosite
+// hands it to us before parsing exp.
 func (s *MemoryStorage) ClientAssertionJWTValid(_ context.Context, jti string) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if exp, ok := s.clientAssertionJWTs[jti]; ok {
-		if time.Now().Before(exp) {
-			return fosite.ErrJTIKnown
-		}
+	if len(jti) > server.MaxAssertionJTILength {
+		return fmt.Errorf("jti exceeds maximum length of %d bytes", server.MaxAssertionJTILength)
 	}
-	return nil
-}
 
-// SetClientAssertionJWT marks a JTI as known for the given expiry time.
-// Before inserting the new JTI, it will clean up any existing JTIs that have expired.
-func (s *MemoryStorage) SetClientAssertionJWT(_ context.Context, jti string, exp time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Clean up expired JTIs
 	now := time.Now()
+	if exp, ok := s.clientAssertionJWTs[jti]; ok && now.Before(exp) {
+		return fosite.ErrJTIKnown
+	}
+
+	// Clean up expired JTIs while the lock is already held.
 	for k, v := range s.clientAssertionJWTs {
 		if now.After(v) {
 			delete(s.clientAssertionJWTs, k)
 		}
 	}
 
+	s.clientAssertionJWTs[jti] = now.Add(assertionReservationTTL)
+	return nil
+}
+
+// SetClientAssertionJWT extends jti's replay marker to its real expiry,
+// rejecting an exp further than MaxAssertionLifespan in the future. This
+// bounds how long a replay-tracking entry survives regardless of what the
+// client's own assertion claims — otherwise a registered caller could set
+// exp decades out and grow this map indefinitely. Unconditional overwrite,
+// not a fresh atomic check: only the caller that already won
+// ClientAssertionJWTValid's reservation reaches this call.
+func (s *MemoryStorage) SetClientAssertionJWT(_ context.Context, jti string, exp time.Time) error {
+	if time.Until(exp) > server.MaxAssertionLifespan {
+		return fmt.Errorf("assertion lifetime exceeds maximum of %s", server.MaxAssertionLifespan)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	s.clientAssertionJWTs[jti] = exp
+	return nil
+}
+
+// ConsumeAssertionJWT atomically records an assertion JWT as consumed until its
+// expiry. Reusing an unexpired (purpose, issuer, jti) tuple returns
+// fosite.ErrJTIKnown. Expired assertions are not retained because a caller must
+// reject them during JWT validation before attempting replay consumption.
+func (s *MemoryStorage) ConsumeAssertionJWT(_ context.Context, purpose, issuer, jti string, exp time.Time) error {
+	key := assertionJWTKey{purpose: purpose, issuer: issuer, jti: jti}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	if !exp.After(now) {
+		return nil
+	}
+
+	if storedExp, ok := s.assertionJWTs[key]; ok {
+		if storedExp.After(now) {
+			return fosite.ErrJTIKnown
+		}
+		delete(s.assertionJWTs, key)
+	}
+
+	s.assertionJWTs[key] = exp
 	return nil
 }
 
@@ -713,6 +1025,18 @@ func (s *MemoryStorage) DeletePKCERequestSession(_ context.Context, signature st
 // -----------------------
 // Upstream Token Storage
 // -----------------------
+
+// ResolveUpstreamTokenRowID returns an opaque ID for process-local refresh
+// coordination of a logical upstream-token row.
+func (*MemoryStorage) ResolveUpstreamTokenRowID(_ context.Context, sessionID, providerName string) (UpstreamTokenRowID, error) {
+	if sessionID == "" {
+		return "", fosite.ErrInvalidRequest.WithHint("session ID cannot be empty")
+	}
+	if providerName == "" {
+		return "", fosite.ErrInvalidRequest.WithHint("provider name cannot be empty")
+	}
+	return upstreamTokenRowID(sessionID, providerName), nil
+}
 
 // StoreUpstreamTokens stores the upstream IDP tokens for a session and provider.
 // A defensive copy is made to prevent aliasing issues.
@@ -1246,29 +1570,46 @@ func cloneDCRCredentials(c *DCRCredentials) *DCRCredentials {
 	return &cp
 }
 
-// StoreDCRCredentials persists DCR credentials for the given key.
-// The credentials are stored under their own Key field; callers must populate
-// it before calling. A defensive copy is made so subsequent caller mutations
-// do not affect persisted state.
+// StoreDCRCredentialsIfAbsent claims creds.Key for creds. The credentials
+// are stored under their own Key field; callers must populate it before
+// calling. A defensive copy is made so subsequent caller mutations do not
+// affect persisted state.
 //
-// Overwrites any existing entry for the same Key. The in-memory backend
-// applies no native TTL — DCR registrations are long-lived and bounded by
-// the operator-configured upstream count, and ClientSecretExpiresAt is
-// retained verbatim for callers to re-check on read (see the interface
-// docstring's "TTL handling" section).
+// Create-if-absent, not overwrite: a single process's dcrFlight singleflight
+// (see pkg/auth/dcr) already prevents concurrent same-key writers within
+// this process, so the check below is not closing a live race here — it is
+// contract symmetry with RedisStorage.StoreDCRCredentialsIfAbsent, which
+// DOES need it to prevent two replicas from independently registering RFC
+// 7591 clients for the same Key and racing on which write wins.
+//
+// The in-memory backend has no native TTL, so "absent" cannot be a plain
+// map-presence check: the Redis backend's rows self-evict via TTL derived
+// from ClientSecretExpiresAt, so a claim there naturally succeeds again once
+// the old row expires. To keep behaviour symmetric, an existing entry whose
+// ClientSecretExpiresAt is non-zero and already in the past is treated as
+// absent — the claim proceeds and overwrites it — so a secret's expiry does
+// not permanently block re-registration on this backend the way a naive
+// presence check would.
 //
 // Validation is delegated to validateDCRCredentialsForStore so the rejection
 // set stays in sync with sibling backends.
-func (s *MemoryStorage) StoreDCRCredentials(_ context.Context, creds *DCRCredentials) error {
+func (s *MemoryStorage) StoreDCRCredentialsIfAbsent(_ context.Context, creds *DCRCredentials) (*DCRCredentials, error) {
 	if err := validateDCRCredentialsForStore(creds); err != nil {
-		return err
+		return nil, err
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if existing, ok := s.dcrCredentials[creds.Key]; ok {
+		expired := !existing.ClientSecretExpiresAt.IsZero() && time.Now().After(existing.ClientSecretExpiresAt)
+		if !expired {
+			return cloneDCRCredentials(existing), nil
+		}
+	}
+
 	s.dcrCredentials[creds.Key] = cloneDCRCredentials(creds)
-	return nil
+	return cloneDCRCredentials(creds), nil
 }
 
 // GetDCRCredentials retrieves DCR credentials by key.
@@ -1340,4 +1681,5 @@ var (
 	_ UpstreamTokenStorage        = (*MemoryStorage)(nil)
 	_ UserStorage                 = (*MemoryStorage)(nil)
 	_ DCRCredentialStore          = (*MemoryStorage)(nil)
+	_ AssertionJWTConsumer        = (*MemoryStorage)(nil)
 )

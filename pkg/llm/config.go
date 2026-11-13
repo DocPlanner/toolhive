@@ -38,11 +38,20 @@ type Config struct {
 	// consumers consistent on a later plain "thv llm setup".
 	Models          []string     `yaml:"models,omitempty"            json:"models,omitempty"`
 	ConfiguredTools []ToolConfig `yaml:"configured_tools,omitempty"  json:"configured_tools,omitempty"`
+	// discoveryAccessToken is populated only for the duration of setup. It is
+	// deliberately unexported so authentication material can never be persisted.
+	discoveryAccessToken string
 }
+
+// SetDiscoveryAccessToken makes the token obtained by setup's authentication
+// flow available to authenticated model discovery without persisting it.
+func (c *Config) SetDiscoveryAccessToken(token string) { c.discoveryAccessToken = token }
 
 // BedrockConfig holds settings for configuring Claude Code to reach an LLM
 // gateway that forwards to AWS Bedrock. It is persisted so that a later plain
 // "thv llm setup" re-applies these settings rather than silently clearing them.
+// That stickiness ends at teardown: reverting the last configured tool resets the
+// whole LLM config (see Teardown), so it cannot outlive the tools that used it.
 type BedrockConfig struct {
 	// Compat, when true, writes CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 and the
 	// per-tier Bedrock model IDs into Claude Code's settings.json. Bedrock rejects
@@ -66,7 +75,7 @@ type ToolConfig struct {
 	// Tool is the canonical tool identifier (e.g. "claude-code", "cursor").
 	Tool string `yaml:"tool" json:"tool"`
 	// Mode is the authentication mode: one of the llmgateway.Mode* values
-	// ("direct", "proxy", "credential-helper", "codex-auth").
+	// ("direct", "proxy", "credential-helper", "codex-auth", "vscode").
 	Mode string `yaml:"mode" json:"mode"`
 	// ConfigPath is the absolute path to the tool's config file that was patched.
 	ConfigPath string `yaml:"config_path" json:"config_path"`

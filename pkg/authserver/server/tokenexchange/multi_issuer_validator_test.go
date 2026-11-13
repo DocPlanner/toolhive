@@ -7,11 +7,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -48,6 +52,32 @@ func startJWKSServer(t *testing.T, tj *testJWKS) *httptest.Server {
 	return srv
 }
 
+// writeTLSCABundle writes srv's self-signed certificate as a PEM CA bundle.
+func writeTLSCABundle(t *testing.T, srv *httptest.Server) string {
+	t.Helper()
+
+	caPath := filepath.Join(t.TempDir(), "ca.crt")
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+	require.NoError(t, os.WriteFile(caPath, caPEM, 0600))
+	return caPath
+}
+
+// startTLSJWKSServer creates a TLS test server that serves a JWKS endpoint and
+// returns the path to a CA bundle that trusts its certificate.
+func startTLSJWKSServer(t *testing.T, tj *testJWKS) (*httptest.Server, string) {
+	t.Helper()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/jwks", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(tj.publicJWKS())
+	})
+
+	srv := httptest.NewTLSServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, writeTLSCABundle(t, srv)
+}
+
 // newMultiValidator creates a MultiIssuerTokenValidator configured for testing.
 // The external JWKS URL is pre-resolved (no discovery needed) unless jwksURL is empty.
 func newMultiValidator(
@@ -70,8 +100,12 @@ func newMultiValidator(
 		issuers[i] = ti
 	}
 
-	v, err := NewMultiIssuerTokenValidator(selfValidator, testIssuer, issuers)
+	v, err := NewMultiIssuerTokenValidator(selfValidator, testIssuer, issuers, nil)
 	require.NoError(t, err)
+	// Release each issuer's JWKS worker pool at test end — Close is idempotent,
+	// so tests that also close explicitly are unaffected. Without this the suite
+	// leaks the very worker pools this validator's Close exists to release.
+	t.Cleanup(func() { _ = v.Close() })
 	return v
 }
 
@@ -87,6 +121,188 @@ func externalClaims() jwt.Claims {
 		NotBefore: jwt.NewNumericDate(now.Add(-time.Minute)),
 		ID:        "jti-ext-789",
 	}
+}
+
+func TestMultiIssuerTokenValidator_ExternalIssuerCABundle(t *testing.T) {
+	t.Parallel()
+
+	t.Run("trusts private TLS JWKS with configured bundle", func(t *testing.T) {
+		t.Parallel()
+
+		selfJWKS := newTestJWKS(t)
+		externalJWKS := newTestJWKS(t)
+		srv, caPath := startTLSJWKSServer(t, externalJWKS)
+		validator := newMultiValidator(t, selfJWKS, []TrustedIssuer{{
+			IssuerURL:              testExternalIssuer,
+			ExpectedAudience:       testExternalAudience,
+			JWKSURL:                srv.URL + "/jwks",
+			CAFilePath:             caPath,
+			AllowedActors:          []string{"ext-agent"},
+			AllowedDelegateClients: []string{anyDelegateClient},
+		}})
+
+		result, err := validator.Validate(context.Background(), externalJWKS.signToken(t, externalClaims(), map[string]any{"azp": "ext-agent"}))
+		require.NoError(t, err)
+		assert.Equal(t, "ext-user-456", result.Subject)
+	})
+
+	t.Run("rejects private TLS JWKS without configured bundle", func(t *testing.T) {
+		t.Parallel()
+
+		selfJWKS := newTestJWKS(t)
+		externalJWKS := newTestJWKS(t)
+		srv, _ := startTLSJWKSServer(t, externalJWKS)
+		validator := newMultiValidator(t, selfJWKS, []TrustedIssuer{{
+			IssuerURL:              testExternalIssuer,
+			ExpectedAudience:       testExternalAudience,
+			JWKSURL:                srv.URL + "/jwks",
+			AllowedActors:          []string{"ext-agent"},
+			AllowedDelegateClients: []string{anyDelegateClient},
+		}})
+
+		result, err := validator.Validate(context.Background(), externalJWKS.signToken(t, externalClaims(), map[string]any{"azp": "ext-agent"}))
+		require.Error(t, err)
+		assert.Nil(t, result)
+		// jwx's httprc layer does not propagate the x509 cause: the registration
+		// fails as "resource registered but not ready" once the fetch times out.
+		// Assert on the stage that failed instead, which together with the
+		// success case above pins the bundle as the load-bearing difference.
+		assert.Contains(t, err.Error(), "failed to fetch JWKS")
+		// This subtest waits out httpTimeout (10s) because the fetch context is
+		// detached from the caller's, so a shorter context here cannot bound it.
+	})
+
+	t.Run("unreadable bundle fails construction", func(t *testing.T) {
+		t.Parallel()
+
+		selfJWKS := newTestJWKS(t)
+		selfValidator, err := NewSelfIssuedTokenValidator(selfJWKS.publicJWKS(), testIssuer, []string{testIssuer})
+		require.NoError(t, err)
+
+		_, err = NewMultiIssuerTokenValidator(selfValidator, testIssuer, []TrustedIssuer{{
+			IssuerURL:              testExternalIssuer,
+			ExpectedAudience:       testExternalAudience,
+			JWKSURL:                "https://issuer.example.com/jwks",
+			CAFilePath:             filepath.Join(t.TempDir(), "missing-ca.crt"),
+			AllowedDelegateClients: []string{anyDelegateClient},
+		}}, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), testExternalIssuer)
+		assert.Contains(t, err.Error(), "failed to read CA certificate bundle")
+	})
+}
+
+func TestMultiIssuerTokenValidator_DiscoverJWKSURLWithCABundle(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	srv := httptest.NewUnstartedServer(mux)
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"issuer":   srv.URL,
+			"jwks_uri": srv.URL + "/jwks",
+		})
+	})
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+
+	issuerConfig, err := newExternalIssuerConfig(context.Background(), TrustedIssuer{
+		IssuerURL:              srv.URL,
+		CAFilePath:             writeTLSCABundle(t, srv),
+		AllowPrivateIPs:        true,
+		AllowedDelegateClients: []string{anyDelegateClient},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = issuerConfig.shutdownJWKSCache(context.Background()) })
+
+	jwksURL, err := (&MultiIssuerTokenValidator{}).discoverJWKSURL(context.Background(), issuerConfig)
+	require.NoError(t, err)
+	assert.Equal(t, srv.URL+"/jwks", jwksURL)
+}
+
+func TestMultiIssuerTokenValidator_PrivateTLSKeyRotationRefreshesImmediately(t *testing.T) {
+	t.Parallel()
+
+	selfJWKS := newTestJWKS(t)
+	keyV1 := newECDSAJWK(t, "v1")
+	keyV2 := newECDSAJWK(t, "v2")
+
+	var mu sync.Mutex
+	currentKey := keyV1
+	mux := http.NewServeMux()
+	mux.HandleFunc("/jwks", func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		key := currentKey
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(publicJWKSOf(key))
+	})
+	srv := httptest.NewTLSServer(mux)
+	t.Cleanup(srv.Close)
+
+	validator := newMultiValidator(t, selfJWKS, []TrustedIssuer{{
+		IssuerURL:              testExternalIssuer,
+		ExpectedAudience:       testExternalAudience,
+		JWKSURL:                srv.URL + "/jwks",
+		CAFilePath:             writeTLSCABundle(t, srv),
+		AllowedDelegateClients: []string{"some-toolhive-client"},
+		AllowMayAct:            true,
+	}})
+
+	_, err := validator.Validate(context.Background(), signExternalToken(t, keyV1, externalClaims()))
+	require.NoError(t, err)
+
+	mu.Lock()
+	currentKey = keyV2
+	mu.Unlock()
+
+	claims := externalClaims()
+	claims.ID = "jti-post-private-tls-rotation"
+	result, err := validator.Validate(context.Background(), signExternalToken(t, keyV2, claims))
+	require.NoError(t, err)
+	assert.Equal(t, "ext-user-456", result.Subject)
+}
+
+// TestCompileActorMatcher_AcceptsAnyWellTypedExpression confirms
+// compileActorMatcher does not check an expression's output type: any
+// expression that parses and type-checks against the "claims" variable
+// compiles successfully, even one that can never return bool. The only
+// place a non-bool result is caught is at evaluation, via EvaluateBool's
+// runtime type assertion — see
+// TestCompileActorMatcher_NonBoolResultDeniesAtEvaluation.
+func TestCompileActorMatcher_AcceptsAnyWellTypedExpression(t *testing.T) {
+	t.Parallel()
+
+	for _, expression := range []string{`"engineering"`, "1", "true", "claims.foo"} {
+		t.Run(expression, func(t *testing.T) {
+			t.Parallel()
+
+			expr, err := compileActorMatcher(expression)
+			require.NoError(t, err)
+			assert.NotNil(t, expr)
+		})
+	}
+}
+
+// TestCompileActorMatcher_NonBoolResultDeniesAtEvaluation confirms a
+// syntactically- and type-valid ActorMatcher that can never return bool
+// (here, "claims.foo" where foo is a string claim) is accepted at compile
+// time — see TestCompileActorMatcher_AcceptsAnyWellTypedExpression — but
+// every evaluation against it fails, via EvaluateBool's runtime type
+// assertion. A regression that treated this evaluation error as "no
+// match" rather than surfacing it would be indistinguishable from this test
+// passing, which is why it asserts on the error directly rather than only
+// on the boolean result.
+func TestCompileActorMatcher_NonBoolResultDeniesAtEvaluation(t *testing.T) {
+	t.Parallel()
+
+	expr, err := compileActorMatcher("claims.foo")
+	require.NoError(t, err)
+
+	matched, err := expr.EvaluateBool(map[string]any{"claims": map[string]any{"foo": "a-string-value"}})
+	require.Error(t, err)
+	assert.False(t, matched)
 }
 
 func TestMultiIssuerTokenValidator_Validate(t *testing.T) {
@@ -127,12 +343,13 @@ func TestMultiIssuerTokenValidator_Validate(t *testing.T) {
 			},
 		},
 		{
-			name: "external token accepted",
+			name: "external token allowed actor bypasses a non-matching actor matcher",
 			trustedIssuers: []TrustedIssuer{{
 				IssuerURL:              testExternalIssuer,
 				ExpectedAudience:       testExternalAudience,
 				JWKSURL:                jwksServer.URL + "/jwks",
 				AllowedActors:          []string{"ext-agent"},
+				ActorMatcher:           `false`,
 				AllowedDelegateClients: []string{anyDelegateClient},
 			}},
 			token: func(t *testing.T) string {
@@ -154,7 +371,56 @@ func TestMultiIssuerTokenValidator_Validate(t *testing.T) {
 				assert.False(t, vc.Expiry.IsZero())
 				assert.False(t, vc.IssuedAt.IsZero())
 				assert.Equal(t, "ext-agent", vc.ExternalActor, "actor claim matched via default azp")
+				assert.True(t, vc.ExternalActorAuthorized)
 				assert.Equal(t, testExternalIssuer, vc.ExternalIssuer)
+			},
+		},
+		{
+			// Neither of the other two ActorMatcher: "false" cases in this
+			// table actually exercises rejection: the one above has a
+			// matching AllowedActors entry, and the may_act one below has
+			// may_act. A regression that treated an ActorMatcher evaluation
+			// of false as authorized (instead of returning a matcher-specific
+			// authorization error when no allowlist exists) would slip past both.
+			// This case has no AllowedActors entry and no may_act claim, so a
+			// false matcher result is the only signal in play and must reject.
+			name: "external token actor matcher false with no other consent signal rejected",
+			trustedIssuers: []TrustedIssuer{{
+				IssuerURL:              testExternalIssuer,
+				ExpectedAudience:       testExternalAudience,
+				JWKSURL:                jwksServer.URL + "/jwks",
+				ActorMatcher:           `false`,
+				AllowedDelegateClients: []string{anyDelegateClient},
+			}},
+			token: func(t *testing.T) string {
+				t.Helper()
+				return externalJWKS.signToken(t, externalClaims(), map[string]any{"azp": "ext-agent"})
+			},
+			wantErr:     true,
+			errContains: "was not authorized by actor matcher",
+		},
+		{
+			name: "external token actor matcher receives complete standard and nested custom claims",
+			trustedIssuers: []TrustedIssuer{{
+				IssuerURL:        testExternalIssuer,
+				ExpectedAudience: testExternalAudience,
+				JWKSURL:          jwksServer.URL + "/jwks",
+				AllowedActors:    []string{"different-external-actor"},
+				ActorMatcher: `claims.iss == "https://keycloak.example.com/realms/test" && claims.sub == "ext-user-456" && ` +
+					`claims.azp == "ext-agent" && claims.client_metadata.trust_tier == "high"`,
+				AllowedDelegateClients: []string{anyDelegateClient},
+			}},
+			token: func(t *testing.T) string {
+				t.Helper()
+				return externalJWKS.signToken(t, externalClaims(), map[string]any{
+					"azp":             "ext-agent",
+					"client_metadata": map[string]any{"trust_tier": "high"},
+				})
+			},
+			check: func(t *testing.T, vc *ValidatedClaims) {
+				t.Helper()
+				assert.True(t, vc.ExternalActorAuthorized)
+				assert.Empty(t, vc.ExternalActor, "a matcher need not resolve an external actor claim")
 			},
 		},
 		{
@@ -208,7 +474,9 @@ func TestMultiIssuerTokenValidator_Validate(t *testing.T) {
 				IssuerURL:              testExternalIssuer,
 				ExpectedAudience:       testExternalAudience,
 				JWKSURL:                jwksServer.URL + "/jwks",
+				ActorMatcher:           `false`,
 				AllowedDelegateClients: []string{"toolhive-agent-a"},
+				AllowMayAct:            true,
 			}},
 			token: func(t *testing.T) string {
 				t.Helper()
@@ -418,9 +686,10 @@ func TestMultiIssuerTokenValidator_Validate(t *testing.T) {
 				IssuerURL:        testExternalIssuer,
 				ExpectedAudience: testExternalAudience,
 				JWKSURL:          jwksServer.URL + "/jwks",
-				// AllowedActors intentionally empty: may_act is authoritative and
-				// skips the allowlist entirely.
-				AllowedDelegateClients: []string{anyDelegateClient},
+				// AllowedActors intentionally empty: permitted may_act is authoritative
+				// and skips the allowlist entirely.
+				AllowedDelegateClients: []string{"some-toolhive-client"},
+				AllowMayAct:            true,
 			}},
 			token: func(t *testing.T) string {
 				t.Helper()
@@ -449,7 +718,8 @@ func TestMultiIssuerTokenValidator_Validate(t *testing.T) {
 				IssuerURL:              testExternalIssuer,
 				ExpectedAudience:       testExternalAudience,
 				JWKSURL:                jwksServer.URL + "/jwks",
-				AllowedDelegateClients: []string{anyDelegateClient},
+				AllowedDelegateClients: []string{"some-toolhive-client"},
+				AllowMayAct:            true,
 			}},
 			token: func(t *testing.T) string {
 				t.Helper()
@@ -466,7 +736,8 @@ func TestMultiIssuerTokenValidator_Validate(t *testing.T) {
 				ExpectedAudience:       testExternalAudience,
 				JWKSURL:                jwksServer.URL + "/jwks",
 				AllowedActors:          []string{"someone-else"},
-				AllowedDelegateClients: []string{anyDelegateClient},
+				AllowedDelegateClients: []string{"some-toolhive-client"},
+				AllowMayAct:            true,
 			}},
 			token: func(t *testing.T) string {
 				t.Helper()
@@ -489,7 +760,8 @@ func TestMultiIssuerTokenValidator_Validate(t *testing.T) {
 				ExpectedAudience:       testExternalAudience,
 				JWKSURL:                jwksServer.URL + "/jwks",
 				AllowedActors:          []string{"ext-agent"},
-				AllowedDelegateClients: []string{anyDelegateClient},
+				AllowedDelegateClients: []string{"some-toolhive-client"},
+				AllowMayAct:            true,
 			}},
 			token: func(t *testing.T) string {
 				t.Helper()
@@ -510,7 +782,8 @@ func TestMultiIssuerTokenValidator_Validate(t *testing.T) {
 				ExpectedAudience:       testExternalAudience,
 				JWKSURL:                jwksServer.URL + "/jwks",
 				AllowedActors:          []string{"ext-agent"},
-				AllowedDelegateClients: []string{anyDelegateClient},
+				AllowedDelegateClients: []string{"some-toolhive-client"},
+				AllowMayAct:            true,
 			}},
 			token: func(t *testing.T) string {
 				t.Helper()
@@ -529,7 +802,8 @@ func TestMultiIssuerTokenValidator_Validate(t *testing.T) {
 				ExpectedAudience:       testExternalAudience,
 				JWKSURL:                jwksServer.URL + "/jwks",
 				AllowedActors:          []string{"ext-agent"},
-				AllowedDelegateClients: []string{anyDelegateClient},
+				AllowedDelegateClients: []string{"some-toolhive-client"},
+				AllowMayAct:            true,
 			}},
 			token: func(t *testing.T) string {
 				t.Helper()
@@ -548,7 +822,8 @@ func TestMultiIssuerTokenValidator_Validate(t *testing.T) {
 				ExpectedAudience:       testExternalAudience,
 				JWKSURL:                jwksServer.URL + "/jwks",
 				AllowedActors:          []string{"ext-agent"},
-				AllowedDelegateClients: []string{anyDelegateClient},
+				AllowedDelegateClients: []string{"some-toolhive-client"},
+				AllowMayAct:            true,
 			}},
 			token: func(t *testing.T) string {
 				t.Helper()
@@ -567,7 +842,8 @@ func TestMultiIssuerTokenValidator_Validate(t *testing.T) {
 				ExpectedAudience:       testExternalAudience,
 				JWKSURL:                jwksServer.URL + "/jwks",
 				AllowedActors:          []string{"ext-agent"},
-				AllowedDelegateClients: []string{anyDelegateClient},
+				AllowedDelegateClients: []string{"some-toolhive-client"},
+				AllowMayAct:            true,
 			}},
 			token: func(t *testing.T) string {
 				t.Helper()
@@ -591,7 +867,8 @@ func TestMultiIssuerTokenValidator_Validate(t *testing.T) {
 				IssuerURL:              testExternalIssuer,
 				ExpectedAudience:       testExternalAudience,
 				JWKSURL:                jwksServer.URL + "/jwks",
-				AllowedDelegateClients: []string{anyDelegateClient},
+				AllowedDelegateClients: []string{"some-toolhive-client"},
+				AllowMayAct:            true,
 			}},
 			token: func(t *testing.T) string {
 				t.Helper()
@@ -605,6 +882,25 @@ func TestMultiIssuerTokenValidator_Validate(t *testing.T) {
 			},
 		},
 		{
+			name: "external token may_act without issuer opt-in rejected before allowlist fallback",
+			trustedIssuers: []TrustedIssuer{{
+				IssuerURL:              testExternalIssuer,
+				ExpectedAudience:       testExternalAudience,
+				JWKSURL:                jwksServer.URL + "/jwks",
+				AllowedActors:          []string{"ext-agent"},
+				AllowedDelegateClients: []string{"some-toolhive-client"},
+			}},
+			token: func(t *testing.T) string {
+				t.Helper()
+				return externalJWKS.signToken(t, externalClaims(), map[string]any{
+					"azp":     "ext-agent",
+					"may_act": map[string]any{"sub": "some-toolhive-client", "iss": testIssuer},
+				})
+			},
+			wantErr:     true,
+			errContains: "allow_may_act is disabled",
+		},
+		{
 			// The external issuer's own URL is never a valid may_act.iss
 			// value: a regression that compared against issuerConfig.IssuerURL
 			// instead of v.selfIssuer would wrongly accept this.
@@ -613,7 +909,8 @@ func TestMultiIssuerTokenValidator_Validate(t *testing.T) {
 				IssuerURL:              testExternalIssuer,
 				ExpectedAudience:       testExternalAudience,
 				JWKSURL:                jwksServer.URL + "/jwks",
-				AllowedDelegateClients: []string{anyDelegateClient},
+				AllowedDelegateClients: []string{"some-toolhive-client"},
+				AllowMayAct:            true,
 			}},
 			token: func(t *testing.T) string {
 				t.Helper()
@@ -773,7 +1070,8 @@ func TestMultiIssuerTokenValidator_Validate(t *testing.T) {
 				ExpectedAudience:       testExternalAudience,
 				JWKSURL:                jwksServer.URL + "/jwks",
 				AllowedActors:          []string{"ext-agent"},
-				AllowedDelegateClients: []string{anyDelegateClient},
+				AllowedDelegateClients: []string{"some-toolhive-client"},
+				AllowMayAct:            true,
 			}},
 			token: func(t *testing.T) string {
 				t.Helper()
@@ -989,11 +1287,12 @@ func TestNewMultiIssuerTokenValidator_Validation(t *testing.T) {
 	require.NoError(t, err)
 
 	tests := []struct {
-		name           string
-		selfValidator  *SelfIssuedTokenValidator
-		selfIssuer     string
-		trustedIssuers []TrustedIssuer
-		errContains    string
+		name             string
+		selfValidator    *SelfIssuedTokenValidator
+		selfIssuer       string
+		trustedIssuers   []TrustedIssuer
+		allowedAudiences []string
+		errContains      string
 	}{
 		{
 			name:        "nil selfValidator rejected",
@@ -1086,6 +1385,18 @@ func TestNewMultiIssuerTokenValidator_Validation(t *testing.T) {
 			errContains: "actor_claim",
 		},
 		{
+			name:          "malformed ActorMatcher rejected",
+			selfValidator: selfValidator,
+			selfIssuer:    testIssuer,
+			trustedIssuers: []TrustedIssuer{{
+				IssuerURL:              testExternalIssuer,
+				ExpectedAudience:       testExternalAudience,
+				ActorMatcher:           "claims.",
+				AllowedDelegateClients: []string{anyDelegateClient},
+			}},
+			errContains: "actor_matcher",
+		},
+		{
 			name:          "AllowedDelegateClients with an empty entry rejected",
 			selfValidator: selfValidator,
 			selfIssuer:    testIssuer,
@@ -1137,6 +1448,18 @@ func TestNewMultiIssuerTokenValidator_Validation(t *testing.T) {
 			errContains: "must not combine the wildcard",
 		},
 		{
+			name:          "AllowMayAct with wildcard AllowedDelegateClients rejected",
+			selfValidator: selfValidator,
+			selfIssuer:    testIssuer,
+			trustedIssuers: []TrustedIssuer{{
+				IssuerURL:              testExternalIssuer,
+				ExpectedAudience:       testExternalAudience,
+				AllowedDelegateClients: []string{anyDelegateClient},
+				AllowMayAct:            true,
+			}},
+			errContains: "allow_may_act",
+		},
+		{
 			// AllowPrivateIPs without a hand-configured jwks_url would let
 			// OIDC discovery choose the private target the dial is allowed to
 			// reach; validateTrustedIssuer must reject it so a caller that
@@ -1153,17 +1476,154 @@ func TestNewMultiIssuerTokenValidator_Validation(t *testing.T) {
 			}},
 			errContains: "allow_private_ips requires jwks_url",
 		},
+		{
+			// A jwtBearerGrant issuer that also sets an RFC 8693-delegation-only
+			// field (actorClaim here) must still supply expected_audience: the
+			// delegation logic validates the subject token's audience against
+			// it, and an empty ExpectedAudience can never match (#6391 review).
+			name:          "jwtBearerGrant with ActorClaim but no ExpectedAudience rejected",
+			selfValidator: selfValidator,
+			selfIssuer:    testIssuer,
+			trustedIssuers: []TrustedIssuer{{
+				IssuerURL:              testExternalIssuer,
+				ActorClaim:             "client_id",
+				AllowedDelegateClients: []string{anyDelegateClient},
+				JWTBearerGrant: &JWTBearerGrantPolicy{
+					MaxAssertionAge: "1h",
+					SubjectBindings: []JWTBearerSubjectBinding{
+						{Subject: "agent", AllowedResources: []string{"https://api.example.com/resource"}},
+					},
+				},
+			}},
+			errContains: "expected_audience is required",
+		},
+		{
+			// AllowedActors is also an RFC 8693-delegation-only signal, and must
+			// be caught by the same check even though ActorClaim defaults to
+			// "azp" and is never itself set here (#6391 review follow-up).
+			name:          "jwtBearerGrant with AllowedActors but no ExpectedAudience rejected",
+			selfValidator: selfValidator,
+			selfIssuer:    testIssuer,
+			trustedIssuers: []TrustedIssuer{{
+				IssuerURL:              testExternalIssuer,
+				AllowedActors:          []string{"ext-agent"},
+				AllowedDelegateClients: []string{anyDelegateClient},
+				JWTBearerGrant: &JWTBearerGrantPolicy{
+					MaxAssertionAge: "1h",
+					SubjectBindings: []JWTBearerSubjectBinding{
+						{Subject: "agent", AllowedResources: []string{"https://api.example.com/resource"}},
+					},
+				},
+			}},
+			errContains: "expected_audience is required",
+		},
+		{
+			// AcceptedAudiences identifies this authorization server, not a
+			// resource; an entry shared with a resource audience would let
+			// an upstream resource-scoped access token be replayed as a
+			// JWT-bearer assertion (see validateJWTBearerAcceptedAudiences).
+			name:          "accepted_audiences overlapping a resource audience rejected",
+			selfValidator: selfValidator,
+			selfIssuer:    testIssuer,
+			trustedIssuers: []TrustedIssuer{{
+				IssuerURL: testExternalIssuer,
+				JWTBearerGrant: &JWTBearerGrantPolicy{
+					MaxAssertionAge: "1h",
+					SubjectBindings: []JWTBearerSubjectBinding{
+						{Subject: "agent", AllowedResources: []string{"https://api.example.com/resource"}},
+					},
+					AcceptedAudiences: []string{"https://api.example.com/resource"},
+				},
+			}},
+			allowedAudiences: []string{"https://api.example.com/resource"},
+			errContains:      "must not also be a configured resource audience",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			v, err := NewMultiIssuerTokenValidator(tt.selfValidator, tt.selfIssuer, tt.trustedIssuers)
+			v, err := NewMultiIssuerTokenValidator(tt.selfValidator, tt.selfIssuer, tt.trustedIssuers, tt.allowedAudiences)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.errContains)
 			assert.Nil(t, v)
 		})
 	}
+}
+
+func TestResolveJWTBearerGrantPolicies_RedactsCredentialIssuerOnInvalidDuration(t *testing.T) {
+	t.Parallel()
+
+	const credentialIssuerURL = "https://sentinel-user:sentinel-password@issuer.example.com"
+	resolved, err := ResolveJWTBearerGrantPolicies([]TrustedIssuer{{
+		IssuerURL: credentialIssuerURL,
+		JWTBearerGrant: &JWTBearerGrantPolicy{
+			MaxAssertionAge: "not-a-duration",
+		},
+	}})
+	require.ErrorContains(t, err, "trusted_issuers[0].jwt_bearer_grant.max_assertion_age")
+	assert.Nil(t, resolved)
+	assert.NotContains(t, err.Error(), credentialIssuerURL)
+	assert.NotContains(t, err.Error(), "sentinel-user")
+	assert.NotContains(t, err.Error(), "sentinel-password")
+}
+
+func TestNewMultiIssuerTokenValidator_TrustedIssuerEndpointValidation(t *testing.T) {
+	t.Parallel()
+
+	selfJWKS := newTestJWKS(t)
+	selfValidator, err := NewSelfIssuedTokenValidator(selfJWKS.publicJWKS(), testIssuer, []string{testIssuer})
+	require.NoError(t, err)
+
+	const credentialIssuerURL = "https://sentinel-user:sentinel-password@issuer.example.com"
+	tests := []struct {
+		name            string
+		issuerURL       string
+		jwksURL         string
+		allowPrivateIPs bool
+		wantErr         string
+		wantValid       bool
+	}{
+		{name: "credential-bearing issuer rejected without leaking credentials", issuerURL: credentialIssuerURL, wantErr: "must not contain userinfo"},
+		{name: "unsafe issuer scheme rejected", issuerURL: "ftp://issuer.example.com", wantErr: "scheme must be https"},
+		{name: "HTTP localhost without per issuer opt in rejected", issuerURL: "http://localhost:8080", wantErr: "scheme must be https"},
+		{name: "credential-bearing JWKS rejected without leaking credentials", issuerURL: testExternalIssuer, jwksURL: "https://sentinel-user:sentinel-password@issuer.example.com/keys", wantErr: "jwks_url: must not contain userinfo"},
+		{name: "JWKS unsafe scheme rejected", issuerURL: testExternalIssuer, jwksURL: "ftp://issuer.example.com/keys", wantErr: "jwks_url: must use HTTPS"},
+		{name: "private JWKS rejected without opt in", issuerURL: testExternalIssuer, jwksURL: "https://10.0.0.5/keys", wantErr: "jwks_url: must not point to a private or loopback address"},
+		{name: "private JWKS accepted with opt in", issuerURL: testExternalIssuer, jwksURL: "https://10.0.0.5/keys", allowPrivateIPs: true, wantValid: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			validator, err := NewMultiIssuerTokenValidator(selfValidator, testIssuer, []TrustedIssuer{{
+				IssuerURL: tt.issuerURL, JWKSURL: tt.jwksURL, AllowPrivateIPs: tt.allowPrivateIPs,
+				ExpectedAudience: testExternalAudience, AllowedDelegateClients: []string{anyDelegateClient},
+			}}, nil)
+			if tt.wantValid {
+				require.NoError(t, err)
+				require.NoError(t, validator.Close())
+				return
+			}
+			require.ErrorContains(t, err, tt.wantErr)
+			assert.Nil(t, validator)
+			assert.NotContains(t, err.Error(), credentialIssuerURL)
+			assert.NotContains(t, err.Error(), "sentinel-user")
+			assert.NotContains(t, err.Error(), "sentinel-password")
+		})
+	}
+}
+
+func TestValidateJWTBearerAcceptedAudiences_RejectsResourceAudienceOverlap(t *testing.T) {
+	t.Parallel()
+
+	err := validateJWTBearerAcceptedAudiences(
+		TrustedIssuer{IssuerURL: testExternalIssuer},
+		[]string{"https://api.example.com/resource"},
+		[]string{"https://api.example.com/resource"},
+	)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must not also be a configured resource audience")
 }
 
 func TestNewMultiIssuerTokenValidator_EmptyAllowedActorsAccepted(t *testing.T) {
@@ -1179,9 +1639,182 @@ func TestNewMultiIssuerTokenValidator_EmptyAllowedActorsAccepted(t *testing.T) {
 		IssuerURL:              testExternalIssuer,
 		ExpectedAudience:       testExternalAudience,
 		AllowedDelegateClients: []string{anyDelegateClient},
-	}})
+	}}, nil)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = v.Close() })
 	assert.NotNil(t, v)
+}
+
+// TestNewMultiIssuerTokenValidator_GrantOnlyIssuerAccepted pins the case this
+// PR exists for: a jwtBearerGrant-only issuer (none of ExpectedAudience,
+// ActorClaim, ActorMatcher, AllowMayAct, or AllowedActors set) needs neither
+// ExpectedAudience nor AllowedDelegateClients, since RFC 8693 delegation is
+// not in play.
+func TestNewMultiIssuerTokenValidator_GrantOnlyIssuerAccepted(t *testing.T) {
+	t.Parallel()
+
+	selfJWKS := newTestJWKS(t)
+	selfValidator, err := NewSelfIssuedTokenValidator(selfJWKS.publicJWKS(), testIssuer, []string{testIssuer})
+	require.NoError(t, err)
+
+	v, err := NewMultiIssuerTokenValidator(selfValidator, testIssuer, []TrustedIssuer{{
+		IssuerURL: testExternalIssuer,
+		JWTBearerGrant: &JWTBearerGrantPolicy{
+			MaxAssertionAge: "1h",
+			SubjectBindings: []JWTBearerSubjectBinding{
+				{Subject: "agent", AllowedResources: []string{"https://api.example.com/resource"}},
+			},
+		},
+	}}, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = v.Close() })
+	assert.NotNil(t, v)
+}
+
+// TestMultiIssuerTokenValidator_Close verifies Close releases each issuer's
+// JWKS refresh worker pool (issue #6482). jwk.Cache.Shutdown returns nil only
+// once its controller's goroutines have drained — it waits on the controller's
+// shutdown channel, and returns its context's error if they do not finish in
+// time — so Close returning nil well within its per-cache timeout is proof the
+// workers were stopped rather than left running for the life of the process.
+func TestMultiIssuerTokenValidator_Close(t *testing.T) {
+	t.Parallel()
+
+	selfJWKS := newTestJWKS(t)
+	externalJWKS := newTestJWKS(t)
+	jwksServer := startJWKSServer(t, externalJWKS)
+
+	validator := newMultiValidator(t, selfJWKS, []TrustedIssuer{{
+		IssuerURL:              testExternalIssuer,
+		ExpectedAudience:       testExternalAudience,
+		JWKSURL:                jwksServer.URL + "/jwks",
+		AllowedActors:          []string{"ext-agent"},
+		AllowedDelegateClients: []string{anyDelegateClient},
+	}})
+
+	// Drive a real validation so the issuer's cache is registered and its
+	// worker pool is actively running before shutdown.
+	rawToken := externalJWKS.signToken(t, externalClaims(), map[string]any{"azp": "ext-agent"})
+	_, err := validator.Validate(context.Background(), rawToken)
+	require.NoError(t, err)
+
+	require.NoError(t, validator.Close(), "Close must drain the JWKS worker pool")
+	// Idempotent: a second Close is a no-op, not a panic or error.
+	require.NoError(t, validator.Close())
+}
+
+// TestMultiIssuerTokenValidator_CloseReleasesGoroutines is the guard the
+// nil-return check in TestMultiIssuerTokenValidator_Close cannot provide: a
+// Close that stopped calling Shutdown (or cancel) would still return nil, but
+// would leave the per-issuer worker pool running. This counts goroutines and
+// asserts they drop back after Close.
+//
+// Deliberately not parallel: Go holds t.Parallel() tests paused while
+// non-parallel tests run, so the goroutine count is not perturbed by the rest
+// of the suite.
+//
+//nolint:paralleltest // counts live goroutines; must not run concurrently with other tests
+func TestMultiIssuerTokenValidator_CloseReleasesGoroutines(t *testing.T) {
+	selfJWKS := newTestJWKS(t)
+	selfValidator, err := NewSelfIssuedTokenValidator(selfJWKS.publicJWKS(), testIssuer, []string{testIssuer})
+	require.NoError(t, err)
+
+	before := runtime.NumGoroutine()
+
+	v, err := NewMultiIssuerTokenValidator(selfValidator, testIssuer, []TrustedIssuer{{
+		IssuerURL:              testExternalIssuer,
+		ExpectedAudience:       testExternalAudience,
+		JWKSURL:                "https://external-idp.example.com/jwks",
+		AllowedActors:          []string{"ext-agent"},
+		AllowedDelegateClients: []string{anyDelegateClient},
+	}}, nil)
+	require.NoError(t, err)
+
+	// The per-issuer jwk.Cache starts its worker pool at construction (no fetch
+	// needed), so the goroutines are already running.
+	require.Greater(t, runtime.NumGoroutine(), before, "the JWKS worker pool should be running before Close")
+
+	require.NoError(t, v.Close())
+	requireGoroutinesReleased(t, before)
+}
+
+// requireGoroutinesReleased fails unless the live goroutine count drops to at
+// most want within a short window. It polls with a plain sleep loop rather than
+// require.Eventually because Eventually runs its condition in its own goroutine,
+// which would itself inflate runtime.NumGoroutine() and mask the very count it
+// is checking. Callers rely on Close/construction cleanup being synchronous
+// (Shutdown waits for the pool to drain), so this only absorbs the brief lag
+// between a goroutine returning and the runtime deregistering it.
+func requireGoroutinesReleased(t *testing.T, want int) {
+	t.Helper()
+	var last int
+	for range 200 {
+		last = runtime.NumGoroutine()
+		if last <= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	require.LessOrEqualf(t, last, want, "JWKS worker pool goroutines not released: have %d, want <= %d", last, want)
+}
+
+// TestNewMultiIssuerTokenValidator_PartialConstructionDrainsStartedPools drives
+// the constructor's cleanup loop — #6482's reachable leak: a reconstruction that
+// fails partway must not abandon the caches it already started. The first issuer
+// is valid (its worker pool starts); the second fails inside
+// newExternalIssuerConfig (its CA bundle path does not exist), so construction
+// returns an error with the first pool live. The pool must then be drained.
+//
+// Not parallel, for the same goroutine-counting reason as
+// TestMultiIssuerTokenValidator_CloseReleasesGoroutines.
+//
+//nolint:paralleltest // counts live goroutines; must not run concurrently with other tests
+func TestNewMultiIssuerTokenValidator_PartialConstructionDrainsStartedPools(t *testing.T) {
+	selfJWKS := newTestJWKS(t)
+	selfValidator, err := NewSelfIssuedTokenValidator(selfJWKS.publicJWKS(), testIssuer, []string{testIssuer})
+	require.NoError(t, err)
+
+	before := runtime.NumGoroutine()
+
+	_, err = NewMultiIssuerTokenValidator(selfValidator, testIssuer, []TrustedIssuer{
+		{
+			IssuerURL:              "https://issuer-one.example.com",
+			ExpectedAudience:       testExternalAudience,
+			JWKSURL:                "https://issuer-one.example.com/jwks",
+			AllowedActors:          []string{"ext-agent"},
+			AllowedDelegateClients: []string{anyDelegateClient},
+		},
+		{
+			IssuerURL:              "https://issuer-two.example.com",
+			ExpectedAudience:       testExternalAudience,
+			JWKSURL:                "https://issuer-two.example.com/jwks",
+			CAFilePath:             filepath.Join(t.TempDir(), "does-not-exist.pem"),
+			AllowedActors:          []string{"ext-agent"},
+			AllowedDelegateClients: []string{anyDelegateClient},
+		},
+	}, nil)
+	require.Error(t, err, "construction must fail when the second issuer's CA bundle is unreadable")
+
+	// The constructor's cleanup runs synchronously before it returns the error,
+	// so the first issuer's pool is already draining.
+	requireGoroutinesReleased(t, before)
+}
+
+// TestMultiIssuerTokenValidator_CloseWithoutExternalIssuers pins that Close is
+// safe on a validator that started no per-issuer caches, and on a nil receiver.
+func TestMultiIssuerTokenValidator_CloseWithoutExternalIssuers(t *testing.T) {
+	t.Parallel()
+
+	selfJWKS := newTestJWKS(t)
+	selfValidator, err := NewSelfIssuedTokenValidator(selfJWKS.publicJWKS(), testIssuer, []string{testIssuer})
+	require.NoError(t, err)
+
+	v, err := NewMultiIssuerTokenValidator(selfValidator, testIssuer, nil, nil)
+	require.NoError(t, err)
+	require.NoError(t, v.Close())
+
+	var nilValidator *MultiIssuerTokenValidator
+	require.NoError(t, nilValidator.Close())
 }
 
 // syncBuffer is a concurrency-safe io.Writer over a bytes.Buffer, used by
@@ -1266,8 +1899,9 @@ func TestNewMultiIssuerTokenValidator_AudienceShapeWarning(t *testing.T) {
 				ExpectedAudience:       tt.expectedAudience,
 				AllowedActors:          []string{"ext-agent"}, // avoid the unrelated AllowedActors warning
 				AllowedDelegateClients: []string{anyDelegateClient},
-			}})
+			}}, nil)
 			require.NoError(t, err)
+			t.Cleanup(func() { _ = v.Close() })
 			require.NotNil(t, v)
 
 			logged := buf.String()
@@ -1280,6 +1914,40 @@ func TestNewMultiIssuerTokenValidator_AudienceShapeWarning(t *testing.T) {
 			}
 		})
 	}
+}
+
+//nolint:paralleltest // mutates the package-global slog.Default()
+func TestMultiIssuerTokenValidator_ActorMatcherEvaluationFailure(t *testing.T) {
+	selfJWKS := newTestJWKS(t)
+	externalJWKS := newTestJWKS(t)
+	jwksServer := startJWKSServer(t, externalJWKS)
+
+	var buf syncBuffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	validator := newMultiValidator(t, selfJWKS, []TrustedIssuer{{
+		IssuerURL:        testExternalIssuer,
+		ExpectedAudience: testExternalAudience,
+		JWKSURL:          jwksServer.URL + "/jwks",
+		// timestamp() on a malformed value is CEL's own example of an
+		// evaluation error that quotes the offending value verbatim —
+		// this exercises that the claim value never reaches the error
+		// or the log, not just an attribute-missing error that never
+		// carried a value to begin with.
+		ActorMatcher:           `timestamp(claims["sensitive"]) > timestamp("2000-01-01T00:00:00Z")`,
+		AllowedDelegateClients: []string{anyDelegateClient},
+	}})
+
+	rawToken := externalJWKS.signToken(t, externalClaims(), map[string]any{"sensitive": "sensitive-claim-value"})
+	_, err := validator.Validate(context.Background(), rawToken)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "actor matcher evaluation failed")
+	assert.Contains(t, buf.String(), "level=DEBUG")
+	assert.NotContains(t, err.Error(), "sensitive-claim-value", "returned error must not carry claim values")
+	assert.NotContains(t, buf.String(), "sensitive-claim-value", "diagnostics must not log claims")
+	assert.NotContains(t, buf.String(), rawToken, "diagnostics must not log tokens")
 }
 
 func TestNewMultiIssuerTokenValidator_ClonesAllowedActors(t *testing.T) {
@@ -1569,7 +2237,7 @@ func TestMultiIssuerTokenValidator_DiscoverJWKSURL(t *testing.T) {
 					httpClient:    srv.Client(),
 				}, ""
 			},
-			errContains: "does not match expected issuer",
+			errContains: "discovery document issuer does not match configured issuer",
 		},
 		{
 			name: "missing jwks_uri is rejected",
@@ -1654,8 +2322,9 @@ func TestMultiIssuerTokenValidator_DiscoveryRefusesPrivateAddress(t *testing.T) 
 	}}
 	selfValidator, err := NewSelfIssuedTokenValidator(selfJWKS.publicJWKS(), testIssuer, []string{testIssuer})
 	require.NoError(t, err)
-	validator, err := NewMultiIssuerTokenValidator(selfValidator, testIssuer, trustedIssuers)
+	validator, err := NewMultiIssuerTokenValidator(selfValidator, testIssuer, trustedIssuers, nil)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = validator.Close() })
 
 	claims := externalClaims()
 	claims.Issuer = server.URL
@@ -1721,6 +2390,8 @@ func TestValidateJWKSURL(t *testing.T) {
 		wantErr           string
 	}{
 		{name: "https accepted", url: "https://issuer.example.com/jwks"},
+		{name: "fragment rejected", url: "https://issuer.example.com/jwks#fragment", wantErr: "must not contain fragment"},
+		{name: "query string accepted", url: "https://issuer.example.com/jwks?p=B2C_1_signin"},
 		{name: "http rejected", url: "http://issuer.example.com/jwks", wantErr: "must use HTTPS"},
 		{
 			name:    "userinfo with password rejected",
@@ -1761,6 +2432,7 @@ func TestValidateJWKSURL(t *testing.T) {
 		{name: "private IP literal rejected", url: "https://10.1.2.3/jwks", wantErr: "private or loopback"},
 		{name: "malformed URL rejected", url: "://not-a-url", wantErr: "invalid URL"},
 		{name: "missing host rejected", url: "https:///jwks", wantErr: "host is required"},
+		{name: "empty hostname with port rejected", url: "https://:443/jwks", wantErr: "host is required"},
 	}
 
 	for _, tt := range tests {
@@ -1957,7 +2629,8 @@ func TestMultiIssuerTokenValidator_KeyRotationRefreshesImmediately(t *testing.T)
 		IssuerURL:              testExternalIssuer,
 		ExpectedAudience:       testExternalAudience,
 		JWKSURL:                srv.URL + "/jwks",
-		AllowedDelegateClients: []string{anyDelegateClient},
+		AllowedDelegateClients: []string{"some-toolhive-client"},
+		AllowMayAct:            true,
 	}}
 	validator := newMultiValidator(t, selfJWKS, trustedIssuers)
 
@@ -2021,7 +2694,8 @@ func TestMultiIssuerTokenValidator_UnknownKidRefreshIsRateLimited(t *testing.T) 
 		IssuerURL:              testExternalIssuer,
 		ExpectedAudience:       testExternalAudience,
 		JWKSURL:                srv.URL + "/jwks",
-		AllowedDelegateClients: []string{anyDelegateClient},
+		AllowedDelegateClients: []string{"some-toolhive-client"},
+		AllowMayAct:            true,
 	}}
 	validator := newMultiValidator(t, selfJWKS, trustedIssuers)
 
@@ -2154,16 +2828,9 @@ func TestMultiIssuerTokenValidator_SharedJWKSURL_SamePolicy(t *testing.T) {
 	assert.Equal(t, issuerBURL, resultB.ExternalIssuer)
 }
 
-// TestMultiIssuerTokenValidator_SharedJWKSURL_DifferingPolicy proves the
-// property a per-issuer jwk.Cache adds over a shared one: two issuers
-// resolving to the same jwks_url but configuring DIFFERENT
-// insecure_allow_http/allow_private_ips settings both validate
-// independently, each fetching through its own dedicated *http.Client. A
-// shared cache could not do this — httprc keys a cached resource by URL
-// alone and only honors jwk.WithHTTPClient on a URL's first Register call,
-// so the second issuer would have silently inherited the first one's client
-// and transport policy. Splitting the cache per issuer removes that
-// collision instead of merely guarding against it.
+// TestMultiIssuerTokenValidator_SharedJWKSURL_DifferingPolicy confirms that
+// configured JWKS endpoints are validated against each issuer's own transport
+// policy before construction starts.
 func TestMultiIssuerTokenValidator_SharedJWKSURL_DifferingPolicy(t *testing.T) {
 	t.Parallel()
 
@@ -2179,18 +2846,8 @@ func TestMultiIssuerTokenValidator_SharedJWKSURL_DifferingPolicy(t *testing.T) {
 	jwksServer := startJWKSServer(t, sharedJWKS)
 	sharedJWKSURL := jwksServer.URL + "/jwks"
 
-	// Deliberately NOT newMultiValidator: that helper forces
-	// InsecureAllowHTTP and AllowPrivateIPs to true on every issuer so its
-	// loopback httptest servers are reachable, which would erase the very
-	// difference this test exists to exercise. Both issuers share one
-	// plain-HTTP loopback jwks_url and allow private IPs, and differ ONLY in
-	// InsecureAllowHTTP — so each is judged against its own transport policy:
-	// A is refused for its own reason (no HTTP permitted), B succeeds.
-	//
-	// Under a shared cache B could not succeed here: the policy-claim guard
-	// rejected any second issuer whose policy differed from the URL's first
-	// claimant, and without that guard B would have silently inherited A's
-	// client. Per-issuer caches make both outcomes independent.
+	// The first issuer does not permit the shared plain-HTTP endpoint, so
+	// construction must fail before either cache is created.
 	selfValidator, err := NewSelfIssuedTokenValidator(selfJWKS.publicJWKS(), testIssuer, []string{testIssuer})
 	require.NoError(t, err)
 	validator, err := NewMultiIssuerTokenValidator(selfValidator, testIssuer, []TrustedIssuer{
@@ -2212,37 +2869,9 @@ func TestMultiIssuerTokenValidator_SharedJWKSURL_DifferingPolicy(t *testing.T) {
 			InsecureAllowHTTP:      true,
 			AllowedDelegateClients: []string{anyDelegateClient},
 		},
-	})
-	require.NoError(t, err)
-
-	tokenFor := func(issuer, audience, actor, jti string) string {
-		now := time.Now()
-		claims := jwt.Claims{
-			Subject:   "shared-user",
-			Issuer:    issuer,
-			Audience:  jwt.Audience{audience},
-			Expiry:    jwt.NewNumericDate(now.Add(time.Hour)),
-			IssuedAt:  jwt.NewNumericDate(now),
-			NotBefore: jwt.NewNumericDate(now.Add(-time.Minute)),
-			ID:        jti,
-		}
-		return sharedJWKS.signToken(t, claims, map[string]any{"azp": actor})
-	}
-
-	// A is judged against its OWN policy: it forbids plain HTTP, so its fetch
-	// of the shared http:// jwks_url is refused. Not a policy-conflict error —
-	// A is simply misconfigured for this URL.
-	_, err = validator.Validate(context.Background(), tokenFor(issuerAURL, audienceA, "agent-a", "jti-a"))
-	require.Error(t, err, "the issuer forbidding plain HTTP must be refused for its own jwks_url")
-	assert.Contains(t, err.Error(), "must use HTTPS",
-		"the refusal must come from issuer A's own transport policy")
-
-	// B shares that exact URL but permits HTTP, and succeeds — the outcome a
-	// shared cache could not produce, since A reached the URL first.
-	resultB, err := validator.Validate(context.Background(), tokenFor(issuerBURL, audienceB, "agent-b", "jti-b"))
-	require.NoError(t, err, "the issuer permitting HTTP must validate independently, "+
-		"neither blocked by nor inheriting issuer A's stricter policy")
-	assert.Equal(t, issuerBURL, resultB.ExternalIssuer)
+	}, nil)
+	require.ErrorContains(t, err, "jwks_url: must use HTTPS")
+	assert.Nil(t, validator)
 }
 
 // TestMultiIssuerTokenValidator_RetryAfterFetchFailureRefreshes proves the

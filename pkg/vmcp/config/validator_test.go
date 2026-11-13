@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/stacklok/toolhive/pkg/authserver"
+	"github.com/stacklok/toolhive/pkg/authserver/server/tokenexchange"
 	thvjson "github.com/stacklok/toolhive/pkg/json"
 	"github.com/stacklok/toolhive/pkg/vmcp"
 	authtypes "github.com/stacklok/toolhive/pkg/vmcp/auth/types"
@@ -1282,6 +1283,39 @@ func TestValidateAuthServerIntegration(t *testing.T) {
 			errMsg:  "at least one upstream",
 		},
 		{
+			name: "zero upstreams with delegate client",
+			cfg: &Config{
+				IncomingAuth: &IncomingAuthConfig{Type: IncomingAuthTypeOIDC, OIDC: &OIDCConfig{
+					Issuer: "http://localhost:9090", Audience: "https://my-vmcp",
+				}},
+				OutgoingAuth: &OutgoingAuthConfig{Source: "inline"},
+			},
+			rc: &authserver.RunConfig{
+				Issuer:           "http://localhost:9090",
+				AllowedAudiences: []string{"https://my-vmcp"},
+				DelegateClients:  []authserver.DelegateClientRunConfig{{ClientID: "delegate-client"}},
+			},
+			wantErr: false,
+		},
+		{
+			name: "zero upstreams with JWT bearer trusted issuer",
+			cfg: &Config{
+				IncomingAuth: &IncomingAuthConfig{Type: IncomingAuthTypeOIDC, OIDC: &OIDCConfig{
+					Issuer: "http://localhost:9090", Audience: "https://my-vmcp",
+				}},
+				OutgoingAuth: &OutgoingAuthConfig{Source: "inline"},
+			},
+			rc: &authserver.RunConfig{
+				Issuer:           "http://localhost:9090",
+				AllowedAudiences: []string{"https://my-vmcp"},
+				TrustedIssuers: []tokenexchange.TrustedIssuer{{
+					IssuerURL:      "https://issuer.example.com",
+					JWTBearerGrant: &tokenexchange.JWTBearerGrantPolicy{},
+				}},
+			},
+			wantErr: false,
+		},
+		{
 			name: "v07_audience_not_in_allowed",
 			cfg: &Config{
 				IncomingAuth: &IncomingAuthConfig{
@@ -1560,6 +1594,21 @@ func TestValidator_ValidatePassthroughHeaders(t *testing.T) {
 			headers: []string{"X-Forwarded-For"},
 			wantErr: true,
 			errMsg:  "X-Forwarded-For",
+		},
+		{
+			// Documented contract (virtualmcpserver-api.md): Authorization is
+			// rejected at startup. Forwarding caller-supplied credentials
+			// verbatim to every backend is a credential-leak footgun.
+			name:    "Authorization is restricted",
+			headers: []string{"authorization"},
+			wantErr: true,
+			errMsg:  "Authorization",
+		},
+		{
+			name:    "Cookie is restricted",
+			headers: []string{"Cookie"},
+			wantErr: true,
+			errMsg:  "Cookie",
 		},
 		{
 			name:    "empty string header name is rejected",
