@@ -32,7 +32,7 @@ jobs:
       security-events: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
@@ -45,7 +45,7 @@ jobs:
           fail-build: false
 
       - name: Upload Grype scan results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
         if: always()
         with:
           sarif_file: ${{ steps.grype-scan.outputs.sarif }}
@@ -59,7 +59,7 @@ jobs:
       security-events: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # This job only reads the workflow files; it never pushes.
           persist-credentials: false
@@ -70,9 +70,9 @@ jobs:
       # code when the output format is SARIF, which is what advanced-security
       # selects. The upload happens inside the action.
       - name: Report findings
-        uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 # v0.6.2
+        uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
         with:
-          version: "1.29.0"
+          version: "1.30.1"
           inputs: .github/
           persona: regular
 
@@ -88,9 +88,9 @@ jobs:
       # expressions carrying values GitHub constrains to characters that cannot
       # reach a shell. Lowering this threshold means dealing with those first.
       - name: Fail on new findings
-        uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 # v0.6.2
+        uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
         with:
-          version: "1.29.0"
+          version: "1.30.1"
           inputs: .github/
           persona: regular
           min-severity: medium
@@ -101,7 +101,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
@@ -118,31 +118,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Ignored vulnerabilities with justification:
-          # GO-2026-4514: buger/jsonparser Delete function DoS via malformed JSON (CVE-2025-54410)
-          #   Indirect dependency via mcp-go, invopop/jsonschema, wk8/go-ordered-map.
-          #   The vulnerability is in the Delete function which is not called by ToolHive
-          #   or any of its dependencies. No fixed version exists yet (all versions affected).
-          # GO-2026-4883: Off-by-one error in Moby plugin privilege validation (CVE-2026-33997)
-          #   Affects the Docker daemon's plugin privilege handling code. ToolHive only uses
-          #   the Docker client SDK to manage containers, not the daemon plugin subsystem.
-          #   No fixed version exists for github.com/docker/docker; fix is only in
-          #   github.com/moby/moby/v2 v2.0.0-beta.8+ which is not yet available as a
-          #   docker/docker release.
-          # GO-2026-4887: AuthZ plugin bypass with oversized request bodies (CVE-2026-34040)
-          #   Affects the Docker daemon's AuthZ plugin mechanism. ToolHive only uses the
-          #   Docker client SDK and does not run or configure AuthZ plugins. No fixed version
-          #   exists for github.com/docker/docker; fix is only in github.com/moby/moby/v2
-          #   v2.0.0-beta.8+ which is not yet available as a docker/docker release.
-          # Go stdlib advisories published 2026-06-02, all fixed in go1.26.4 /
-          # go1.25.11 (DoS / log-injection class, no RCE):
-          #   GO-2026-5037 (CVE-2026-27145, crypto/x509 VerifyHostname)
-          #   GO-2026-5038 (CVE-2026-42504, mime WordDecoder.DecodeHeader)
-          #   GO-2026-5039 (CVE-2026-42507, net/textproto error messages)
-          # CI's `setup-go: stable` still resolves to go1.26.3 because the
-          # actions/go-versions manifest lags the Go release. Temporary
-          # exclusion; remove once CI builds on go1.26.4 or later.
-          #
           # GO-2026-5932: golang.org/x/crypto/openpgp is deprecated-by-design
           # ("unsafe, not maintained, should not be used"). No fixed version
           # exists and none is planned.
@@ -185,7 +160,7 @@ jobs:
           # REMOVAL TRIGGER: `go 1.27` sorts above `1.26.0`, so moving the
           # go directive to 1.27 satisfies x/crypto v0.56.0 without a patch
           # version. Bump x/crypto and drop both entries then.
-          IGNORED_VULNS="GO-2026-4514 GO-2026-4883 GO-2026-4887 GO-2026-5617 GO-2026-5668 GO-2026-5746 GO-2026-5932 GO-2026-5037 GO-2026-5038 GO-2026-5039 GO-2026-6354 GO-2026-6355"
+          IGNORED_VULNS="GO-2026-5932 GO-2026-6354 GO-2026-6355"
 
           # Show the raw output for debugging
           # A scan that produced nothing is a failed scan, not a clean one.

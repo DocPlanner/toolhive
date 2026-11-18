@@ -21,6 +21,12 @@ import (
 // cached entry has definitively expired and should be evicted.
 var ErrExpired = errors.New("cache entry expired")
 
+// evictedEntry is a key/value pair buffered for deferred onEvict invocation.
+type evictedEntry[K comparable, V any] struct {
+	key K
+	val V
+}
+
 // ValidatingCache is a node-local write-through cache backed by a
 // capacity-bounded LRU map, with singleflight-deduplicated Get operations and
 // lazy liveness validation on cache hit.
@@ -32,26 +38,42 @@ var ErrExpired = errors.New("cache entry expired")
 // singleflight group so at most one operation executes concurrently per key.
 // Concurrent callers for the same key share the result, coalescing both
 // liveness checks and storage round-trips into a single operation per key.
+//
+// # onEvict runs off the cache lock
+//
+// The user onEvict may perform slow teardown (e.g. closing network
+// connections). To keep that work off the shared cache lock, the LRU's own
+// eviction callback only *buffers* each evicted entry (bufferEvicted); every
+// mutating operation then drains the buffer and invokes the user onEvict via
+// drainEvictions after releasing mu. onEvict therefore never runs while mu is
+// held, so a slow onEvict never blocks Get/Set/RemoveMatching on other keys.
 type ValidatingCache[K comparable, V any] struct {
 	lruCache *lru.Cache[K, V]
 	flight   singleflight.Group
 	load     func(ctx context.Context, key K) (V, error)
 	check    func(ctx context.Context, key K, val V) error
 	onEvict  func(K, V)
-	// mu serializes Set against the conditional eviction in getHit and in
-	// EvictIdle. check() runs outside the lock to avoid holding it during I/O;
-	// the lock is only held for the short Peek+Remove sequence.
+
+	// mu serializes Set against the conditional eviction in getHit and the
+	// per-entry eviction in RemoveMatching, Remove and EvictIdle. check() runs outside the lock to
+	// avoid holding it during I/O; the lock is only held for short
+	// Peek+Remove / Add sequences, never across onEvict.
 	mu sync.Mutex
+
+	// evictMu guards pending. It is only ever acquired on its own (in
+	// bufferEvicted and drainEvictions), never while another lock is being
+	// acquired, so it introduces no lock-ordering cycle with mu even though
+	// bufferEvicted may run while mu is held.
+	evictMu sync.Mutex
+	// pending holds entries evicted by the LRU but not yet handed to the user
+	// onEvict. Drained (and the user onEvict invoked) by drainEvictions after
+	// mu is released. Always nil when onEvict is nil.
+	pending []evictedEntry[K, V]
+
 	// lastUsed records when each entry was last read or written (K -> time.Time).
-	// EvictIdle reads it; the LRU eviction callback removes an entry's record.
+	// EvictIdle reads it; the LRU eviction callback removes an entry's record, so
+	// the records stay bounded by the cache capacity. DocPlanner fork.
 	lastUsed sync.Map
-	// detachMu guards detached.
-	detachMu sync.Mutex
-	// detached holds the entries that Remove and EvictIdle take out of the LRU
-	// while holding mu. The LRU eviction callback skips onEvict for them; the
-	// caller calls onEvict after releasing mu, so a slow onEvict (a session Close
-	// doing backend I/O) never blocks Set or a concurrent eviction.
-	detached map[K]V
 }
 
 // New creates a ValidatingCache with the given capacity and callbacks.
@@ -65,7 +87,9 @@ type ValidatingCache[K comparable, V any] struct {
 // key and the cached value so callers can inspect the value without a separate
 // read. Returning ErrExpired evicts the entry; any other error is transient
 // (cached value returned unchanged). It must not be nil.
-// onEvict is called after any eviction (LRU or expiry); it may be nil.
+// onEvict is called after any eviction (LRU or expiry); it may be nil. It is
+// always invoked outside the cache lock (see the type doc), so it is safe for
+// onEvict to perform slow teardown without blocking other cache operations.
 func New[K comparable, V any](
 	capacity int,
 	load func(context.Context, K) (V, error),
@@ -82,30 +106,61 @@ func New[K comparable, V any](
 		panic("cache.New: check must not be nil")
 	}
 
-	vc := &ValidatingCache[K, V]{
-		load:     load,
-		check:    check,
-		onEvict:  onEvict,
-		detached: make(map[K]V),
+	c := &ValidatingCache[K, V]{
+		load:    load,
+		check:   check,
+		onEvict: onEvict,
 	}
-	c, err := lru.NewWithEvict(capacity, func(key K, val V) {
-		vc.lastUsed.Delete(key)
-		if onEvict != nil && !vc.takeDetached(key, val) {
-			onEvict(key, val)
+
+	// The LRU callback drops the entry's last-use record. When onEvict is nil
+	// evicted values are otherwise simply dropped; else the callback only
+	// buffers, and drainEvictions runs the real onEvict off the lock.
+	lruCache, err := lru.NewWithEvict(capacity, func(key K, val V) {
+		c.lastUsed.Delete(key)
+		if onEvict != nil {
+			c.bufferEvicted(key, val)
 		}
 	})
 	if err != nil {
 		// Only possible if size < 0, which we have already ruled out above.
 		panic(fmt.Sprintf("cache.New: lru.NewWithEvict: %v", err))
 	}
-	vc.lruCache = c
-	return vc
+	c.lruCache = lruCache
+	return c
+}
+
+// bufferEvicted is the LRU's eviction callback. The LRU fires it from Add/Remove
+// while the caller may still hold mu (getHit, Set, RemoveMatching), so it must
+// not run the user onEvict inline. It records the entry for drainEvictions to
+// hand to onEvict after mu is released. Only called when onEvict is non-nil.
+func (c *ValidatingCache[K, V]) bufferEvicted(key K, val V) {
+	c.evictMu.Lock()
+	c.pending = append(c.pending, evictedEntry[K, V]{key: key, val: val})
+	c.evictMu.Unlock()
+}
+
+// drainEvictions invokes the user onEvict for every entry buffered since the
+// last drain. Callers MUST NOT hold mu, so onEvict runs off the cache lock. It
+// is safe to call when onEvict is nil (nothing is ever buffered) and when there
+// is nothing pending.
+func (c *ValidatingCache[K, V]) drainEvictions() {
+	if c.onEvict == nil {
+		return
+	}
+	c.evictMu.Lock()
+	pending := c.pending
+	c.pending = nil
+	c.evictMu.Unlock()
+
+	for _, e := range pending {
+		c.onEvict(e.key, e.val)
+	}
 }
 
 // getHit validates a known-present cache entry and returns its value.
-// If the entry has definitively expired it is evicted and (zero, false) is
-// returned. Transient check errors leave the entry in place and return the
-// cached value.
+// If the entry has definitively expired it is removed (its eviction buffered
+// for the caller to drain) and (zero, false) is returned. Transient check
+// errors leave the entry in place and return the cached value.
 func (c *ValidatingCache[K, V]) getHit(ctx context.Context, key K, val V) (V, bool) {
 	if err := c.check(ctx, key, val); err != nil {
 		if errors.Is(err, ErrExpired) {
@@ -115,7 +170,7 @@ func (c *ValidatingCache[K, V]) getHit(ctx context.Context, key K, val V) (V, bo
 			// freshly-written value that the caller intended to keep.
 			c.mu.Lock()
 			if current, ok := c.lruCache.Peek(key); ok && sameEntry(current, val) {
-				// Remove fires the eviction callback automatically.
+				// Remove buffers the eviction; Get drains it after mu is released.
 				c.lruCache.Remove(key)
 			}
 			c.mu.Unlock()
@@ -171,7 +226,9 @@ func (c *ValidatingCache[K, V]) Get(ctx context.Context, key K) (V, bool) {
 		// their value wins and we return it instead.
 		if alreadySet, _ := c.lruCache.ContainsOrAdd(key, v); alreadySet {
 			if winner, ok := c.lruCache.Get(key); ok {
-				// Winner confirmed: v is definitively discarded — release its resources.
+				// Winner confirmed: v is definitively discarded — release its
+				// resources. v was never stored, so it is not buffered; invoke
+				// onEvict directly (this runs outside mu, so it is off the lock).
 				if c.onEvict != nil {
 					c.onEvict(key, v)
 				}
@@ -179,13 +236,18 @@ func (c *ValidatingCache[K, V]) Get(ctx context.Context, key K) (V, bool) {
 				return result{v: winner}, nil
 			}
 			// The concurrent winner was itself evicted by LRU pressure between
-			// ContainsOrAdd and Get. Fall back to storing v — do NOT call onEvict
-			// since v has not been released and is still valid.
+			// ContainsOrAdd and Get. Fall back to storing v — do NOT release v
+			// since it has not been discarded and is still valid.
 			c.lruCache.Add(key, v)
 		}
 		c.lastUsed.Store(key, time.Now())
 		return result{v: v}, nil
 	})
+	// Drain any evictions buffered by getHit's Remove or the miss path's
+	// ContainsOrAdd/Add (LRU capacity eviction). mu is not held here, so onEvict
+	// runs off the lock. Coalesced singleflight waiters also drain; a drain that
+	// finds nothing pending is a cheap no-op.
+	c.drainEvictions()
 	if err != nil {
 		var zero V
 		return zero, false
@@ -196,29 +258,29 @@ func (c *ValidatingCache[K, V]) Get(ctx context.Context, key K) (V, bool) {
 
 // Set stores value under key, moving the entry to the MRU position. If the
 // cache is at capacity, the least-recently-used entry is evicted first and
-// onEvict is called for it.
+// onEvict is called for it — after mu is released, so a slow onEvict does not
+// block concurrent cache operations.
 func (c *ValidatingCache[K, V]) Set(key K, value V) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.lruCache.Add(key, value)
 	c.lastUsed.Store(key, time.Now())
+	c.mu.Unlock()
+	c.drainEvictions()
 }
 
 // Remove evicts key, calling onEvict for its value after the cache lock is
-// released. It is a no-op when key is not cached.
+// released. It is a no-op when key is not cached. DocPlanner fork.
 func (c *ValidatingCache[K, V]) Remove(key K) {
 	c.mu.Lock()
-	val, removed := c.removeDetached(key)
+	c.lruCache.Remove(key) // buffers the eviction; drained below
 	c.mu.Unlock()
-	if removed && c.onEvict != nil {
-		c.onEvict(key, val)
-	}
+	c.drainEvictions()
 }
 
 // EvictIdle evicts every entry that no Get or Set has used for longer than
 // maxAge, calling onEvict for each after the cache lock is released. It calls
 // neither check nor load, so it never touches the backing store (for example, it
-// does not refresh a Redis TTL).
+// does not refresh a Redis TTL). DocPlanner fork.
 //
 // An entry that a concurrent Get returns just before EvictIdle removes it is
 // still handed to that caller after onEvict has run.
@@ -233,19 +295,13 @@ func (c *ValidatingCache[K, V]) EvictIdle(maxAge time.Duration) {
 		c.mu.Lock()
 		// CompareAndDelete skips an entry that a Get or Set touched after Range
 		// read it; Set holds mu, so it cannot re-add the key in between.
-		var (
-			val     V
-			removed bool
-		)
 		if c.lastUsed.CompareAndDelete(rawKey, rawUsed) {
-			val, removed = c.removeDetached(key)
+			c.lruCache.Remove(key) // buffers the eviction; drained below
 		}
 		c.mu.Unlock()
-		if removed && c.onEvict != nil {
-			c.onEvict(key, val)
-		}
 		return true
 	})
+	c.drainEvictions()
 }
 
 // Len returns the number of entries currently in the cache.
@@ -253,41 +309,45 @@ func (c *ValidatingCache[K, V]) Len() int {
 	return c.lruCache.Len()
 }
 
-// removeDetached removes key from the LRU without running onEvict, and returns
-// the removed value for the caller to release after it unlocks mu. The caller
-// must hold mu. The LRU capacity eviction in Get does not hold mu, so it can
-// evict the same entry concurrently; exactly one of the two calls onEvict for
-// it. Peek and the detach mark happen under detachMu, which the eviction
-// callback also takes: an eviction whose callback runs after the mark skips
-// onEvict, and one that removed the entry before Peek leaves nothing to detach.
-func (c *ValidatingCache[K, V]) removeDetached(key K) (V, bool) {
-	c.detachMu.Lock()
-	val, ok := c.lruCache.Peek(key)
-	if ok {
-		c.detached[key] = val
+// RemoveMatching evicts every entry for which pred reports true, invoking the
+// user onEvict for each removed entry, and returns the number removed.
+//
+// pred runs under the cache lock (the same lock Set contends for) and must not
+// call back into the cache. onEvict, however, runs via drainEvictions after all
+// removals complete and the lock is released, so a slow onEvict (e.g. closing a
+// hung backend connection) delays only the drain, never the shared cache lock:
+// a concurrent Set/Get on any key proceeds while a slow teardown is in flight.
+// This is intended for infrequent bulk eviction (e.g. reconciling sessions
+// after a backend is removed from the registry), not a hot path.
+func (c *ValidatingCache[K, V]) RemoveMatching(pred func(K, V) bool) int {
+	// Snapshot the candidate keys under a short lock. Keys() returns a copy and
+	// Peek does not update recency, so evaluating pred here leaves the LRU order
+	// of surviving entries unchanged.
+	c.mu.Lock()
+	var candidates []K
+	for _, key := range c.lruCache.Keys() {
+		if val, ok := c.lruCache.Peek(key); ok && pred(key, val) {
+			candidates = append(candidates, key)
+		}
 	}
-	c.detachMu.Unlock()
-	if !ok {
-		var zero V
-		return zero, false
-	}
-	c.lruCache.Remove(key)
-	// Drop the mark if no callback took it: a concurrent eviction removed val
-	// and a newer value for key took its place before Remove.
-	c.takeDetached(key, val)
-	return val, true
-}
+	c.mu.Unlock()
 
-// takeDetached reports whether (key, val) is marked as detached, and clears the mark.
-func (c *ValidatingCache[K, V]) takeDetached(key K, val V) bool {
-	c.detachMu.Lock()
-	defer c.detachMu.Unlock()
-	marked, ok := c.detached[key]
-	if !ok || !sameEntry(marked, val) {
-		return false
+	var removed int
+	for _, key := range candidates {
+		c.mu.Lock()
+		// Re-check under the lock: a concurrent Set may have replaced the entry
+		// with a value pred no longer selects, or another path may have evicted
+		// it. Peek+pred both guards that race and keeps eviction correct.
+		if val, ok := c.lruCache.Peek(key); ok && pred(key, val) {
+			c.lruCache.Remove(key) // buffers the eviction; drained below
+			removed++
+		}
+		c.mu.Unlock()
 	}
-	delete(c.detached, key)
-	return true
+	// Run onEvict for the removed entries off the lock, so a slow teardown of one
+	// session never blocks Get/Set for the rest of the node.
+	c.drainEvictions()
+	return removed
 }
 
 // sameEntry reports whether a and b are the same cache entry.

@@ -663,6 +663,13 @@ type OIDCUpstreamRunConfig struct {
 	// stable per user (e.g. Entra/Azure AD's "oid"). See upstream.OIDCConfig.
 	SubjectClaim string `json:"subject_claim,omitempty" yaml:"subject_claim,omitempty"`
 
+	// DCRConfig enables RFC 7591 Dynamic Client Registration against the
+	// upstream authorization server. When set, the client credentials are
+	// obtained at runtime rather than being pre-provisioned via ClientID /
+	// ClientSecretFile / ClientSecretEnvVar, and ClientID must be left empty.
+	// Mutually exclusive with ClientID.
+	DCRConfig *DCRUpstreamConfig `json:"dcr_config,omitempty" yaml:"dcr_config,omitempty"`
+
 	// CAFilePath is the path to a PEM CA bundle added to the system roots.
 	CAFilePath string `json:"ca_file_path,omitempty" yaml:"ca_file_path,omitempty"`
 
@@ -702,6 +709,13 @@ type OAuth2UpstreamRunConfig struct {
 	// ClientSecretEnvVar is the name of an environment variable containing the client secret.
 	// Mutually exclusive with ClientSecretFile. Optional for public clients using PKCE.
 	ClientSecretEnvVar string `json:"client_secret_env_var,omitempty" yaml:"client_secret_env_var,omitempty"`
+
+	// TokenEndpointAuthMethod selects how the client authenticates at the OAuth token
+	// endpoint. When empty, credentials are sent in the request body (the historical
+	// client_secret_post-shaped default). Set this to client_secret_basic explicitly
+	// for providers that require HTTP Basic auth. Public clients without a secret use
+	// the "none" method.
+	TokenEndpointAuthMethod string `json:"token_endpoint_auth_method,omitempty" yaml:"token_endpoint_auth_method,omitempty"`
 
 	// RedirectURI is the callback URL where the upstream IDP will redirect after authentication.
 	// When not specified, defaults to `{issuer}/oauth/callback`.
@@ -767,11 +781,13 @@ type OAuth2UpstreamRunConfig struct {
 }
 
 // DCRUpstreamConfig configures RFC 7591 Dynamic Client Registration for an
-// upstream authorization server. When present on an OAuth2 upstream, the
-// authserver performs registration at runtime to obtain client credentials,
-// replacing the need to pre-provision a ClientID.
+// OAuth2 or OIDC upstream. When present, the authserver performs registration
+// at runtime to obtain client credentials, replacing the need to pre-provision
+// a ClientID.
 //
-// Exactly one of DiscoveryURL or RegistrationEndpoint must be set. DiscoveryURL
+// OAuth2 upstreams must set exactly one of DiscoveryURL or
+// RegistrationEndpoint. OIDC upstreams may omit both and derive DiscoveryURL
+// from IssuerURL.
 // points at RFC 8414 / OIDC Discovery metadata from which the registration
 // endpoint is resolved; RegistrationEndpoint is used directly when the upstream
 // does not publish discovery metadata.
@@ -1370,6 +1386,37 @@ func (c *Config) warnTrustedIssuerAudiences() {
 	}
 }
 
+// Validate checks that the OIDCUpstreamRunConfig has either a pre-provisioned
+// client ID or a DCR configuration, but not both. OIDC DCR may omit both endpoint
+// selectors because discovery is derived from IssuerURL.
+func (c *OIDCUpstreamRunConfig) Validate() error {
+	hasClientID := c.ClientID != ""
+	hasDCR := c.DCRConfig != nil
+	if hasClientID == hasDCR {
+		return fmt.Errorf("oidc upstream: exactly one of client_id or dcr_config must be set")
+	}
+	if !hasDCR {
+		return nil
+	}
+	if c.DCRConfig.DiscoveryURL != "" && c.DCRConfig.RegistrationEndpoint != "" {
+		return fmt.Errorf("oidc upstream: dcr_config discovery_url and registration_endpoint are mutually exclusive")
+	}
+	if c.DCRConfig.DiscoveryURL == "" && c.DCRConfig.RegistrationEndpoint == "" {
+		if c.DCRConfig.InitialAccessTokenFile != "" && c.DCRConfig.InitialAccessTokenEnvVar != "" {
+			return fmt.Errorf(
+				"oidc upstream: dcr_config initial_access_token_file and initial_access_token_env_var are mutually exclusive")
+		}
+		if c.IssuerURL == "" {
+			return fmt.Errorf("oidc upstream: issuer_url is required when dcr_config omits discovery_url and registration_endpoint")
+		}
+		return nil
+	}
+	if err := c.DCRConfig.Validate(); err != nil {
+		return fmt.Errorf("oidc upstream: invalid dcr_config: %w", err)
+	}
+	return nil
+}
+
 // Validate checks that the OAuth2UpstreamRunConfig is internally consistent.
 // It enforces the mutual exclusivity of ClientID and DCRConfig: exactly one must
 // be set. A ClientID is required for pre-provisioned clients; a DCRConfig is
@@ -1418,6 +1465,34 @@ func (c *OAuth2UpstreamRunConfig) Validate() error {
 
 	if c.IdentityFromToken != nil && c.IdentityFromToken.SubjectPath == "" {
 		return fmt.Errorf("oauth2 upstream: identity_from_token.subject_path must not be empty when identity_from_token is configured")
+	}
+
+	return c.validateTokenEndpointAuthMethod()
+}
+
+// validateTokenEndpointAuthMethod checks TokenEndpointAuthMethod against the
+// set of methods buildPureOAuth2Config/authStyleFromMethod support, and that
+// the method is consistent with whether a client secret source is configured.
+// Split out of Validate to keep that method's cyclomatic complexity down.
+func (c *OAuth2UpstreamRunConfig) validateTokenEndpointAuthMethod() error {
+	hasSecretSource := c.ClientSecretFile != "" || c.ClientSecretEnvVar != ""
+
+	switch c.TokenEndpointAuthMethod {
+	case "":
+		// Empty means the historical POST-body default; buildPureOAuth2Config
+		// passes it through unchanged, it does not resolve to a confidential method.
+	case oauthproto.TokenEndpointAuthMethodNone:
+		if hasSecretSource {
+			return fmt.Errorf("oauth2 upstream: token_endpoint_auth_method none cannot be used with a client secret")
+		}
+	case oauthproto.TokenEndpointAuthMethodClientSecretBasic, oauthproto.TokenEndpointAuthMethodClientSecretPost:
+		if !hasSecretSource {
+			return fmt.Errorf(
+				"oauth2 upstream: token_endpoint_auth_method %q requires client_secret_file or client_secret_env_var",
+				c.TokenEndpointAuthMethod)
+		}
+	default:
+		return fmt.Errorf("oauth2 upstream: unsupported token_endpoint_auth_method %q", c.TokenEndpointAuthMethod)
 	}
 
 	return nil
