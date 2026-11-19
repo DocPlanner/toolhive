@@ -20,13 +20,17 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
 	"github.com/ory/fosite"
+	"github.com/spiffe/go-spiffe/v2/bundle/jwtbundle"
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 
 	servercrypto "github.com/stacklok/toolhive/pkg/authserver/server/crypto"
+	"github.com/stacklok/toolhive/pkg/authserver/server/keys"
 	"github.com/stacklok/toolhive/pkg/authserver/server/registration"
 	"github.com/stacklok/toolhive/pkg/networking"
 )
@@ -116,6 +120,21 @@ type AuthorizationServerConfig struct {
 	// only when this is true, mirroring how the grant itself is only
 	// registered with fosite when true (see buildProvider).
 	JWTBearerGrantEnabled bool
+	// SPIFFEClientResolver resolves a verified SPIFFE identity to its
+	// configured OAuth client for the SPIFFE client-authentication strategy.
+	// Nil when no SPIFFE trust is configured; package server cannot import
+	// the concrete association registry and storage that back this resolver
+	// (authserver imports server), so the caller supplies it as a closure.
+	SPIFFEClientResolver SPIFFEClientResolver
+	// SPIFFEX509BundleSource provides X.509 bundles for verifying SPIFFE
+	// X.509-SVID client certificates. Not yet read by this package: carried
+	// here, copied through from AuthorizationServerParams, so the X.509 and
+	// JWT SPIFFE client-authentication arms land on a shared field instead of
+	// each independently extending this struct.
+	SPIFFEX509BundleSource x509bundle.Source
+	// SPIFFEJWTBundleSource provides JWT bundles for verifying SPIFFE
+	// JWT-SVID client assertions. See SPIFFEX509BundleSource.
+	SPIFFEJWTBundleSource jwtbundle.Source
 }
 
 // Factory is a constructor which is used to create an OAuth2 endpoint handler.
@@ -138,6 +157,13 @@ type AuthorizationServerParams struct {
 	SigningKeyID         string
 	SigningKeyAlgorithm  string
 	SigningKey           crypto.Signer
+	// AdditionalPublicKeys are published in the JWKS alongside the primary
+	// signing key, in public form only, so that tokens signed with a
+	// previous key remain verifiable during rotation. Typically sourced from
+	// keys.KeyProvider.PublicKeys(ctx), which includes the primary signing
+	// key itself; the entry matching SigningKeyID is skipped to avoid
+	// publishing it twice.
+	AdditionalPublicKeys []*keys.PublicKeyData
 	// AllowedAudiences is the list of valid resource URIs that tokens can be issued for.
 	// Per RFC 8707, the "resource" parameter in token requests is validated against this list.
 	// Security: An empty list means NO audiences are permitted (secure default).
@@ -184,6 +210,19 @@ type AuthorizationServerParams struct {
 	// RFC 7523 JWT-bearer grant configured. See AuthorizationServerConfig's
 	// field of the same name.
 	JWTBearerGrantEnabled bool
+	// SPIFFEClientResolver resolves a verified SPIFFE identity to its
+	// configured OAuth client. Nil when no SPIFFE trust is configured.
+	// See the identically named field on AuthorizationServerConfig.
+	SPIFFEClientResolver SPIFFEClientResolver
+	// SPIFFEX509BundleSource provides X.509 bundles for verifying SPIFFE
+	// X.509-SVID client certificates. Not yet read by this package: threaded
+	// through here so the X.509 and JWT SPIFFE client-authentication arms
+	// land on a shared field instead of each independently extending this
+	// struct.
+	SPIFFEX509BundleSource x509bundle.Source
+	// SPIFFEJWTBundleSource provides JWT bundles for verifying SPIFFE
+	// JWT-SVID client assertions. See SPIFFEX509BundleSource.
+	SPIFFEJWTBundleSource jwtbundle.Source
 }
 
 // validateIssuerURL validates that the issuer is a valid URL with http or https scheme
@@ -364,6 +403,24 @@ func NewAuthorizationServerConfig(cfg *AuthorizationServerParams) (*Authorizatio
 		Use:       "sig",
 	}
 
+	// The JWKS published at /.well-known/jwks.json must include every
+	// fallback key still in rotation, not just the primary signing key,
+	// or the documented key-rotation procedure never opens its overlap
+	// window (#6451). The primary key is listed first; any additional
+	// key matching its KeyID is skipped to avoid publishing it twice.
+	signingJWKS := &jose.JSONWebKeySet{Keys: []jose.JSONWebKey{jwk}}
+	for _, pubKey := range cfg.AdditionalPublicKeys {
+		if pubKey.KeyID == cfg.SigningKeyID {
+			continue
+		}
+		signingJWKS.Keys = append(signingJWKS.Keys, jose.JSONWebKey{
+			Key:       pubKey.PublicKey,
+			KeyID:     pubKey.KeyID,
+			Algorithm: pubKey.Algorithm,
+			Use:       "sig",
+		})
+	}
+
 	fositeConfig := &fosite.Config{
 		AccessTokenIssuer:              cfg.Issuer,
 		AccessTokenLifespan:            cfg.AccessTokenLifespan,
@@ -390,7 +447,7 @@ func NewAuthorizationServerConfig(cfg *AuthorizationServerParams) (*Authorizatio
 	return &AuthorizationServerConfig{
 		Config:                              fositeConfig,
 		SigningKey:                          &jwk,
-		SigningJWKS:                         &jose.JSONWebKeySet{Keys: []jose.JSONWebKey{jwk}},
+		SigningJWKS:                         signingJWKS,
 		AllowedAudiences:                    cfg.AllowedAudiences,
 		ScopesSupported:                     cfg.ScopesSupported,
 		BaselineClientScopes:                cfg.BaselineClientScopes,
@@ -404,6 +461,9 @@ func NewAuthorizationServerConfig(cfg *AuthorizationServerParams) (*Authorizatio
 		ForceConfidentialRedirectURIs:             cfg.ForceConfidentialRedirectURIs,
 		TokenExchangeEnabled:                      !cfg.DisableTokenExchange,
 		JWTBearerGrantEnabled:                     cfg.JWTBearerGrantEnabled,
+		SPIFFEClientResolver:                      cfg.SPIFFEClientResolver,
+		SPIFFEX509BundleSource:                    cfg.SPIFFEX509BundleSource,
+		SPIFFEJWTBundleSource:                     cfg.SPIFFEJWTBundleSource,
 	}, nil
 }
 
@@ -423,11 +483,30 @@ func NewAuthorizationServer(
 	); err != nil {
 		return nil, err
 	}
-	fositeConfig := config.Config
-	provider := fosite.NewOAuth2Provider(storage, fositeConfig)
+	providerConfig := *config
+	fositeConfig := *config.Config
+	fositeConfig.AuthorizeEndpointHandlers = slices.Clone(fositeConfig.AuthorizeEndpointHandlers)
+	fositeConfig.TokenEndpointHandlers = slices.Clone(fositeConfig.TokenEndpointHandlers)
+	fositeConfig.TokenIntrospectionHandlers = slices.Clone(fositeConfig.TokenIntrospectionHandlers)
+	fositeConfig.RevocationHandlers = slices.Clone(fositeConfig.RevocationHandlers)
+	fositeConfig.PushedAuthorizeEndpointHandlers = slices.Clone(fositeConfig.PushedAuthorizeEndpointHandlers)
+	providerConfig.Config = &fositeConfig
+	provider := fosite.NewOAuth2Provider(storage, &fositeConfig)
+	// Select the fallback after constructing the provider because fosite's
+	// built-in strategy is a provider method. Preserve a caller-supplied strategy
+	// when present, then install the SPIFFE dispatcher on the provider-local copy.
+	defaultStrategy := func() fosite.ClientAuthenticationStrategy {
+		if fositeConfig.ClientAuthenticationStrategy != nil {
+			return fositeConfig.ClientAuthenticationStrategy
+		}
+		return provider.DefaultClientAuthenticationStrategy
+	}()
+	fositeConfig.ClientAuthenticationStrategy = newSPIFFEClientAuthenticationStrategy(
+		defaultStrategy, providerConfig.SPIFFEClientResolver,
+	)
 
 	for _, factory := range factories {
-		result, err := factory(config, storage, strategy)
+		result, err := factory(&providerConfig, storage, strategy)
 		if err != nil {
 			return nil, fmt.Errorf("authorization server factory failed: %w", err)
 		}

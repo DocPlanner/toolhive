@@ -18,7 +18,7 @@ import (
 	"github.com/ory/fosite"
 	"github.com/redis/go-redis/v9"
 
-	tcredis "github.com/stacklok/toolhive-core/redis"
+	"github.com/stacklok/toolhive-core/redisconn"
 	"github.com/stacklok/toolhive/pkg/authserver/server"
 	"github.com/stacklok/toolhive/pkg/authserver/server/registration"
 	"github.com/stacklok/toolhive/pkg/authserver/server/session"
@@ -127,15 +127,15 @@ type storedSession struct {
 //
 // Connection-mode validation, timeout defaults, client construction (standalone,
 // cluster, or sentinel), TLS plumbing, and connectivity verification are
-// delegated to the shared toolhive-core redis package. cfg.Password may be
+// delegated to the shared toolhive-core redisconn package. cfg.Password may be
 // empty when the Redis server does not require authentication (the auth server
 // does not mandate ACL auth); the keyPrefix is storage-specific and required.
-func NewRedisStorage(ctx context.Context, cfg tcredis.Config, keyPrefix string) (*RedisStorage, error) {
+func NewRedisStorage(ctx context.Context, cfg redisconn.Config, keyPrefix string) (*RedisStorage, error) {
 	if keyPrefix == "" {
 		return nil, errors.New("invalid redis configuration: key prefix is required")
 	}
 
-	client, err := tcredis.NewClient(ctx, &cfg)
+	client, err := redisconn.NewClient(ctx, &cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -658,7 +658,7 @@ func (s *RedisStorage) GetClient(ctx context.Context, id string) (fosite.Client,
 	data, err := getCmd.Bytes()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
-			return nil, fmt.Errorf("%w: %w", ErrNotFound, fosite.ErrNotFound.WithHint("Client not found"))
+			return nil, notFoundRFC6749Error("Client not found")
 		}
 		return nil, fmt.Errorf("failed to get client: %w", err)
 	}
@@ -811,7 +811,7 @@ func (s *RedisStorage) GetAuthorizeCodeSession(ctx context.Context, code string,
 	data, err := s.client.Get(ctx, key).Bytes()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
-			return nil, fmt.Errorf("%w: %w", ErrNotFound, fosite.ErrNotFound.WithHint("Authorization code not found"))
+			return nil, notFoundRFC6749Error("Authorization code not found")
 		}
 		return nil, fmt.Errorf("failed to get authorization code: %w", err)
 	}
@@ -850,7 +850,7 @@ func (s *RedisStorage) InvalidateAuthorizeCodeSession(ctx context.Context, code 
 		return fmt.Errorf("failed to check authorization code: %w", err)
 	}
 	if exists == 0 {
-		return fmt.Errorf("%w: %w", ErrNotFound, fosite.ErrNotFound.WithHint("Authorization code not found"))
+		return notFoundRFC6749Error("Authorization code not found")
 	}
 
 	// Atomically: create invalidation marker and extend auth code TTL to match.
@@ -902,7 +902,7 @@ func (s *RedisStorage) GetAccessTokenSession(ctx context.Context, signature stri
 	data, err := s.client.Get(ctx, key).Bytes()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
-			return nil, fmt.Errorf("%w: %w", ErrNotFound, fosite.ErrNotFound.WithHint("Access token not found"))
+			return nil, notFoundRFC6749Error("Access token not found")
 		}
 		return nil, fmt.Errorf("failed to get access token: %w", err)
 	}
@@ -918,7 +918,7 @@ func (s *RedisStorage) DeleteAccessTokenSession(ctx context.Context, signature s
 	data, err := s.client.Get(ctx, key).Bytes()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
-			return fmt.Errorf("%w: %w", ErrNotFound, fosite.ErrNotFound.WithHint("Access token not found"))
+			return notFoundRFC6749Error("Access token not found")
 		}
 		return fmt.Errorf("failed to get access token: %w", err)
 	}
@@ -978,7 +978,7 @@ func (s *RedisStorage) GetRefreshTokenSession(ctx context.Context, signature str
 	data, err := s.client.Get(ctx, key).Bytes()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
-			return nil, fmt.Errorf("%w: %w", ErrNotFound, fosite.ErrNotFound.WithHint("Refresh token not found"))
+			return nil, notFoundRFC6749Error("Refresh token not found")
 		}
 		return nil, fmt.Errorf("failed to get refresh token: %w", err)
 	}
@@ -994,7 +994,7 @@ func (s *RedisStorage) DeleteRefreshTokenSession(ctx context.Context, signature 
 	data, err := s.client.Get(ctx, key).Bytes()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
-			return fmt.Errorf("%w: %w", ErrNotFound, fosite.ErrNotFound.WithHint("Refresh token not found"))
+			return notFoundRFC6749Error("Refresh token not found")
 		}
 		return fmt.Errorf("failed to get refresh token: %w", err)
 	}
@@ -1129,7 +1129,7 @@ func (s *RedisStorage) GetPKCERequestSession(ctx context.Context, signature stri
 	data, err := s.client.Get(ctx, key).Bytes()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
-			return nil, fmt.Errorf("%w: %w", ErrNotFound, fosite.ErrNotFound.WithHint("PKCE request not found"))
+			return nil, notFoundRFC6749Error("PKCE request not found")
 		}
 		return nil, fmt.Errorf("failed to get PKCE request: %w", err)
 	}
@@ -1146,7 +1146,7 @@ func (s *RedisStorage) DeletePKCERequestSession(ctx context.Context, signature s
 		return fmt.Errorf("failed to delete PKCE request: %w", err)
 	}
 	if result == 0 {
-		return fmt.Errorf("%w: %w", ErrNotFound, fosite.ErrNotFound.WithHint("PKCE request not found"))
+		return notFoundRFC6749Error("PKCE request not found")
 	}
 
 	return nil
@@ -1224,21 +1224,21 @@ const (
 	redisPTTLPersistent time.Duration = -1 // key exists without a TTL
 )
 
-// extractStoredUpstreamUserID returns the stored UserID from a token payload.
-// Corrupt payloads are tolerated here because older writes may have already
-// succeeded; in that case we skip reverse-index cleanup and let TTL expiry bound
-// the stale entry.
-func extractStoredUpstreamUserID(data string) string {
+// extractStoredUpstreamFields returns the stored UserID and RefreshToken from a
+// token payload. A missing row, the null marker and a corrupt payload all yield
+// empty values, as upstream's Lua scripts do: for a corrupt payload we skip
+// reverse-index cleanup and let TTL expiry bound the stale entry.
+func extractStoredUpstreamFields(data string) (userID, refreshToken string) {
 	if data == "" || data == nullMarker {
-		return ""
+		return "", ""
 	}
 
 	var stored storedUpstreamTokens
 	if err := json.Unmarshal([]byte(data), &stored); err != nil {
-		return ""
+		return "", ""
 	}
 
-	return stored.UserID
+	return stored.UserID, stored.RefreshToken
 }
 
 // marshalUpstreamTokensWithTTL marshals tokens and calculates TTL.
@@ -1301,8 +1301,6 @@ func marshalUpstreamTokensWithTTL(tokens *UpstreamTokens) ([]byte, time.Duration
 // StoreUpstreamTokens stores the upstream IDP tokens for a session and provider.
 // The write is coordinated with WATCH/MULTI so Dragonfly sees every accessed key
 // explicitly and reverse-index maintenance stays consistent under concurrent writes.
-//
-//nolint:gocyclo // the WATCH/MULTI retry and index-TTL rules replace a single Lua script
 func (s *RedisStorage) StoreUpstreamTokens(ctx context.Context, sessionID, providerName string, tokens *UpstreamTokens) error {
 	if sessionID == "" {
 		return fosite.ErrInvalidRequest.WithHint("session ID cannot be empty")
@@ -1310,7 +1308,47 @@ func (s *RedisStorage) StoreUpstreamTokens(ctx context.Context, sessionID, provi
 	if providerName == "" {
 		return fosite.ErrInvalidRequest.WithHint("provider name cannot be empty")
 	}
+	if err := s.writeUpstreamTokens(ctx, sessionID, providerName, nil, tokens); err != nil {
+		return fmt.Errorf("failed to store upstream tokens: %w", err)
+	}
+	return nil
+}
 
+// CompareAndSwapUpstreamTokens stores tokens for (sessionID, providerName)
+// only if the refresh token currently stored there equals
+// expectedRefreshToken; see the interface doc
+// (UpstreamTokenStorage.CompareAndSwapUpstreamTokens) for the coordination
+// contract. Upstream runs this as a Lua script that builds the user-set keys at
+// run time, which Dragonfly rejects; the fork reads the row and compares the
+// refresh token inside the same WATCH/MULTI transaction as the write instead.
+func (s *RedisStorage) CompareAndSwapUpstreamTokens(
+	ctx context.Context, sessionID, providerName, expectedRefreshToken string, tokens *UpstreamTokens,
+) error {
+	if sessionID == "" {
+		return fosite.ErrInvalidRequest.WithHint("session ID cannot be empty")
+	}
+	if providerName == "" {
+		return fosite.ErrInvalidRequest.WithHint("provider name cannot be empty")
+	}
+	err := s.writeUpstreamTokens(ctx, sessionID, providerName, &expectedRefreshToken, tokens)
+	if err == nil || errors.Is(err, ErrConcurrentRefresh) {
+		return err
+	}
+	return fmt.Errorf("failed to compare-and-swap upstream tokens: %w", err)
+}
+
+// writeUpstreamTokens is the shared WATCH/MULTI write behind StoreUpstreamTokens
+// and CompareAndSwapUpstreamTokens; the callers validate sessionID and
+// providerName. It replaces upstream's storeUpstreamTokensScript
+// and casUpstreamTokensScript (Lua). With a non-nil expectedRefreshToken the row is
+// written only if its stored refresh token (empty for a missing row, the null
+// marker or a corrupt payload) equals *expectedRefreshToken; otherwise it returns
+// ErrConcurrentRefresh and writes nothing. WATCH on the row key makes EXEC fail if
+// another writer changes the row after the comparison, and the retry then compares
+// again against the new row.
+func (s *RedisStorage) writeUpstreamTokens(
+	ctx context.Context, sessionID, providerName string, expectedRefreshToken *string, tokens *UpstreamTokens,
+) error {
 	key := redisUpstreamKey(s.keyPrefix, sessionID, providerName)
 	idxKey := redisSetKey(s.keyPrefix, KeyTypeUpstreamIdx, sessionID)
 
@@ -1326,58 +1364,49 @@ func (s *RedisStorage) StoreUpstreamTokens(ctx context.Context, sessionID, provi
 
 	userSetKeyPrefix := s.keyPrefix + KeyTypeUserUpstream + ":"
 
-	for attempt := 0; attempt < maxStoreUpstreamTokensRetries; attempt++ {
-		err = s.client.Watch(ctx, func(tx *redis.Tx) error {
-			existing, getErr := tx.Get(ctx, key).Result()
-			if getErr != nil && !errors.Is(getErr, redis.Nil) {
-				return fmt.Errorf("failed to read existing upstream tokens: %w", getErr)
-			}
-
-			oldUserID := extractStoredUpstreamUserID(existing)
-
-			currentTTL, ttlErr := tx.PTTL(ctx, idxKey).Result()
-			if ttlErr != nil && !errors.Is(ttlErr, redis.Nil) {
-				return fmt.Errorf("failed to read upstream token index TTL: %w", ttlErr)
-			}
-
-			oldUserSetKey := ""
-			if oldUserID != "" && oldUserID != newUserID {
-				oldUserSetKey = userSetKeyPrefix + oldUserID
-			}
-
-			newUserSetKey := ""
-			if newUserID != "" {
-				newUserSetKey = userSetKeyPrefix + newUserID
-			}
-
-			_, pipeErr := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-				pipe.Set(ctx, key, data, ttl)
-				pipe.SAdd(ctx, idxKey, key)
-
-				queueUpstreamIndexTTL(ctx, pipe, idxKey, currentTTL, ttl)
-
-				if oldUserSetKey != "" {
-					pipe.SRem(ctx, oldUserSetKey, key)
-				}
-
-				if newUserSetKey != "" {
-					pipe.SAdd(ctx, newUserSetKey, key)
-				}
-
-				return nil
-			})
-
-			return pipeErr
-		}, key, idxKey)
-		if err == nil {
-			return nil
+	write := func(tx *redis.Tx) error {
+		existing, getErr := tx.Get(ctx, key).Result()
+		if getErr != nil && !errors.Is(getErr, redis.Nil) {
+			return fmt.Errorf("failed to read existing upstream tokens: %w", getErr)
 		}
+
+		oldUserID, oldRefreshToken := extractStoredUpstreamFields(existing)
+		if expectedRefreshToken != nil && oldRefreshToken != *expectedRefreshToken {
+			return ErrConcurrentRefresh
+		}
+
+		currentTTL, ttlErr := tx.PTTL(ctx, idxKey).Result()
+		if ttlErr != nil && !errors.Is(ttlErr, redis.Nil) {
+			return fmt.Errorf("failed to read upstream token index TTL: %w", ttlErr)
+		}
+
+		_, pipeErr := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.Set(ctx, key, data, ttl)
+			pipe.SAdd(ctx, idxKey, key)
+
+			queueUpstreamIndexTTL(ctx, pipe, idxKey, currentTTL, ttl)
+
+			if oldUserID != "" && oldUserID != newUserID {
+				pipe.SRem(ctx, userSetKeyPrefix+oldUserID, key)
+			}
+			if newUserID != "" {
+				pipe.SAdd(ctx, userSetKeyPrefix+newUserID, key)
+			}
+
+			return nil
+		})
+
+		return pipeErr
+	}
+
+	for attempt := 0; attempt < maxStoreUpstreamTokensRetries; attempt++ {
+		err = s.client.Watch(ctx, write, key, idxKey)
 		if !errors.Is(err, redis.TxFailedErr) {
-			return fmt.Errorf("failed to store upstream tokens: %w", err)
+			return err
 		}
 	}
 
-	return fmt.Errorf("failed to store upstream tokens: %w", redis.TxFailedErr)
+	return redis.TxFailedErr
 }
 
 // ResolveUpstreamTokenRowID returns an opaque ID for process-local refresh
@@ -1483,7 +1512,7 @@ func (s *RedisStorage) DeleteUpstreamTokens(ctx context.Context, sessionID strin
 	providerKeys, err := s.client.SMembers(ctx, idxKey).Result()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
-			return fmt.Errorf("%w: %w", ErrNotFound, fosite.ErrNotFound.WithHint("Upstream tokens not found"))
+			return notFoundRFC6749Error("Upstream tokens not found")
 		}
 		return fmt.Errorf("failed to get upstream token index: %w", err)
 	}
@@ -1492,7 +1521,7 @@ func (s *RedisStorage) DeleteUpstreamTokens(ctx context.Context, sessionID strin
 	warnDroppedIndexMembers("DeleteUpstreamTokens", idxKey, s.keyPrefix, dropped)
 
 	if len(providerKeys) == 0 {
-		return fmt.Errorf("%w: %w", ErrNotFound, fosite.ErrNotFound.WithHint("Upstream tokens not found"))
+		return notFoundRFC6749Error("Upstream tokens not found")
 	}
 
 	// Collect UserIDs for reverse-index cleanup before deleting
@@ -1594,7 +1623,7 @@ func (s *RedisStorage) GetLatestUpstreamTokensForUser(ctx context.Context, userI
 	warnDroppedIndexMembers("GetLatestUpstreamTokensForUser", setKey, s.keyPrefix, dropped)
 
 	if len(members) == 0 {
-		return nil, fmt.Errorf("%w: %w", ErrNotFound, fosite.ErrNotFound.WithHint("Upstream tokens not found"))
+		return nil, notFoundRFC6749Error("Upstream tokens not found")
 	}
 
 	values, err := s.client.MGet(ctx, members...).Result()
@@ -1619,7 +1648,7 @@ func (s *RedisStorage) GetLatestUpstreamTokensForUser(ctx context.Context, userI
 	}
 
 	if winner == nil {
-		return nil, fmt.Errorf("%w: %w", ErrNotFound, fosite.ErrNotFound.WithHint("Upstream tokens not found"))
+		return nil, notFoundRFC6749Error("Upstream tokens not found")
 	}
 
 	return winner.toUpstreamTokens(), nil
@@ -1685,7 +1714,7 @@ func (s *RedisStorage) getUpstreamTokensFromKey(ctx context.Context, key string)
 	data, err := s.client.Get(ctx, key).Bytes()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
-			return nil, fmt.Errorf("%w: %w", ErrNotFound, fosite.ErrNotFound.WithHint("Upstream tokens not found"))
+			return nil, notFoundRFC6749Error("Upstream tokens not found")
 		}
 		return nil, fmt.Errorf("failed to get upstream tokens: %w", err)
 	}
@@ -2014,7 +2043,7 @@ func (s *RedisStorage) GetDCRCredentials(ctx context.Context, key DCRKey) (*DCRC
 	data, err := s.client.Get(ctx, redisKey).Bytes()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
-			return nil, fmt.Errorf("%w: %w", ErrNotFound, fosite.ErrNotFound.WithHint("DCR credentials not found"))
+			return nil, notFoundRFC6749Error("DCR credentials not found")
 		}
 		return nil, fmt.Errorf("failed to get dcr credentials: %w", err)
 	}
@@ -2098,7 +2127,7 @@ func (s *RedisStorage) LoadPendingAuthorization(ctx context.Context, state strin
 	data, err := s.client.Get(ctx, key).Bytes()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
-			return nil, fmt.Errorf("%w: %w", ErrNotFound, fosite.ErrNotFound.WithHint("Pending authorization not found"))
+			return nil, notFoundRFC6749Error("Pending authorization not found")
 		}
 		return nil, fmt.Errorf("failed to get pending authorization: %w", err)
 	}
@@ -2145,7 +2174,7 @@ func (s *RedisStorage) DeletePendingAuthorization(ctx context.Context, state str
 		return fmt.Errorf("failed to delete pending authorization: %w", err)
 	}
 	if result == 0 {
-		return fmt.Errorf("%w: %w", ErrNotFound, fosite.ErrNotFound.WithHint("Pending authorization not found"))
+		return notFoundRFC6749Error("Pending authorization not found")
 	}
 
 	return nil

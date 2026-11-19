@@ -4,7 +4,7 @@
 fork patches we carry. Upstream releases are brought in with a merge commit
 (`Merge upstream vX.Y.Z into dp-stable`), never a rebase.
 
-Merge base: upstream **v0.47.1** (`73c80e34a`), merged in `1d26445f1` (PAIINFRA-244).
+Merge base: upstream **v0.49.0** (`e532cf07d`), merged in `94089223d` (PAIINFRA-249). v0.48.0 was skipped.
 
 Goal: carry as few patches as possible. Each row below says what the patch does, why DocPlanner
 needs it, and when it can go. Check the "Drop when" column on every upstream merge.
@@ -21,7 +21,6 @@ commit](#changes-that-live-only-in-a-merge-commit)), so replaying the commits al
 |---|---|---|---|
 | `GenerationChangedPredicate` on every primary watch; vMCP `MaxConcurrentReconciles=3` | Status-only updates started full reconciles, and one slow vMCP blocked the others | `2c68591f2` | Upstream filters status-only events |
 | Follow-ups the predicate needs: MCPRegistry keeps reconciling after adding its finalizer, MCPRemoteProxy requeues and watches MCPGroup, EmbeddingServer stays Failed on an invalid PodTemplateSpec, MCPServer reconciles on annotation changes (restart annotation) | The predicate hides these changes | `c7660fbb4`, `1960086e7`, `b3b0da4b1`, `198b61950` | Together with the predicate |
-| vMCP env compared with `equality.Semantic`, labels and annotations as a subset, status setters skip unchanged values | False diffs caused an endless vMCP reconcile loop. Upstream compares pod-template labels exactly since v0.47 | `8071da52d` | Upstream compares semantically |
 | vMCP Service/Deployment AlreadyExists and Conflict errors requeue (in upstream's `createDeployment`/`updateDeployment` since v0.47.1) | Create/update races marked the vMCP as failed | `0532bd27f`, merge v0.47.1 | Upstream requeues on these errors |
 | vMCP drift check also compares nodeSelector, tolerations and affinity | Scheduling changes did not roll the vMCP | `3a8e50139` (the MCPServer StatefulSet cleanup from the same commit was removed in PAIINFRA-243: since upstream #6379 the MCPServer owns a StatefulSet with that name) | Upstream checks scheduling drift |
 | Explicit `spec.config.backends` merged with the discovered backends (explicit wins on the same name) | Hubs declare remote backends there; upstream overwrites the list | `8e474c8b2` | Upstream merges static backends |
@@ -41,7 +40,7 @@ commit](#changes-that-live-only-in-a-merge-commit)), so replaying the commits al
 | 401 with `WWW-Authenticate` when `authz.primaryUpstreamProvider` has no token (empty provider names ignored) | Clients log in again on 401, not on 403 | `44b70f6a5`, `f387a57f2` | Upstream returns 401 for a missing upstream token |
 | `upstreamInject` with `providerName: caller` forwards the already-validated caller bearer token to the backend | Lets a backend authenticate the hub caller with the same token, without the embedded auth server | `c333920ac` | Upstream supports forwarding the caller token |
 | DCR and CIMD without `scope` default to `scopesSupported` (RFC 7591) | Clients that register without `scope` got no scopes. Upstream grants `DefaultScopes` ∩ `scopesSupported` since v0.47 (#6186) | `16c2fba5e`, `7019ea20c`, merge v0.47.1 | `baselineClientScopes` set to `scopesSupported` in our values gives the same result |
-| Upstream-token writes use WATCH/MULTI instead of Lua | Our Dragonfly does not run the Lua scripts upstream uses | `907d7040d`, merge v0.28.3 | Upstream stops using Lua there, or we leave Dragonfly |
+| Upstream-token writes (`StoreUpstreamTokens` and, since v0.49.0, `CompareAndSwapUpstreamTokens`) use WATCH/MULTI instead of Lua, through one helper (`writeUpstreamTokens`). The CAS compares the stored refresh token inside the watched transaction. `redis_dragonfly_integration_test.go` runs them against a Dragonfly container | Upstream's scripts build the user-set keys at run time (`ARGV[4]..userID`); Dragonfly rejects keys a script did not declare | `907d7040d`, merge v0.28.3, merge v0.49.0 | Upstream stops using Lua there, or we leave Dragonfly (the Dragonfly test's first case fails when Dragonfly accepts undeclared keys) |
 | Audit user name falls back to the `username` claim | Cognito access tokens have no `name` or `email` | `a40493885` | Upstream reads `username` |
 | Client JSON-RPC responses (replies to elicitation, sampling, roots) pass through authz and the validating webhook. Only a body with no `method` member and a `result` or `error` counts as a reply (`ParsedMCPRequest.IsClientResponse`) | Upstream answers them with 400, so server-to-client requests never complete | `f22ee7fa6`, v0.42.1 follow-up | Upstream parses responses |
 
@@ -55,7 +54,7 @@ commit](#changes-that-live-only-in-a-merge-commit)), so replaying the commits al
 | The Host header stays the configured target host when `backend_url` pins a pod IP; any other Host is rewritten to the URL host, as upstream does | Backends with strict host validation rejected the pod IP | `ce851b471`, v0.42.1 follow-up | Upstream keeps the target Host |
 | HTTP 400 "no valid session ID" or "expired session ID" counts as a lost session (re-initialize and replay); only the first 4 KiB of the body are read | TypeScript SDK servers and mcp-for-argocd answer 400, not 404 | `8abac892e`, `16ffb4874`, merge v0.42.1 | Upstream treats these as session loss |
 | Streamable proxy answers a timeout or failure with a JSON-RPC error, not HTTP 504/500 | vMCP got a transport error instead of a call error | `cce5872bd` | Upstream returns JSON-RPC errors |
-| `ValidatingCache.Remove` and `EvictIdle`; entries closed outside the lock | The vMCP session cache needs eviction and close | `036974570`, `51de52641` | Upstream adds eviction |
+| `ValidatingCache.Remove` and `EvictIdle` (with the `lastUsed` record) | The vMCP session cache needs eviction and close. Since v0.49.0 they use upstream's buffered `onEvict` (#6549), which runs outside the lock | `036974570`, `51de52641`, merge v0.49.0 | Upstream adds per-key and idle eviction |
 
 ### Virtual MCP server
 
@@ -78,7 +77,7 @@ commit](#changes-that-live-only-in-a-merge-commit)), so replaying the commits al
 |---|---|---|---|
 | Jobs on `ubuntu-latest`; golangci-lint v2.14.0 with `only-new-issues` | The public repo gets no large runners; upstream's lint debt must not block fork PRs | `b387fe750` | Never (fork CI) |
 | Lifecycle e2e with 4 ginkgo processes; optimizer e2e timeout 90 s; managed-backend health assertion skipped | Smaller runners; managed backends are checked from workload status | `22368126a`, `05373f634`, `560253e96` | With the runner and health rows |
-| Module versions above upstream (x/net, x/crypto, x/sys, x/mod, x/text, x/tools, x/sync, x/term, grpc, zipkin) | govulncheck findings | `fd8d45c58`, `f90409530`, `b3929efa7` | Upstream reaches the same versions |
+| Module versions above upstream (at v0.49.0: x/crypto, x/net, x/sync, x/sys, x/term, x/text, x/tools, chi, go-jose v4, klauspost/compress, zipkin exporter) | govulncheck findings | `fd8d45c58`, `f90409530`, `b3929efa7` | Upstream reaches the same versions |
 
 ## Notes
 
@@ -159,6 +158,14 @@ merge (PAIINFRA-243): since v0.45.0 (#6379) the MCPServer owns a StatefulSet wit
 | DCR/CIMD default scope | `ValidateScopes` keeps the fork default (whole allowed set) with upstream's new 3-value signature; `droppedDefaults` is always nil |
 | Health `backendChanged` | Workload type and managed-workload status checks added next to upstream's AuthConfig check |
 
+### Merge upstream v0.49.0
+
+| Behaviour | How it was re-applied |
+|---|---|
+| Upstream-token CAS without Lua | Upstream's `storeUpstreamTokensScript` and new `casUpstreamTokensScript` (#6548) are not used. `StoreUpstreamTokens` and `CompareAndSwapUpstreamTokens` share `writeUpstreamTokens` (WATCH/MULTI). No new Redis commands, so the `toolhive-auth` ACL needs no change |
+| Cache eviction | Upstream's buffer-and-drain `onEvict` (#6549) replaces the fork's `detached` map; `Remove` and `EvictIdle` remove under `mu` and drain afterwards |
+| Redis ACL username | `redisconn.Config.Username` set next to upstream's set-but-empty password check (#6551) in `buildSessionDataStorage`; `newTransportSessionStorage` kept for the proxy runner |
+
 ## Dropped patches
 
 Patches that no longer change anything relative to upstream, or whose code path upstream removed.
@@ -195,3 +202,6 @@ They stay in history; don't re-apply them on a replay.
 | `3a8e50139` (cleanup part) | Delete StatefulSet-era objects of a migrated MCPServer | Upstream #6379 (v0.45.0) owns a StatefulSet with the same name; the cleanup would delete every backend. Removed before the v0.47.1 merge (PAIINFRA-243). |
 | `3533730ce`, `4cf28e14c`, `703e8e849`, `bafe4d46a` (write timeout) | Per-backend request timeouts, 90 s fallback, configurable server write timeout | Upstream applies `operational.timeouts` per backend (#6411) and lifts the write deadline while an MCP POST waits for a backend. Dropped in the v0.47.1 merge. |
 | `c4984e59c` (and `serve_refresh.go`, `refresh_scheduler.go`) | Capability refresh on backend health or registry changes | Upstream #6196 resyncs passthrough sessions when a backend's advertisability or the backend set changes. The add-only resources/prompts resync goes with it (no usage in Datadog APM). Dropped in the v0.47.1 merge. |
+| `8071da52d` | vMCP env compared semantically, labels and annotations as a subset, status setters skip unchanged values | Upstream #6377 (v0.49.0) compares env semantically and labels as a subset; `MutateAndPatchStatus` skips an empty patch (#4942). Dropped in the v0.49.0 merge. |
+| `036974570`, `51de52641` (detach part) | `onEvict` called outside the lock through a `detached` map | Upstream #6549 buffers evictions and drains them outside the lock. Dropped in the v0.49.0 merge. |
+| `f90409530` (ignore list) | Extra govulncheck ignores (GO-2026-4514, -4883, -4887, -5617, -5668, -5746) | Upstream's list since the Go 1.27 bump (#6639) is used as is. Dropped in the v0.49.0 merge. |
